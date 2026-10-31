@@ -17,9 +17,10 @@
 //! `APPEND` is not collected at all: it is delivered as it arrives, as
 //! [`LexEvent::AppendChunk`]s.
 //!
-//! An [`ImapCommand`] carries the tokens; `args` is the same arguments
-//! rendered canonically as text (quoted and escaped), for the command
-//! handlers that have not yet been moved to read tokens.
+//! Every verb has a grammar (see `server::grammar`) that reads the tokens as
+//! they arrive and refuses the command at the first one that cannot be
+//! right. An [`ImapCommand`] carries the typed [`Request`] that results; a
+//! verb with no grammar is refused as soon as it has been read.
 
 use hopf_mailbox::{Flag, MessageSet};
 
@@ -58,86 +59,26 @@ pub struct ImapCommand {
     pub tag: String,
     /// Uppercased command verb.
     pub verb: String,
-    /// The arguments, as the lexer tokenized them.
-    pub tokens: Vec<ArgToken>,
-    /// The same arguments rendered as text: see [`render_args`].
-    pub args: String,
-    /// The command with its arguments read, for a verb whose grammar the
-    /// lexer already runs (see `server::grammar`); then `tokens` and `args`
-    /// are empty.
-    pub request: Option<Request>,
+    /// The command with its arguments read.
+    pub request: Request,
+    /// The tokens, for the lexer's own tests (see `ImapServerLexer::raw`).
+    #[cfg(test)]
+    pub(crate) tokens: Vec<ArgToken>,
 }
 
 impl ImapCommand {
-    /// A command from its tokens.
-    pub fn new(tag: impl Into<String>, verb: impl Into<String>, tokens: Vec<ArgToken>) -> Self {
-        let args = render_args(&tokens);
-        Self { tag: tag.into(), verb: verb.into(), tokens, args, request: None }
-    }
-
-    /// A command whose arguments the lexer has read.
-    pub fn typed(tag: impl Into<String>, verb: impl Into<String>, request: Request) -> Self {
-        Self { tag: tag.into(), verb: verb.into(), tokens: Vec::new(), args: String::new(), request: Some(request) }
-    }
-
-    /// The command that the first argument of this one names, with the rest
-    /// as its arguments (`UID FETCH ...` is a `FETCH`).
-    pub fn sub_command(&self) -> Option<ImapCommand> {
-        let (ArgToken::Atom(verb), rest) = self.tokens.split_first()? else {
-            return None;
-        };
-        Some(ImapCommand::new(self.tag.clone(), verb.to_ascii_uppercase(), rest.to_vec()))
+    /// A command whose arguments have been read.
+    pub fn new(tag: impl Into<String>, verb: impl Into<String>, request: Request) -> Self {
+        Self {
+            tag: tag.into(),
+            verb: verb.into(),
+            request,
+            #[cfg(test)]
+            tokens: Vec::new(),
+        }
     }
 }
 
-/// The arguments as text for the handlers that read text: atoms as they are,
-/// quoted strings quoted and escaped, a literal bare if it is a plain word
-/// and quoted otherwise, a list's parentheses without spaces inside them.
-pub fn render_args(tokens: &[ArgToken]) -> String {
-    let mut out = String::new();
-    let mut after_open = true;
-    for token in tokens {
-        match token {
-            ArgToken::Close => {
-                out.push(')');
-                after_open = false;
-                continue;
-            }
-            _ if !after_open => out.push(' '),
-            _ => {}
-        }
-        after_open = false;
-        match token {
-            ArgToken::Atom(a) => out.push_str(a),
-            ArgToken::Quoted(q) => push_quoted(&mut out, q),
-            ArgToken::Literal(bytes) => {
-                let text = String::from_utf8_lossy(bytes);
-                if !text.is_empty() && text.bytes().all(|b| b.is_ascii_graphic() && !b"(){\"\\%*]".contains(&b)) {
-                    out.push_str(&text);
-                } else {
-                    push_quoted(&mut out, &text);
-                }
-            }
-            ArgToken::Open => {
-                out.push('(');
-                after_open = true;
-            }
-            ArgToken::Close => unreachable!("handled above"),
-        }
-    }
-    out
-}
-
-fn push_quoted(out: &mut String, text: &str) {
-    out.push('"');
-    for c in text.chars() {
-        if c == '"' || c == '\\' {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out.push('"');
-}
 
 /// Events produced while feeding the lexer (commands and sync-literal prompts).
 #[derive(Debug)]
@@ -246,8 +187,9 @@ pub struct ImapServerLexer {
     tag: Vec<u8>,
     /// The verb, once read.
     verb: Option<String>,
-    /// The arguments so far, for a verb with no grammar yet.
-    tokens: Vec<ArgToken>,
+    /// Where the machines of `raw` lexers leave the tokens they are given.
+    #[cfg(test)]
+    collected: Option<std::sync::Arc<std::sync::Mutex<Vec<ArgToken>>>>,
     /// The machine reading the arguments of this verb, if it has one.
     grammar: Option<Box<dyn Grammar>>,
     /// The verb is `UID`: the next token names the command it is for.
@@ -286,7 +228,8 @@ impl ImapServerLexer {
             cr_from: State::Tag,
             tag: Vec::new(),
             verb: None,
-            tokens: Vec::new(),
+            #[cfg(test)]
+            collected: None,
             grammar: None,
             uid_pending: false,
             line_ended: false,
@@ -303,6 +246,27 @@ impl ImapServerLexer {
             raw: Vec::new(),
             ready: Vec::new(),
         }
+    }
+
+    /// A lexer for tests of tokenization: a verb with no grammar of its own
+    /// is read by one that keeps its tokens, and not refused.
+    #[cfg(test)]
+    pub(crate) fn raw(max_line: usize) -> Self {
+        let mut lexer = Self::new(max_line);
+        lexer.collected = Some(Default::default());
+        lexer
+    }
+
+    /// The machine for `verb`, if it has one.
+    fn grammar_for(&self, verb: &str, by_uid: bool) -> Option<Box<dyn Grammar>> {
+        if let Some(grammar) = grammar_for(verb, by_uid) {
+            return Some(grammar);
+        }
+        #[cfg(test)]
+        if let Some(collected) = &self.collected {
+            return Some(Box::new(Collect(std::sync::Arc::clone(collected))));
+        }
+        None
     }
 
     /// Switch to raw-line mode for one SASL continuation response: the next
@@ -649,36 +613,39 @@ impl ImapServerLexer {
     /// verb; after that each goes to the verb's grammar, which may refuse it.
     fn push_token(&mut self, token: ArgToken) {
         if self.verb.is_none() {
-            match token {
-                ArgToken::Atom(word) => {
-                    let verb = word.to_ascii_uppercase();
-                    self.grammar = grammar_for(&verb, false);
-                    self.uid_pending = verb == "UID";
-                    self.verb = Some(verb);
+            let ArgToken::Atom(word) = token else {
+                return self.fail("Missing command");
+            };
+            let verb = word.to_ascii_uppercase();
+            if verb == "UID" {
+                self.uid_pending = true;
+            } else {
+                match self.grammar_for(&verb, false) {
+                    Some(grammar) => self.grammar = Some(grammar),
+                    None => return self.refuse(Reject(format!("Unknown command {verb}").into())),
                 }
-                _ => self.fail("Missing command"),
             }
+            self.verb = Some(verb);
             return;
         }
         if self.uid_pending {
             // `UID` names the command that follows it.
             self.uid_pending = false;
-            if let ArgToken::Atom(sub) = &token {
-                if let Some(grammar) = grammar_for(&sub.to_ascii_uppercase(), true) {
-                    self.grammar = Some(grammar);
-                    return;
-                }
+            let grammar = match &token {
+                ArgToken::Atom(sub) => self.grammar_for(&sub.to_ascii_uppercase(), true),
+                _ => None,
+            };
+            match grammar {
+                Some(grammar) => self.grammar = Some(grammar),
+                None => self.refuse(Reject::new("Unsupported UID command")),
             }
-            self.tokens.push(token);
             return;
         }
         if let Some(grammar) = self.grammar.as_mut() {
             if let Err(reject) = grammar.token(token.as_tok()) {
                 self.refuse(reject);
             }
-            return;
         }
-        self.tokens.push(token);
     }
 
     /// A grammar refused the command: reply, and skip what is left of the
@@ -789,7 +756,6 @@ impl ImapServerLexer {
     fn reset_command(&mut self) {
         self.tag.clear();
         self.verb = None;
-        self.tokens.clear();
         self.grammar = None;
         self.uid_pending = false;
         self.word.clear();
@@ -815,7 +781,11 @@ impl ImapServerLexer {
                     let verb = String::from_utf8_lossy(&self.tag).to_ascii_uppercase();
                     self.tag.clear();
                     self.typed_bytes = 0;
-                    self.ready.push(LexEvent::Command(ImapCommand::new("*", verb, Vec::new())));
+                    if verb == "DONE" {
+                        self.ready.push(LexEvent::Command(ImapCommand::new("*", verb, Request::Done)));
+                    } else {
+                        self.ready.push(LexEvent::Error { tag: "*".to_string(), message: "Missing command".to_string() });
+                    }
                 }
                 self.state = State::Tag;
             }
@@ -834,30 +804,34 @@ impl ImapServerLexer {
     fn finish_command(&mut self) {
         let tag = std::mem::take(&mut self.tag);
         let verb = self.verb.take();
-        let tokens = std::mem::take(&mut self.tokens);
         let grammar = self.grammar.take();
-        self.uid_pending = false;
+        let uid_pending = std::mem::take(&mut self.uid_pending);
         self.typed_bytes = 0;
         self.literal_total = 0;
         if tag.is_empty() {
             return;
         }
-        if let Some(grammar) = grammar {
-            let tag = String::from_utf8_lossy(&tag).into_owned();
-            match grammar.finish() {
-                Ok(request) => {
-                    self.ready.push(LexEvent::Command(ImapCommand::typed(tag, verb.unwrap_or_default(), request)));
+        let tag = String::from_utf8_lossy(&tag).into_owned();
+        let outcome = match (verb, grammar) {
+            (None, _) => Err(Reject::new("Missing command")),
+            (Some(_), None) if uid_pending => Err(Reject::new("Missing UID command")),
+            (Some(_), None) => Err(Reject::new("Missing command")),
+            (Some(verb), Some(grammar)) => grammar.finish().map(|request| (verb, request)),
+        };
+        match outcome {
+            #[allow(unused_mut)]
+            Ok((verb, request)) => {
+                let mut command = ImapCommand::new(tag, verb, request);
+                #[cfg(test)]
+                if let Some(collected) = &self.collected {
+                    command.tokens = std::mem::take(&mut *collected.lock().unwrap());
                 }
-                Err(reject) => self.ready.push(LexEvent::Error { tag, message: reject.0.into_owned() }),
+                self.ready.push(LexEvent::Command(command));
             }
-            return;
+            Err(reject) => self.ready.push(LexEvent::Error { tag, message: reject.0.into_owned() }),
         }
-        self.ready.push(LexEvent::Command(ImapCommand::new(
-            String::from_utf8_lossy(&tag).into_owned(),
-            verb.unwrap_or_default(),
-            tokens,
-        )));
     }
+
 }
 
 /// Parse an IMAP astring (atom / quoted) from the start of `s`.
@@ -992,13 +966,40 @@ pub fn parse_sequence_set(s: &str) -> Result<(MessageSet, &str), String> {
     Ok((set, s[end..].trim_start()))
 }
 
+/// The machine of a verb read by a `raw` lexer: it keeps its tokens.
+#[cfg(test)]
+struct Collect(std::sync::Arc<std::sync::Mutex<Vec<ArgToken>>>);
+
+#[cfg(test)]
+impl Grammar for Collect {
+    fn token(&mut self, tok: crate::server::grammar::Tok<'_>) -> Result<(), Reject> {
+        use crate::server::grammar::Tok;
+        self.0.lock().unwrap().push(match tok {
+            Tok::Atom(a) => ArgToken::Atom(a.to_string()),
+            Tok::Quoted(q) => ArgToken::Quoted(q.to_string()),
+            Tok::Literal(l) => ArgToken::Literal(l.to_vec()),
+            Tok::Open => ArgToken::Open,
+            Tok::Close => ArgToken::Close,
+        });
+        Ok(())
+    }
+
+    fn literal(&mut self, _size: u64) -> Result<(), Reject> {
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> Result<Request, Reject> {
+        Ok(Request::Noop)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn parse_simple_command() {
-        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut lex = ImapServerLexer::raw(MAX_COMMAND_LINE);
         let mut data: &[u8] = b"a1 NOOP\r\n";
         let ev = lex.feed(&mut data);
         assert!(data.is_empty());
@@ -1007,7 +1008,6 @@ mod tests {
             LexEvent::Command(c) => {
                 assert_eq!(c.tag, "a1");
                 assert_eq!(c.verb, "NOOP");
-                assert!(c.args.is_empty());
             }
             _ => panic!("expected command"),
         }
@@ -1015,13 +1015,13 @@ mod tests {
 
     #[test]
     fn parse_login() {
-        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut lex = ImapServerLexer::raw(MAX_COMMAND_LINE);
         let mut data: &[u8] = b"a1 LOGIN alice secret\r\n";
         let ev = lex.feed(&mut data);
         match &ev[0] {
             LexEvent::Command(c) => {
                 assert_eq!(c.verb, "LOGIN");
-                assert_eq!(c.request, Some(login("alice", "secret")));
+                assert_eq!(c.request, login("alice", "secret"));
             }
             _ => panic!(),
         }
@@ -1029,7 +1029,7 @@ mod tests {
 
     #[test]
     fn non_sync_literal() {
-        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut lex = ImapServerLexer::raw(MAX_COMMAND_LINE);
         let mut data: &[u8] = b"a1 LOGIN {5+}\r\nalice secret\r\n";
         let ev = lex.feed(&mut data);
         assert!(data.is_empty());
@@ -1042,7 +1042,7 @@ mod tests {
             .collect();
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].verb, "LOGIN");
-        assert_eq!(cmds[0].request, Some(login("alice", "secret")));
+        assert_eq!(cmds[0].request, login("alice", "secret"));
         let mut data2: &[u8] = b"a2 CAPABILITY\r\n";
         let ev2 = lex.feed(&mut data2);
         assert!(matches!(ev2[0], LexEvent::Command(_)));
@@ -1050,7 +1050,7 @@ mod tests {
 
     #[test]
     fn sync_literal_needs_continuation() {
-        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut lex = ImapServerLexer::raw(MAX_COMMAND_LINE);
         let mut data: &[u8] = b"a1 LOGIN {5}\r\n";
         let ev = lex.feed(&mut data);
         assert!(matches!(ev[0], LexEvent::NeedContinuation));
@@ -1068,7 +1068,7 @@ mod tests {
             .collect();
         assert!(!cmds.is_empty());
         assert_eq!(cmds[0].verb, "LOGIN");
-        assert_eq!(cmds[0].request, Some(login("alice", "secret")));
+        assert_eq!(cmds[0].request, login("alice", "secret"));
     }
 
     #[test]
@@ -1076,7 +1076,7 @@ mod tests {
         // The literal's bytes arrive one at a time across many feed() calls,
         // proving bulk-vs-dribbled delivery is equivalent and nothing is
         // ever retained by the caller.
-        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut lex = ImapServerLexer::raw(MAX_COMMAND_LINE);
         let msg: &[u8] = b"a1 LOGIN {5}\r\nalice secret\r\n";
         let mut events = Vec::new();
         for &b in msg {
@@ -1093,12 +1093,12 @@ mod tests {
             .collect();
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].verb, "LOGIN");
-        assert_eq!(cmds[0].request, Some(login("alice", "secret")));
+        assert_eq!(cmds[0].request, login("alice", "secret"));
     }
 
     #[test]
     fn append_literal_streams_and_finishes_command() {
-        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut lex = ImapServerLexer::raw(MAX_COMMAND_LINE);
         let mut data: &[u8] = b"a1 APPEND INBOX {5}\r\nhello\r\n";
         let ev = lex.feed(&mut data);
         assert!(data.is_empty());
@@ -1119,7 +1119,7 @@ mod tests {
 
     #[test]
     fn append_literal_chunk_delivered_as_soon_as_bytes_arrive_even_before_command_completes() {
-        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut lex = ImapServerLexer::raw(MAX_COMMAND_LINE);
         let mut data: &[u8] = b"a1 APPEND INBOX {11}\r\nhel";
         let ev = lex.feed(&mut data);
         assert!(lex.in_literal());
@@ -1154,7 +1154,7 @@ mod tests {
 
     #[test]
     fn in_literal_reports_mid_literal_state() {
-        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut lex = ImapServerLexer::raw(MAX_COMMAND_LINE);
         let mut data: &[u8] = b"a1 LOGIN {5+}\r\nal";
         let _ = lex.feed(&mut data);
         assert!(lex.in_literal());
@@ -1165,7 +1165,7 @@ mod tests {
 
     #[test]
     fn oversized_literal_rejected() {
-        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut lex = ImapServerLexer::raw(MAX_COMMAND_LINE);
         let line = format!("a1 LOGIN {{{}}}\r\n", MAX_LITERAL_SIZE + 1);
         let mut data: &[u8] = line.as_bytes();
         let ev = lex.feed(&mut data);
@@ -1181,7 +1181,7 @@ mod tests {
         // they're only bounded by MAX_LITERAL_SIZE - so a size above
         // LITERAL_MINUS_LIMIT must still be accepted, prompting a
         // continuation request rather than an error.
-        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut lex = ImapServerLexer::raw(MAX_COMMAND_LINE);
         let n = LITERAL_MINUS_LIMIT + 1;
         assert!(n < MAX_LITERAL_SIZE);
         let line = format!("a1 LOGIN {{{n}}}\r\n");
@@ -1195,7 +1195,7 @@ mod tests {
         // Non-synchronizing literals (`{n+}`) above LITERAL_MINUS_LIMIT are
         // exactly what RFC 7888 forbids: the client would send the bytes
         // without giving the server a chance to reject first.
-        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut lex = ImapServerLexer::raw(MAX_COMMAND_LINE);
         let n = LITERAL_MINUS_LIMIT + 1;
         let line = format!("a1 LOGIN {{{n}+}}\r\n");
         let mut data: &[u8] = line.as_bytes();
@@ -1208,7 +1208,7 @@ mod tests {
 
     #[test]
     fn pipelined_commands() {
-        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut lex = ImapServerLexer::raw(MAX_COMMAND_LINE);
         let mut data: &[u8] = b"a1 NOOP\r\na2 CAPABILITY\r\n";
         let ev = lex.feed(&mut data);
         assert_eq!(ev.len(), 2);
@@ -1220,7 +1220,7 @@ mod tests {
         // even when its bytes (and CRLF) arrive across separate `feed`
         // calls — this is the exact class of bug the raw-line scratch
         // buffer replaces a windows(2)-CRLF-scan with.
-        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut lex = ImapServerLexer::raw(MAX_COMMAND_LINE);
         let mut a: &[u8] = b"a1 AUTHENTICATE PLAIN\r\n";
         let ev = lex.feed(&mut a);
         assert_eq!(ev.len(), 1);
@@ -1241,7 +1241,7 @@ mod tests {
     fn sasl_response_all_split_points_are_equivalent() {
         let msg: &[u8] = b"AGFsaWNlAHNlY3JldA==\r\n";
         for split in 1..msg.len() {
-            let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+            let mut lex = ImapServerLexer::raw(MAX_COMMAND_LINE);
             lex.expect_sasl_response();
             let mut a: &[u8] = &msg[..split];
             let mut ev = lex.feed(&mut a);
@@ -1261,7 +1261,7 @@ mod tests {
     fn sasl_response_abort_line_passed_through_raw() {
         // `*` (RFC 3501 continuation abort) isn't interpreted by the lexer —
         // that's the caller's job, same as base64 decoding.
-        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut lex = ImapServerLexer::raw(MAX_COMMAND_LINE);
         lex.expect_sasl_response();
         let mut data: &[u8] = b"*\r\n";
         let ev = lex.feed(&mut data);
@@ -1273,7 +1273,7 @@ mod tests {
 
     #[test]
     fn sasl_response_resumes_normal_commands_afterward() {
-        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut lex = ImapServerLexer::raw(MAX_COMMAND_LINE);
         lex.expect_sasl_response();
         let mut data: &[u8] = b"AGFsaWNlAHNlY3JldA==\r\na2 NOOP\r\n";
         let ev = lex.feed(&mut data);
@@ -1287,7 +1287,7 @@ mod tests {
 
     #[test]
     fn split_buffers() {
-        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut lex = ImapServerLexer::raw(MAX_COMMAND_LINE);
         let mut a: &[u8] = b"a1 NO";
         assert!(lex.feed(&mut a).is_empty());
         let mut b: &[u8] = b"OP\r\n";
@@ -1300,14 +1300,13 @@ mod tests {
 
     #[test]
     fn bare_tag_only_line_is_idle_done() {
-        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut lex = ImapServerLexer::raw(MAX_COMMAND_LINE);
         let mut data: &[u8] = b"DONE\r\n";
         let ev = lex.feed(&mut data);
         match &ev[0] {
             LexEvent::Command(c) => {
                 assert_eq!(c.tag, "*");
                 assert_eq!(c.verb, "DONE");
-                assert!(c.args.is_empty());
             }
             _ => panic!("expected command"),
         }
@@ -1315,7 +1314,7 @@ mod tests {
 
     #[test]
     fn blank_line_produces_no_command() {
-        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut lex = ImapServerLexer::raw(MAX_COMMAND_LINE);
         let mut data: &[u8] = b"\r\na1 NOOP\r\n";
         let ev = lex.feed(&mut data);
         assert_eq!(ev.len(), 1);
@@ -1324,7 +1323,7 @@ mod tests {
 
     #[test]
     fn oversized_tag_discards_and_resyncs() {
-        let mut lex = ImapServerLexer::new(4);
+        let mut lex = ImapServerLexer::raw(4);
         let mut data: &[u8] = b"toolongtag NOOP\r\na2 NOOP\r\n";
         let ev = lex.feed(&mut data);
         let cmds: Vec<_> = ev
@@ -1340,13 +1339,13 @@ mod tests {
 
     #[test]
     fn literal_cr_not_followed_by_lf_is_content() {
-        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut lex = ImapServerLexer::raw(MAX_COMMAND_LINE);
         let mut data: &[u8] = b"a1 XSEARCH a\rb\r\n";
         let ev = lex.feed(&mut data);
         match &ev[0] {
             LexEvent::Command(c) => {
                 assert_eq!(c.verb, "XSEARCH");
-                assert_eq!(c.args, "a\rb");
+                assert_eq!(c.tokens, vec![ArgToken::Atom("a\rb".into())]);
             }
             _ => panic!(),
         }
@@ -1358,7 +1357,7 @@ mod tests {
     fn one_byte_at_a_time_matches_bulk_feed() {
         let msg: &[u8] = b"a1 LOGIN alice secret\r\na2 CAPABILITY\r\na3 LOGOUT\r\n";
 
-        let mut bulk = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut bulk = ImapServerLexer::raw(MAX_COMMAND_LINE);
         let mut bulk_data = msg;
         let bulk_ev = bulk.feed(&mut bulk_data);
         let bulk_cmds: Vec<_> = bulk_ev
@@ -1369,7 +1368,7 @@ mod tests {
             })
             .collect();
 
-        let mut drip = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut drip = ImapServerLexer::raw(MAX_COMMAND_LINE);
         let mut drip_cmds = Vec::new();
         for &b in msg {
             let mut one: &[u8] = &[b];
@@ -1390,7 +1389,7 @@ mod tests {
     #[test]
     fn all_split_points_are_equivalent() {
         let msg: &[u8] = b"a1 LOGIN {5}\r\nalice secret\r\na2 CAPABILITY\r\na3 LOGOUT\r\n";
-        let mut base = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut base = ImapServerLexer::raw(MAX_COMMAND_LINE);
         let mut base_data = msg;
         let base_ev = base.feed(&mut base_data);
         let base_cmds: Vec<_> = base_ev
@@ -1402,7 +1401,7 @@ mod tests {
             .collect();
 
         for split in 1..msg.len() {
-            let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+            let mut lex = ImapServerLexer::raw(MAX_COMMAND_LINE);
             let mut a: &[u8] = &msg[..split];
             let mut ev = lex.feed(&mut a);
             assert!(a.is_empty(), "split {split} retained bytes");
@@ -1478,7 +1477,7 @@ mod tests {
 
     /// Lexes `wire` in chunks of `chunk` bytes, returning every event.
     fn lex(wire: &[u8], chunk: usize) -> Vec<LexEvent> {
-        let mut lexer = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut lexer = ImapServerLexer::raw(MAX_COMMAND_LINE);
         let mut out = Vec::new();
         for piece in wire.chunks(chunk) {
             let mut data: &[u8] = piece;
@@ -1555,33 +1554,6 @@ mod tests {
     }
 
     #[test]
-    fn args_render_tokens_as_text_for_handlers_that_read_text() {
-        let tokens = vec![
-            lit(b"alice"),
-            lit(b"two words"),
-            q("say \"hi\""),
-            ArgToken::Open,
-            a("\\Seen"),
-            a("\\Flagged"),
-            ArgToken::Close,
-            lit(b""),
-            lit(b"1:*"),
-        ];
-        assert_eq!(
-            render_args(&tokens),
-            "alice \"two words\" \"say \\\"hi\\\"\" (\\Seen \\Flagged) \"\" \"1:*\""
-        );
-    }
-
-    #[test]
-    fn uid_names_the_command_after_it() {
-        let c = ImapCommand::new("t", "UID", vec![a("fetch"), a("1:*"), a("FLAGS")]);
-        let sub = c.sub_command().unwrap();
-        assert_eq!((sub.verb.as_str(), sub.args.as_str()), ("FETCH", "1:* FLAGS"));
-        assert!(ImapCommand::new("t", "UID", vec![]).sub_command().is_none());
-    }
-
-    #[test]
     fn append_body_is_the_literal_after_the_mailbox() {
         // The mailbox may itself be a literal; only the message after it is
         // the body, delivered as chunks and not collected.
@@ -1602,7 +1574,7 @@ mod tests {
             let requests: Vec<_> = events
                 .into_iter()
                 .filter_map(|e| match e {
-                    LexEvent::Command(c) => c.request,
+                    LexEvent::Command(c) => Some(c.request),
                     _ => None,
                 })
                 .collect();
@@ -1612,7 +1584,7 @@ mod tests {
 
     #[test]
     fn literals_in_one_command_are_capped_together() {
-        let mut lexer = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut lexer = ImapServerLexer::raw(MAX_COMMAND_LINE);
         let one = MAX_LITERAL_SIZE / 2 + 1;
         // Each is under the cap; both together are not.
         let mut first: &[u8] = format!("a1 XSEARCH TEXT {{{one}}}\r\n").as_bytes().to_vec().leak();
@@ -1655,7 +1627,7 @@ mod tests {
 
     #[test]
     fn a_line_over_the_limit_is_an_error_but_literals_do_not_count() {
-        let mut lexer = ImapServerLexer::new(40);
+        let mut lexer = ImapServerLexer::raw(40);
         let mut wire = b"a1 LOGIN {200+}\r\n".to_vec();
         wire.extend(vec![b'x'; 200]);
         wire.extend_from_slice(b" ok\r\n");

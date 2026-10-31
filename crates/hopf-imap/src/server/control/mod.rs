@@ -787,42 +787,8 @@ impl ImapControlHandler {
             }
             return;
         }
-        let verb = cmd.verb.clone();
-        let tel = self.begin_command_telemetry(&verb);
-        let verb = verb.as_str();
-        match verb {
-            // The lexer has read this command's arguments.
-            _ if cmd.request.is_some() => {
-                if let Some(request) = cmd.request {
-                    self.dispatch_request(endpoint, cmd.tag, request);
-                }
-            }
-            "CAPABILITY" => {
-                let caps = self.capabilities();
-                self.send(endpoint, untagged(&format!("CAPABILITY {caps}")));
-                self.send(endpoint, tagged_ok(&cmd.tag, "CAPABILITY completed"));
-            }
-            "NOOP" => self.cmd_noop(endpoint, &cmd.tag),
-            "LOGOUT" => {
-                self.idle.end();
-                self.session = ImapSessionState::Logout;
-                self.send(endpoint, untagged("BYE Logging out"));
-                self.send(endpoint, tagged_ok(&cmd.tag, "LOGOUT completed"));
-                self.offload_close(false);
-                endpoint.close();
-            }
-            "STARTTLS" => self.cmd_starttls(endpoint, &cmd.tag),
-            "CLOSE" => self.cmd_close(endpoint, &cmd.tag, true),
-            "UNSELECT" => self.cmd_close(endpoint, &cmd.tag, false),
-            "NAMESPACE" => self.cmd_namespace(endpoint, &cmd.tag),
-            "IDLE" => self.cmd_idle(endpoint, &cmd.tag),
-            "UID" => self.cmd_uid(endpoint, cmd),
-            "DONE" => self.send(endpoint, tagged_bad(&cmd.tag, "Not IDLEing")),
-            _ => self.send(
-                endpoint,
-                tagged_bad(&cmd.tag, &format!("Unknown command {}", cmd.verb)),
-            ),
-        }
+        let tel = self.begin_command_telemetry(&cmd.verb);
+        self.dispatch_request(endpoint, cmd.tag, cmd.request);
         // Hold telemetry across storage offloads and multi-step AUTHENTICATE.
         if self.busy.load(Ordering::Relaxed) || self.pending_auth.is_some() {
             self.pending_cmd_tel = tel;
@@ -860,6 +826,26 @@ impl ImapControlHandler {
             Request::Search { criteria, by_uid } => self.cmd_search(endpoint, tag, criteria, by_uid),
             Request::Sort { keys, criteria, by_uid } => self.cmd_sort(endpoint, tag, keys, criteria, by_uid),
             Request::Thread { algorithm, criteria, by_uid } => self.cmd_thread(endpoint, tag, algorithm, criteria, by_uid),
+            Request::Capability => {
+                let caps = self.capabilities();
+                self.send(endpoint, untagged(&format!("CAPABILITY {caps}")));
+                self.send(endpoint, tagged_ok(&tag, "CAPABILITY completed"));
+            }
+            Request::Noop => self.cmd_noop(endpoint, &tag),
+            Request::Logout => {
+                self.idle.end();
+                self.session = ImapSessionState::Logout;
+                self.send(endpoint, untagged("BYE Logging out"));
+                self.send(endpoint, tagged_ok(&tag, "LOGOUT completed"));
+                self.offload_close(false);
+                endpoint.close();
+            }
+            Request::StartTls => self.cmd_starttls(endpoint, &tag),
+            Request::Close => self.cmd_close(endpoint, &tag, true),
+            Request::Unselect => self.cmd_close(endpoint, &tag, false),
+            Request::Namespace => self.cmd_namespace(endpoint, &tag),
+            Request::Idle => self.cmd_idle(endpoint, &tag),
+            Request::Done => self.send(endpoint, tagged_bad(&tag, "Not IDLEing")),
             Request::GetMetadata { command } => self.cmd_getmetadata(endpoint, tag, command),
             Request::SetMetadata { command } => self.cmd_setmetadata(endpoint, tag, command),
             Request::Notify { state } => self.cmd_notify(endpoint, tag, state),
@@ -1795,19 +1781,6 @@ impl ImapControlHandler {
         }
     }
 
-    fn cmd_uid(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
-        if !self.require_selected(endpoint, &cmd.tag) {
-            return;
-        }
-        let Some(sub_cmd) = cmd.sub_command() else {
-            self.send(endpoint, tagged_bad(&cmd.tag, "Missing UID command"));
-            return;
-        };
-        match sub_cmd.verb.as_str() {
-            _ => self.send(endpoint, tagged_bad(&cmd.tag, "Unsupported UID command")),
-        }
-    }
-
     fn offload_close(&self, expunge: bool) {
         let bundle = Arc::clone(&self.bundle);
         let Some(handle) = self.control_handle.clone() else {
@@ -2316,7 +2289,7 @@ mod append_offload_tests {
         let append_cmd = ImapCommand::new(
             "a1",
             "APPEND",
-            vec![crate::server::codec::ArgToken::Atom("INBOX".into())],
+            crate::server::grammar::Request::Append { mailbox: "INBOX".into(), flags: Default::default() },
         );
         // Mirrors `receive()`'s `LexEvent::Command` arm.
         if h.finalize_pending_append() {
@@ -2327,7 +2300,7 @@ mod append_offload_tests {
 
         // A further pipelined command must queue behind the still-
         // finalizing APPEND, not run ahead of it.
-        let noop_cmd = ImapCommand::new("a2", "NOOP", Vec::new());
+        let noop_cmd = ImapCommand::new("a2", "NOOP", crate::server::grammar::Request::Noop);
         h.enqueue_or_dispatch(&mut ep, noop_cmd);
         if h.pending_append_cmd.is_some() {
             assert_eq!(

@@ -500,7 +500,7 @@ mod tests {
             let mut data: &[u8] = piece;
             for e in lexer.feed(&mut data) {
                 match e {
-                    LexEvent::Command(c) => out.push(Ok(c.request.expect("a typed request"))),
+                    LexEvent::Command(c) => out.push(Ok(c.request)),
                     LexEvent::Error { message, .. } => out.push(Err(message)),
                     _ => {}
                 }

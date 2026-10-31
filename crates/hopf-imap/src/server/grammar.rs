@@ -136,6 +136,24 @@ pub enum Request {
     Id { fields: Vec<(String, Option<String>)> },
     /// `EXPUNGE`, or `UID EXPUNGE set`.
     Expunge { uids: Option<MessageSet> },
+    /// `CAPABILITY`
+    Capability,
+    /// `NOOP`
+    Noop,
+    /// `LOGOUT`
+    Logout,
+    /// `STARTTLS`
+    StartTls,
+    /// `CLOSE`
+    Close,
+    /// `UNSELECT`
+    Unselect,
+    /// `NAMESPACE`
+    Namespace,
+    /// `IDLE`
+    Idle,
+    /// `DONE`, which ends an IDLE (and is a command of its own, if not in one).
+    Done,
 }
 
 /// The machine for one command's arguments.
@@ -165,6 +183,7 @@ pub fn grammar_for(verb: &str, by_uid: bool) -> Option<Box<dyn Grammar>> {
         Some(Box::new(Pattern::new(slots, extra, build, by_uid)))
     };
     const NAME: &str = "Invalid mailbox name";
+    const NO_ARGS: &str = "Command takes no arguments";
     if by_uid {
         return match verb {
             "STORE" => pattern(STORE, "Invalid flag list", build_store),
@@ -201,6 +220,15 @@ pub fn grammar_for(verb: &str, by_uid: bool) -> Option<Box<dyn Grammar>> {
         "LSUB" => Some(Box::new(List::new(true))),
         "APPEND" => Some(Box::new(Append::default())),
         "EXPUNGE" => pattern(&[], "Invalid EXPUNGE arguments", build_expunge),
+        "CAPABILITY" => pattern(&[], NO_ARGS, |_, _| Ok(Request::Capability)),
+        "NOOP" => pattern(&[], NO_ARGS, |_, _| Ok(Request::Noop)),
+        "LOGOUT" => pattern(&[], NO_ARGS, |_, _| Ok(Request::Logout)),
+        "STARTTLS" => pattern(&[], NO_ARGS, |_, _| Ok(Request::StartTls)),
+        "CLOSE" => pattern(&[], NO_ARGS, |_, _| Ok(Request::Close)),
+        "UNSELECT" => pattern(&[], NO_ARGS, |_, _| Ok(Request::Unselect)),
+        "NAMESPACE" => pattern(&[], NO_ARGS, |_, _| Ok(Request::Namespace)),
+        "IDLE" => pattern(&[], NO_ARGS, |_, _| Ok(Request::Idle)),
+        "DONE" => pattern(&[], NO_ARGS, |_, _| Ok(Request::Done)),
         "GETMETADATA" => Some(Box::new(GetMetadata::new())),
         "SETMETADATA" => Some(Box::new(SetMetadata::new())),
         "NOTIFY" => Some(Box::new(Notify::new())),
@@ -1320,7 +1348,7 @@ mod tests {
         lex(wire.as_bytes(), chunk)
             .into_iter()
             .filter_map(|e| match e {
-                LexEvent::Command(c) => Some(Ok(c.request.expect("a typed request"))),
+                LexEvent::Command(c) => Some(Ok(c.request)),
                 LexEvent::Error { message, .. } => Some(Err(message)),
                 _ => None,
             })
@@ -1714,7 +1742,7 @@ mod tests {
         let got = events
             .into_iter()
             .filter_map(|e| match e {
-                LexEvent::Command(c) => Some(Ok(c.request.expect("a typed request"))),
+                LexEvent::Command(c) => Some(Ok(c.request)),
                 LexEvent::Error { message, .. } => Some(Err(message)),
                 _ => None,
             })
@@ -1808,5 +1836,46 @@ mod tests {
                 assert_eq!(shape(wire, chunk), want, "{wire:?} chunk={chunk}");
             }
         }
+    }
+
+    #[test]
+    fn verbs_without_arguments_take_none() {
+        for (verb, want) in [
+            ("CAPABILITY", Request::Capability),
+            ("noop", Request::Noop),
+            ("LOGOUT", Request::Logout),
+            ("STARTTLS", Request::StartTls),
+            ("CLOSE", Request::Close),
+            ("UNSELECT", Request::Unselect),
+            ("NAMESPACE", Request::Namespace),
+            ("IDLE", Request::Idle),
+            ("DONE", Request::Done),
+        ] {
+            assert_eq!(one(&format!("a {verb}\r\n")), Ok(want), "{verb}");
+            assert_eq!(one(&format!("a {verb} extra\r\n")), Err("Command takes no arguments".to_string()), "{verb}");
+            assert_eq!(one(&format!("a {verb} (\r\n")), Err("Command takes no arguments".to_string()), "{verb}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_verb_is_refused_at_once() {
+        assert_eq!(one("a FROB 1 2 3\r\n"), Err("Unknown command FROB".to_string()));
+        // Its arguments are not collected: a literal is never asked for.
+        let events = lex(b"a FROB {5}\r\nb NOOP\r\n", 1);
+        assert!(!events.iter().any(|e| matches!(e, LexEvent::NeedContinuation)), "{events:?}");
+        // One sent without waiting is skipped.
+        assert_eq!(shape("a FROB {6+}\r\nb NOOP\r\nc NOOP\r\n", 1), vec!["err", "ok:NOOP"]);
+        // A bare tag is not a command; DONE, sent as one, is.
+        assert_eq!(shape("a\r\nb NOOP\r\n", 1), vec!["err", "ok:NOOP"]);
+        assert_eq!(shape("DONE\r\n", 1), vec!["ok:DONE"]);
+    }
+
+    #[test]
+    fn uid_needs_a_command_it_knows() {
+        assert_eq!(one("a UID\r\n"), Err("Missing UID command".to_string()));
+        assert_eq!(one("a UID FROB 1\r\n"), Err("Unsupported UID command".to_string()));
+        assert_eq!(one("a UID NOOP\r\n"), Err("Unsupported UID command".to_string()));
+        assert_eq!(one("a UID (\r\n"), Err("Unsupported UID command".to_string()));
+        assert!(matches!(one("a UID FETCH 1 FLAGS\r\n"), Ok(Request::Fetch { by_uid: true, .. })));
     }
 }
