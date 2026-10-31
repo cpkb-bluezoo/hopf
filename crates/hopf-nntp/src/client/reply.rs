@@ -31,15 +31,280 @@ pub(crate) fn is_multiline_code(code: u16) -> bool {
     matches!(code, 100 | 101 | 215 | 220 | 221 | 222 | 224 | 225 | 230 | 231)
 }
 
-/// One line of a multi-line block: `None` at the terminating `.`, else
-/// the line with a stuffed leading dot removed.
-pub(crate) fn unstuff_line(line: &[u8]) -> Option<&[u8]> {
-    if line == b"." {
-        None
-    } else if line.starts_with(b"..") {
-        Some(&line[1..])
-    } else {
-        Some(line)
+/// The longest status line, or line of a multi-line block, the lexer will
+/// accept; past it the reply is a protocol error.
+pub(crate) const MAX_REPLY_LINE: usize = 64 * 1024;
+
+/// What the lexer found.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReplyEvent {
+    /// More bytes are needed.
+    NeedMore,
+    /// A status line: its three-digit code and the text after it.
+    Status(NntpStatus),
+    /// A line of a multi-line block, dot-unstuffed and without its CRLF;
+    /// read it with [`NntpReplyLexer::line`] until the next call.
+    Line,
+    /// The `.` line that ends a multi-line block.
+    BlockEnd,
+    /// A status line that does not begin with three digits (what there was
+    /// of it, to report; see [`NntpReplyLexer::take_malformed`]).
+    Malformed,
+    /// A line longer than [`MAX_REPLY_LINE`].
+    TooLong,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    /// Between items: the first byte decides, by what is expected.
+    Idle,
+    /// Reading the three digits of a status code.
+    Digits { seen: u8, code: u16 },
+    /// Reading the text of a status line.
+    Text,
+    /// Status text: saw CR.
+    TextCr,
+    /// A line that is not a status: skipping to its CRLF (kept to report).
+    Bad,
+    BadCr,
+    /// Block: start of a line.
+    LineStart,
+    /// Block: the line so far is a single `.`.
+    Dot,
+    /// Block: the line so far is `.` and a CR.
+    DotCr,
+    /// Block: inside a line.
+    InLine,
+    /// Block: inside a line, saw CR.
+    LineCr,
+}
+
+/// Incremental NNTP reply parser (RFC 3977 §3): status lines and
+/// multi-line blocks, read straight out of the connection's ring.
+///
+/// A status code is read digit by digit and its text kept in a bounded
+/// scratch buffer, so no line is ever copied out whole and parsed again. In a
+/// block, byte stuffing and the `.` terminator are dealt with as the bytes
+/// arrive, and each line is built in one reusable buffer. It stops after
+/// every event, so the caller can say (with [`Self::expect_block`]) what
+/// comes next.
+#[derive(Debug)]
+pub(crate) struct NntpReplyLexer {
+    state: State,
+    /// A multi-line block is due at the next item.
+    block: bool,
+    /// Status text, or a block line, or the start of a bad line.
+    scratch: Vec<u8>,
+    code: u16,
+}
+
+impl Default for NntpReplyLexer {
+    fn default() -> Self {
+        Self { state: State::Idle, block: false, scratch: Vec::new(), code: 0 }
+    }
+}
+
+impl NntpReplyLexer {
+    /// Whether the next item is a multi-line block (until a lone `.`) or a
+    /// status line. Takes effect at the start of the next item.
+    pub fn expect_block(&mut self, block: bool) {
+        self.block = block;
+    }
+
+    /// The block line [`ReplyEvent::Line`] reported.
+    pub fn line(&self) -> &[u8] {
+        &self.scratch
+    }
+
+    /// The start of the line [`ReplyEvent::Malformed`] reported.
+    pub fn take_malformed(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.scratch)
+    }
+
+    /// Reads from `buf` up to the next event, consuming what it reads.
+    pub fn next_event(&mut self, buf: &mut hopf_core::LoopBuf) -> ReplyEvent {
+        loop {
+            let first = buf.readable_spans().0;
+            if first.is_empty() {
+                return ReplyEvent::NeedMore;
+            }
+            let (used, event) = self.scan(first);
+            buf.advance(used);
+            if let Some(event) = event {
+                return event;
+            }
+        }
+    }
+
+    /// Reads from `data` up to the next event; returns how much it used.
+    fn scan(&mut self, data: &[u8]) -> (usize, Option<ReplyEvent>) {
+        let mut i = 0;
+        while i < data.len() {
+            let b = data[i];
+            // Inside a line, take everything up to the next CR in one go.
+            if matches!(self.state, State::InLine | State::Text | State::Bad) {
+                let run = data[i..].iter().position(|&c| c == b'\r').unwrap_or(data.len() - i);
+                if run > 0 {
+                    if self.scratch.len() + run > MAX_REPLY_LINE {
+                        self.reset();
+                        return (i + run, Some(ReplyEvent::TooLong));
+                    }
+                    self.scratch.extend_from_slice(&data[i..i + run]);
+                    i += run;
+                    continue;
+                }
+            }
+            i += 1;
+            if let Some(event) = self.step(b) {
+                return (i, Some(event));
+            }
+            if self.scratch.len() > MAX_REPLY_LINE {
+                self.reset();
+                return (i, Some(ReplyEvent::TooLong));
+            }
+        }
+        (i, None)
+    }
+
+    fn reset(&mut self) {
+        self.state = State::Idle;
+        self.scratch.clear();
+    }
+
+    fn step(&mut self, b: u8) -> Option<ReplyEvent> {
+        loop {
+            match self.state {
+                State::Idle => {
+                    self.scratch.clear();
+                    self.state = if self.block { State::LineStart } else { State::Digits { seen: 0, code: 0 } };
+                    continue;
+                }
+                State::Digits { seen, code } => {
+                    if b.is_ascii_digit() {
+                        let code = code * 10 + u16::from(b - b'0');
+                        if seen == 2 {
+                            self.code = code;
+                            self.state = State::Text;
+                        } else {
+                            self.state = State::Digits { seen: seen + 1, code };
+                        }
+                        return None;
+                    }
+                    // Not a status line: keep what there is of it to report
+                    // (the digits already read are the start of it).
+                    self.scratch.clear();
+                    if seen > 0 {
+                        self.scratch.extend_from_slice(format!("{code:0width$}", width = seen as usize).as_bytes());
+                    }
+                    if b == b'\r' {
+                        self.state = State::BadCr;
+                    } else {
+                        self.scratch.push(b);
+                        self.state = State::Bad;
+                    }
+                    return None;
+                }
+                State::Text => {
+                    // Only a CR gets here (a run takes the rest).
+                    self.state = State::TextCr;
+                    return None;
+                }
+                State::TextCr => {
+                    if b == b'\n' {
+                        let text = String::from_utf8_lossy(&self.scratch).trim_start().to_string();
+                        let status = NntpStatus { code: self.code, text };
+                        self.reset();
+                        return Some(ReplyEvent::Status(status));
+                    }
+                    // A lone CR is part of the text.
+                    self.scratch.push(b'\r');
+                    if b == b'\r' {
+                        return None; // still possibly the CR of the CRLF
+                    }
+                    self.scratch.push(b);
+                    self.state = State::Text;
+                    return None;
+                }
+                State::Bad => {
+                    self.state = State::BadCr;
+                    return None;
+                }
+                State::BadCr => {
+                    if b == b'\n' {
+                        self.state = State::Idle;
+                        return Some(ReplyEvent::Malformed);
+                    }
+                    self.scratch.push(b'\r');
+                    if b == b'\r' {
+                        return None;
+                    }
+                    self.scratch.push(b);
+                    self.state = State::Bad;
+                    return None;
+                }
+                State::LineStart => {
+                    match b {
+                        b'.' => self.state = State::Dot,
+                        b'\r' => self.state = State::LineCr,
+                        _ => {
+                            self.scratch.push(b);
+                            self.state = State::InLine;
+                        }
+                    }
+                    return None;
+                }
+                State::Dot => match b {
+                    b'\r' => {
+                        self.state = State::DotCr;
+                        return None;
+                    }
+                    b'.' => {
+                        // A stuffed dot: the line begins with this one.
+                        self.scratch.push(b'.');
+                        self.state = State::InLine;
+                        return None;
+                    }
+                    _ => {
+                        // A single leading dot is kept as it is.
+                        self.scratch.push(b'.');
+                        self.scratch.push(b);
+                        self.state = State::InLine;
+                        return None;
+                    }
+                },
+                State::DotCr => {
+                    if b == b'\n' {
+                        self.state = State::Idle;
+                        self.block = false;
+                        return Some(ReplyEvent::BlockEnd);
+                    }
+                    // ".\r" and more: the dot and the CR are the line.
+                    self.scratch.push(b'.');
+                    self.state = State::LineCr;
+                    continue;
+                }
+                State::InLine => {
+                    // Only a CR gets here (a run takes the rest).
+                    self.state = State::LineCr;
+                    return None;
+                }
+                State::LineCr => {
+                    if b == b'\n' {
+                        // (`Idle` clears the scratch for the next line, and
+                        // goes on in block mode until the block ends.)
+                        self.state = State::Idle;
+                        return Some(ReplyEvent::Line);
+                    }
+                    self.scratch.push(b'\r');
+                    if b == b'\r' {
+                        return None;
+                    }
+                    self.scratch.push(b);
+                    self.state = State::InLine;
+                    return None;
+                }
+            }
+        }
     }
 }
 
@@ -173,11 +438,116 @@ mod tests {
         assert_eq!(parse_status("20"), None);
     }
 
+    use hopf_core::LoopBuf;
+
+    /// Feeds `wire` in chunks of `chunk` through a ring of `ring` bytes,
+    /// collecting what the lexer reports; `blocks` says, for each status
+    /// event in turn, whether a block follows it.
+    fn lex(wire: &[u8], chunk: usize, ring: usize, blocks: &[bool]) -> Vec<String> {
+        let mut lexer = NntpReplyLexer::default();
+        let mut buf = LoopBuf::with_capacity(ring);
+        let mut out = Vec::new();
+        let mut statuses = 0;
+        let mut rest = wire;
+        loop {
+            match lexer.next_event(&mut buf) {
+                ReplyEvent::NeedMore => {
+                    if rest.is_empty() {
+                        break;
+                    }
+                    let n = buf.extend_from_slice(&rest[..chunk.min(rest.len())]);
+                    rest = &rest[n..];
+                }
+                ReplyEvent::Status(s) => {
+                    out.push(format!("S{} {}", s.code, s.text));
+                    lexer.expect_block(blocks.get(statuses).copied().unwrap_or(false));
+                    statuses += 1;
+                }
+                ReplyEvent::Line => out.push(format!("L{}", String::from_utf8_lossy(lexer.line()))),
+                ReplyEvent::BlockEnd => out.push("E".to_string()),
+                ReplyEvent::Malformed => out.push(format!("M{}", String::from_utf8_lossy(&lexer.take_malformed()))),
+                ReplyEvent::TooLong => {
+                    out.push("TOOLONG".to_string());
+                    break;
+                }
+            }
+        }
+        out
+    }
+
     #[test]
-    fn unstuffing() {
-        assert_eq!(unstuff_line(b"..dot"), Some(&b".dot"[..]));
-        assert_eq!(unstuff_line(b"plain"), Some(&b"plain"[..]));
-        assert_eq!(unstuff_line(b"."), None);
+    fn status_and_block_are_read_the_same_under_every_chunking() {
+        let wire = b"200 ready\r\n215 list\r\nalt.a 3 1 y\r\n..dot\r\n.keep\r\n\r\nlast\r\n.\r\n281 ok\r\n";
+        let want = vec![
+            "S200 ready",
+            "S215 list",
+            "Lalt.a 3 1 y",
+            "L.dot",
+            "L.keep",
+            "L",
+            "Llast",
+            "E",
+            "S281 ok",
+        ];
+        for chunk in [1, 2, 3, 5, 7, 11, 100] {
+            assert_eq!(lex(wire, chunk, 64, &[false, true]), want, "chunk={chunk}");
+        }
+    }
+
+    #[test]
+    fn a_status_without_text_or_with_leading_spaces() {
+        assert_eq!(lex(b"381\r\n200   hi\r\n", 3, 32, &[]), vec!["S381 ", "S200 hi"]);
+    }
+
+    #[test]
+    fn a_lone_cr_or_lf_is_part_of_the_text_and_of_block_lines() {
+        assert_eq!(lex(b"211 a\rb\nc\r\n", 1, 32, &[]), vec!["S211 a\rb\nc"]);
+        assert_eq!(lex(b"215 x\r\na\rb\r\n.\rZ\r\n.\r\n", 2, 32, &[true]), vec!["S215 x", "La\rb", "L.\rZ", "E"]);
+    }
+
+    #[test]
+    fn a_line_that_is_not_a_status_is_reported_with_what_there_was_of_it() {
+        assert_eq!(lex(b"hello\r\n", 2, 32, &[]), vec!["Mhello"]);
+        assert_eq!(lex(b"20\r\n", 5, 32, &[]), vec!["M20"]);
+        assert_eq!(lex(b"200 ok\r\nx\r\n", 4, 32, &[]), vec!["S200 ok", "Mx"]);
+    }
+
+    #[test]
+    fn a_line_over_the_limit_is_too_long() {
+        let mut wire = b"200 ".to_vec();
+        wire.extend(vec![b'x'; MAX_REPLY_LINE + 10]);
+        wire.extend_from_slice(b"\r\n");
+        assert_eq!(lex(&wire, 4096, 8192, &[]), vec!["TOOLONG"]);
+        let mut block = b"215 l\r\n".to_vec();
+        block.extend(vec![b'y'; MAX_REPLY_LINE + 10]);
+        block.extend_from_slice(b"\r\n.\r\n");
+        assert_eq!(lex(&block, 4096, 8192, &[true]), vec!["S215 l", "TOOLONG"]);
+    }
+
+    #[test]
+    fn reads_across_the_wrap_of_the_ring() {
+        let wire = b"215 l\r\nabc\r\n.\r\n";
+        for lead in 0..10 {
+            let mut lexer = NntpReplyLexer::default();
+            let mut buf = LoopBuf::with_capacity(16);
+            buf.extend_from_slice(&vec![0u8; lead]);
+            buf.advance(lead);
+            assert_eq!(buf.extend_from_slice(wire), wire.len());
+            let mut got = Vec::new();
+            loop {
+                match lexer.next_event(&mut buf) {
+                    ReplyEvent::Status(s) => {
+                        got.push(format!("S{}", s.code));
+                        lexer.expect_block(true);
+                    }
+                    ReplyEvent::Line => got.push(String::from_utf8_lossy(lexer.line()).into_owned()),
+                    ReplyEvent::BlockEnd => got.push("E".into()),
+                    _ => break,
+                }
+            }
+            assert_eq!(got, vec!["S215", "abc", "E"], "lead={lead}");
+            assert!(buf.is_empty());
+        }
     }
 
     #[test]

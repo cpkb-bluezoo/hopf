@@ -7,14 +7,20 @@
 //! `verb`/`arg` scratch buffers — never in a buffer the caller has to retain
 //! and re-supply. See `hopf_http::h1::parse` for the design this follows.
 //!
+//! The argument is read according to its verb as its bytes arrive. `MAIL`
+//! and `RCPT` are tokenized by a [`PathTokenizer`] - the keyword, the path
+//! and each ESMTP parameter are recognised as they complete, and the
+//! argument is never held or searched again; the argument of a verb that
+//! takes none is skipped; only a string (`HELO`, `EHLO`, `AUTH`, `BDAT`,
+//! `XCLIENT`) is kept, bounded.
+//!
 //! Most verbs are built directly into a typed [`SmtpCommand`] variant here
 //! (`RSET`/`QUIT`/`NOOP`/`STARTTLS`/… take no argument at all; `AUTH`'s
 //! mechanism/initial-response are already split and the initial response is
-//! already base64-decoded). `MAIL`/`RCPT`/`BDAT` keep their raw argument
-//! text — their ESMTP-parameter grammar is already parsed by dedicated,
-//! well-tested functions in `server::delivery` with rich per-field error
-//! messages, and duplicating that here would only relocate complexity, not
-//! reduce it.
+//! already base64-decoded). `MAIL`/`RCPT` carry the tokens of the path and
+//! parameters; what the parameters mean is decided, with rich per-field
+//! error messages, by `server::delivery::interpret_mail_from` /
+//! `interpret_rcpt_to`. `BDAT` keeps its raw argument text.
 //!
 //! `AUTH`'s SASL continuation lines (bare base64, no verb) are handled by
 //! the same lexer via [`SmtpServerLexer::expect_sasl_response`] — call it
@@ -35,6 +41,8 @@
 
 use rmimeparser::charset::base64;
 
+use super::delivery::{ParamParseError, PathArgs, PathTokenizer};
+
 /// Command-line length limit (octets), applied independently to the verb
 /// and to the argument. RFC 5321 §4.5.3.1.4 sets the minimum a server must
 /// accept at 512; this crate allows a larger practical margin.
@@ -49,12 +57,13 @@ pub enum SmtpCommand {
     Helo(String),
     /// `EHLO hostname`
     Ehlo(String),
-    /// `MAIL <arg>` — raw text after `MAIL `, parsed by
-    /// `server::delivery::parse_mail_from_arg`.
-    Mail(String),
-    /// `RCPT <arg>` — raw text after `RCPT `, parsed by
-    /// `server::delivery::parse_rcpt_to_arg`.
-    Rcpt(String),
+    /// `MAIL FROM:<path> [params]` - the path and the parameters as the
+    /// lexer tokenized them (see [`PathTokenizer`]); what they mean is
+    /// `server::delivery::interpret_mail_from`. A syntax error is the `Err`.
+    Mail(Result<PathArgs, ParamParseError>),
+    /// `RCPT TO:<path> [params]`, tokenized likewise; what they mean is
+    /// `server::delivery::interpret_rcpt_to`.
+    Rcpt(Result<PathArgs, ParamParseError>),
     /// `DATA`
     Data,
     /// `BDAT size [LAST]` — raw text after `BDAT `.
@@ -126,12 +135,29 @@ enum State {
     RawLineCr,
 }
 
+/// What the argument of the verb just read is made of, which decides what
+/// the lexer does with each byte of it as it arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArgKind {
+    /// A string (`HELO`, `EHLO`, `AUTH`, `BDAT`, `XCLIENT`): kept, bounded.
+    Text,
+    /// A path and its parameters (`MAIL`, `RCPT`): tokenized as it arrives,
+    /// nothing kept but the tokens.
+    Path,
+    /// Takes no argument, or an unknown verb: whatever follows is skipped.
+    Ignored,
+}
+
 /// Incremental, semantic SMTP command-line parser. See the module docs.
 pub struct SmtpServerLexer {
     max_line: usize,
     state: State,
     verb: Vec<u8>,
     arg: Vec<u8>,
+    /// Bytes of argument so far, kept or not, for the length cap.
+    arg_len: usize,
+    kind: ArgKind,
+    path: Option<PathTokenizer>,
     have_arg: bool,
     raw: Vec<u8>,
     ready: Vec<SmtpCommand>,
@@ -148,6 +174,9 @@ impl SmtpServerLexer {
             state: State::Verb,
             verb: Vec::new(),
             arg: Vec::new(),
+            arg_len: 0,
+            kind: ArgKind::Ignored,
+            path: None,
             have_arg: false,
             raw: Vec::new(),
             ready: Vec::new(),
@@ -232,7 +261,7 @@ impl SmtpServerLexer {
                     if b == b'\r' {
                         self.state = State::Cr;
                     } else if b == b' ' {
-                        self.have_arg = true;
+                        self.start_arg();
                         self.state = State::Arg;
                     } else {
                         self.push_content(b);
@@ -280,17 +309,53 @@ impl SmtpServerLexer {
         }
     }
 
+    /// The verb is complete and an argument follows: decide what it is made
+    /// of from the verb.
+    fn start_arg(&mut self) {
+        self.have_arg = true;
+        self.arg_len = 0;
+        self.arg.clear();
+        self.path = None;
+        let verb = String::from_utf8_lossy(&self.verb).to_ascii_uppercase();
+        self.kind = match verb.as_str() {
+            "HELO" | "EHLO" | "AUTH" | "BDAT" | "XCLIENT" => ArgKind::Text,
+            "MAIL" => {
+                self.path = Some(PathTokenizer::mail(false));
+                ArgKind::Path
+            }
+            "RCPT" => {
+                self.path = Some(PathTokenizer::rcpt(false));
+                ArgKind::Path
+            }
+            _ => ArgKind::Ignored,
+        };
+    }
+
     fn push_content(&mut self, b: u8) {
-        let buf = if self.have_arg { &mut self.arg } else { &mut self.verb };
-        if buf.len() >= self.max_line {
+        let len = if self.have_arg { self.arg_len } else { self.verb.len() };
+        if len >= self.max_line {
             self.verb.clear();
             self.arg.clear();
+            self.path = None;
             self.have_arg = false;
             self.line_too_long = true;
             self.state = State::Resync;
             return;
         }
-        buf.push(b);
+        if !self.have_arg {
+            self.verb.push(b);
+            return;
+        }
+        self.arg_len += 1;
+        match self.kind {
+            ArgKind::Text => self.arg.push(b),
+            ArgKind::Path => {
+                if let Some(path) = self.path.as_mut() {
+                    path.feed(b);
+                }
+            }
+            ArgKind::Ignored => {}
+        }
     }
 
     fn finish_raw_line(&mut self) {
@@ -311,12 +376,32 @@ impl SmtpServerLexer {
     fn finish_command(&mut self) {
         let verb = String::from_utf8_lossy(&self.verb).to_ascii_uppercase();
         let arg = std::mem::take(&mut self.arg);
+        let path = self.path.take();
+        let had_arg = self.have_arg;
         self.verb.clear();
         self.have_arg = false;
         if verb.is_empty() {
             return;
         }
-        self.ready.push(build_command(&verb, &arg));
+        let command = match (verb.as_str(), path) {
+            ("MAIL", path) => SmtpCommand::Mail(finish_path(path, had_arg, PathTokenizer::mail)),
+            ("RCPT", path) => SmtpCommand::Rcpt(finish_path(path, had_arg, PathTokenizer::rcpt)),
+            _ => build_command(&verb, &arg),
+        };
+        self.ready.push(command);
+    }
+}
+
+/// The tokens of a `MAIL`/`RCPT` argument. A verb with no argument at all
+/// has none: that is a syntax error, not a null path.
+fn finish_path(
+    path: Option<PathTokenizer>,
+    had_arg: bool,
+    strict: fn(bool) -> PathTokenizer,
+) -> Result<PathArgs, ParamParseError> {
+    match path {
+        Some(tokenizer) if had_arg => tokenizer.finish(),
+        _ => strict(true).finish(),
     }
 }
 
@@ -326,8 +411,6 @@ fn build_command(verb: &str, arg: &[u8]) -> SmtpCommand {
     match verb {
         "HELO" => SmtpCommand::Helo(trimmed.to_string()),
         "EHLO" => SmtpCommand::Ehlo(trimmed.to_string()),
-        "MAIL" => SmtpCommand::Mail(text),
-        "RCPT" => SmtpCommand::Rcpt(text),
         "DATA" => SmtpCommand::Data,
         "BDAT" => SmtpCommand::Bdat(trimmed.to_string()),
         "RSET" => SmtpCommand::Rset,
@@ -361,13 +444,17 @@ fn build_command(verb: &str, arg: &[u8]) -> SmtpCommand {
 mod tests {
     use super::*;
 
+    fn path(address: &str, params: &[&str]) -> Result<PathArgs, ParamParseError> {
+        Ok(PathArgs { address: address.into(), params: params.iter().map(|p| p.to_string()).collect() })
+    }
+
     #[test]
     fn parse_mail_from() {
         let mut lex = SmtpServerLexer::new(4096);
         let mut data: &[u8] = b"MAIL FROM:<a@b.com>\r\n";
         let cmds = lex.feed(&mut data);
         assert!(data.is_empty());
-        assert_eq!(cmds, vec![SmtpCommand::Mail("FROM:<a@b.com>".into())]);
+        assert_eq!(cmds, vec![SmtpCommand::Mail(path("a@b.com", &[]))]);
     }
 
     #[test]
@@ -398,8 +485,8 @@ mod tests {
         assert_eq!(
             cmds,
             vec![
-                SmtpCommand::Mail("FROM:<a@b>".into()),
-                SmtpCommand::Rcpt("TO:<c@d>".into()),
+                SmtpCommand::Mail(path("a@b", &[])),
+                SmtpCommand::Rcpt(path("c@d", &[])),
                 SmtpCommand::Data,
             ]
         );
@@ -483,8 +570,8 @@ mod tests {
         assert_eq!(
             cmds,
             vec![
-                SmtpCommand::Mail("FROM:<a@b>".into()),
-                SmtpCommand::Rcpt("TO:<c@d>".into()),
+                SmtpCommand::Mail(path("a@b", &[])),
+                SmtpCommand::Rcpt(path("c@d", &[])),
                 SmtpCommand::Bdat("5 LAST".into()),
             ]
         );
@@ -637,7 +724,9 @@ mod tests {
         let mut lex = SmtpServerLexer::new(4096);
         let mut data: &[u8] = b"RCPT a\rb\r\n";
         let cmds = lex.feed(&mut data);
-        assert_eq!(cmds, vec![SmtpCommand::Rcpt("a\rb".into())]);
+        // The CR does not end the line; as white space it separates the
+        // address from a parameter, as it always did once the line was parsed.
+        assert_eq!(cmds, vec![SmtpCommand::Rcpt(path("a", &["b"]))]);
     }
 
     /// One byte per `feed()` call must produce identical commands to a
@@ -680,5 +769,38 @@ mod tests {
             assert!(b.is_empty(), "split {split} retained bytes");
             assert_eq!(cmds, base_cmds, "split {split} diverged");
         }
+    }
+
+    #[test]
+    fn mail_and_rcpt_arguments_are_tokenized_as_they_arrive() {
+        let wire = b"MAIL FROM:<a@b.com> SIZE=100 BODY=8BITMIME\r\nRCPT TO:<c@d>  NOTIFY=NEVER\r\nMAIL\r\nMAIL FROM:<open\r\n";
+        let want = vec![
+            SmtpCommand::Mail(path("a@b.com", &["SIZE=100", "BODY=8BITMIME"])),
+            SmtpCommand::Rcpt(path("c@d", &["NOTIFY=NEVER"])),
+            SmtpCommand::Mail(Err(ParamParseError { message: "Syntax: MAIL FROM:<address>".into() })),
+            SmtpCommand::Mail(Err(ParamParseError { message: "Unclosed angle-addr".into() })),
+        ];
+        for chunk in [1, 2, 3, 7, 100] {
+            let mut lex = SmtpServerLexer::new(4096);
+            let mut got = Vec::new();
+            for piece in wire.chunks(chunk) {
+                let mut data: &[u8] = piece;
+                got.extend(lex.feed(&mut data));
+            }
+            assert_eq!(got, want, "chunk={chunk}");
+        }
+    }
+
+    #[test]
+    fn an_argument_to_a_verb_that_takes_none_is_skipped_and_still_bounded() {
+        let mut lex = SmtpServerLexer::new(32);
+        let mut data: &[u8] = b"RSET please\r\nNOOP\r\n";
+        assert_eq!(lex.feed(&mut data), vec![SmtpCommand::Rset, SmtpCommand::Noop]);
+        let mut long = b"RSET ".to_vec();
+        long.extend(vec![b'x'; 64]);
+        long.extend_from_slice(b"\r\nNOOP\r\n");
+        let mut data: &[u8] = &long;
+        assert_eq!(lex.feed(&mut data), vec![SmtpCommand::Noop]);
+        assert!(lex.took_line_too_long());
     }
 }

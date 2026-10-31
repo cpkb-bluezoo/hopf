@@ -19,7 +19,8 @@ use hopf_otel::{
 use crate::server::codec::{SmtpCommand, SmtpServerLexer, MAX_COMMAND_LINE};
 use crate::server::data::{BdatAccumulator, DotUnstuffer};
 use crate::server::delivery::{
-    parse_mail_from_arg, parse_rcpt_to_arg, BodyType, DeliveryRequirements, DsnRecipientParams,
+    interpret_mail_from, interpret_rcpt_to, BodyType, DeliveryRequirements, DsnRecipientParams,
+    ParamParseError, PathArgs,
 };
 use crate::server::handler::{
     AuthenticateState, ConnectedState, DeferredDelivery, HelloHandler, HelloState, MailFromHandler,
@@ -421,8 +422,8 @@ impl SmtpControlHandler {
         match cmd {
             SmtpCommand::Helo(hostname) => self.cmd_helo(endpoint, &hostname, false),
             SmtpCommand::Ehlo(hostname) => self.cmd_helo(endpoint, &hostname, true),
-            SmtpCommand::Mail(arg) => self.cmd_mail(endpoint, arg.trim()),
-            SmtpCommand::Rcpt(arg) => self.cmd_rcpt(endpoint, arg.trim()),
+            SmtpCommand::Mail(args) => self.cmd_mail(endpoint, &args),
+            SmtpCommand::Rcpt(args) => self.cmd_rcpt(endpoint, &args),
             SmtpCommand::Data => self.cmd_data(endpoint),
             SmtpCommand::Bdat(arg) => self.cmd_bdat(endpoint, &arg),
             SmtpCommand::Rset => self.cmd_rset(endpoint),
@@ -517,7 +518,7 @@ impl SmtpControlHandler {
         }
     }
 
-    fn cmd_mail(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
+    fn cmd_mail(&mut self, endpoint: &mut dyn Endpoint, args: &Result<PathArgs, ParamParseError>) {
         if self.session != SmtpSessionState::Ready {
             self.send_enhanced(endpoint, 503, "5.5.1", "Bad sequence of commands");
             return;
@@ -542,17 +543,11 @@ impl SmtpControlHandler {
         }
         self.mail_transactions = self.mail_transactions.saturating_add(1);
 
-        let parsed = match parse_mail_from_arg(&format!("FROM:{}", strip_mail_prefix(arg))) {
+        let parsed = match args.as_ref().map_err(Clone::clone).and_then(interpret_mail_from) {
             Ok(p) => p,
             Err(e) => {
-                // try with arg as-is if it already has FROM:
-                match parse_mail_from_arg(arg) {
-                    Ok(p) => p,
-                    Err(_) => {
-                        self.send_enhanced(endpoint, 501, "5.5.4", &e.message);
-                        return;
-                    }
-                }
+                self.send_enhanced(endpoint, 501, "5.5.4", &e.message);
+                return;
             }
         };
         if let Some(sz) = parsed.size {
@@ -638,7 +633,7 @@ impl SmtpControlHandler {
         }
     }
 
-    fn cmd_rcpt(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
+    fn cmd_rcpt(&mut self, endpoint: &mut dyn Endpoint, args: &Result<PathArgs, ParamParseError>) {
         if self.session != SmtpSessionState::Mail && self.session != SmtpSessionState::Rcpt {
             self.send_enhanced(endpoint, 503, "5.5.1", "Bad sequence of commands");
             return;
@@ -647,15 +642,12 @@ impl SmtpControlHandler {
             self.send_enhanced(endpoint, 452, "4.5.3", "Too many recipients");
             return;
         }
-        let (addr_raw, dsn) = match parse_rcpt_to_arg(arg) {
+        let (addr_raw, dsn) = match args.as_ref().map_err(Clone::clone).and_then(interpret_rcpt_to) {
             Ok(v) => v,
-            Err(_) => match parse_rcpt_to_arg(&format!("TO:{arg}")) {
-                Ok(v) => v,
-                Err(e) => {
-                    self.send_enhanced(endpoint, 501, "5.5.4", &e.message);
-                    return;
-                }
-            },
+            Err(e) => {
+                self.send_enhanced(endpoint, 501, "5.5.4", &e.message);
+                return;
+            }
         };
         let recipient = match self.parse_address(&addr_raw) {
             Some(a) => a,
@@ -1507,17 +1499,6 @@ impl ProtocolHandler for SmtpControlHandler {
     fn error(&mut self, endpoint: &mut dyn Endpoint, _err: &std::io::Error) {
         endpoint.close();
     }
-}
-
-fn strip_mail_prefix(arg: &str) -> &str {
-    let t = arg.trim();
-    if let Some(rest) = t.strip_prefix("FROM:") {
-        return rest.trim();
-    }
-    if let Some(rest) = t.strip_prefix("from:") {
-        return rest.trim();
-    }
-    t
 }
 
 // ── State context adapters ──────────────────────────────────────────────

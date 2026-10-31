@@ -217,21 +217,208 @@ impl ParamParseError {
     }
 }
 
+/// The tokens of the argument of `MAIL FROM:` or `RCPT TO:` (RFC 5321
+/// §4.1.1.2, §4.1.1.3): the path, with the angle brackets taken off, and the
+/// ESMTP parameters, each a `name[=value]` word.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PathArgs {
+    /// The path; empty for the null reverse-path `<>`.
+    pub address: String,
+    /// The parameters, in order, as written.
+    pub params: Vec<String>,
+}
+
+/// White space as `char::is_whitespace` has it, for ASCII.
+fn is_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathStage {
+    /// Skipping white space before the first token.
+    Start,
+    /// Matching the `FROM:` / `TO:` keyword.
+    Keyword,
+    /// After the keyword, skipping white space.
+    AfterKeyword,
+    /// Inside `<...>`.
+    Angle,
+    /// An address with no angle brackets.
+    Bare,
+    /// Between parameters.
+    BetweenParams,
+    /// Inside a parameter.
+    Param,
+    /// A syntax error: the rest is skipped.
+    Dead,
+}
+
+/// Reads the argument of `MAIL` or `RCPT` as the bytes arrive: the keyword,
+/// the path, and each parameter are recognised as they complete, and the
+/// argument itself is never held.
+#[derive(Debug, Clone)]
+pub struct PathTokenizer {
+    keyword: &'static [u8],
+    syntax: &'static str,
+    require_keyword: bool,
+    stage: PathStage,
+    head: Vec<u8>,
+    address: Vec<u8>,
+    params: Vec<Vec<u8>>,
+    cur: Vec<u8>,
+}
+
+impl PathTokenizer {
+    /// For `MAIL FROM:`. With `require_keyword` an argument that does not
+    /// begin with `FROM:` (in any case) is a syntax error; without it, the
+    /// path alone is accepted, as clients commonly send it.
+    pub fn mail(require_keyword: bool) -> Self {
+        Self::new(b"FROM:", "Syntax: MAIL FROM:<address>", require_keyword)
+    }
+
+    /// For `RCPT TO:`; see [`Self::mail`].
+    pub fn rcpt(require_keyword: bool) -> Self {
+        Self::new(b"TO:", "Syntax: RCPT TO:<address>", require_keyword)
+    }
+
+    fn new(keyword: &'static [u8], syntax: &'static str, require_keyword: bool) -> Self {
+        Self {
+            keyword,
+            syntax,
+            require_keyword,
+            stage: PathStage::Start,
+            head: Vec::new(),
+            address: Vec::new(),
+            params: Vec::new(),
+            cur: Vec::new(),
+        }
+    }
+
+    /// The next byte of the argument.
+    pub fn feed(&mut self, b: u8) {
+        match self.stage {
+            PathStage::Dead => {}
+            PathStage::Start => {
+                if is_ws(b) {
+                } else if b == b'<' {
+                    // A path with no keyword before it.
+                    self.stage = if self.require_keyword { PathStage::Dead } else { PathStage::Angle };
+                } else {
+                    self.stage = PathStage::Keyword;
+                    self.keyword_byte(b);
+                }
+            }
+            PathStage::Keyword => self.keyword_byte(b),
+            PathStage::AfterKeyword => {
+                if is_ws(b) {
+                } else if b == b'<' {
+                    self.stage = PathStage::Angle;
+                } else {
+                    self.stage = PathStage::Bare;
+                    self.address.push(b);
+                }
+            }
+            PathStage::Angle => {
+                if b == b'>' {
+                    self.stage = PathStage::BetweenParams;
+                } else {
+                    self.address.push(b);
+                }
+            }
+            PathStage::Bare => {
+                if is_ws(b) {
+                    self.stage = PathStage::BetweenParams;
+                } else {
+                    self.address.push(b);
+                }
+            }
+            PathStage::BetweenParams => {
+                if !is_ws(b) {
+                    self.stage = PathStage::Param;
+                    self.cur.push(b);
+                }
+            }
+            PathStage::Param => {
+                if is_ws(b) {
+                    self.params.push(std::mem::take(&mut self.cur));
+                    self.stage = PathStage::BetweenParams;
+                } else {
+                    self.cur.push(b);
+                }
+            }
+        }
+    }
+
+    fn keyword_byte(&mut self, b: u8) {
+        let i = self.head.len();
+        if i < self.keyword.len() && b.to_ascii_uppercase() == self.keyword[i] {
+            self.head.push(b);
+            if self.head.len() == self.keyword.len() {
+                self.head.clear();
+                self.stage = PathStage::AfterKeyword;
+            }
+            return;
+        }
+        if self.require_keyword {
+            self.stage = PathStage::Dead;
+            return;
+        }
+        // Not the keyword: what has been read is the start of a bare
+        // address.
+        let mut bytes = std::mem::take(&mut self.head);
+        bytes.push(b);
+        self.stage = PathStage::Bare;
+        for x in bytes {
+            self.feed(x);
+        }
+    }
+
+    /// The end of the argument.
+    pub fn finish(mut self) -> Result<PathArgs, ParamParseError> {
+        match self.stage {
+            PathStage::Dead => return Err(ParamParseError::new(self.syntax)),
+            PathStage::Start | PathStage::Keyword if self.require_keyword => {
+                return Err(ParamParseError::new(self.syntax));
+            }
+            PathStage::Keyword => {
+                // Only part of a keyword: it was the address.
+                let bytes = std::mem::take(&mut self.head);
+                self.address = bytes;
+            }
+            PathStage::Angle => return Err(ParamParseError::new("Unclosed angle-addr")),
+            PathStage::Param => self.params.push(std::mem::take(&mut self.cur)),
+            _ => {}
+        }
+        Ok(PathArgs {
+            address: String::from_utf8_lossy(&self.address).into_owned(),
+            params: self
+                .params
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect(),
+        })
+    }
+}
+
+/// Reads a whole argument string with [`PathTokenizer`].
+fn tokenize_path(mut tokenizer: PathTokenizer, arg: &str) -> Result<PathArgs, ParamParseError> {
+    for b in arg.bytes() {
+        tokenizer.feed(b);
+    }
+    tokenizer.finish()
+}
+
 /// Pragmatic MAIL FROM argument parser (`FROM:<addr> [params…]`).
 pub fn parse_mail_from_arg(arg: &str) -> Result<MailFromParse, ParamParseError> {
-    let arg = arg.trim();
-    let rest = arg
-        .strip_prefix("FROM:")
-        .or_else(|| arg.strip_prefix("from:"))
-        .or_else(|| arg.strip_prefix("From:"))
-        .ok_or_else(|| ParamParseError::new("Syntax: MAIL FROM:<address>"))?
-        .trim();
+    interpret_mail_from(&tokenize_path(PathTokenizer::mail(true), arg)?)
+}
 
-    let (address_part, params_part) = split_angle_or_token(rest)?;
-    let sender_raw = if address_part.is_empty() {
+/// What the tokens of a `MAIL FROM:` argument mean.
+pub fn interpret_mail_from(args: &PathArgs) -> Result<MailFromParse, ParamParseError> {
+    let sender_raw = if args.address.is_empty() {
         None
     } else {
-        Some(address_part.to_string())
+        Some(args.address.clone())
     };
 
     let mut out = MailFromParse {
@@ -242,8 +429,8 @@ pub fn parse_mail_from_arg(arg: &str) -> Result<MailFromParse, ParamParseError> 
         delivery: DeliveryRequirements::default(),
     };
 
-    if let Some(params) = params_part {
-        for param in split_params(params) {
+    {
+        for param in args.params.iter().map(String::as_str) {
             let upper = param.to_ascii_uppercase();
             if let Some(v) = upper.strip_prefix("SIZE=") {
                 let n: u64 = v
@@ -313,22 +500,18 @@ pub fn parse_mail_from_arg(arg: &str) -> Result<MailFromParse, ParamParseError> 
 
 /// Parse RCPT TO argument → (address, dsn params).
 pub fn parse_rcpt_to_arg(arg: &str) -> Result<(String, DsnRecipientParams), ParamParseError> {
-    let arg = arg.trim();
-    let rest = arg
-        .strip_prefix("TO:")
-        .or_else(|| arg.strip_prefix("to:"))
-        .or_else(|| arg.strip_prefix("To:"))
-        .ok_or_else(|| ParamParseError::new("Syntax: RCPT TO:<address>"))?
-        .trim();
+    interpret_rcpt_to(&tokenize_path(PathTokenizer::rcpt(true), arg)?)
+}
 
-    let (address_part, params_part) = split_angle_or_token(rest)?;
-    if address_part.is_empty() {
+/// What the tokens of a `RCPT TO:` argument mean.
+pub fn interpret_rcpt_to(args: &PathArgs) -> Result<(String, DsnRecipientParams), ParamParseError> {
+    if args.address.is_empty() {
         return Err(ParamParseError::new("Empty recipient address"));
     }
 
     let mut dsn = DsnRecipientParams::default();
-    if let Some(params) = params_part {
-        for param in split_params(params) {
+    {
+        for param in args.params.iter().map(String::as_str) {
             let upper = param.to_ascii_uppercase();
             if let Some(v) = upper.strip_prefix("NOTIFY=") {
                 for part in v.split(',') {
@@ -363,27 +546,7 @@ pub fn parse_rcpt_to_arg(arg: &str) -> Result<(String, DsnRecipientParams), Para
             }
         }
     }
-    Ok((address_part.to_string(), dsn))
-}
-
-fn split_angle_or_token(rest: &str) -> Result<(&str, Option<&str>), ParamParseError> {
-    if rest.starts_with('<') {
-        let close = rest
-            .find('>')
-            .ok_or_else(|| ParamParseError::new("Unclosed angle-addr"))?;
-        let addr = &rest[1..close];
-        let after = rest[close + 1..].trim();
-        Ok((addr, if after.is_empty() { None } else { Some(after) }))
-    } else {
-        let mut parts = rest.splitn(2, char::is_whitespace);
-        let addr = parts.next().unwrap_or("");
-        let after = parts.next().map(str::trim).filter(|s| !s.is_empty());
-        Ok((addr, after))
-    }
-}
-
-fn split_params(params: &str) -> Vec<&str> {
-    params.split_whitespace().collect()
+    Ok((args.address.clone(), dsn))
 }
 
 #[cfg(test)]
@@ -446,5 +609,82 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(params.render(), " NOTIFY=NEVER");
+    }
+
+    /// The tokens as the code that waited for the whole argument and then
+    /// searched it made them: the oracle the incremental tokenizer is held to.
+    fn old_tokens(arg: &str, prefixes: [&str; 3], syntax: &str) -> Result<(String, Vec<String>), String> {
+        let arg = arg.trim();
+        let rest = prefixes
+            .iter()
+            .find_map(|p| arg.strip_prefix(p))
+            .ok_or_else(|| syntax.to_string())?
+            .trim();
+        let (addr, after) = if rest.starts_with('<') {
+            let close = rest.find('>').ok_or_else(|| "Unclosed angle-addr".to_string())?;
+            let after = rest[close + 1..].trim();
+            (&rest[1..close], if after.is_empty() { None } else { Some(after) })
+        } else {
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let addr = parts.next().unwrap_or("");
+            (addr, parts.next().map(str::trim).filter(|s| !s.is_empty()))
+        };
+        let params = after.map(|p| p.split_whitespace().map(String::from).collect()).unwrap_or_default();
+        Ok((addr.to_string(), params))
+    }
+
+    #[test]
+    fn path_tokens_match_the_whole_argument_parser() {
+        let bodies = [
+            "<a@b.com>", "<>", "<a@b.com> SIZE=100", "<a@b.com>   SIZE=100  BODY=8BITMIME ",
+            "<a@b.com>SIZE=1", "< a@b.com >", "<a b@c>", "<unclosed", "<a@b> <c@d>", "a@b.com",
+            "a@b.com SIZE=5", "", " ", "<a@b>\tNOTIFY=NEVER", "<a@b> ORCPT=rfc822;x@y", "<<a>>",
+            "<a@b> x y z", "<a>\rb", "<@route:a@b>",
+        ];
+        for (keyword, prefixes, syntax, make) in [
+            ("FROM:", ["FROM:", "from:", "From:"], "Syntax: MAIL FROM:<address>", PathTokenizer::mail as fn(bool) -> PathTokenizer),
+            ("TO:", ["TO:", "to:", "To:"], "Syntax: RCPT TO:<address>", PathTokenizer::rcpt),
+        ] {
+            for lead in ["", " ", "  "] {
+                for sep in ["", " ", "  ", "\t"] {
+                    for body in bodies {
+                        for case in [keyword.to_string(), keyword.to_lowercase(), {
+                            let mut c = keyword.to_lowercase();
+                            c.replace_range(0..1, &keyword[0..1]);
+                            c
+                        }] {
+                            let arg = format!("{lead}{case}{sep}{body}");
+                            let want = old_tokens(&arg, prefixes, syntax);
+                            let got = tokenize_path(make(true), &arg)
+                                .map(|a| (a.address, a.params))
+                                .map_err(|e| e.message);
+                            assert_eq!(got, want, "arg {arg:?}");
+                        }
+                    }
+                }
+            }
+            // No keyword at all is a syntax error when it is required.
+            for body in bodies {
+                let want = old_tokens(body, prefixes, syntax);
+                let got = tokenize_path(make(true), body).map(|a| (a.address, a.params)).map_err(|e| e.message);
+                assert_eq!(got, want, "arg {body:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn without_a_required_keyword_the_path_alone_is_accepted() {
+        let got = tokenize_path(PathTokenizer::mail(false), "<a@b.com> SIZE=10").unwrap();
+        assert_eq!(got, PathArgs { address: "a@b.com".into(), params: vec!["SIZE=10".into()] });
+        let got = tokenize_path(PathTokenizer::rcpt(false), "to:<u@d>").unwrap();
+        assert_eq!(got.address, "u@d");
+        // Any case of the keyword, and white space after it.
+        let got = tokenize_path(PathTokenizer::mail(false), "FrOm:  <a@b>").unwrap();
+        assert_eq!(got.address, "a@b");
+        // A bare address that begins like the keyword.
+        let got = tokenize_path(PathTokenizer::rcpt(false), "tom@example.com").unwrap();
+        assert_eq!(got.address, "tom@example.com");
+        let got = tokenize_path(PathTokenizer::rcpt(false), "t").unwrap();
+        assert_eq!(got.address, "t");
     }
 }

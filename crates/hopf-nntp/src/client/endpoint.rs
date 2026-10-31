@@ -10,13 +10,13 @@ use std::time::Duration;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use hopf_auth::{create_client, SaslClient, SaslClientStep, SaslMechanism};
-use hopf_core::{take_crlf_line, Endpoint, LoopBuf, ProtocolHandler, SecurityInfo, SharedTlsConnector, TimerHandle};
+use hopf_core::{Endpoint, LoopBuf, ProtocolHandler, SecurityInfo, SharedTlsConnector, TimerHandle};
 
 use super::error::NntpClientError;
 use super::handlers::{NntpClientHandler, NntpGreeting};
 use super::reply::{
-    has_capability, is_multiline_code, normalize_capabilities, parse_status, sasl_mechanisms,
-    unstuff_line, NntpStatus,
+    has_capability, is_multiline_code, normalize_capabilities, sasl_mechanisms, NntpReplyLexer,
+    NntpStatus, ReplyEvent,
 };
 use super::session::{Command, NntpSession, Queue};
 
@@ -27,10 +27,6 @@ const SASL_PREFERENCE: &[SaslMechanism] = &[
     SaslMechanism::Plain,
     SaslMechanism::Login,
 ];
-
-/// A command's status line, or a multi-line block, must not exceed this
-/// many buffered bytes without a line ending.
-const MAX_LINE: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TlsMode {
@@ -88,6 +84,10 @@ pub(crate) struct NntpClientEndpoint {
     in_flight: Option<(Command, InFlight)>,
     timer: Option<TimerHandle>,
     connected_notified: bool,
+    lexer: NntpReplyLexer,
+    /// A multi-line block is due next (set by whichever handler saw the
+    /// status that announces it, cleared at the block's end).
+    block_next: bool,
 }
 
 impl NntpClientEndpoint {
@@ -116,6 +116,8 @@ impl NntpClientEndpoint {
             in_flight: None,
             timer: None,
             connected_notified: false,
+            lexer: NntpReplyLexer::default(),
+            block_next: false,
         }
     }
 
@@ -187,11 +189,7 @@ impl NntpClientEndpoint {
 
     // ── handshake ────────────────────────────────────────────────────────
 
-    fn on_greeting(&mut self, ep: &mut dyn Endpoint, line: &[u8]) {
-        let text = String::from_utf8_lossy(line);
-        let Some(status) = parse_status(&text) else {
-            return self.protocol_error(ep, "invalid NNTP greeting", line);
-        };
+    fn on_greeting(&mut self, ep: &mut dyn Endpoint, status: NntpStatus) {
         if status.code != 200 && status.code != 201 {
             return self.fail(ep, io::Error::new(io::ErrorKind::ConnectionRefused, format!("NNTP greeting: {} {}", status.code, status.text)));
         }
@@ -205,29 +203,22 @@ impl NntpClientEndpoint {
         self.send_line(ep, "CAPABILITIES");
     }
 
-    fn on_capabilities_line(&mut self, ep: &mut dyn Endpoint, after_tls: bool, collecting: bool, line: &[u8]) {
-        if !collecting {
-            let text = String::from_utf8_lossy(line);
-            match parse_status(&text) {
-                Some(s) if s.code == 101 => {
-                    self.phase = Phase::Capabilities { after_tls, collecting: true };
-                }
-                Some(_) => {
-                    // No CAPABILITIES support: carry on with none.
-                    self.capabilities = Vec::new();
-                    self.after_capabilities(ep, after_tls);
-                }
-                None => self.protocol_error(ep, "bad CAPABILITIES reply", line),
-            }
-            return;
+    /// The status line that answers `CAPABILITIES`: `101` announces the
+    /// list.
+    fn on_capabilities_status(&mut self, ep: &mut dyn Endpoint, after_tls: bool, status: NntpStatus) {
+        if status.code == 101 {
+            self.phase = Phase::Capabilities { after_tls, collecting: true };
+            self.block_next = true;
+        } else {
+            // No CAPABILITIES support: carry on with none.
+            self.capabilities = Vec::new();
+            self.after_capabilities(ep, after_tls);
         }
-        match unstuff_line(line) {
-            Some(l) => self.caps_lines.push(l.to_vec()),
-            None => {
-                self.capabilities = normalize_capabilities(&self.caps_lines);
-                self.after_capabilities(ep, after_tls);
-            }
-        }
+    }
+
+    fn on_capabilities_end(&mut self, ep: &mut dyn Endpoint, after_tls: bool) {
+        self.capabilities = normalize_capabilities(&self.caps_lines);
+        self.after_capabilities(ep, after_tls);
     }
 
     fn after_capabilities(&mut self, ep: &mut dyn Endpoint, after_tls: bool) {
@@ -247,10 +238,9 @@ impl NntpClientEndpoint {
         self.authenticate(ep);
     }
 
-    fn on_starttls_reply(&mut self, ep: &mut dyn Endpoint, line: &[u8]) {
-        let text = String::from_utf8_lossy(line);
-        match parse_status(&text) {
-            Some(s) if s.code == 382 => {
+    fn on_starttls_reply(&mut self, ep: &mut dyn Endpoint, s: NntpStatus) {
+        match s {
+            s if s.code == 382 => {
                 let Some((connector, name)) = self.tls.clone() else {
                     return self.fail(ep, io::Error::new(io::ErrorKind::InvalidInput, "STARTTLS accepted but no TLS connector configured"));
                 };
@@ -260,13 +250,11 @@ impl NntpClientEndpoint {
                     self.fail(ep, io::Error::other(format!("STARTTLS: {e:?}")));
                 }
             }
-            Some(s) if self.tls_mode == TlsMode::StartTlsOpportunistic => {
+            _ if self.tls_mode == TlsMode::StartTlsOpportunistic => {
                 // Offered but refused: carry on in the clear.
-                let _ = s;
                 self.authenticate(ep);
             }
-            Some(s) => self.fail(ep, io::Error::new(io::ErrorKind::ConnectionRefused, format!("STARTTLS refused: {} {}", s.code, s.text))),
-            None => self.protocol_error(ep, "bad STARTTLS reply", line),
+            s => self.fail(ep, io::Error::new(io::ErrorKind::ConnectionRefused, format!("STARTTLS refused: {} {}", s.code, s.text))),
         }
     }
 
@@ -302,9 +290,7 @@ impl NntpClientEndpoint {
         self.fail(ep, io::Error::new(io::ErrorKind::PermissionDenied, format!("{what}: {} {}", s.code, s.text)));
     }
 
-    fn on_auth_user_reply(&mut self, ep: &mut dyn Endpoint, line: &[u8]) {
-        let text = String::from_utf8_lossy(line);
-        let Some(s) = parse_status(&text) else { return self.protocol_error(ep, "bad AUTHINFO USER reply", line) };
+    fn on_auth_user_reply(&mut self, ep: &mut dyn Endpoint, s: NntpStatus) {
         match s.code {
             281 => {
                 self.authenticated = true;
@@ -319,9 +305,7 @@ impl NntpClientEndpoint {
         }
     }
 
-    fn on_auth_pass_reply(&mut self, ep: &mut dyn Endpoint, line: &[u8]) {
-        let text = String::from_utf8_lossy(line);
-        let Some(s) = parse_status(&text) else { return self.protocol_error(ep, "bad AUTHINFO PASS reply", line) };
+    fn on_auth_pass_reply(&mut self, ep: &mut dyn Endpoint, s: NntpStatus) {
         if s.code == 281 {
             self.authenticated = true;
             self.become_ready(ep);
@@ -330,9 +314,7 @@ impl NntpClientEndpoint {
         }
     }
 
-    fn on_auth_sasl_reply(&mut self, ep: &mut dyn Endpoint, line: &[u8]) {
-        let text = String::from_utf8_lossy(line);
-        let Some(s) = parse_status(&text) else { return self.protocol_error(ep, "bad AUTHINFO SASL reply", line) };
+    fn on_auth_sasl_reply(&mut self, ep: &mut dyn Endpoint, s: NntpStatus) {
         match s.code {
             281 => {
                 self.sasl = None;
@@ -343,11 +325,11 @@ impl NntpClientEndpoint {
                 let challenge = if s.text.trim() == "=" { Vec::new() } else {
                     match B64.decode(s.text.trim()) {
                         Ok(c) => c,
-                        Err(_) => return self.protocol_error(ep, "undecodable SASL challenge", line),
+                        Err(_) => return self.protocol_error(ep, "undecodable SASL challenge", s.text.as_bytes()),
                     }
                 };
                 let Some(client) = self.sasl.as_mut() else {
-                    return self.protocol_error(ep, "unexpected SASL challenge", line);
+                    return self.protocol_error(ep, "unexpected SASL challenge", s.text.as_bytes());
                 };
                 match client.evaluate(Some(&challenge)) {
                     SaslClientStep::Response(r) | SaslClientStep::Complete(r) => {
@@ -401,50 +383,58 @@ impl NntpClientEndpoint {
         }
     }
 
-    fn on_command_line(&mut self, ep: &mut dyn Endpoint, line: &[u8]) {
+    /// A status line while a command is in flight.
+    fn on_command_status(&mut self, ep: &mut dyn Endpoint, status: NntpStatus) {
         self.arm_timer(ep);
         let Some((mut cmd, waiting)) = self.in_flight.take() else {
             // Nothing asked for this; servers do not speak unprompted.
             return;
         };
-        match waiting {
-            InFlight::Lines => match unstuff_line(line) {
-                Some(l) => {
-                    (cmd.on_line)(l);
-                    self.in_flight = Some((cmd, InFlight::Lines));
-                }
-                // The status that opened the block is already captured in
-                // the completion wrapper; this placeholder is replaced there.
-                None => self.complete(ep, cmd, Ok(NntpStatus { code: 0, text: String::new() })),
-            },
-            InFlight::Status | InFlight::Final => {
-                let text = String::from_utf8_lossy(line);
-                let Some(status) = parse_status(&text) else {
-                    self.in_flight = Some((cmd, waiting));
-                    return self.protocol_error(ep, "bad status line", line);
-                };
-                if let (InFlight::Status, Some((code, payload))) = (&waiting, cmd.continuation.take()) {
-                    if status.code == code {
-                        ep.send(&payload);
-                        self.arm_timer(ep);
-                        self.in_flight = Some((cmd, InFlight::Final));
-                        return;
-                    }
-                }
-                if cmd.multiline && is_multiline_code(status.code) {
-                    // Remember the status; completion fires at the dot.
-                    let code = status.code;
-                    let text = status.text;
-                    let on_complete = std::mem::replace(&mut cmd.on_complete, Box::new(|_| {}));
-                    cmd.on_complete = Box::new(move |r| match r {
-                        Ok(_) => on_complete(Ok(NntpStatus { code, text })),
-                        Err(e) => on_complete(Err(e)),
-                    });
-                    self.in_flight = Some((cmd, InFlight::Lines));
-                } else {
-                    self.complete(ep, cmd, Ok(status));
-                }
+        if matches!(waiting, InFlight::Lines) {
+            // (A status where a block was due cannot be read: the lexer
+            // is in block mode.)
+            self.in_flight = Some((cmd, waiting));
+            return;
+        }
+        if let (InFlight::Status, Some((code, payload))) = (&waiting, cmd.continuation.take()) {
+            if status.code == code {
+                ep.send(&payload);
+                self.arm_timer(ep);
+                self.in_flight = Some((cmd, InFlight::Final));
+                return;
             }
+        }
+        if matches!(waiting, InFlight::Status) && cmd.multiline && is_multiline_code(status.code) {
+            // Remember the status; completion fires at the dot.
+            let code = status.code;
+            let text = status.text;
+            let on_complete = std::mem::replace(&mut cmd.on_complete, Box::new(|_| {}));
+            cmd.on_complete = Box::new(move |r| match r {
+                Ok(_) => on_complete(Ok(NntpStatus { code, text })),
+                Err(e) => on_complete(Err(e)),
+            });
+            self.in_flight = Some((cmd, InFlight::Lines));
+            self.block_next = true;
+        } else {
+            self.complete(ep, cmd, Ok(status));
+        }
+    }
+
+    /// A line of the multi-line block of the command in flight.
+    fn on_command_block_line(&mut self, ep: &mut dyn Endpoint, line: &[u8]) {
+        self.arm_timer(ep);
+        if let Some((cmd, InFlight::Lines)) = self.in_flight.as_mut() {
+            (cmd.on_line)(line);
+        }
+    }
+
+    /// The `.` that ends the block of the command in flight.
+    fn on_command_block_end(&mut self, ep: &mut dyn Endpoint) {
+        self.arm_timer(ep);
+        if let Some((cmd, InFlight::Lines)) = self.in_flight.take() {
+            // The status that opened the block is already captured in the
+            // completion wrapper; this placeholder is replaced there.
+            self.complete(ep, cmd, Ok(NntpStatus { code: 0, text: String::new() }));
         }
     }
 
@@ -470,28 +460,59 @@ impl ProtocolHandler for NntpClientEndpoint {
     }
 
     fn receive(&mut self, ep: &mut dyn Endpoint, buf: &mut LoopBuf) {
+        // The lexer is taken out of `self` while the handlers, which may
+        // change what it should expect next, run.
+        let mut lexer = std::mem::take(&mut self.lexer);
         loop {
             if self.phase == Phase::Closed {
-                return;
+                break;
             }
-            let Some(line) = take_crlf_line(buf) else {
-                if buf.len() > MAX_LINE {
+            lexer.expect_block(self.block_next);
+            match lexer.next_event(buf) {
+                ReplyEvent::NeedMore => break,
+                ReplyEvent::TooLong => {
                     self.fail(ep, io::Error::new(io::ErrorKind::InvalidData, "reply line too long"));
                 }
-                break;
-            };
-            match self.phase {
-                Phase::Greeting => self.on_greeting(ep, &line),
-                Phase::Capabilities { after_tls, collecting } => self.on_capabilities_line(ep, after_tls, collecting, &line),
-                Phase::StartTls => self.on_starttls_reply(ep, &line),
-                Phase::PendingTls => {}
-                Phase::AuthUser => self.on_auth_user_reply(ep, &line),
-                Phase::AuthPass => self.on_auth_pass_reply(ep, &line),
-                Phase::AuthSasl => self.on_auth_sasl_reply(ep, &line),
-                Phase::Ready => self.on_command_line(ep, &line),
-                Phase::Closed => return,
+                ReplyEvent::Malformed => {
+                    let line = lexer.take_malformed();
+                    let what = match self.phase {
+                        Phase::Greeting => "invalid NNTP greeting",
+                        Phase::Capabilities { .. } => "bad CAPABILITIES reply",
+                        Phase::StartTls => "bad STARTTLS reply",
+                        Phase::AuthUser => "bad AUTHINFO USER reply",
+                        Phase::AuthPass => "bad AUTHINFO PASS reply",
+                        Phase::AuthSasl => "bad AUTHINFO SASL reply",
+                        _ => "bad status line",
+                    };
+                    self.protocol_error(ep, what, &line);
+                }
+                ReplyEvent::Status(status) => match self.phase {
+                    Phase::Greeting => self.on_greeting(ep, status),
+                    Phase::Capabilities { after_tls, .. } => self.on_capabilities_status(ep, after_tls, status),
+                    Phase::StartTls => self.on_starttls_reply(ep, status),
+                    Phase::PendingTls => {}
+                    Phase::AuthUser => self.on_auth_user_reply(ep, status),
+                    Phase::AuthPass => self.on_auth_pass_reply(ep, status),
+                    Phase::AuthSasl => self.on_auth_sasl_reply(ep, status),
+                    Phase::Ready => self.on_command_status(ep, status),
+                    Phase::Closed => {}
+                },
+                ReplyEvent::Line => match self.phase {
+                    Phase::Capabilities { .. } => self.caps_lines.push(lexer.line().to_vec()),
+                    Phase::Ready => self.on_command_block_line(ep, lexer.line()),
+                    _ => {}
+                },
+                ReplyEvent::BlockEnd => {
+                    self.block_next = false;
+                    match self.phase {
+                        Phase::Capabilities { after_tls, .. } => self.on_capabilities_end(ep, after_tls),
+                        Phase::Ready => self.on_command_block_end(ep),
+                        _ => {}
+                    }
+                }
             }
         }
+        self.lexer = lexer;
         // A poke, or the end of a reply: send what is queued.
         self.dispatch(ep);
     }

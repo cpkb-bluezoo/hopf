@@ -7,6 +7,11 @@
 //! `verb`/`arg` scratch buffers — never in a buffer the caller has to retain
 //! and re-supply.
 //!
+//! The argument is read according to its verb as its bytes arrive: message
+//! numbers (`RETR`, `DELE`, `TOP`, `LIST`, `UIDL`) are accumulated as numbers
+//! with nothing kept, the argument of a verb that takes none is skipped, and
+//! only a string (`USER`, `PASS`, `APOP`, `AUTH`) is kept, bounded.
+//!
 //! Beyond tokenizing the line, the lexer also builds the semantic
 //! [`Pop3Command`] directly: `RETR`/`DELE`/`TOP`'s message numbers are
 //! already-parsed `u32`s, `APOP`'s name/digest are already split, and
@@ -123,12 +128,112 @@ enum State {
     RawLineCr,
 }
 
+/// What the argument of the verb just read is made of, which decides what the
+/// lexer does with each byte of it as it arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArgKind {
+    /// A string (`USER`, `PASS`, `APOP`, `AUTH`): kept, bounded, since the
+    /// string is the thing.
+    Text,
+    /// Message numbers (`RETR`, `DELE`, `TOP`, `LIST`, `UIDL`): read as
+    /// numbers while they arrive, nothing kept.
+    Numbers(u8),
+    /// Takes no argument (or an unknown verb): whatever follows is skipped,
+    /// nothing kept.
+    Ignored,
+}
+
+/// Reads up to `want` whitespace-separated decimal numbers as the bytes
+/// arrive: no buffer, just the number being read.
+#[derive(Debug, Clone, Copy, Default)]
+struct Numbers {
+    want: u8,
+    /// Numbers completed.
+    done: u8,
+    values: [Option<u32>; 2],
+    /// Inside a number.
+    in_token: bool,
+    /// The number being read: its value, whether it has a digit yet, whether
+    /// it is still a number at all (a sign only first; no overflow).
+    value: u64,
+    digits: u8,
+    valid: bool,
+    /// More numbers than wanted.
+    extra: bool,
+}
+
+impl Numbers {
+    fn new(want: u8) -> Self {
+        Self { want, ..Self::default() }
+    }
+
+    fn feed(&mut self, b: u8) {
+        // ASCII white space, as `char::is_whitespace` has it.
+        if matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) {
+            self.end_token();
+            return;
+        }
+        if !self.in_token {
+            if self.done >= self.want {
+                self.extra = true;
+                return;
+            }
+            self.in_token = true;
+            self.value = 0;
+            self.digits = 0;
+            self.valid = true;
+            if b == b'+' {
+                return; // a sign is allowed before the digits
+            }
+        }
+        if !self.valid {
+            return;
+        }
+        if b.is_ascii_digit() {
+            self.digits += 1;
+            self.value = self.value * 10 + u64::from(b - b'0');
+            if self.value > u64::from(u32::MAX) {
+                self.valid = false;
+            }
+        } else {
+            self.valid = false;
+        }
+    }
+
+    fn end_token(&mut self) {
+        if self.in_token {
+            self.in_token = false;
+            let ok = self.valid && self.digits > 0;
+            if let Some(slot) = self.values.get_mut(self.done as usize) {
+                *slot = ok.then_some(self.value as u32);
+            }
+            self.done += 1;
+        }
+    }
+
+    /// The numbers read, if exactly `want` valid ones were (`None` for any
+    /// other shape).
+    fn all(mut self) -> Option<[u32; 2]> {
+        self.end_token();
+        if self.extra || self.done != self.want {
+            return None;
+        }
+        let a = self.values[0]?;
+        let b = if self.want > 1 { self.values[1]? } else { 0 };
+        Some([a, b])
+    }
+}
+
 /// Incremental, semantic POP3 command-line parser. See the module docs.
 pub struct Pop3ServerLexer {
     max_line: usize,
     state: State,
     verb: Vec<u8>,
     arg: Vec<u8>,
+    /// Bytes of argument so far, kept or not, for the length cap.
+    arg_len: usize,
+    kind: ArgKind,
+    numbers: Numbers,
     have_arg: bool,
     raw: Vec<u8>,
     ready: Vec<Pop3Command>,
@@ -144,6 +249,9 @@ impl Pop3ServerLexer {
             state: State::Verb,
             verb: Vec::new(),
             arg: Vec::new(),
+            arg_len: 0,
+            kind: ArgKind::Ignored,
+            numbers: Numbers::default(),
             have_arg: false,
             raw: Vec::new(),
             ready: Vec::new(),
@@ -211,7 +319,7 @@ impl Pop3ServerLexer {
                     if b == b'\r' {
                         self.state = State::Cr;
                     } else if b == b' ' {
-                        self.have_arg = true;
+                        self.start_arg();
                         self.state = State::Arg;
                     } else {
                         self.push_content(b);
@@ -260,9 +368,27 @@ impl Pop3ServerLexer {
         }
     }
 
+    /// The verb is complete and an argument follows: decide what it is made
+    /// of from the verb.
+    fn start_arg(&mut self) {
+        self.have_arg = true;
+        self.arg_len = 0;
+        self.arg.clear();
+        let verb = String::from_utf8_lossy(&self.verb).to_ascii_uppercase();
+        self.kind = match verb.as_str() {
+            "USER" | "PASS" | "APOP" | "AUTH" => ArgKind::Text,
+            "RETR" | "DELE" | "LIST" | "UIDL" => ArgKind::Numbers(1),
+            "TOP" => ArgKind::Numbers(2),
+            _ => ArgKind::Ignored,
+        };
+        if let ArgKind::Numbers(want) = self.kind {
+            self.numbers = Numbers::new(want);
+        }
+    }
+
     fn push_content(&mut self, b: u8) {
-        let buf = if self.have_arg { &mut self.arg } else { &mut self.verb };
-        if buf.len() >= self.max_line {
+        let len = if self.have_arg { self.arg_len } else { self.verb.len() };
+        if len >= self.max_line {
             self.verb.clear();
             self.arg.clear();
             self.have_arg = false;
@@ -270,7 +396,16 @@ impl Pop3ServerLexer {
             self.state = State::Resync;
             return;
         }
-        buf.push(b);
+        if !self.have_arg {
+            self.verb.push(b);
+            return;
+        }
+        self.arg_len += 1;
+        match self.kind {
+            ArgKind::Text => self.arg.push(b),
+            ArgKind::Numbers(_) => self.numbers.feed(b),
+            ArgKind::Ignored => {}
+        }
     }
 
     fn finish_raw_line(&mut self) {
@@ -291,6 +426,7 @@ impl Pop3ServerLexer {
     fn finish_command(&mut self) {
         let verb = String::from_utf8_lossy(&self.verb).to_ascii_uppercase();
         let arg = std::mem::take(&mut self.arg);
+        let had_arg = self.have_arg;
         self.verb.clear();
         self.have_arg = false;
         if verb.is_empty() {
@@ -298,13 +434,26 @@ impl Pop3ServerLexer {
             // silently ignored, matching a bare CRLF keepalive.
             return;
         }
-        self.ready.push(build_command(&verb, &arg));
+        // A verb with no argument has no numbers either.
+        let numbers = if had_arg {
+            self.numbers
+        } else {
+            match verb.as_str() {
+                "TOP" => Numbers::new(2),
+                _ => Numbers::new(1),
+            }
+        };
+        self.ready.push(build_command(&verb, &arg, numbers));
     }
 }
 
-fn build_command(verb: &str, arg: &[u8]) -> Pop3Command {
+fn build_command(verb: &str, arg: &[u8], numbers: Numbers) -> Pop3Command {
     let text = String::from_utf8_lossy(arg).into_owned();
     let trimmed = text.trim();
+    // The message numbers were read as the bytes arrived; `None` unless the
+    // argument was exactly the right count of valid numbers.
+    let nums = numbers.all();
+    let msg = nums.map(|n| n[0]).filter(|&n| n > 0);
     match verb {
         "USER" => Pop3Command::User(trimmed.to_string()),
         "PASS" => Pop3Command::Pass(trimmed.to_string()),
@@ -337,30 +486,29 @@ fn build_command(verb: &str, arg: &[u8]) -> Pop3Command {
         "NOOP" => Pop3Command::Noop,
         "QUIT" => Pop3Command::Quit,
         "STAT" => Pop3Command::Stat,
-        "LIST" => Pop3Command::List(parse_optional_msg(trimmed)),
-        "RETR" => match parse_msg(trimmed) {
+        "LIST" => Pop3Command::List(msg),
+        "RETR" => match msg {
             Some(n) => Pop3Command::Retr(n),
             None => Pop3Command::Malformed { verb: verb.to_string() },
         },
-        "DELE" => match parse_msg(trimmed) {
+        "DELE" => match msg {
             Some(n) => Pop3Command::Dele(n),
             None => Pop3Command::Malformed { verb: verb.to_string() },
         },
         "RSET" => Pop3Command::Rset,
-        "TOP" => match split_two(trimmed) {
-            Some((n, lines)) => match (n.parse::<u32>(), lines.parse::<u32>()) {
-                (Ok(n), Ok(lines)) => Pop3Command::Top(n, lines),
-                _ => Pop3Command::Malformed { verb: verb.to_string() },
-            },
+        "TOP" => match nums {
+            Some([n, lines]) => Pop3Command::Top(n, lines),
             None => Pop3Command::Malformed { verb: verb.to_string() },
         },
-        "UIDL" => Pop3Command::Uidl(parse_optional_msg(trimmed)),
+        "UIDL" => Pop3Command::Uidl(msg),
         _ => Pop3Command::Unknown { verb: verb.to_string() },
     }
 }
 
-/// A positive message number (`RETR`/`DELE`/`TOP`'s required argument, or
-/// `LIST`/`UIDL`'s optional one).
+/// The message-number arguments as they were parsed once the whole line was
+/// in, kept as the reference the incremental [`Numbers`] reader is tested
+/// against.
+#[cfg(test)]
 fn parse_msg(s: &str) -> Option<u32> {
     if s.is_empty() {
         return None;
@@ -370,6 +518,7 @@ fn parse_msg(s: &str) -> Option<u32> {
 
 /// Same shape as [`parse_msg`], named separately for call-site clarity where
 /// `None` means "apply to the whole mailbox" rather than "syntax error".
+#[cfg(test)]
 fn parse_optional_msg(s: &str) -> Option<u32> {
     parse_msg(s)
 }
@@ -721,5 +870,68 @@ mod tests {
             lex.feed(&mut sasl_data),
             vec![Pop3Command::SaslResponse(b"\0alice\0secret".to_vec())]
         );
+    }
+
+    /// The command the whole-line parser gave for a message-number verb.
+    fn reference(verb: &str, arg: &str) -> Pop3Command {
+        let trimmed = arg.trim();
+        let bad = || Pop3Command::Malformed { verb: verb.to_string() };
+        match verb {
+            "LIST" => Pop3Command::List(parse_optional_msg(trimmed)),
+            "UIDL" => Pop3Command::Uidl(parse_optional_msg(trimmed)),
+            "RETR" => parse_msg(trimmed).map_or_else(bad, Pop3Command::Retr),
+            "DELE" => parse_msg(trimmed).map_or_else(bad, Pop3Command::Dele),
+            "TOP" => match split_two(trimmed) {
+                Some((n, lines)) => match (n.parse::<u32>(), lines.parse::<u32>()) {
+                    (Ok(n), Ok(lines)) => Pop3Command::Top(n, lines),
+                    _ => bad(),
+                },
+                None => bad(),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    /// The incremental number reader agrees with the parser that waited for
+    /// the whole line, on awkward arguments, however the line is chunked.
+    #[test]
+    fn message_numbers_read_as_they_arrive_match_the_whole_line_parser() {
+        let args = [
+            "", " ", "5", " 5 ", "  12  ", "+5", "+", "0", "-1", "007", "4294967295", "4294967296",
+            "99999999999999999999", "5 6", "2 10", "2  10", "2\t10", "2 10 3", "2 x", "x 2", "abc",
+            "1_0", "5x", "x5", "2 ", " 2 10 ", "0 0", "+2 +3", "2 +3", "\t7", "7\t", "1\r2",
+        ];
+        for verb in ["LIST", "UIDL", "RETR", "DELE", "TOP"] {
+            for arg in args {
+                // A bare verb has no argument; one with a space has.
+                let line = if arg.is_empty() { format!("{verb}\r\n") } else { format!("{verb} {arg}\r\n") };
+                // (The reference sees an empty argument for a bare verb.)
+                let want = reference(verb, arg);
+                for chunk in [1, 2, 3, 100] {
+                    let mut lex = Pop3ServerLexer::new(MAX_COMMAND_LINE);
+                    let mut got = Vec::new();
+                    for piece in line.as_bytes().chunks(chunk) {
+                        let mut data: &[u8] = piece;
+                        got.extend(lex.feed(&mut data));
+                    }
+                    assert_eq!(got, vec![want.clone()], "{line:?} chunk={chunk}");
+                }
+            }
+        }
+    }
+
+    /// An argument to a verb that takes none is skipped, not kept, and a
+    /// too-long one is still caught.
+    #[test]
+    fn arguments_of_verbs_that_take_none_are_skipped_and_still_bounded() {
+        let mut lex = Pop3ServerLexer::new(32);
+        let mut data: &[u8] = b"STAT some ignored words\r\nNOOP\r\n";
+        assert_eq!(lex.feed(&mut data), vec![Pop3Command::Stat, Pop3Command::Noop]);
+        let mut long = b"STAT ".to_vec();
+        long.extend(vec![b'x'; 40]);
+        long.extend_from_slice(b"\r\nNOOP\r\n");
+        let mut data: &[u8] = &long;
+        assert_eq!(lex.feed(&mut data), vec![Pop3Command::Noop]);
+        assert!(lex.took_line_too_long());
     }
 }

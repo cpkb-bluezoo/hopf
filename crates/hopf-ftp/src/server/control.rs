@@ -18,7 +18,7 @@ use hopf_otel::{
 };
 
 use crate::server::ascii::format_ftp_mtime;
-use crate::server::codec::{FtpCommand, FtpServerLexer, MAX_COMMAND_LINE};
+use crate::server::codec::{EprtError, FtpCommand, FtpServerLexer, MAX_COMMAND_LINE};
 use crate::server::data::{
     DataBridge, FtpDataHandler, OutboundTransfer, StorTransfer, TransferTelemetry,
 };
@@ -456,8 +456,8 @@ impl FtpControlHandler {
             }
             FtpCommand::Pasv => self.cmd_pasv(endpoint),
             FtpCommand::Epsv(_) => self.cmd_epsv(endpoint, arg),
-            FtpCommand::Port(_) => self.cmd_port(endpoint, arg),
-            FtpCommand::Eprt(_) => self.cmd_eprt(endpoint, arg),
+            FtpCommand::Port(addr) => self.cmd_port(endpoint, addr),
+            FtpCommand::Eprt(parsed) => self.cmd_eprt(endpoint, parsed),
             FtpCommand::Retr(_) => self.cmd_retr(endpoint, arg),
             FtpCommand::Stor(_) => self.cmd_stor(endpoint, arg, false, None),
             FtpCommand::Appe(_) => self.cmd_stor(endpoint, arg, true, None),
@@ -473,7 +473,7 @@ impl FtpControlHandler {
             FtpCommand::Mkd(_) => self.cmd_mkd(endpoint, arg),
             FtpCommand::Rnfr(_) => self.cmd_rnfr(endpoint, arg),
             FtpCommand::Rnto(_) => self.cmd_rnto(endpoint, arg),
-            FtpCommand::Rest(_) => self.cmd_rest(endpoint, arg),
+            FtpCommand::Rest(marker) => self.cmd_rest(endpoint, marker),
             FtpCommand::Abor => {
                 // Drop any stashed offloaded-open outcome so a later
                 // `sync_pending_open` cannot revive it if the captured
@@ -730,7 +730,7 @@ impl FtpControlHandler {
         }
     }
 
-    fn cmd_port(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
+    fn cmd_port(&mut self, endpoint: &mut dyn Endpoint, addr: Option<SocketAddr>) {
         if !self.require_auth(endpoint) {
             return;
         }
@@ -739,7 +739,7 @@ impl FtpControlHandler {
             return;
         }
         self.clear_pasv();
-        let Some(addr) = parse_port(arg) else {
+        let Some(addr) = addr else {
             self.send_reply(endpoint, 501, "Syntax error in parameters");
             return;
         };
@@ -752,7 +752,7 @@ impl FtpControlHandler {
         self.send_reply(endpoint, 200, "PORT command successful");
     }
 
-    fn cmd_eprt(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
+    fn cmd_eprt(&mut self, endpoint: &mut dyn Endpoint, parsed: Result<SocketAddr, EprtError>) {
         if !self.require_auth(endpoint) {
             return;
         }
@@ -761,7 +761,7 @@ impl FtpControlHandler {
             return;
         }
         self.clear_pasv();
-        match parse_eprt(arg) {
+        match parsed {
             Ok(addr) => {
                 if !self.config.allow_active_bounce && addr.ip() != self.meta.peer.ip() {
                     self.send_reply(endpoint, 504, "EPRT to foreign address rejected");
@@ -1395,13 +1395,13 @@ impl FtpControlHandler {
         }
     }
 
-    fn cmd_rest(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
-        match arg.parse::<u64>() {
-            Ok(n) => {
+    fn cmd_rest(&mut self, endpoint: &mut dyn Endpoint, marker: Option<u64>) {
+        match marker {
+            Some(n) => {
                 self.restart = n;
                 self.send_reply(endpoint, 350, "Restart marker accepted");
             }
-            Err(_) => self.send_reply(endpoint, 501, "Invalid restart marker"),
+            None => self.send_reply(endpoint, 501, "Invalid restart marker"),
         }
     }
 
@@ -1545,49 +1545,6 @@ impl ProtocolHandler for FtpControlHandler {
     }
 }
 
-fn parse_port(arg: &str) -> Option<SocketAddr> {
-    let parts: Vec<_> = arg.split(',').collect();
-    if parts.len() != 6 {
-        return None;
-    }
-    let o: Vec<u8> = parts[..4]
-        .iter()
-        .map(|s| s.parse().ok())
-        .collect::<Option<_>>()?;
-    let p1: u16 = parts[4].parse().ok()?;
-    let p2: u16 = parts[5].parse().ok()?;
-    let port = p1 * 256 + p2;
-    Some(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::new(o[0], o[1], o[2], o[3])),
-        port,
-    ))
-}
-
-enum EprtError {
-    Syntax,
-    ProtocolNotSupported { supported: &'static str },
-}
-
-fn parse_eprt(arg: &str) -> Result<SocketAddr, EprtError> {
-    // |1|127.0.0.1|65000| or |2|::1|65000|
-    let parts: Vec<_> = arg.trim_matches('|').split('|').collect();
-    if parts.len() < 3 {
-        return Err(EprtError::Syntax);
-    }
-    let host: IpAddr = parts[1].parse().map_err(|_| EprtError::Syntax)?;
-    let port: u16 = parts[2].parse().map_err(|_| EprtError::Syntax)?;
-    match (parts[0], host) {
-        ("1", IpAddr::V4(_)) => Ok(SocketAddr::new(host, port)),
-        ("2", IpAddr::V6(_)) => Ok(SocketAddr::new(host, port)),
-        ("1", IpAddr::V6(_)) | ("2", IpAddr::V4(_)) => Err(EprtError::ProtocolNotSupported {
-            supported: if host.is_ipv4() { "1" } else { "2" },
-        }),
-        _ => Err(EprtError::ProtocolNotSupported {
-            supported: "1,2",
-        }),
-    }
-}
-
 /// RFC 3659 `Perm=` fact letters for the logged-in user's abilities.
 fn mls_perm(is_dir: bool, read_only: bool) -> &'static str {
     if is_dir {
@@ -1605,31 +1562,6 @@ fn mls_perm(is_dir: bool, read_only: bool) -> &'static str {
 
 #[allow(dead_code)]
 fn _binding_ty(_: BindingId) {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::Ipv6Addr;
-
-    #[test]
-    fn parse_eprt_validates_net_prt_against_address() {
-        assert!(parse_eprt("|1|127.0.0.1|65000|").is_ok());
-        assert!(parse_eprt("|2|::1|65000|").is_ok());
-        assert!(matches!(
-            parse_eprt("|1|::1|65000|"),
-            Err(EprtError::ProtocolNotSupported { .. })
-        ));
-        assert!(matches!(
-            parse_eprt("|2|127.0.0.1|65000|"),
-            Err(EprtError::ProtocolNotSupported { .. })
-        ));
-        assert!(matches!(
-            parse_eprt("|3|127.0.0.1|65000|"),
-            Err(EprtError::ProtocolNotSupported { .. })
-        ));
-        let _ = Ipv6Addr::LOCALHOST;
-    }
-}
 
 #[cfg(test)]
 mod open_offload_tests {
