@@ -15,6 +15,7 @@
 //! balanced parenthesized list, ending with it.
 
 use super::error::ImapError;
+use super::code::ImapResponseCode;
 use super::reply::ImapEvent;
 use super::structure::{ImapBodyStructure, ImapEnvelope};
 
@@ -51,6 +52,8 @@ pub(crate) enum Output {
     Body(ImapBodyStructure),
     /// A FETCH `INTERNALDATE`, without its quotes.
     Date(String),
+    /// A response code.
+    Code(ImapResponseCode),
 }
 
 /// A machine for one payload.
@@ -94,10 +97,21 @@ enum St {
     Cr,
 }
 
+/// What a payload is, and so where it ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// The rest of the line.
+    Line,
+    /// One value.
+    Value,
+    /// A response code: up to its `]`.
+    Code,
+}
+
 /// Reads tokens from bytes.
 pub(crate) struct Tokenizer {
     st: St,
-    value_mode: bool,
+    mode: Mode,
     /// Parenthesis depth.
     depth: usize,
     /// The word, quoted string or literal being read.
@@ -118,15 +132,15 @@ fn protocol(message: &str) -> ImapError {
 }
 
 /// Ends a bare word.
-fn ends_word(b: u8) -> bool {
-    matches!(b, b' ' | b'\r' | b'\n' | b'(' | b')' | b'"')
+fn ends_word(mode: Mode, b: u8) -> bool {
+    matches!(b, b' ' | b'\r' | b'\n' | b'(' | b')' | b'"') || (mode == Mode::Code && b == b']')
 }
 
 impl Tokenizer {
-    fn new(value_mode: bool) -> Self {
+    fn new(mode: Mode) -> Self {
         Self {
             st: St::Between,
-            value_mode,
+            mode,
             depth: 0,
             buf: Vec::new(),
             size: 0,
@@ -140,12 +154,17 @@ impl Tokenizer {
 
     /// For a payload that is the rest of the line.
     pub(crate) fn line() -> Self {
-        Self::new(false)
+        Self::new(Mode::Line)
     }
 
     /// For a payload that is one value: a word, a string, or a balanced list.
     pub(crate) fn value() -> Self {
-        Self::new(true)
+        Self::new(Mode::Value)
+    }
+
+    /// For a response code: its tokens, up to the `]` that ends it.
+    pub(crate) fn code() -> Self {
+        Self::new(Mode::Code)
     }
 
     /// Did the payload go wrong (and is it being read through only)?
@@ -179,7 +198,7 @@ impl Tokenizer {
 
     /// A token has been given to the sink: is the value complete?
     fn complete(&self, reprocess: bool) -> Out {
-        if self.value_mode && self.depth == 0 {
+        if self.mode == Mode::Value && self.depth == 0 {
             Out::Done { reprocess }
         } else {
             Out::More
@@ -198,6 +217,8 @@ impl Tokenizer {
                             Ok(Out::More)
                         }
                         b'\n' => Err(protocol("expected CRLF")),
+                        // The end of a response code.
+                        b']' if self.mode == Mode::Code && self.depth == 0 => Ok(Out::Done { reprocess: false }),
                         b'(' => {
                             self.depth += 1;
                             self.emit(sink, Tok::Open);
@@ -205,7 +226,7 @@ impl Tokenizer {
                         }
                         b')' => {
                             if self.depth == 0 {
-                                if self.value_mode {
+                                if self.mode == Mode::Value {
                                     return Err(protocol("unexpected ')'"));
                                 }
                                 self.bad = true;
@@ -235,7 +256,7 @@ impl Tokenizer {
                     };
                 }
                 St::Atom => {
-                    if !ends_word(b) {
+                    if !ends_word(self.mode, b) {
                         self.keep(b);
                         return Ok(Out::More);
                     }
@@ -259,6 +280,12 @@ impl Tokenizer {
                         }
                         b'\\' => {
                             self.st = St::QuotedEscape;
+                            Ok(Out::More)
+                        }
+                        // (A line read only to be dropped may have a stray quote.)
+                        b'\r' if self.mode == Mode::Line => {
+                            self.bad = true;
+                            self.st = St::Cr;
                             Ok(Out::More)
                         }
                         b'\r' | b'\n' => Err(protocol("line ended inside a quoted string")),
@@ -310,7 +337,7 @@ impl Tokenizer {
                         return Err(protocol("expected LF after CR"));
                     }
                     self.st = St::Between;
-                    if self.value_mode {
+                    if self.mode != Mode::Line {
                         return Err(protocol("line ended inside a value"));
                     }
                     return Ok(Out::Eol);

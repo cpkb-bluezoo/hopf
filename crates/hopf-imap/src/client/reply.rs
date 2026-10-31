@@ -23,9 +23,10 @@
 //! parentheses to a small machine for the payload, which builds the typed
 //! value as they arrive; a literal is a string like any other. An attribute
 //! hopf does not know is read the same way and dropped. (Response codes,
-//! `[COPYUID …]` and the like, are still captured as bounded text, and truly
-//! unrecognised untagged response types - future/vendor extensions - are
-//! scanned to the next CRLF without literal-marker detection.)
+//! `[COPYUID …]` and the like, are built the same way into a typed
+//! [`ImapResponseCode`], and an untagged response of a type hopf does not
+//! know - a future or vendor extension - is read through its tokens, so a
+//! literal in it cannot desync the lexer.)
 //!
 //! IMAP's own grammar is self-describing (the leading word after `* `/tag
 //! says what kind of response this is), so unlike POP3/SMTP/FTP there is no
@@ -37,6 +38,7 @@
 //! already correct before this rewrite and is unchanged in spirit.
 
 use super::error::ImapError;
+use super::code::{CodeSink, ImapResponseCode};
 use super::sinks::{Discard, IdSink, MetadataSink, NamespaceSink, QuotaRootSink, QuotaSink, ThreadSink};
 use super::structure_sink::{DateSink, StructureSink};
 use super::state::{
@@ -80,43 +82,43 @@ pub enum ImapEvent {
         tag: String,
         /// Completion status.
         status: ImapStatus,
-        /// Bracketed response code without `[]`, if present.
-        code: Option<String>,
+        /// The bracketed response code, if present.
+        code: Option<ImapResponseCode>,
         /// Human-readable completion text.
         message: String,
     },
     /// Untagged `OK` (greeting, or a mid-session status update).
     UntaggedOk {
-        /// Bracketed response code without `[]`, if present.
-        code: Option<String>,
+        /// The bracketed response code, if present.
+        code: Option<ImapResponseCode>,
         /// Text after the code.
         text: String,
     },
     /// Untagged `NO`.
     UntaggedNo {
-        /// Bracketed response code without `[]`, if present.
-        code: Option<String>,
+        /// The bracketed response code, if present.
+        code: Option<ImapResponseCode>,
         /// Text after the code.
         text: String,
     },
     /// Untagged `BAD`.
     UntaggedBad {
-        /// Bracketed response code without `[]`, if present.
-        code: Option<String>,
+        /// The bracketed response code, if present.
+        code: Option<ImapResponseCode>,
         /// Text after the code.
         text: String,
     },
     /// `* BYE …` — server is closing the connection.
     Bye {
-        /// Bracketed response code without `[]`, if present.
-        code: Option<String>,
+        /// The bracketed response code, if present.
+        code: Option<ImapResponseCode>,
         /// Text after the code.
         text: String,
     },
     /// `* PREAUTH …` — greeting only, already-authenticated session.
     Preauth {
-        /// Bracketed response code without `[]`, if present.
-        code: Option<String>,
+        /// The bracketed response code, if present.
+        code: Option<ImapResponseCode>,
         /// Text after the code.
         text: String,
     },
@@ -259,16 +261,15 @@ enum ListCloseKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AwaitLfKind {
     Continuation,
-    Tagged { status: ImapStatus, code: Option<String> },
-    UntaggedOk { code: Option<String> },
-    UntaggedNo { code: Option<String> },
-    UntaggedBad { code: Option<String> },
-    Bye { code: Option<String> },
-    Preauth { code: Option<String> },
+    Tagged { status: ImapStatus, code: Option<ImapResponseCode> },
+    UntaggedOk { code: Option<ImapResponseCode> },
+    UntaggedNo { code: Option<ImapResponseCode> },
+    UntaggedBad { code: Option<ImapResponseCode> },
+    Bye { code: Option<ImapResponseCode> },
+    Preauth { code: Option<ImapResponseCode> },
     Capability,
     Enabled,
     NumList(NumListKind),
-    Other,
     Exists(u32),
     Recent(u32),
     Expunge(u32),
@@ -293,8 +294,8 @@ enum State {
     Continuation,
     /// About to see an optional `[code]` then text.
     RespTextStart { ctx: RespCtx },
-    /// Inside `[...]`, quote/depth aware; content kept in `text`.
-    RespCode { ctx: RespCtx, depth: i32, in_quote: bool, escape: bool },
+    /// Inside `[...]`, read by [`CodeSink`].
+    RespCode { ctx: RespCtx },
     /// Consumed the closing `]`; expect SP then message, or CRLF directly.
     RespCodeGap { ctx: RespCtx },
     /// Free text to CRLF.
@@ -306,8 +307,6 @@ enum State {
     /// Optional `(MODSEQ n)`-style trailer after SEARCH/SORT numbers, or
     /// the remainder of an unrecognised line — quote/depth aware skip.
     NumListTrailerSkip { kind: NumListKind, depth: i32, in_quote: bool, escape: bool },
-    /// Discard remaining bytes of an unrecognised untagged line to CRLF.
-    SkipToCrlf,
     /// `(` expected (`LIST`/`LSUB` attribute list).
     ListAttrsOpen,
     /// Inside the attribute list, quote/depth aware.
@@ -438,7 +437,7 @@ pub struct ImapReplyLexer {
     tag: String,
     /// A just-completed response code, held while the message text after
     /// it is read into `text`.
-    code: Option<String>,
+    code: Option<ImapResponseCode>,
     literal_remaining: u64,
     caps: ImapCapabilities,
     list_entry: ImapListEntry,
@@ -512,7 +511,7 @@ impl ImapReplyLexer {
 
     /// Is the payload in `State::Payload` in the middle of a literal's octets?
     fn payload_in_literal(&self) -> bool {
-        matches!(self.state, State::Payload | State::FetchValue)
+        matches!(self.state, State::Payload | State::FetchValue | State::RespCode { .. })
             && self.payload.as_ref().is_some_and(|p| p.tokens.in_literal())
     }
 
@@ -551,7 +550,10 @@ impl ImapReplyLexer {
                 rest = &rest[take..];
                 match out {
                     Out::Eol => events.push(self.finish_payload()),
-                    Out::Done { .. } => self.finish_fetch_value(),
+                    Out::Done { .. } => match self.state {
+                        State::RespCode { ctx } => self.finish_code(ctx),
+                        _ => self.finish_fetch_value(),
+                    },
                     Out::More => {}
                 }
                 continue;
@@ -613,9 +615,7 @@ impl ImapReplyLexer {
             State::TaggedAfterTag => self.on_tagged_after_tag(b),
             State::Continuation => self.on_continuation(b),
             State::RespTextStart { ctx } => self.on_resp_text_start(ctx, b),
-            State::RespCode { ctx, depth, in_quote, escape } => {
-                self.on_resp_code(ctx, depth, in_quote, escape, b)
-            }
+            State::RespCode { ctx } => self.on_resp_code(ctx, b),
             State::RespCodeGap { ctx } => self.on_resp_code_gap(ctx, b),
             State::RespMessage { ctx } => self.on_resp_message(ctx, b),
             State::TokenList { use_ } => self.on_token_list(use_, b),
@@ -623,7 +623,6 @@ impl ImapReplyLexer {
             State::NumListTrailerSkip { kind, depth, in_quote, escape } => {
                 self.on_num_list_trailer_skip(kind, depth, in_quote, escape, b)
             }
-            State::SkipToCrlf => self.on_skip_to_crlf(b),
             State::ListAttrsOpen => self.on_list_attrs_open(b),
             State::ListAttrsBody { depth, in_quote, escape } => {
                 self.on_list_attrs_body(depth, in_quote, escape, b)
@@ -804,10 +803,12 @@ impl ImapReplyLexer {
                     "ID" => self.begin_bounded(BoundedKind::Id, by_cr),
                     "METADATA" => self.begin_bounded(BoundedKind::Metadata, by_cr),
                     _ => {
+                        // A response hopf does not know: read through its
+                        // tokens (a literal in it may hold anything) and drop it.
+                        self.payload = Some(Payload { tokens: Tokenizer::line(), sink: Box::new(Discard) });
+                        self.state = State::Payload;
                         if by_cr {
-                            self.state = State::AwaitLf(AwaitLfKind::Other);
-                        } else {
-                            self.state = State::SkipToCrlf;
+                            return self.on_payload(b'\r');
                         }
                         Ok(None)
                     }
@@ -903,7 +904,8 @@ impl ImapReplyLexer {
     fn on_resp_text_start(&mut self, ctx: RespCtx, b: u8) -> Result<Option<ImapEvent>, ImapError> {
         match b {
             b'[' => {
-                self.state = State::RespCode { ctx, depth: 1, in_quote: false, escape: false };
+                self.payload = Some(Payload { tokens: Tokenizer::code(), sink: Box::<CodeSink>::default() });
+                self.state = State::RespCode { ctx };
                 Ok(None)
             }
             b'\r' => {
@@ -919,57 +921,26 @@ impl ImapReplyLexer {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn on_resp_code(
-        &mut self,
-        ctx: RespCtx,
-        depth: i32,
-        in_quote: bool,
-        escape: bool,
-        b: u8,
-    ) -> Result<Option<ImapEvent>, ImapError> {
-        if escape {
-            self.push_text(b)?;
-            self.state = State::RespCode { ctx, depth, in_quote, escape: false };
-            return Ok(None);
-        }
-        if in_quote {
-            match b {
-                b'\\' => self.state = State::RespCode { ctx, depth, in_quote, escape: true },
-                b'"' => {
-                    self.push_text(b)?;
-                    self.state = State::RespCode { ctx, depth, in_quote: false, escape: false };
-                }
-                _ => {
-                    self.push_text(b)?;
-                    self.state = State::RespCode { ctx, depth, in_quote, escape: false };
-                }
-            }
-            return Ok(None);
-        }
-        match b {
-            b'"' => {
-                self.push_text(b)?;
-                self.state = State::RespCode { ctx, depth, in_quote: true, escape: false };
-            }
-            b'[' => {
-                self.push_text(b)?;
-                self.state = State::RespCode { ctx, depth: depth + 1, in_quote: false, escape: false };
-            }
-            b']' if depth > 1 => {
-                self.push_text(b)?;
-                self.state = State::RespCode { ctx, depth: depth - 1, in_quote: false, escape: false };
-            }
-            b']' => {
-                self.code = Some(self.take_text());
-                self.state = State::RespCodeGap { ctx };
-            }
-            _ => {
-                self.push_text(b)?;
-                self.state = State::RespCode { ctx, depth, in_quote: false, escape: false };
-            }
+    /// A byte of a response code.
+    fn on_resp_code(&mut self, ctx: RespCtx, b: u8) -> Result<Option<ImapEvent>, ImapError> {
+        let payload = self.payload.as_mut().ok_or_else(|| ImapError::Parse("internal: no payload".into()))?;
+        if let Out::Done { .. } = payload.tokens.byte(b, &mut *payload.sink)? {
+            self.finish_code(ctx);
         }
         Ok(None)
+    }
+
+    /// The `]` has been read: the code, unless it was not one.
+    fn finish_code(&mut self, ctx: RespCtx) {
+        self.code = None;
+        if let Some(Payload { tokens, sink }) = self.payload.take() {
+            if !tokens.is_bad() {
+                if let Ok(Output::Code(code)) = sink.finish() {
+                    self.code = Some(code);
+                }
+            }
+        }
+        self.state = State::RespCodeGap { ctx };
     }
 
     fn on_resp_code_gap(&mut self, ctx: RespCtx, b: u8) -> Result<Option<ImapEvent>, ImapError> {
@@ -1158,15 +1129,6 @@ impl ImapReplyLexer {
                 Ok(None)
             }
         }
-    }
-
-    fn on_skip_to_crlf(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        if b == b'\r' {
-            self.state = State::AwaitLf(AwaitLfKind::Other);
-            return Ok(None);
-        }
-        self.state = State::SkipToCrlf;
-        Ok(None)
     }
 
     // ── LIST / LSUB ───────────────────────────────────────────────────────
@@ -2142,7 +2104,6 @@ impl ImapReplyLexer {
             AwaitLfKind::NumList(NumListKind::Sort) => {
                 ImapEvent::SortNumbers(std::mem::take(&mut self.search_nums))
             }
-            AwaitLfKind::Other => ImapEvent::Other,
             AwaitLfKind::Exists(n) => ImapEvent::Exists(n),
             AwaitLfKind::Recent(n) => ImapEvent::Recent(n),
             AwaitLfKind::Expunge(n) => ImapEvent::Expunge(n),
@@ -2155,7 +2116,7 @@ impl ImapReplyLexer {
     }
 }
 
-fn resp_text_await(ctx: RespCtx, code: Option<String>) -> AwaitLfKind {
+fn resp_text_await(ctx: RespCtx, code: Option<ImapResponseCode>) -> AwaitLfKind {
     match ctx {
         RespCtx::TaggedOk => AwaitLfKind::Tagged { status: ImapStatus::Ok, code },
         RespCtx::TaggedNo => AwaitLfKind::Tagged { status: ImapStatus::No, code },
@@ -2168,7 +2129,7 @@ fn resp_text_await(ctx: RespCtx, code: Option<String>) -> AwaitLfKind {
     }
 }
 
-fn apply_capability_token(caps: &mut ImapCapabilities, upper: &str) {
+pub(super) fn apply_capability_token(caps: &mut ImapCapabilities, upper: &str) {
     match upper {
         "STARTTLS" => caps.starttls = true,
         "LITERAL-" => caps.literal_minus = true,
@@ -2261,7 +2222,7 @@ mod tests {
         assert_eq!(
             ev,
             vec![ImapEvent::UntaggedOk {
-                code: Some("CAPABILITY IMAP4rev2 STARTTLS".into()),
+                code: Some(ImapResponseCode::Capability(ImapCapabilities::parse("IMAP4rev2 STARTTLS"))),
                 text: "ready".into(),
             }]
         );
@@ -2322,7 +2283,7 @@ mod tests {
             vec![ImapEvent::Tagged {
                 tag: "A002".into(),
                 status: ImapStatus::No,
-                code: Some("ALERT".into()),
+                code: Some(ImapResponseCode::Alert),
                 message: "denied".into(),
             }]
         );
@@ -2347,7 +2308,7 @@ mod tests {
             vec![ImapEvent::Tagged {
                 tag: "A000".into(),
                 status: ImapStatus::Ok,
-                code: Some("READ-WRITE".into()),
+                code: Some(ImapResponseCode::ReadWrite),
                 message: "".into(),
             }]
         );
@@ -2885,6 +2846,22 @@ mod tests {
             feed_all(&mut lex2, "* ID (\"name\" \"hopf\")\r\n"),
             vec![ImapEvent::IdParams(vec![("name".into(), "hopf".into())])]
         );
+    }
+
+    #[test]
+    fn an_unrecognised_response_with_a_literal_is_read_through() {
+        // The literal's octets hold a line break and something that looks
+        // like the next response; neither ends the response or starts one.
+        let wire = b"* X-VENDOR (a {15}\r\nx\r\n* 9 EXISTS\r\n b \"it's\r\n* 4 EXISTS\r\n";
+        for chunk in [1, 2, 5, 64] {
+            let mut lex = ImapReplyLexer::new();
+            let mut events = Vec::new();
+            for piece in wire.chunks(chunk) {
+                let mut data: &[u8] = piece;
+                events.extend(lex.feed(&mut data).expect("no protocol error"));
+            }
+            assert_eq!(events, vec![ImapEvent::Other, ImapEvent::Exists(4)], "chunk={chunk}");
+        }
     }
 
     #[test]

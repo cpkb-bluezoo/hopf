@@ -16,6 +16,7 @@ use rmimeparser::charset::base64;
 
 use crate::compress::ImapCompressLayer;
 
+use super::code::ImapResponseCode;
 use super::handlers::{ImapClientDriver, ImapClientHandlerFactory};
 use super::pending::{ImapTagGenerator, PendingCommand, PendingKind, PendingMap, UntaggedClass};
 use super::reply::{ImapEvent, ImapReplyLexer, ImapStatus};
@@ -360,11 +361,11 @@ impl ImapClientEndpoint {
             }
             ImapEvent::UntaggedOk { code, text } => self.on_untagged_ok(code, text, ep),
             ImapEvent::UntaggedNo { code, text } => {
-                self.apply_status_code_if_present(code.as_deref());
+                self.apply_status_code_if_present(code.as_ref());
                 let _ = text;
             }
             ImapEvent::UntaggedBad { code, text } => {
-                self.apply_status_code_if_present(code.as_deref());
+                self.apply_status_code_if_present(code.as_ref());
                 let _ = text;
             }
             ImapEvent::Bye { text, .. } => self.on_bye(text, ep),
@@ -399,7 +400,7 @@ impl ImapClientEndpoint {
     /// `OK` codes are (e.g. a `[COPYUID …]` can in principle ride any
     /// status). Greeting handling only ever sees `OK`/`PREAUTH`/`BYE` per
     /// RFC 9051, so `NO`/`BAD` never occur during `Connecting`.
-    fn apply_status_code_if_present(&mut self, code: Option<&str>) {
+    fn apply_status_code_if_present(&mut self, code: Option<&ImapResponseCode>) {
         if let Some(c) = code {
             self.apply_untagged_status_code(c);
         }
@@ -416,15 +417,11 @@ impl ImapClientEndpoint {
     /// only called when a CAPABILITY line/code was actually seen. The
     /// *returned* value reflects only what arrived on this reply (empty if
     /// nothing new), also matching Gumdrop's fresh `ArrayList` per call.
-    fn resolve_and_promote_caps(&mut self, code: Option<&str>) -> ImapCapabilities {
+    fn resolve_and_promote_caps(&mut self, code: Option<&ImapResponseCode>) -> ImapCapabilities {
         let fresh = if let Some(c) = self.capa_buf.take() {
             Some(c)
-        } else if let Some(code) = code {
-            if code.to_ascii_uppercase().starts_with("CAPABILITY ") {
-                Some(ImapCapabilities::parse(&code["CAPABILITY ".len()..]))
-            } else {
-                None
-            }
+        } else if let Some(ImapResponseCode::Capability(caps)) = code {
+            Some(caps.clone())
         } else {
             None
         };
@@ -434,43 +431,26 @@ impl ImapClientEndpoint {
         fresh.unwrap_or_default()
     }
 
-    fn apply_untagged_status_code(&mut self, code: &str) {
-        let cu = code.to_ascii_uppercase();
-        if cu.starts_with("COPYUID ") {
-            self.last_copyuid = ImapCopyUid::parse(code);
-        } else if let Some(v) = cu.strip_prefix("UIDVALIDITY ") {
-            self.select_info.uid_validity = v.trim().parse().ok();
-        } else if let Some(v) = cu.strip_prefix("UIDNEXT ") {
-            self.select_info.uid_next = v.trim().parse().ok();
-        } else if let Some(v) = cu.strip_prefix("UNSEEN ") {
-            self.select_info.unseen = v.trim().parse().ok();
-        } else if let Some(v) = cu.strip_prefix("HIGHESTMODSEQ ") {
-            self.select_info.highest_modseq = v.trim().parse().ok();
-        } else if cu.starts_with("MAILBOXID (") {
-            // Extracted from the original-case `code`, not `cu` — the
-            // objectid itself is case-sensitive, unlike the keyword.
-            self.select_info.mailbox_id = code
-                .find('(')
-                .and_then(|start| {
-                    code[start + 1..]
-                        .find(')')
-                        .map(|end| code[start + 1..start + 1 + end].to_string())
-                });
-        } else if cu.starts_with("PERMANENTFLAGS") {
-            let rest = code.get("PERMANENTFLAGS".len()..).unwrap_or("").trim_start();
-            self.select_info.permanent_flags = parse_flag_list(rest);
-        } else if cu == "READ-WRITE" {
-            self.select_info.read_write = Some(true);
-        } else if cu == "READ-ONLY" {
-            self.select_info.read_write = Some(false);
+    fn apply_untagged_status_code(&mut self, code: &ImapResponseCode) {
+        match code {
+            ImapResponseCode::CopyUid(copy) => self.last_copyuid = Some(copy.clone()),
+            ImapResponseCode::UidValidity(v) => self.select_info.uid_validity = Some(*v),
+            ImapResponseCode::UidNext(v) => self.select_info.uid_next = Some(*v),
+            ImapResponseCode::Unseen(v) => self.select_info.unseen = Some(*v),
+            ImapResponseCode::HighestModSeq(v) => self.select_info.highest_modseq = Some(*v),
+            ImapResponseCode::MailboxId(id) => self.select_info.mailbox_id = Some(id.clone()),
+            ImapResponseCode::PermanentFlags(flags) => self.select_info.permanent_flags = flags.clone(),
+            ImapResponseCode::ReadWrite => self.select_info.read_write = Some(true),
+            ImapResponseCode::ReadOnly => self.select_info.read_write = Some(false),
+            _ => {}
         }
     }
 
-    fn on_untagged_ok(&mut self, code: Option<String>, text: String, ep: &mut dyn Endpoint) {
+    fn on_untagged_ok(&mut self, code: Option<ImapResponseCode>, text: String, ep: &mut dyn Endpoint) {
         if self.session == SessionState::Connecting {
             self.cancel_greeting_timer();
             self.session = SessionState::NotAuthenticated;
-            let caps = self.resolve_and_promote_caps(code.as_deref());
+            let caps = self.resolve_and_promote_caps(code.as_ref());
             let mut driver = match self.driver.take() {
                 Some(d) => d,
                 None => return,
@@ -479,7 +459,7 @@ impl ImapClientEndpoint {
             self.driver = Some(driver);
             return;
         }
-        self.apply_status_code_if_present(code.as_deref());
+        self.apply_status_code_if_present(code.as_ref());
     }
 
     fn on_bye(&mut self, text: String, ep: &mut dyn Endpoint) {
@@ -491,13 +471,13 @@ impl ImapClientEndpoint {
         // needed here — `disconnected()` will fire shortly and clean up.
     }
 
-    fn on_preauth(&mut self, code: Option<String>, ep: &mut dyn Endpoint) {
+    fn on_preauth(&mut self, code: Option<ImapResponseCode>, ep: &mut dyn Endpoint) {
         if self.session != SessionState::Connecting {
             return;
         }
         self.cancel_greeting_timer();
         self.session = SessionState::Authenticated;
-        let caps = self.resolve_and_promote_caps(code.as_deref());
+        let caps = self.resolve_and_promote_caps(code.as_ref());
         let mut driver = match self.driver.take() {
             Some(d) => d,
             None => return,
@@ -840,7 +820,7 @@ impl ImapClientEndpoint {
         &mut self,
         tag: String,
         status: ImapStatus,
-        response_code: Option<String>,
+        response_code: Option<ImapResponseCode>,
         message: String,
         ep: &mut dyn Endpoint,
     ) {
@@ -850,25 +830,18 @@ impl ImapClientEndpoint {
         };
         self.cancel_message_timer();
 
-        if let Some(ref code) = response_code {
-            let cu = code.to_ascii_uppercase();
-            if cu.starts_with("COPYUID ") {
-                self.last_copyuid = ImapCopyUid::parse(code);
-            } else if cu.starts_with("APPENDUID ") {
-                self.last_appenduid = ImapAppendUid::parse(code);
-            }
+        match &response_code {
+            Some(ImapResponseCode::CopyUid(copy)) => self.last_copyuid = Some(copy.clone()),
+            Some(ImapResponseCode::AppendUid(append)) => self.last_appenduid = Some(*append),
+            _ => {}
         }
 
         match cmd.kind {
             PendingKind::Capability => {
                 let caps = if let Some(c) = self.capa_buf.take() {
                     c
-                } else if let Some(ref code) = response_code {
-                    if code.to_ascii_uppercase().starts_with("CAPABILITY ") {
-                        ImapCapabilities::parse(&code["CAPABILITY ".len()..])
-                    } else {
-                        ImapCapabilities::default()
-                    }
+                } else if let Some(ImapResponseCode::Capability(caps)) = &response_code {
+                    caps.clone()
                 } else {
                     ImapCapabilities::default()
                 };
@@ -908,7 +881,7 @@ impl ImapClientEndpoint {
             PendingKind::Login | PendingKind::Authenticate => match status {
                 ImapStatus::Ok => {
                     self.session = SessionState::Authenticated;
-                    let caps = self.resolve_and_promote_caps(response_code.as_deref());
+                    let caps = self.resolve_and_promote_caps(response_code.as_ref());
                     let mut driver = match self.driver.take() {
                         Some(d) => d,
                         None => return,
@@ -1142,7 +1115,7 @@ impl ImapClientEndpoint {
                     Some(d) => d,
                     None => return,
                 };
-                driver.on_command_complete(ep, &tag, status, response_code.as_deref(), &message);
+                driver.on_command_complete(ep, &tag, status, response_code.as_ref(), &message);
                 self.driver = Some(driver);
             }
         }
@@ -1681,7 +1654,8 @@ impl ImapClientEndpoint {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn parse_flag_list(s: &str) -> Vec<String> {
+#[cfg(test)]
+pub(super) fn parse_flag_list(s: &str) -> Vec<String> {
     let s = s.trim();
     let s = s
         .strip_prefix('(')

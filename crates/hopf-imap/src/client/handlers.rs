@@ -6,6 +6,7 @@ use std::io;
 
 use hopf_core::{subsystem_log, Endpoint, LogLevel};
 
+use super::code::ImapResponseCode;
 use super::reply::ImapStatus;
 use super::state::{
     ImapAppendUid, ImapCapabilities, ImapClientAppend, ImapClientAuthExchange,
@@ -493,7 +494,7 @@ pub trait ImapClientDriver: Send {
         ep: &mut dyn Endpoint,
         tag: &str,
         status: ImapStatus,
-        response_code: Option<&str>,
+        response_code: Option<&ImapResponseCode>,
         message: &str,
     ) {
         let _ = (ep, tag, status, response_code, message);

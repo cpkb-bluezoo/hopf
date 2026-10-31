@@ -51,6 +51,7 @@
 //! completes and still correlate replies correctly (including out-of-order
 //! tagged OK).
 
+mod code;
 pub mod endpoint;
 pub mod error;
 pub mod facade;
@@ -65,6 +66,7 @@ mod structure_sink;
 pub mod timeout;
 mod tokens;
 
+pub use code::{ImapCodeArg, ImapResponseCode};
 pub use endpoint::ImapClientEndpoint;
 pub use error::{ImapError, ImapResult};
 pub use facade::ImapClient;
