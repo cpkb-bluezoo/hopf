@@ -671,8 +671,8 @@ impl ImapServerLexer {
                 return;
             }
         }
-        // The body of an APPEND is its message: an argument after the mailbox.
-        let append_body = self.verb.as_deref() == Some("APPEND") && !self.tokens.is_empty();
+        // The body of an APPEND is its message: streamed, not collected.
+        let append_body = self.grammar.as_ref().is_some_and(|g| g.streams_literal());
         if n > MAX_LITERAL_SIZE || (!append_body && self.literal_total.saturating_add(n) > MAX_LITERAL_SIZE) {
             self.emit_error("Literal too large");
             self.reset_command();
@@ -1546,11 +1546,16 @@ mod tests {
                 .flatten()
                 .collect();
             assert_eq!(body, b"hello", "chunk={chunk}");
-            assert_eq!(
-                commands(events),
-                vec![cmd("a1", "APPEND", vec![lit(b"INBOX"), ArgToken::Open, a("\\Seen"), ArgToken::Close])],
-                "chunk={chunk}"
-            );
+            let mut seen = BTreeSetFlags::default();
+            seen.add("\\Seen");
+            let requests: Vec<_> = events
+                .into_iter()
+                .filter_map(|e| match e {
+                    LexEvent::Command(c) => c.request,
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(requests, vec![Request::Append { mailbox: "INBOX".to_string(), flags: seen }], "chunk={chunk}");
         }
     }
 

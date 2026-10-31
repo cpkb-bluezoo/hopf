@@ -4,7 +4,7 @@
 
 mod ext;
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,7 +27,7 @@ use crate::server::list_ext::ListCommand;
 use crate::server::handler::StoreAction;
 use hopf_mailbox::MessageSet;
 use crate::server::codec::{
-    parse_astring, parse_flag_list, parse_sequence_set, BTreeSetFlags, ImapCommand,
+    parse_sequence_set, BTreeSetFlags, ImapCommand,
     ImapServerLexer, LexEvent, MAX_COMMAND_LINE,
 };
 use crate::server::fetch_format::{FetchItem, FetchModifiers};
@@ -821,7 +821,6 @@ impl ImapControlHandler {
             "GETMETADATA" => self.cmd_getmetadata(endpoint, cmd),
             "SETMETADATA" => self.cmd_setmetadata(endpoint, cmd),
             "NOTIFY" => self.cmd_notify(endpoint, cmd),
-            "APPEND" => self.cmd_append(endpoint, cmd),
             "SEARCH" => self.cmd_search(endpoint, cmd, false),
             "SORT" => self.cmd_sort(endpoint, cmd, false),
             "THREAD" => self.cmd_thread(endpoint, cmd, false),
@@ -866,6 +865,7 @@ impl ImapControlHandler {
                 self.cmd_store(endpoint, tag, set, action, silent, flags, by_uid)
             }
             Request::Status { mailbox, items } => self.cmd_status(endpoint, tag, mailbox, items),
+            Request::Append { mailbox, flags } => self.cmd_append(endpoint, tag, mailbox, flags),
             Request::List { command, lsub } => self.cmd_list(endpoint, tag, command, lsub),
             Request::Fetch { set, items, modifiers, by_uid } => {
                 self.cmd_fetch(endpoint, tag, set, items, modifiers, by_uid)
@@ -1533,55 +1533,27 @@ impl ImapControlHandler {
         }
     }
 
-    fn cmd_append(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
-        if !self.require_auth(endpoint, &cmd.tag) {
+    fn cmd_append(&mut self, endpoint: &mut dyn Endpoint, tag: String, name: String, flags: BTreeSetFlags) {
+        if !self.require_auth(endpoint, &tag) {
             return;
         }
         if let Some(err) = self.pending_append_error.take() {
             if let Some(path) = self.pending_append_path.take() {
                 let _ = std::fs::remove_file(path);
             }
-            self.send(
-                endpoint,
-                tagged_no(&cmd.tag, &format!("Could not stage message: {err}")),
-            );
+            self.send(endpoint, tagged_no(&tag, &format!("Could not stage message: {err}")));
             return;
         }
         let Some(body_path) = self.pending_append_path.take() else {
-            self.send(
-                endpoint,
-                tagged_bad(&cmd.tag, "APPEND requires a message literal"),
-            );
+            self.send(endpoint, tagged_bad(&tag, "APPEND requires a message literal"));
             return;
         };
-        let Ok((name, rest)) = parse_astring(cmd.args.trim()) else {
-            self.send(endpoint, tagged_bad(&cmd.tag, "Invalid APPEND mailbox"));
-            return;
-        };
-        let mut rest = rest;
-        let mut flags = BTreeSet::new();
-        if rest.starts_with('(') {
-            match parse_flag_list(rest) {
-                Ok((f, r)) => {
-                    flags = f.flags;
-                    rest = r;
-                }
-                Err(e) => {
-                    self.send(endpoint, tagged_bad(&cmd.tag, &e));
-                    return;
-                }
-            }
-        }
-        let internal_date: Option<SystemTime> = if rest.starts_with('"') {
-            let _ = parse_astring(rest);
-            None
-        } else {
-            None
-        };
+        let flags = flags.flags;
+        let internal_date: Option<SystemTime> = None;
         if let Some(mut h) = self.selected.take() {
             let mut view = AppendView {
                 endpoint,
-                tag: &cmd.tag,
+                tag: &tag,
                 mailbox: name.clone(),
                 body_path: Some(body_path),
                 flags: flags.clone(),
@@ -1606,7 +1578,7 @@ impl ImapControlHandler {
         if let Some(mut h) = self.authenticated.take() {
             let mut view = AppendView {
                 endpoint,
-                tag: &cmd.tag,
+                tag: &tag,
                 mailbox: name.clone(),
                 body_path: Some(body_path),
                 flags: flags.clone(),

@@ -109,6 +109,9 @@ pub enum Request {
     Fetch { set: MessageSet, items: Vec<FetchItem>, modifiers: FetchModifiers, by_uid: bool },
     /// `LIST [(select)] reference pattern [RETURN (options)]` / `LSUB reference pattern`
     List { command: ListCommand, lsub: bool },
+    /// `APPEND mailbox [(flags)] [date-time] {size}` - the message itself is
+    /// not part of the request: it is streamed as its octets arrive.
+    Append { mailbox: String, flags: BTreeSetFlags },
 }
 
 /// The machine for one command's arguments.
@@ -119,6 +122,13 @@ pub trait Grammar: Send {
     /// A literal of `size` octets is announced where the next token would
     /// stand: may one be, of that size?
     fn literal(&mut self, size: u64) -> Result<(), Reject>;
+
+    /// Is the literal just accepted the command's last, to be streamed to the
+    /// caller as it arrives instead of being collected into a token? The
+    /// command then ends with it.
+    fn streams_literal(&self) -> bool {
+        false
+    }
 
     /// The end of the line.
     fn finish(self: Box<Self>) -> Result<Request, Reject>;
@@ -161,6 +171,7 @@ pub fn grammar_for(verb: &str, by_uid: bool) -> Option<Box<dyn Grammar>> {
         "FETCH" => Some(Box::new(Fetch::new(false))),
         "LIST" => Some(Box::new(List::new(false))),
         "LSUB" => Some(Box::new(List::new(true))),
+        "APPEND" => Some(Box::new(Append::default())),
         _ => None,
     }
 }
@@ -1165,6 +1176,85 @@ impl Grammar for List {
     }
 }
 
+// ── APPEND ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum AppendAt {
+    /// The mailbox.
+    #[default]
+    Mailbox,
+    /// After it: `(`, the date-time, or the message.
+    Options,
+    /// A flag, or the `)` that ends them.
+    Flags,
+    /// After the flags: the date-time, or the message.
+    AfterFlags,
+    /// After the date-time: the message.
+    AfterDate,
+    /// The message's literal has been announced: the command ends with it.
+    Body,
+}
+
+/// `APPEND mailbox [(flag ...)] [date-time] {size}`
+#[derive(Default)]
+struct Append {
+    at: AppendAt,
+    mailbox: String,
+    flags: BTreeSetFlags,
+}
+
+impl Grammar for Append {
+    fn token(&mut self, tok: Tok<'_>) -> Result<(), Reject> {
+        match (self.at, tok) {
+            (AppendAt::Mailbox, Tok::Atom(a)) if !a.is_empty() && a.bytes().all(is_astring_char) => {
+                self.mailbox = a.to_string();
+                self.at = AppendAt::Options;
+            }
+            (AppendAt::Mailbox, Tok::Quoted(q)) => {
+                self.mailbox = q.to_string();
+                self.at = AppendAt::Options;
+            }
+            (AppendAt::Mailbox, Tok::Literal(l)) => {
+                self.mailbox = String::from_utf8_lossy(l).into_owned();
+                self.at = AppendAt::Options;
+            }
+            (AppendAt::Mailbox, _) => return Err(Reject::new("Invalid APPEND mailbox")),
+            (AppendAt::Options, Tok::Open) => self.at = AppendAt::Flags,
+            (AppendAt::Flags, Tok::Atom(a)) => self.flags.add(a),
+            (AppendAt::Flags, Tok::Close) => self.at = AppendAt::AfterFlags,
+            // The internal date is not kept: messages are stored as of now.
+            (AppendAt::Options | AppendAt::AfterFlags, Tok::Quoted(_)) => self.at = AppendAt::AfterDate,
+            _ => return Err(Reject::new("Invalid APPEND arguments")),
+        }
+        Ok(())
+    }
+
+    fn literal(&mut self, size: u64) -> Result<(), Reject> {
+        match self.at {
+            AppendAt::Mailbox if size > MAX_NAME_LITERAL => Err(Reject::new("Literal too large")),
+            AppendAt::Mailbox => Ok(()),
+            AppendAt::Options | AppendAt::AfterFlags | AppendAt::AfterDate => {
+                self.at = AppendAt::Body;
+                Ok(())
+            }
+            AppendAt::Flags | AppendAt::Body => Err(Reject::new("Literal not allowed here")),
+        }
+    }
+
+    fn streams_literal(&self) -> bool {
+        self.at == AppendAt::Body
+    }
+
+    fn finish(self: Box<Self>) -> Result<Request, Reject> {
+        match self.at {
+            AppendAt::Body => Ok(Request::Append { mailbox: self.mailbox, flags: self.flags }),
+            AppendAt::Mailbox => Err(Reject::new("Invalid APPEND mailbox")),
+            AppendAt::Flags => Err(Reject::new("unclosed flag list")),
+            _ => Err(Reject::new("APPEND requires a message literal")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1566,5 +1656,80 @@ mod tests {
         let got = outcomes("a LIST (NOPE) \"\" *\r\nb LIST \"\" *\r\n", 1);
         assert_eq!(got[0], Err("unknown LIST selection option NOPE".to_string()));
         assert!(matches!(got[1], Ok(_)), "{got:?}");
+    }
+
+    /// The request, the streamed message and the refusals made of `wire`.
+    fn append(wire: &str, chunk: usize) -> (Vec<Result<Request, String>>, Vec<u8>) {
+        let events = lex(wire.as_bytes(), chunk);
+        let body = events
+            .iter()
+            .filter_map(|e| match e {
+                LexEvent::AppendChunk(c) => Some(c.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let got = events
+            .into_iter()
+            .filter_map(|e| match e {
+                LexEvent::Command(c) => Some(Ok(c.request.expect("a typed request"))),
+                LexEvent::Error { message, .. } => Some(Err(message)),
+                _ => None,
+            })
+            .collect();
+        (got, body)
+    }
+
+    fn flags_of(names: &[&str]) -> BTreeSetFlags {
+        let mut f = BTreeSetFlags::default();
+        for n in names {
+            f.add(n);
+        }
+        f
+    }
+
+    #[test]
+    fn append_reads_its_options_then_streams_the_message() {
+        let wires = [
+            ("a APPEND INBOX {5}\r\nhello\r\n", "INBOX", &[][..]),
+            ("a APPEND \"Sent Items\" (\\Seen $x) {5}\r\nhello\r\n", "Sent Items", &["\\Seen", "$x"][..]),
+            ("a APPEND INBOX () {5+}\r\nhello\r\n", "INBOX", &[][..]),
+            ("a APPEND INBOX \"17-Jul-1996 02:44:25 -0700\" {5}\r\nhello\r\n", "INBOX", &[][..]),
+            ("a APPEND INBOX (\\Draft) \"17-Jul-1996 02:44:25 -0700\" {5}\r\nhello\r\n", "INBOX", &["\\Draft"][..]),
+            ("a APPEND {5+}\r\nINBOX (\\Seen) {5+}\r\nhello\r\n", "INBOX", &["\\Seen"][..]),
+        ];
+        for (wire, mailbox, flags) in wires {
+            for chunk in [1, 3, 1000] {
+                let (got, body) = append(wire, chunk);
+                assert_eq!(body, b"hello", "{wire:?} chunk={chunk}");
+                assert_eq!(got, vec![Ok(Request::Append { mailbox: mailbox.to_string(), flags: flags_of(flags) })], "{wire:?} chunk={chunk}");
+            }
+        }
+    }
+
+    #[test]
+    fn append_is_refused_before_the_continuation() {
+        for (wire, message) in [
+            ("a APPEND\r\n", "Invalid APPEND mailbox"),
+            ("a APPEND INBOX\r\n", "APPEND requires a message literal"),
+            ("a APPEND INBOX (\\Seen\r\n", "unclosed flag list"),
+            ("a APPEND INBOX (\\Seen) \"d\"\r\n", "APPEND requires a message literal"),
+            ("a APPEND INBOX junk {5}\r\n", "Invalid APPEND arguments"),
+            ("a APPEND INBOX \"d\" \"e\" {5}\r\n", "Invalid APPEND arguments"),
+            ("a APPEND INBOX (\\Seen {5}\r\n", "Literal not allowed here"),
+            ("a APPEND {70000}\r\n", "Literal too large"),
+        ] {
+            for chunk in [1, 1000] {
+                let (got, body) = append(wire, chunk);
+                assert_eq!(got, vec![Err(message.to_string())], "{wire:?} chunk={chunk}");
+                assert!(body.is_empty());
+            }
+        }
+        // A non-synchronizing message sent after a refusal is skipped, not run.
+        let (got, body) = append("a APPEND INBOX (\\Seen {6+}\r\nb NOOP\r\nc APPEND INBOX {2+}\r\nhi\r\n", 1);
+        assert_eq!(got[0], Err("Literal not allowed here".to_string()));
+        assert_eq!(got[1], Ok(Request::Append { mailbox: "INBOX".to_string(), flags: BTreeSetFlags::default() }));
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(body, b"hi");
     }
 }
