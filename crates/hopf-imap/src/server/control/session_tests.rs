@@ -5,111 +5,35 @@
 //! queues the callbacks that storage workers post, so the test can run them
 //! against the endpoint the way the reactor does.
 
-use std::collections::VecDeque;
-use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::Ordering;
 
-use hopf_core::{
-    ConnHandle, ConnHandleBackend, Endpoint, LoopBuf, PeerAddr, ProtocolHandler, Runtime, RuntimeConfig,
-    SecurityInfo, StartTlsError, TimerHandle, WriteReadyCallback,
-};
+use hopf_core::testing::Peer;
+use hopf_core::{Runtime, RuntimeConfig};
 
 use super::*;
 use crate::server::handler::{DefaultImapHandlerFactory, ImapHandlerFactory};
 
-type Job = Box<dyn FnOnce(&mut dyn Endpoint) + Send>;
-
-/// What the connection saw, shared between the endpoint and its handle.
-#[derive(Default)]
-struct Wire {
-    out: Mutex<Vec<u8>>,
-    jobs: Mutex<VecDeque<Job>>,
-    poked: AtomicBool,
-    paused: AtomicBool,
-    closed: AtomicBool,
-}
-
-struct Backend(Arc<Wire>);
-
-impl ConnHandleBackend for Backend {
-    fn with_endpoint(&self, task: Job) {
-        self.0.jobs.lock().unwrap().push_back(task);
-    }
-
-    fn execute(&self, task: Box<dyn FnOnce() + Send>) {
-        task();
-    }
-
-    fn is_probably_open(&self) -> bool {
-        !self.0.closed.load(Ordering::Relaxed)
-    }
-
-    fn schedule_timer(&self, _delay: Duration, _callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
-        TimerHandle::from_cancel(|| {})
-    }
-}
-
-struct TestEndpoint(Arc<Wire>);
-
-impl Endpoint for TestEndpoint {
-    fn send(&mut self, data: &[u8]) {
-        self.0.out.lock().unwrap().extend_from_slice(data);
-    }
-    fn is_open(&self) -> bool {
-        !self.0.closed.load(Ordering::Relaxed)
-    }
-    fn is_closing(&self) -> bool {
-        self.0.closed.load(Ordering::Relaxed)
-    }
-    fn close(&mut self) {
-        self.0.closed.store(true, Ordering::Relaxed);
-    }
-    fn local_addr(&self) -> io::Result<PeerAddr> {
-        Ok(PeerAddr::Inet("127.0.0.1:143".parse().unwrap()))
-    }
-    fn remote_addr(&self) -> io::Result<PeerAddr> {
-        Ok(PeerAddr::Inet("127.0.0.1:9999".parse().unwrap()))
-    }
-    fn security_info(&self) -> &SecurityInfo {
-        static PLAINTEXT: std::sync::OnceLock<SecurityInfo> = std::sync::OnceLock::new();
-        PLAINTEXT.get_or_init(SecurityInfo::plaintext)
-    }
-    fn start_tls(&mut self) -> Result<(), StartTlsError> {
-        Err(StartTlsError::Unsupported)
-    }
-    fn pause_read(&mut self) {
-        self.0.paused.store(true, Ordering::Relaxed);
-    }
-    fn resume_read(&mut self) {
-        self.0.paused.store(false, Ordering::Relaxed);
-    }
-    fn on_write_ready(&mut self, _callback: Option<WriteReadyCallback>) {}
-    fn execute(&self, task: Box<dyn FnOnce() + Send>) {
-        task();
-    }
-    fn schedule_timer(&self, _delay: Duration, _callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
-        TimerHandle::from_cancel(|| {})
-    }
-    fn handle(&self) -> ConnHandle {
-        ConnHandle::from_backend(Arc::new(Backend(Arc::clone(&self.0))))
-    }
-    fn poke_handler(&mut self) {
-        self.0.poked.store(true, Ordering::Relaxed);
-    }
-}
-
 /// One client connected to a handler over a Maildir under a temporary directory.
 pub(super) struct Session {
-    h: ImapControlHandler,
-    ep: TestEndpoint,
-    wire: Arc<Wire>,
-    input: LoopBuf,
+    peer: Peer<ImapControlHandler>,
     /// What the server said on connecting.
     pub(super) greeting: String,
     /// The Maildir root, kept for the session's life.
     _root: tempfile::TempDir,
+}
+
+impl Deref for Session {
+    type Target = Peer<ImapControlHandler>;
+    fn deref(&self) -> &Self::Target {
+        &self.peer
+    }
+}
+
+impl DerefMut for Session {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.peer
+    }
 }
 
 impl Session {
@@ -135,66 +59,10 @@ impl Session {
         let config = configure(config);
         let client = DefaultImapHandlerFactory::new("ready").create();
         let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
-        let h = ImapControlHandler::new(client, config, rt, ImapServerMetrics::shared());
-        let wire = Arc::new(Wire::default());
-        let mut session = Self { h, ep: TestEndpoint(Arc::clone(&wire)), wire, input: LoopBuf::with_capacity(1 << 20), greeting: String::new(), _root: root };
-        session.h.connected(&mut session.ep);
-        session.pump();
-        session.greeting = session.take();
-        session
-    }
-
-    /// Everything the server has written since the last call.
-    pub(super) fn take(&mut self) -> String {
-        String::from_utf8_lossy(&std::mem::take(&mut *self.wire.out.lock().unwrap())).into_owned()
-    }
-
-    /// Sends `wire` and returns what the server answered by the time it is idle.
-    pub(super) fn run(&mut self, wire: &str) -> String {
-        self.input.extend_from_slice(wire.as_bytes());
-        self.pump();
-        self.take()
-    }
-
-    /// Sends `wire` in chunks of `chunk` bytes, waiting for idle after each.
-    pub(super) fn run_chunked(&mut self, wire: &str, chunk: usize) -> String {
-        for piece in wire.as_bytes().chunks(chunk) {
-            self.input.extend_from_slice(piece);
-            self.pump();
-        }
-        self.take()
-    }
-
-    pub(super) fn is_closed(&self) -> bool {
-        self.wire.closed.load(Ordering::Relaxed)
-    }
-
-    /// Plays the reactor until the handler has nothing left to do.
-    fn pump(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            loop {
-                let job = self.wire.jobs.lock().unwrap().pop_front();
-                match job {
-                    Some(job) => job(&mut self.ep),
-                    None => break,
-                }
-            }
-            let poked = self.wire.poked.swap(false, Ordering::Relaxed);
-            let paused = self.wire.paused.load(Ordering::Relaxed);
-            if poked || (!paused && !self.input.is_empty()) {
-                self.h.receive(&mut self.ep, &mut self.input);
-                continue;
-            }
-            let working = self.h.busy.load(Ordering::Relaxed)
-                || !self.h.cmd_queue.is_empty()
-                || !self.wire.jobs.lock().unwrap().is_empty();
-            if !working {
-                return;
-            }
-            assert!(Instant::now() < deadline, "the handler never went idle; output so far: {:?}", self.take());
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        let handler = ImapControlHandler::new(client, config, rt, ImapServerMetrics::shared());
+        let mut peer = Peer::connect(handler, |h| h.busy.load(Ordering::Relaxed) || !h.cmd_queue.is_empty());
+        let greeting = peer.take();
+        Self { peer, greeting, _root: root }
     }
 
     /// Logs in as the test user.
@@ -419,8 +287,8 @@ fn an_append_before_login_is_refused_and_nothing_is_spooled() {
     let mut s = Session::new();
     let out = s.run("x APPEND INBOX {5}\r\nhello\r\n");
     assert!(out.contains("x NO Not authenticated"), "{out}");
-    assert!(s.h.pending_append_path.is_none(), "a spool file was kept: {:?}", s.h.pending_append_path);
-    assert!(s.h.append_spool.lock().unwrap().path.is_none());
+    assert!(s.handler.pending_append_path.is_none(), "a spool file was kept: {:?}", s.handler.pending_append_path);
+    assert!(s.handler.append_spool.lock().unwrap().path.is_none());
     // And the connection is still usable afterwards.
     assert!(status(&s.run("y NOOP\r\n"), "y").starts_with("y OK "));
 }
@@ -837,7 +705,7 @@ fn a_pipelined_login_and_append_works_and_a_failed_login_keeps_nothing() {
     let out = bad.run(&format!("a LOGIN u wrong\r\nb APPEND INBOX {{{}}}\r\n{m}\r\n", m.len()));
     assert!(status(&out, "a").starts_with("a NO "), "{out}");
     assert!(status(&out, "b").starts_with("b NO "), "{out}");
-    assert!(bad.h.pending_append_path.is_none(), "the spooled body was kept: {:?}", bad.h.pending_append_path);
+    assert!(bad.handler.pending_append_path.is_none(), "the spooled body was kept: {:?}", bad.handler.pending_append_path);
 }
 
 /// Commands sent in one write are answered in order, however long an
@@ -1105,7 +973,7 @@ fn authenticate_without_an_initial_response_prompts_for_one() {
     let plain = |user: &str, pass: &str| b64(format!("\0{user}\0{pass}").as_bytes());
     let secure = || {
         let mut s = Session::new();
-        s.h.tls = true;
+        s.handler.tls = true;
         s
     };
     // The prompt, then the response.
@@ -1189,7 +1057,7 @@ fn scram_sha_256_authenticates_end_to_end() {
 #[test]
 fn a_mechanism_where_the_server_speaks_first_is_unaffected() {
     let mut s = Session::new();
-    s.h.tls = true;
+    s.handler.tls = true;
     let out = s.run("a AUTHENTICATE LOGIN\r\n");
     assert_eq!(out, format!("+ {}\r\n", b64(b"Username:")));
     let out = s.run(&format!("{}\r\n", b64(b"u")));

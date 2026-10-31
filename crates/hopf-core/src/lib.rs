@@ -40,6 +40,8 @@ pub mod security;
 pub mod service;
 pub mod storage;
 pub mod telemetry;
+#[cfg(feature = "testing")]
+pub mod testing;
 pub mod tls;
 pub mod udp;
 

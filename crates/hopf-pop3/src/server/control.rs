@@ -99,6 +99,10 @@ pub struct Pop3ControlHandler {
     pending_user: Option<String>,
     apop_timestamp: String,
     sasl: Option<Box<dyn SaslServer>>,
+    /// The mechanism has succeeded for this user and its final data has been
+    /// sent as a `+`: the client's empty line is all that is awaited before
+    /// the command completes (RFC 4422 §3.5).
+    sasl_ack: Option<String>,
     control_handle: Option<ConnHandle>,
     bundle: Arc<Mutex<MailboxBundle>>,
     pending_msg: u32,
@@ -116,6 +120,10 @@ pub struct Pop3ControlHandler {
     busy: Arc<AtomicBool>,
     /// Slot for ListWriter/UidlWriter to restore the transaction handler.
     txn_slot: Arc<Mutex<Option<Box<dyn TransactionHandler>>>>,
+    /// The body of a multi-line LIST or UIDL reply, left by its writer for
+    /// `take_txn_slot` to send with the endpoint, so that it goes out where
+    /// the reply belongs and not after whatever was sent since.
+    listing_slot: Arc<Mutex<Vec<u8>>>,
     /// In-flight mailbox open: handler + outcome filled by the storage callback.
     pending_open: Arc<Mutex<Option<PendingOpen>>>,
     /// In-flight credential check: outcome filled by the storage callback
@@ -192,6 +200,7 @@ impl Pop3ControlHandler {
             pending_user: None,
             apop_timestamp,
             sasl: None,
+            sasl_ack: None,
             control_handle: None,
             bundle: Arc::new(Mutex::new(MailboxBundle {
                 store: None,
@@ -213,6 +222,7 @@ impl Pop3ControlHandler {
             },
             busy: Arc::new(AtomicBool::new(false)),
             txn_slot: Arc::new(Mutex::new(None)),
+            listing_slot: Arc::new(Mutex::new(Vec::new())),
             pending_open: Arc::new(Mutex::new(None)),
             pending_auth_check: Arc::new(Mutex::new(None)),
             cmd_queue: VecDeque::new(),
@@ -370,10 +380,12 @@ impl Pop3ControlHandler {
                 Pop3Command::SaslResponse(data) => self.handle_sasl_response(endpoint, data),
                 Pop3Command::SaslAbort => {
                     self.sasl = None;
+                    self.sasl_ack = None;
                     self.send(endpoint, reply::err("[AUTH] Authentication cancelled"));
                 }
                 Pop3Command::SaslResponseInvalid => {
                     self.sasl = None;
+                    self.sasl_ack = None;
                     self.auth_failed(endpoint, "[AUTH] Invalid base64");
                 }
                 _ => unreachable!(),
@@ -382,7 +394,7 @@ impl Pop3ControlHandler {
         }
 
         self.last_activity = Instant::now();
-        self.take_txn_slot();
+        self.take_txn_slot(endpoint);
         if self.busy.load(Ordering::Relaxed) {
             self.send(
                 endpoint,
@@ -567,7 +579,7 @@ impl Pop3ControlHandler {
 
     fn cmd_pass(&mut self, endpoint: &mut dyn Endpoint, password: &str) {
         if self.login_delay_active() {
-            self.send(endpoint, reply::err("[AUTH] Login delay active"));
+            self.send(endpoint, reply::err("[LOGIN-DELAY] Login delay active"));
             return;
         }
         let Some(user) = self.pending_user.clone() else {
@@ -613,7 +625,7 @@ impl Pop3ControlHandler {
             return;
         }
         if self.login_delay_active() {
-            self.send(endpoint, reply::err("[AUTH] Login delay active"));
+            self.send(endpoint, reply::err("[LOGIN-DELAY] Login delay active"));
             return;
         }
         let Some(handle) = self.control_handle.clone() else {
@@ -646,7 +658,7 @@ impl Pop3ControlHandler {
 
     fn cmd_auth_list(&mut self, endpoint: &mut dyn Endpoint) {
         if self.login_delay_active() {
-            self.send(endpoint, reply::err("[AUTH] Login delay active"));
+            self.send(endpoint, reply::err("[LOGIN-DELAY] Login delay active"));
             return;
         }
         // RFC 1734-style listing
@@ -664,7 +676,7 @@ impl Pop3ControlHandler {
         initial_response: Option<Vec<u8>>,
     ) {
         if self.login_delay_active() {
-            self.send(endpoint, reply::err("[AUTH] Login delay active"));
+            self.send(endpoint, reply::err("[LOGIN-DELAY] Login delay active"));
             return;
         }
         let Some(mech) = hopf_auth::SaslMechanism::from_name(mechanism) else {
@@ -692,6 +704,17 @@ impl Pop3ControlHandler {
             // mean the mechanism authenticated nobody, so it's still a
             // failure (see `AuthCheckOutcome::Step::first_step`).
             self.sasl_step(endpoint, server, None, true);
+            return;
+        }
+
+        if initial_response.is_none() {
+            // A mechanism where the client speaks first, and the client has not
+            // (RFC 5034 §4): an empty challenge asks for its first message,
+            // which is the next line. Stepping the mechanism with nothing would
+            // only fail it.
+            self.send(endpoint, reply::continuation(""));
+            self.sasl = Some(server);
+            self.lexer.expect_sasl_response();
             return;
         }
 
@@ -752,6 +775,14 @@ impl Pop3ControlHandler {
         let Some(server) = self.sasl.take() else {
             return;
         };
+        if let Some(username) = self.sasl_ack.take() {
+            if response.is_empty() {
+                self.finish_auth(endpoint, &username);
+            } else {
+                self.auth_failed(endpoint, "[AUTH] Expected an empty response");
+            }
+            return;
+        }
         self.sasl_step(endpoint, server, Some(&response), false);
     }
 
@@ -782,12 +813,18 @@ impl Pop3ControlHandler {
                         username,
                         final_message,
                     } if !first_step => {
-                        if let Some(fm) = final_message {
-                            if !fm.is_empty() {
+                        match final_message.filter(|fm| !fm.is_empty()) {
+                            Some(fm) => {
+                                // Data for the client goes out as a continuation,
+                                // and the client answers it with an empty line;
+                                // only then is the command complete.
                                 self.send(endpoint, reply::continuation(&base64::encode(&fm)));
+                                self.sasl = Some(server);
+                                self.sasl_ack = Some(username);
+                                self.lexer.expect_sasl_response();
                             }
+                            None => self.finish_auth(endpoint, &username),
                         }
-                        self.finish_auth(endpoint, &username);
                     }
                     SaslServerStep::Complete { .. } | SaslServerStep::Failure => {
                         self.auth_failed(endpoint, "[AUTH] Authentication failed");
@@ -828,9 +865,13 @@ impl Pop3ControlHandler {
         self.sync_pending_open();
     }
 
-    fn take_txn_slot(&mut self) {
+    fn take_txn_slot(&mut self, endpoint: &mut dyn Endpoint) {
         if let Some(h) = self.txn_slot.lock().unwrap().take() {
             self.transaction = Some(h);
+        }
+        let body = std::mem::take(&mut *self.listing_slot.lock().unwrap());
+        if !body.is_empty() {
+            endpoint.send(&body);
         }
     }
 
@@ -923,20 +964,20 @@ impl Pop3ControlHandler {
             self.send(endpoint, reply::err("[SYS/PERM] No handler"));
             return;
         };
-        let handle = endpoint.handle();
+        let listing_slot = Arc::clone(&self.listing_slot);
         let txn_slot = Arc::clone(&self.txn_slot);
         let mut done = false;
         self.with_mailbox_ref(|mb, this| {
             let mut view = ListView {
                 endpoint,
                 transaction: &mut this.transaction,
-                handle: handle.clone(),
+                listing_slot: Arc::clone(&listing_slot),
                 txn_slot: Arc::clone(&txn_slot),
             };
             handler.list(&mut view, mb, n.unwrap_or(0));
             done = true;
         });
-        self.take_txn_slot();
+        self.take_txn_slot(endpoint);
         if !done {
             self.transaction = Some(handler);
             self.send(endpoint, reply::err("[SYS/TEMP] Mailbox not open"));
@@ -1065,20 +1106,20 @@ impl Pop3ControlHandler {
             self.send(endpoint, reply::err("[SYS/PERM] No handler"));
             return;
         };
-        let handle = endpoint.handle();
+        let listing_slot = Arc::clone(&self.listing_slot);
         let txn_slot = Arc::clone(&self.txn_slot);
         let mut done = false;
         self.with_mailbox_ref(|mb, this| {
             let mut view = UidlView {
                 endpoint,
                 transaction: &mut this.transaction,
-                handle: handle.clone(),
+                listing_slot: Arc::clone(&listing_slot),
                 txn_slot: Arc::clone(&txn_slot),
             };
             handler.uidl(&mut view, mb, n.unwrap_or(0));
             done = true;
         });
-        self.take_txn_slot();
+        self.take_txn_slot(endpoint);
         if !done {
             self.transaction = Some(handler);
             self.send(endpoint, reply::err("[SYS/TEMP] Mailbox not open"));
@@ -1308,7 +1349,7 @@ impl ProtocolHandler for Pop3ControlHandler {
         hopf_core::with_slice(buf, |data| {
             self.sync_pending_open();
             self.sync_pending_auth_check(endpoint);
-            self.take_txn_slot();
+            self.take_txn_slot(endpoint);
             self.drain_queue(endpoint);
 
             if self.busy.load(Ordering::Relaxed) {
@@ -1524,7 +1565,7 @@ impl MailboxStatusState for StatusView<'_> {
 struct ListView<'a> {
     endpoint: &'a mut dyn Endpoint,
     transaction: &'a mut Option<Box<dyn TransactionHandler>>,
-    handle: ConnHandle,
+    listing_slot: Arc<Mutex<Vec<u8>>>,
     txn_slot: Arc<Mutex<Option<Box<dyn TransactionHandler>>>>,
 }
 
@@ -1532,7 +1573,7 @@ impl ListState for ListView<'_> {
     fn begin_listing(&mut self, count: u32) -> Box<dyn ListWriter> {
         self.endpoint.send(&reply::ok(&format!("{count} messages")));
         Box::new(ListWriterImpl {
-            handle: self.handle.clone(),
+            listing_slot: Arc::clone(&self.listing_slot),
             lines: Vec::new(),
             txn_slot: Arc::clone(&self.txn_slot),
         })
@@ -1560,7 +1601,7 @@ impl ListState for ListView<'_> {
 }
 
 struct ListWriterImpl {
-    handle: ConnHandle,
+    listing_slot: Arc<Mutex<Vec<u8>>>,
     lines: Vec<Vec<u8>>,
     txn_slot: Arc<Mutex<Option<Box<dyn TransactionHandler>>>>,
 }
@@ -1576,7 +1617,7 @@ impl ListWriter for ListWriterImpl {
             out.extend_from_slice(line);
         }
         out.extend_from_slice(&reply::multiline_end());
-        self.handle.send(out);
+        self.listing_slot.lock().unwrap().extend_from_slice(&out);
         *self.txn_slot.lock().unwrap() = Some(handler);
     }
 }
@@ -1692,7 +1733,7 @@ impl TopState for TopView<'_> {
 struct UidlView<'a> {
     endpoint: &'a mut dyn Endpoint,
     transaction: &'a mut Option<Box<dyn TransactionHandler>>,
-    handle: ConnHandle,
+    listing_slot: Arc<Mutex<Vec<u8>>>,
     txn_slot: Arc<Mutex<Option<Box<dyn TransactionHandler>>>>,
 }
 
@@ -1700,7 +1741,7 @@ impl UidlState for UidlView<'_> {
     fn begin_listing(&mut self) -> Box<dyn UidlWriter> {
         self.endpoint.send(&reply::ok("Unique-ID listing follows"));
         Box::new(UidlWriterImpl {
-            handle: self.handle.clone(),
+            listing_slot: Arc::clone(&self.listing_slot),
             lines: Vec::new(),
             txn_slot: Arc::clone(&self.txn_slot),
         })
@@ -1728,7 +1769,7 @@ impl UidlState for UidlView<'_> {
 }
 
 struct UidlWriterImpl {
-    handle: ConnHandle,
+    listing_slot: Arc<Mutex<Vec<u8>>>,
     lines: Vec<Vec<u8>>,
     txn_slot: Arc<Mutex<Option<Box<dyn TransactionHandler>>>>,
 }
@@ -1744,7 +1785,7 @@ impl UidlWriter for UidlWriterImpl {
             out.extend_from_slice(line);
         }
         out.extend_from_slice(&reply::multiline_end());
-        self.handle.send(out);
+        self.listing_slot.lock().unwrap().extend_from_slice(&out);
         *self.txn_slot.lock().unwrap() = Some(handler);
     }
 }
@@ -1914,6 +1955,9 @@ fn message_has_non_ascii(mb: &mut dyn Mailbox, message_number: u32) -> bool {
         Err(_) => false,
     }
 }
+
+#[cfg(test)]
+mod session_tests;
 
 #[cfg(test)]
 mod top_streaming_tests {

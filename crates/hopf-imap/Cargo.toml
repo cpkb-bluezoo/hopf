@@ -30,5 +30,6 @@ loopbuf = { workspace = true }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
+hopf-core = { workspace = true, features = ["testing"] }
 tempfile = { workspace = true }
 rcgen = { workspace = true }

@@ -35,6 +35,10 @@ tempfile = { workspace = true }
 default = []
 # Ed448 DNSSEC verify (RFC 8080) — AWS-LC has no Ed448.
 ed448 = ["dep:ed448-goldilocks-plus"]
+# In-process test support (`hopf_core::testing`): a recording endpoint and a peer
+# that plays the reactor, to script a whole session against a handler. For
+# dev-dependencies; nothing else uses it.
+testing = []
 # Runtime/TCP smokes; not compiled in CI (`cargo test --lib` without this feature).
 integration = []
 # The validated-cryptography switch: builds AWS-LC's FIPS module
