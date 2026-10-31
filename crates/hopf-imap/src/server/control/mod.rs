@@ -178,11 +178,17 @@ pub struct ImapControlHandler {
     local: SocketAddr,
     meta: ImapConnectionMetadata,
     busy: Arc<AtomicBool>,
-    cmd_queue: VecDeque<ImapCommand>,
+    /// Commands read but not yet run, in order: one waits while a storage
+    /// operation is in flight, and an APPEND also while its body is still
+    /// being written to the disk.
+    cmd_queue: VecDeque<QueuedCommand>,
     pending_auth: Option<PendingAuth>,
     pending_auth_check: Arc<Mutex<Option<AuthCheckOutcome>>>,
     /// APPEND literal being spooled to a temp file as chunks arrive — never
-    /// buffered whole in memory (see `AppendChunk`/`finalize_pending_append`).
+    /// buffered whole in memory (see `AppendChunk`/`seal_append_spool`). When
+    /// the APPEND's command has been read, the spool is sealed into its
+    /// [`QueuedCommand`] and this is replaced by a fresh one, so literals
+    /// pipelined one after another each get a file of their own.
     /// Writes are offloaded to `hopf_core::StorageExecutor` (issue #185)
     /// rather than done inline on the reactor thread; shared (not a plain
     /// field) so the storage-pool write callback, which only ever gets a
@@ -190,16 +196,10 @@ pub struct ImapControlHandler {
     append_spool: Arc<Mutex<AppendSpoolState>>,
     /// First spool write error, if any.
     pending_append_error: Option<String>,
-    /// Finalized spool path, ready for `cmd_append` to stream from — `None`
-    /// path with no error means a zero-length (`{0}`) literal.
+    /// The spool path of the APPEND being run, ready for `cmd_append` to
+    /// stream from — `None` path with no error means a zero-length (`{0}`)
+    /// literal.
     pending_append_path: Option<std::path::PathBuf>,
-    /// The APPEND's own trailing `Command` event, stashed when it arrives
-    /// before `append_spool`'s queued writes have finished draining (issue
-    /// #185) — `sync_pending_append` finalizes and dispatches it once
-    /// ready, triggered by the last write's `poke_handler` call. Also
-    /// blocks `enqueue_or_dispatch`/`drain_queue` the same way `busy`
-    /// does, so a further pipelined command can't run ahead of it.
-    pending_append_cmd: Option<ImapCommand>,
     pending_open: Arc<Mutex<Option<PendingOpen>>>,
     /// Per-session ENABLE set.
     enabled: EnabledExtensions,
@@ -280,7 +280,6 @@ impl ImapControlHandler {
             append_spool: Arc::new(Mutex::new(AppendSpoolState::default())),
             pending_append_error: None,
             pending_append_path: None,
-            pending_append_cmd: None,
             pending_open: Arc::new(Mutex::new(None)),
             enabled: EnabledExtensions::default(),
             idle: IdleState::default(),
@@ -748,22 +747,26 @@ impl ImapControlHandler {
         }
     }
 
+    /// Runs the queued commands in order, up to one that must wait: while a
+    /// storage operation is in flight nothing runs, and an APPEND waits for
+    /// its body to be on the disk (issue #185).
     fn drain_queue(&mut self, endpoint: &mut dyn Endpoint) {
-        while !self.busy.load(Ordering::Relaxed) && self.pending_append_cmd.is_none() {
-            let Some(cmd) = self.cmd_queue.pop_front() else {
+        while !self.busy.load(Ordering::Relaxed) {
+            let Some(front) = self.cmd_queue.front() else {
                 break;
             };
-            self.dispatch(endpoint, cmd);
-        }
-    }
-
-    fn enqueue_or_dispatch(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
-        // `pending_append_cmd` gates the same way `busy` does (issue
-        // #185) — a further pipelined command must not run ahead of an
-        // APPEND whose spool writes are still draining.
-        if self.busy.load(Ordering::Relaxed) || self.pending_append_cmd.is_some() {
-            self.cmd_queue.push_back(cmd);
-        } else {
+            if let Some(spool) = &front.spool {
+                let g = spool.lock().unwrap();
+                if g.draining || !g.queue.is_empty() {
+                    break;
+                }
+            }
+            let Some(QueuedCommand { cmd, spool }) = self.cmd_queue.pop_front() else {
+                break;
+            };
+            if let Some(spool) = spool {
+                self.take_append_spool(&spool);
+            }
             self.dispatch(endpoint, cmd);
         }
     }
@@ -1830,15 +1833,6 @@ impl ImapControlHandler {
         if g.error.is_some() {
             return;
         }
-        if self.pending_append_cmd.is_some() {
-            // A previous APPEND's spool hasn't finalized yet (issue #185)
-            // — only reachable via extremely aggressive LITERAL+
-            // pipelining that outruns our own finalize (a second literal
-            // starting before the first APPEND's tagged reply). Refuse
-            // rather than silently appending into the wrong message.
-            g.error = Some("internal: previous APPEND still finalizing".into());
-            return;
-        }
         g.queue.push_back(chunk.to_vec());
         let should_start = !g.draining;
         if should_start {
@@ -1854,38 +1848,22 @@ impl ImapControlHandler {
         }
     }
 
-    /// Move the just-completed APPEND spool (if any) into
-    /// `pending_append_path`, ready for `cmd_append` to stream from.
-    /// Returns `false` (and does nothing else) while writes are still
-    /// draining (issue #185) — the caller must defer via
-    /// `pending_append_cmd`/`sync_pending_append` instead of finalizing
-    /// before every chunk has actually landed.
-    fn finalize_pending_append(&mut self) -> bool {
-        let mut g = self.append_spool.lock().unwrap();
-        if g.draining || !g.queue.is_empty() {
-            return false;
-        }
+    /// The APPEND whose literal has just been read is complete as far as
+    /// the reader is concerned: its spool is sealed (writes already queued
+    /// for it carry on into it) and the next literal starts a fresh one.
+    fn seal_append_spool(&mut self) -> Arc<Mutex<AppendSpoolState>> {
+        std::mem::replace(&mut self.append_spool, Arc::new(Mutex::new(AppendSpoolState::default())))
+    }
+
+    /// The sealed `spool` has drained: its path and first error become
+    /// `pending_append_path` / `pending_append_error`, ready for `cmd_append`.
+    fn take_append_spool(&mut self, spool: &Arc<Mutex<AppendSpoolState>>) {
+        let mut g = spool.lock().unwrap();
         if let Some(f) = g.file.take() {
             let _ = f.sync_all();
         }
         self.pending_append_path = g.path.take();
         self.pending_append_error = g.error.take();
-        true
-    }
-
-    /// Re-invoke the deferred APPEND `Command` event once `append_spool`'s
-    /// queued writes have finished draining (issue #185) — mirrors
-    /// `sync_pending_auth_check`, triggered by the last write's
-    /// `poke_handler` call (see `drain_next_append_chunk`).
-    fn sync_pending_append(&mut self, endpoint: &mut dyn Endpoint) {
-        let Some(cmd) = self.pending_append_cmd.take() else {
-            return;
-        };
-        if !self.finalize_pending_append() {
-            self.pending_append_cmd = Some(cmd);
-            return;
-        }
-        self.enqueue_or_dispatch(endpoint, cmd);
     }
 
     fn feed_auth_line(&mut self, endpoint: &mut dyn Endpoint, line: &[u8]) {
@@ -1995,7 +1973,6 @@ impl ImapControlHandler {
     fn receive_inner(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         self.sync_pending(endpoint);
         self.sync_pending_auth_check(endpoint);
-        self.sync_pending_append(endpoint);
         self.drain_queue(endpoint);
 
         if self.busy.load(Ordering::Relaxed) && !self.lexer.in_literal() {
@@ -2023,37 +2000,29 @@ impl ImapControlHandler {
                 }
                 LexEvent::Command(cmd) => {
                     // An APPEND literal (if any) always finishes immediately
-                    // before its Command event — see `codec::feed_literal`'s
-                    // `LiteralPhase::Append` arm — so finalizing here always
-                    // picks up exactly the literal that belongs to `cmd`.
-                    if self.finalize_pending_append() {
-                        // State gating (reject Selected cmds when not
-                        // selected) happens inside dispatch. While a
-                        // storage operation is in flight,
-                        // `enqueue_or_dispatch` queues pipelined commands
-                        // instead of dispatching, so keep consuming every
-                        // event lexed from this buffer — breaking here
-                        // would drop them.
-                        self.enqueue_or_dispatch(endpoint, cmd);
-                    } else {
-                        // Spool writes from this literal are still
-                        // draining (issue #185) — `cmd` reads
-                        // `pending_append_path`, which isn't set yet.
-                        // Defer both finalize and dispatch;
-                        // `sync_pending_append` re-invokes this once
-                        // `finalize_pending_append` succeeds, triggered by
-                        // the last write's `poke_handler` call (see
-                        // `drain_next_append_chunk`).
-                        self.pending_append_cmd = Some(cmd);
-                    }
+                    // before its Command event - see `codec::feed_literal`'s
+                    // `LiteralPhase::Append` arm - so the spool sealed here is
+                    // exactly the one that belongs to `cmd`. State gating
+                    // (rejecting Selected commands when not selected) happens
+                    // inside dispatch; every command goes through the queue so
+                    // that none runs ahead of one that is waiting.
+                    let spool = matches!(cmd.request, Request::Append { .. }).then(|| self.seal_append_spool());
+                    self.cmd_queue.push_back(QueuedCommand { cmd, spool });
+                    self.drain_queue(endpoint);
                 }
             }
         }
         self.sync_pending(endpoint);
         self.sync_pending_auth_check(endpoint);
-        self.sync_pending_append(endpoint);
         self.drain_queue(endpoint);
     }
+}
+
+/// A command read from the client and waiting its turn. An APPEND carries the
+/// spool its body is being written to.
+struct QueuedCommand {
+    cmd: ImapCommand,
+    spool: Option<Arc<Mutex<AppendSpoolState>>>,
 }
 
 /// Shared, mutex-guarded APPEND literal spool state (issue #185) — see
@@ -2115,16 +2084,20 @@ fn drain_next_append_chunk(state: Arc<Mutex<AppendSpoolState>>, runtime: Arc<Run
                     g.draining = false;
                 }
             }
-            cb_handle.with_endpoint(|ep| {
-                // Lets `ImapControlHandler::sync_pending_append` (issue
-                // #185) re-check readiness promptly once this was the
-                // last outstanding write, instead of waiting for the
-                // client's next input to trigger another `receive()`.
-                ep.poke_handler();
-            });
+            let poke_handle = cb_handle.clone();
+            // The next write is started (or `draining` cleared) before the
+            // poke, so that when the handler looks at the spool in answer to
+            // it, a spool with nothing left to write is seen to be done.
             if ok {
                 drain_next_append_chunk(cb_state, cb_runtime, cb_handle);
             }
+            poke_handle.with_endpoint(|ep| {
+                // Lets `ImapControlHandler::drain_queue` (issue #185) run an
+                // APPEND promptly once this was the last outstanding write,
+                // instead of waiting for the client's next input to trigger
+                // another `receive()`.
+                ep.poke_handler();
+            });
         },
     );
 }
@@ -2275,10 +2248,18 @@ mod append_offload_tests {
             h.handle_append_chunk(chunk.as_bytes());
         }
 
+        let spool = h.seal_append_spool();
         assert!(
-            wait_for(|| h.finalize_pending_append(), 3000),
-            "finalize must eventually succeed once every offloaded write lands"
+            wait_for(
+                || {
+                    let g = spool.lock().unwrap();
+                    !g.draining && g.queue.is_empty()
+                },
+                3000
+            ),
+            "the spool must drain once every offloaded write lands"
         );
+        h.take_append_spool(&spool);
         let path = h
             .pending_append_path
             .clone()
@@ -2295,7 +2276,8 @@ mod append_offload_tests {
     #[test]
     fn empty_literal_never_creates_a_spool_file() {
         let mut h = test_handler();
-        assert!(h.finalize_pending_append());
+        let spool = h.seal_append_spool();
+        h.take_append_spool(&spool);
         assert!(h.pending_append_path.is_none());
         assert!(h.pending_append_error.is_none());
     }
@@ -2312,38 +2294,31 @@ mod append_offload_tests {
             crate::server::grammar::Request::Append { mailbox: "INBOX".into(), flags: Default::default() },
         );
         // Mirrors `receive()`'s `LexEvent::Command` arm.
-        if h.finalize_pending_append() {
-            h.enqueue_or_dispatch(&mut ep, append_cmd);
-        } else {
-            h.pending_append_cmd = Some(append_cmd);
-        }
+        let spool = Some(h.seal_append_spool());
+        h.cmd_queue.push_back(QueuedCommand { cmd: append_cmd, spool });
+        h.drain_queue(&mut ep);
 
-        // A further pipelined command must queue behind the still-
-        // finalizing APPEND, not run ahead of it.
+        // A further pipelined command must queue behind the APPEND, not run
+        // ahead of it.
         let noop_cmd = ImapCommand::new("a2", "NOOP", crate::server::grammar::Request::Noop);
-        h.enqueue_or_dispatch(&mut ep, noop_cmd);
-        if h.pending_append_cmd.is_some() {
-            assert_eq!(
-                h.cmd_queue.len(),
-                1,
-                "a2 must queue behind the still-finalizing APPEND, not dispatch early"
+        h.cmd_queue.push_back(QueuedCommand { cmd: noop_cmd, spool: None });
+        h.drain_queue(&mut ep);
+        if h.cmd_queue.iter().any(|q| q.cmd.tag == "a1") {
+            assert!(
+                h.cmd_queue.iter().any(|q| q.cmd.tag == "a2"),
+                "a2 must wait behind the still-draining APPEND, not dispatch early"
             );
         }
 
         assert!(
             wait_for(
                 || {
-                    h.sync_pending_append(&mut ep);
-                    h.pending_append_cmd.is_none()
+                    h.drain_queue(&mut ep);
+                    h.cmd_queue.is_empty() && !h.busy.load(Ordering::Relaxed)
                 },
-                2000
+                3000
             ),
-            "the deferred APPEND command must eventually finalize and dispatch"
-        );
-        h.drain_queue(&mut ep);
-        assert!(
-            h.cmd_queue.is_empty(),
-            "a2 must have drained once the APPEND finished"
+            "the APPEND and the command behind it must both run once the body is on disk"
         );
         if let Some(path) = h.pending_append_path.take() {
             let _ = std::fs::remove_file(path);

@@ -187,7 +187,7 @@ impl Session {
                 continue;
             }
             let working = self.h.busy.load(Ordering::Relaxed)
-                || self.h.pending_append_cmd.is_some()
+                || !self.h.cmd_queue.is_empty()
                 || !self.wire.jobs.lock().unwrap().is_empty();
             if !working {
                 return;
@@ -834,4 +834,33 @@ fn a_pipelined_login_and_append_works_and_a_failed_login_keeps_nothing() {
     assert!(status(&out, "a").starts_with("a NO "), "{out}");
     assert!(status(&out, "b").starts_with("b NO "), "{out}");
     assert!(bad.h.pending_append_path.is_none(), "the spooled body was kept: {:?}", bad.h.pending_append_path);
+}
+
+/// Commands sent in one write are answered in order, however long an
+/// APPEND's body takes to reach the disk.
+#[test]
+fn an_append_pipelined_with_other_commands_is_answered_in_order() {
+    let m = message("hi", "a@x.org", "u@x.org", ALICE, "body\r\n");
+    let n = message("yo", "b@x.org", "u@x.org", BOB, "other\r\n");
+    let script = format!(
+        "a LOGIN u p\r\nb CREATE Box\r\nc APPEND Box (\\Seen) {{{}}}\r\n{m}\r\nd NOOP\r\ne APPEND Box {{{}}}\r\n{n}\r\nf SELECT Box\r\ng FETCH 1:2 (FLAGS BODY.PEEK[HEADER.FIELDS (Subject)])\r\nh SEARCH SUBJECT yo\r\ni LOGOUT\r\n",
+        m.len(),
+        n.len()
+    );
+    let mut s = Session::new();
+    s.take();
+    let out = s.run(&script);
+    let tags: Vec<&str> = out
+        .lines()
+        .filter(|l| !l.starts_with('+') && !l.starts_with('*') && l.len() > 2 && l.as_bytes()[1] == b' ' && l.as_bytes()[0].is_ascii_lowercase())
+        .map(|l| &l[..1])
+        .collect();
+    assert_eq!(tags, ["a", "b", "c", "d", "e", "f", "g", "h", "i"], "{out}");
+    assert!(status(&out, "c").starts_with("c OK [APPENDUID "), "{out}");
+    assert!(status(&out, "e").starts_with("e OK [APPENDUID "), "{out}");
+    assert!(out.contains("* 2 EXISTS"), "{out}");
+    // Each message went to its own APPEND: the first seen, with its subject.
+    assert!(out.contains("* 1 FETCH (FLAGS (\\Seen)") && out.contains("Subject: hi"), "{out}");
+    assert!(out.contains("* 2 FETCH (FLAGS ()") && out.contains("Subject: yo"), "{out}");
+    assert!(out.contains("* SEARCH 2"), "{out}");
 }
