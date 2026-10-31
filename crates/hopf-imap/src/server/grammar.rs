@@ -1732,4 +1732,39 @@ mod tests {
         assert_eq!(got.len(), 2, "{got:?}");
         assert_eq!(body, b"hi");
     }
+
+    /// What the lexer made of `wire`, one word per event: `ok:VERB`, or `err`.
+    fn shape(wire: &str, chunk: usize) -> Vec<String> {
+        lex(wire.as_bytes(), chunk)
+            .into_iter()
+            .filter_map(|e| match e {
+                LexEvent::Command(c) => Some(format!("ok:{}", c.verb)),
+                LexEvent::Error { .. } => Some("err".to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_literal_sent_after_a_refusal_is_skipped_not_run() {
+        let cases = [
+            // Refused at a token; a non-synchronizing literal ends the line.
+            ("a COPY x INBOX {6+}\r\nb NOOP\r\nc COPY 1 INBOX\r\n", vec!["err", "ok:COPY"]),
+            // The line goes on after the literal, and ends in another.
+            ("a COPY x {3+}\r\nabc {4+}\r\nb NO rest\r\nc COPY 1 INBOX\r\n", vec!["err", "ok:COPY"]),
+            // The grammar refuses the literal itself; the rest of its line is not a command.
+            ("a FETCH 1 {3+}\r\nabc FLAGS\r\nb FETCH 1 UID\r\n", vec!["err", "ok:FETCH"]),
+            // A synchronizing literal is never sent after a refusal: nothing to skip.
+            ("a COPY x {6}\r\nb COPY 1 INBOX\r\n", vec!["err", "ok:COPY"]),
+            // Not a literal: braces in the middle of a refused line mean nothing.
+            ("a COPY x {6+} y\r\nb COPY 1 INBOX\r\n", vec!["err", "ok:COPY"]),
+            // After an empty literal the line still goes on.
+            ("a COPY x {0+}\r\nstill a\r\nb COPY 1 INBOX\r\n", vec!["err", "ok:COPY"]),
+        ];
+        for (wire, want) in cases {
+            for chunk in [1, 2, 5, 1000] {
+                assert_eq!(shape(wire, chunk), want, "{wire:?} chunk={chunk}");
+            }
+        }
+    }
 }

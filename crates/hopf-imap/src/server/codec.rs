@@ -184,6 +184,22 @@ enum LiteralPhase {
     },
 }
 
+/// How the end of a line being skipped reads: whether it is a literal the
+/// client will send whatever was said of the command (`{n+}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkipSpec {
+    /// Not (yet) the start of one.
+    None,
+    /// `{`
+    Open,
+    /// `{` and the digits so far.
+    Digits(u64),
+    /// `{n+`
+    Plus(u64),
+    /// `{n+}`: a literal of `n` octets if the line ends here.
+    Close(u64),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     /// Reading the tag, up to SP or CR.
@@ -238,6 +254,8 @@ pub struct ImapServerLexer {
     uid_pending: bool,
     /// The line's CRLF has been read, so a refusal has nothing left to skip.
     line_ended: bool,
+    /// The end of the line being skipped (`Resync`), as far as it is read.
+    skip_spec: SkipSpec,
     /// The atom or quoted string being read.
     word: Vec<u8>,
     /// Unclosed `[` in the atom being read: inside brackets, white space and
@@ -274,6 +292,7 @@ impl ImapServerLexer {
             line_ended: false,
             word: Vec::new(),
             brackets: 0,
+            skip_spec: SkipSpec::None,
             literal_size: 0,
             literal_digits: 0,
             literal_plus: false,
@@ -345,7 +364,8 @@ impl ImapServerLexer {
                 *remaining -= take as u64;
                 if *remaining == 0 {
                     self.literal = LiteralPhase::None;
-                    self.state = State::Tag;
+                    // The line goes on after the literal, and is skipped too.
+                    self.resync();
                 }
             }
             LiteralPhase::Append { remaining } => {
@@ -389,13 +409,34 @@ impl ImapServerLexer {
                 State::Resync => {
                     if b == b'\r' {
                         self.state = State::ResyncCr;
+                    } else {
+                        self.skip_spec = match (self.skip_spec, b) {
+                            (_, b'{') => SkipSpec::Open,
+                            (SkipSpec::Open, b'0'..=b'9') => SkipSpec::Digits(u64::from(b - b'0')),
+                            (SkipSpec::Digits(n), b'0'..=b'9') => {
+                                SkipSpec::Digits(n.saturating_mul(10).saturating_add(u64::from(b - b'0')))
+                            }
+                            (SkipSpec::Digits(n), b'+') => SkipSpec::Plus(n),
+                            (SkipSpec::Plus(n), b'}') => SkipSpec::Close(n),
+                            _ => SkipSpec::None,
+                        };
                     }
                     return;
                 }
                 State::ResyncCr => {
                     if b == b'\n' {
-                        self.state = State::Tag;
+                        // A literal the client sends without waiting is part of
+                        // this line: skip its octets, and the rest of the line.
+                        match std::mem::replace(&mut self.skip_spec, SkipSpec::None) {
+                            SkipSpec::Close(n) if n > 0 => {
+                                self.literal = LiteralPhase::Skip { remaining: n };
+                                self.state = State::Literal;
+                            }
+                            SkipSpec::Close(_) => self.state = State::Resync,
+                            _ => self.state = State::Tag,
+                        }
                     } else if b != b'\r' {
+                        self.skip_spec = SkipSpec::None;
                         self.state = State::Resync;
                     }
                     return;
@@ -563,7 +604,7 @@ impl ImapServerLexer {
                     } else if self.raw.len() >= self.max_line {
                         self.emit_error("Line too long");
                         self.raw.clear();
-                        self.state = State::Resync;
+                        self.resync();
                     } else {
                         self.raw.push(b);
                     }
@@ -645,7 +686,11 @@ impl ImapServerLexer {
     fn refuse(&mut self, reject: Reject) {
         self.emit_error(&reject.0);
         self.reset_command();
-        self.state = if self.line_ended { State::Tag } else { State::Resync };
+        if self.line_ended {
+            self.state = State::Tag;
+        } else {
+            self.resync();
+        }
     }
 
     /// `{n}` and the line it ends have been read: take the octets.
@@ -711,6 +756,12 @@ impl ImapServerLexer {
     fn fail(&mut self, message: &str) {
         self.emit_error(message);
         self.reset_command();
+        self.resync();
+    }
+
+    /// Skip the rest of the line.
+    fn resync(&mut self) {
+        self.skip_spec = SkipSpec::None;
         self.state = State::Resync;
     }
 
