@@ -550,12 +550,12 @@ pub fn format_fetch_attrs(
                 emit("RFC822.TEXT", &lit, &mut out, &mut first);
             }
             FetchItem::Body {
-                peek,
+                peek: _,
                 header_fields,
                 section,
                 partial,
             } => {
-                let name = body_item_name(*peek, section, header_fields.as_deref(), *partial);
+                let name = body_item_name(section, header_fields.as_deref(), *partial);
                 let data: Vec<u8> = match (section, msg) {
                     (BodySection::Full, Some(m)) => m.to_vec(),
                     (BodySection::Header, Some(m)) => message_header(m).to_vec(),
@@ -840,12 +840,12 @@ pub fn push_fetch_attrs(
                 stream_window(mb, seq, header_len, u64::MAX, push)?;
             }
             FetchItem::Body {
-                peek,
+                peek: _,
                 header_fields,
                 section,
                 partial,
             } => {
-                let name = body_item_name(*peek, section, header_fields.as_deref(), *partial);
+                let name = body_item_name(section, header_fields.as_deref(), *partial);
                 push(name.as_bytes());
                 push(b" ");
                 match section {
@@ -930,13 +930,15 @@ pub fn push_fetch_attrs(
     Ok(())
 }
 
+/// The name a `BODY[...]` or `BODY.PEEK[...]` item goes by in a FETCH
+/// response. RFC 9051 §6.4.5: `BODY.PEEK` is only a way of asking; the
+/// response data item is always `BODY[<section>]`.
 fn body_item_name(
-    peek: bool,
     section: &BodySection,
     fields: Option<&[String]>,
     partial: Option<(u64, u64)>,
 ) -> String {
-    let prefix = if peek { "BODY.PEEK" } else { "BODY" };
+    let prefix = "BODY";
     let base = match section {
         BodySection::Full => format!("{prefix}[]"),
         BodySection::Header => format!("{prefix}[HEADER]"),

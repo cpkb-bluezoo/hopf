@@ -1521,6 +1521,11 @@ impl ImapControlHandler {
 
     fn cmd_append(&mut self, endpoint: &mut dyn Endpoint, tag: String, name: String, flags: BTreeSetFlags) {
         if !self.require_auth(endpoint, &tag) {
+            // Refused (a pipelined login failed): the body spooled for it goes too.
+            self.pending_append_error = None;
+            if let Some(path) = self.pending_append_path.take() {
+                let _ = std::fs::remove_file(path);
+            }
             return;
         }
         if let Some(err) = self.pending_append_error.take() {
@@ -1811,6 +1816,16 @@ impl ImapControlHandler {
     /// to the same file must be ordered, and `StorageExecutor::submit_on`
     /// doesn't guarantee that across separate calls).
     fn handle_append_chunk(&mut self, chunk: &[u8]) {
+        // The body of an APPEND arrives (and is spooled) before the command is
+        // dispatched. Until the client has logged in it is read and dropped,
+        // so an unauthenticated connection cannot make the server write to
+        // disk; the command is then refused as usual. (A login that is still
+        // being checked, or is queued ahead of this command, may yet succeed,
+        // so a pipelined LOGIN and APPEND keep working.)
+        let may_log_in_first = self.busy.load(Ordering::Relaxed) || self.pending_auth.is_some() || !self.cmd_queue.is_empty();
+        if !matches!(self.session, ImapSessionState::Authenticated | ImapSessionState::Selected) && !may_log_in_first {
+            return;
+        }
         let mut g = self.append_spool.lock().unwrap();
         if g.error.is_some() {
             return;
@@ -2131,6 +2146,9 @@ fn unique_append_spool_path() -> std::path::PathBuf {
 }
 
 #[cfg(test)]
+mod session_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::server::codec::ImapServerLexer;
@@ -2231,6 +2249,8 @@ mod append_offload_tests {
         let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
         let mut h = ImapControlHandler::new(client, config, rt, ImapServerMetrics::shared());
         h.control_handle = Some(ConnHandle::from_execute(Arc::new(|task| task())));
+        // (An APPEND body is only spooled for a client that has logged in.)
+        h.session = ImapSessionState::Authenticated;
         h
     }
 
