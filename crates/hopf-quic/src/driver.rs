@@ -1100,7 +1100,7 @@ impl Driver {
                             // that we have both halves in scope, same as
                             // the TCP reactor's `poke_handler` does inline.
                             if stream.endpoint.take_wants_poke() {
-                                let mut empty: &[u8] = &[];
+                                let mut empty = hopf_core::LoopBuf::with_capacity(1);
                                 stream.handler.receive(&mut stream.endpoint, &mut empty);
                             }
                         }
@@ -1883,7 +1883,7 @@ impl Driver {
                     let handler = &mut stream.handler;
                     let endpoint = &mut stream.endpoint;
                     deliver_with_residual(&mut stream.pending_in, &new_data, |slice| {
-                        handler.receive(endpoint, slice);
+                        hopf_core::forward_slice(&mut **handler, endpoint, slice);
                     });
                 }
             }
@@ -2317,7 +2317,7 @@ mod tests {
 
     impl ProtocolHandler for Echo {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             endpoint.send(data);
             *data = &[];
         }
@@ -2337,7 +2337,7 @@ mod tests {
                 self.sent = true;
             }
         }
-        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             self.got.lock().unwrap().extend_from_slice(data);
             *data = &[];
             endpoint.close();
@@ -2790,7 +2790,7 @@ mod tests {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {
             *self.connected.lock().unwrap() = true;
         }
-        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             *data = &[];
         }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
@@ -3075,7 +3075,7 @@ mod tests {
 
     impl ProtocolHandler for SplitTokenProbe {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             if data.len() < self.expected.len() {
                 return; // not enough yet — consume nothing, wait for more
             }
@@ -3108,7 +3108,7 @@ mod tests {
                 }),
             );
         }
-        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             *data = &[];
         }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
@@ -3179,7 +3179,7 @@ mod tests {
 
     impl ProtocolHandler for DefersThenPokesSelf {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             let first_call = self.calls.lock().unwrap().is_empty();
             self.calls.lock().unwrap().push(data.len());
             *data = &[];
@@ -3259,7 +3259,7 @@ mod tests {
             // so the server side sees it and its own connected() fires.
             endpoint.send(b"x");
         }
-        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             *data = &[];
         }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
@@ -3330,7 +3330,7 @@ mod tests {
             // observed by the peer at all).
             endpoint.send(b"x");
         }
-        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             *data = &[];
         }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
@@ -3557,7 +3557,7 @@ mod tests {
                 endpoint.send(b"x");
                 endpoint.close_connection(APP_CODE as u32);
             }
-            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
                 *data = &[];
             }
             fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
@@ -3703,7 +3703,7 @@ mod tests {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             Self::arm_poll(endpoint, Arc::clone(&self.release));
         }
-        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             *data = &[];
         }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
@@ -3720,7 +3720,7 @@ mod tests {
         struct EchoCloseOnPeerFin;
         impl ProtocolHandler for EchoCloseOnPeerFin {
             fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-            fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
                 endpoint.send(data);
                 *data = &[];
             }
@@ -3819,7 +3819,7 @@ mod tests {
         }
         impl ProtocolHandler for DelayedReplyAfterPeerFin {
             fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
                 *data = &[];
             }
             fn disconnected(&mut self, endpoint: &mut dyn Endpoint) {
@@ -3846,7 +3846,7 @@ mod tests {
                 endpoint.send(b"request");
                 endpoint.close(); // send FIN immediately after request bytes
             }
-            fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
                 self.got.lock().unwrap().extend_from_slice(data);
                 *data = &[];
                 endpoint.close();
@@ -3901,7 +3901,7 @@ mod tests {
             endpoint.send(b"second");
             endpoint.close();
         }
-        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             *data = &[];
         }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
@@ -4034,7 +4034,7 @@ mod tests {
 
     impl ProtocolHandler for RecordsUniBytes {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             self.got.lock().unwrap().extend_from_slice(data);
             *data = &[];
         }
@@ -4138,7 +4138,7 @@ mod tests {
         }
         impl ProtocolHandler for IdleClient {
             fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
                 *data = &[];
             }
             fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
@@ -4220,7 +4220,7 @@ mod tests {
             fn connected(&mut self, endpoint: &mut dyn Endpoint) {
                 let _ = endpoint.send_datagram(b"ping");
             }
-            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
                 *data = &[];
             }
             fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
@@ -4276,7 +4276,7 @@ mod tests {
                 let huge = vec![0u8; 65535];
                 let _ = endpoint.send_datagram(&huge);
             }
-            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
                 *data = &[];
             }
             fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
@@ -4316,7 +4316,7 @@ mod tests {
 
     impl ProtocolHandler for CountsBytes {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             self.total.fetch_add(data.len(), std::sync::atomic::Ordering::SeqCst);
             *data = &[];
         }
@@ -4336,7 +4336,7 @@ mod tests {
                 self.sent = true;
             }
         }
-        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             *data = &[];
         }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}

@@ -1252,7 +1252,7 @@ impl ProtocolHandler for AmqpClientEndpoint {
         self.arm_handshake_timer(endpoint);
     }
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         // Take ownership of parser temporarily to avoid borrow conflicts.
         let mut parser = std::mem::replace(
             &mut self.parser,
@@ -1524,7 +1524,7 @@ mod tests {
         data.extend_from_slice(&body2);
 
         let mut slice: &[u8] = &data;
-        ep.receive(&mut fake, &mut slice);
+        ep.receive_slice(&mut fake, &mut slice);
 
         let s = state.lock().unwrap();
         assert_eq!(s.body_by_channel.get(&1).map(Vec::as_slice), Some(&b"one-A"[..]));

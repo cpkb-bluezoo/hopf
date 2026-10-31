@@ -37,7 +37,7 @@ struct FixedHttpServer {
 impl ProtocolHandler for FixedHttpServer {
     fn connected(&mut self, _: &mut dyn Endpoint) {}
 
-    fn receive(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
         self.buf.extend_from_slice(data);
         *data = &[];
         if self.buf.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -1033,7 +1033,7 @@ struct AltSvcAnnouncingServer {
 }
 impl ProtocolHandler for AltSvcAnnouncingServer {
     fn connected(&mut self, _: &mut dyn Endpoint) {}
-    fn receive(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
         self.buf.extend_from_slice(data);
         *data = &[];
         if self.buf.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -1641,7 +1641,7 @@ struct RedirectingHttpServer {
 impl ProtocolHandler for RedirectingHttpServer {
     fn connected(&mut self, _: &mut dyn Endpoint) {}
 
-    fn receive(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
         self.buf.extend_from_slice(data);
         *data = &[];
         if self.buf.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -1707,7 +1707,7 @@ struct RawCapturingServer {
 impl ProtocolHandler for RawCapturingServer {
     fn connected(&mut self, _: &mut dyn Endpoint) {}
 
-    fn receive(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
         self.buf.extend_from_slice(data);
         *data = &[];
         if let Some(pos) = self.buf.windows(4).position(|w| w == b"\r\n\r\n") {

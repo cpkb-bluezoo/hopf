@@ -518,7 +518,7 @@ impl ProtocolHandler for HqServerStream {
 
     fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         self.buf.extend_from_slice(data);
         *data = &[];
         if self.sent {
@@ -571,7 +571,7 @@ impl ProtocolHandler for HqClientStream {
         self.state = ClientStreamState::Receiving { path, file };
     }
 
-    fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         if let ClientStreamState::Receiving { file, .. } = &mut self.state {
             if !data.is_empty() {
                 file.write_all(data).ok();

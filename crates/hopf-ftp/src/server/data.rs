@@ -635,7 +635,7 @@ impl ProtocolHandler for FtpDataHandler {
         }
     }
 
-    fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         self.take_stor();
         if let Some(state) = &self.stor_state {
             let handle = self.data_handle.clone().expect("receive() only runs after arm()");
@@ -912,7 +912,7 @@ mod tests {
             let chunk = vec![i; 500];
             expected_bytes.extend_from_slice(&chunk);
             let mut data: &[u8] = &chunk;
-            handler.receive(&mut ep, &mut data);
+            handler.receive_slice(&mut ep, &mut data);
         }
         handler.disconnected(&mut ep);
 
@@ -959,9 +959,9 @@ mod tests {
 
         // First chunk succeeds (call 1), second chunk fails (call 2).
         let mut first: &[u8] = b"first chunk ok";
-        handler.receive(&mut ep, &mut first);
+        handler.receive_slice(&mut ep, &mut first);
         let mut second: &[u8] = b"second chunk fails";
-        handler.receive(&mut ep, &mut second);
+        handler.receive_slice(&mut ep, &mut second);
         handler.disconnected(&mut ep);
 
         assert!(

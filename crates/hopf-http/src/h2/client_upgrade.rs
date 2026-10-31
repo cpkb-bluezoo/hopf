@@ -193,7 +193,7 @@ impl H2cUpgradeClientEndpoint {
         ));
         h2ep.connected(endpoint);
         if !remainder.is_empty() {
-            h2ep.receive(endpoint, remainder);
+            h2ep.receive_slice(endpoint, remainder);
         }
         self.phase = Phase::H2(h2ep);
     }
@@ -214,7 +214,7 @@ impl ProtocolHandler for H2cUpgradeClientEndpoint {
         // h2c Upgrade is cleartext-only; this endpoint is never dialed over TLS.
     }
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         match &mut self.phase {
             Phase::H1(codec) => {
                 let _ = codec.receive(data);
@@ -230,7 +230,7 @@ impl ProtocolHandler for H2cUpgradeClientEndpoint {
                     endpoint.close();
                 }
             }
-            Phase::H2(ep) => ep.receive(endpoint, data),
+            Phase::H2(ep) => ep.receive_slice(endpoint, data),
         }
     }
 
@@ -395,7 +395,7 @@ mod tests {
 
         let mut response: &[u8] =
             b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n";
-        ep.receive(&mut endpoint, &mut response);
+        ep.receive_slice(&mut endpoint, &mut response);
         assert!(response.is_empty(), "the whole 101 response head must be consumed");
 
         assert!(matches!(ep.phase, Phase::H2(_)), "must have promoted to H2");
@@ -429,7 +429,7 @@ mod tests {
 
         let mut response: &[u8] =
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-        ep.receive(&mut endpoint, &mut response);
+        ep.receive_slice(&mut endpoint, &mut response);
         assert!(response.is_empty());
 
         assert!(matches!(ep.phase, Phase::H1(_)), "must stay on HTTP/1.1");

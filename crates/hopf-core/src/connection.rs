@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use mio::event::Source;
 use mio::net::{TcpStream, UnixStream};
+use loopbuf::LoopBuf;
 use mio::{Interest, Registry, Token};
 
 use crate::bufpool::BufferPool;
@@ -135,12 +136,13 @@ pub(crate) struct TcpConnection {
     pub token: Token,
     pub stream: Stream,
     handler: Option<Box<dyn ProtocolHandler>>,
-    /// Wire buffer (ciphertext when TLS is active, plaintext otherwise).
-    net_in: Vec<u8>,
+    /// Wire ring (ciphertext when TLS is active, plaintext otherwise). Its
+    /// size is fixed for the life of the connection.
+    net_in: LoopBuf,
     net_out: Vec<u8>,
-    /// Plaintext inbound when TLS is active.
-    app_in: Vec<u8>,
-    max_net_in: usize,
+    /// Plaintext inbound when TLS is active: a ring too, fed from `net_in`
+    /// only while it has room for what the next ciphertext can decrypt to.
+    app_in: LoopBuf,
     max_net_out: usize,
     read_paused: bool,
     pub interest: Interest,
@@ -174,6 +176,18 @@ pub(crate) struct TcpConnection {
     open_flag: Arc<AtomicBool>,
 }
 
+/// What a ring is made of when the real one is lent to a handler.
+fn placeholder_ring() -> LoopBuf {
+    LoopBuf::with_capacity(1)
+}
+
+/// Size of the plaintext ring of a connection that has TLS.
+const APP_IN_BYTES: usize = 64 * 1024;
+
+/// Room the plaintext ring must keep free beyond the ciphertext fed next:
+/// the record the engine may be holding part of decrypts to up to 16 KiB.
+const TLS_PLAINTEXT_RESERVE: usize = 16 * 1024 + 512;
+
 pub(crate) enum ReadOutcome {
     Bytes,
     Eof,
@@ -197,6 +211,8 @@ struct TlsPumpOutcome {
     error: Option<String>,
     peer_closed: bool,
     verification_id: Option<u64>,
+    /// Plaintext arrived that the plaintext ring had no room for.
+    app_in_overflow: bool,
 }
 
 /// Bridges [`TlsRecordEngine`]'s sink events onto `TcpConnection`'s buffers —
@@ -206,7 +222,7 @@ struct TlsPumpOutcome {
 /// `&mut TcpConnection` as a whole, which this partial borrow can't offer).
 struct TlsSinkAdapter<'a> {
     net_out: &'a mut Vec<u8>,
-    app_in: &'a mut Vec<u8>,
+    app_in: &'a mut LoopBuf,
     outcome: &'a mut TlsPumpOutcome,
 }
 
@@ -216,7 +232,9 @@ impl TlsRecordSink for TlsSinkAdapter<'_> {
     }
 
     fn application_data(&mut self, plaintext: &[u8]) {
-        self.app_in.extend_from_slice(plaintext);
+        if self.app_in.extend_from_slice(plaintext) < plaintext.len() {
+            self.outcome.app_in_overflow = true;
+        }
     }
 
     fn handshake_complete(&mut self, info: SecurityInfo) {
@@ -255,7 +273,7 @@ impl TcpConnection {
         let local = stream
             .local_addr()
             .unwrap_or_else(|_| PeerAddr::Inet(SocketAddr::from(([0, 0, 0, 0], 0))));
-        let net_in = pool.acquire(DEFAULT_BUFFER_SIZE);
+        let net_in = pool.acquire_ring(params.max_net_in);
         let net_out = pool.acquire(DEFAULT_BUFFER_SIZE);
         let tls = if params.secure {
             if let Some(connector) = params.tls_connector.as_ref() {
@@ -278,14 +296,18 @@ impl TcpConnection {
             None
         };
         let has_tls = tls.is_some();
+        let app_in = if has_tls {
+            pool.acquire_ring(APP_IN_BYTES)
+        } else {
+            placeholder_ring()
+        };
         let mut conn = Self {
             token,
             stream,
             handler: Some(handler),
             net_in,
             net_out,
-            app_in: Vec::new(),
-            max_net_in: params.max_net_in,
+            app_in,
             max_net_out: params.max_net_out,
             read_paused: false,
             interest: Interest::READABLE,
@@ -392,7 +414,7 @@ impl TcpConnection {
         if !self.open {
             return None;
         }
-        if self.read_paused {
+        if self.read_paused || self.inbound_backed_up() {
             if self.wants_write() {
                 Some(Interest::WRITABLE)
             } else {
@@ -414,63 +436,43 @@ impl TcpConnection {
         self.connecting || !self.net_out.is_empty() || self.close_requested
     }
 
-    pub fn prepare_net_in(&mut self) -> io::Result<()> {
-        let remaining_cap = self.net_in.capacity() - self.net_in.len();
-        if remaining_cap >= DEFAULT_BUFFER_SIZE {
-            return Ok(());
+    /// Gives the plaintext ring a real size once TLS is on the connection.
+    fn ensure_app_in(&mut self) {
+        if self.app_in.capacity() < APP_IN_BYTES {
+            let old = std::mem::replace(&mut self.app_in, self.pool.acquire_ring(APP_IN_BYTES));
+            debug_assert!(old.is_empty());
         }
-        if self.net_in.len() >= self.max_net_in {
+    }
+
+    /// Reading stops while the ring holds as much ciphertext as it can and
+    /// the plaintext ring cannot take more of it: the handler is behind.
+    fn inbound_backed_up(&self) -> bool {
+        self.tls.is_some() && self.net_in.is_full()
+    }
+
+    pub fn read_from_socket(&mut self) -> io::Result<ReadOutcome> {
+        if self.net_in.is_full() {
+            // Full after the handler has had its turn. With TLS the handler
+            // may simply be behind (backpressure: read again once it has
+            // caught up); otherwise it left a whole ring's worth unconsumed,
+            // which is a token the ring can never hold.
+            if self.inbound_backed_up() {
+                return Ok(ReadOutcome::WouldBlock);
+            }
             return Err(io::Error::new(
                 ErrorKind::OutOfMemory,
                 "inbound buffer full",
             ));
         }
-        let needed = (self.net_in.len() + DEFAULT_BUFFER_SIZE).min(self.max_net_in);
-        let grow_to = needed.next_power_of_two().min(self.max_net_in).max(needed);
-        if grow_to <= self.net_in.capacity() {
-            return Ok(());
-        }
-        let mut new_buf = self.pool.acquire(grow_to);
-        new_buf.clear();
-        new_buf.extend_from_slice(&self.net_in);
-        let old = std::mem::replace(&mut self.net_in, new_buf);
-        self.pool.release(old);
-        Ok(())
-    }
-
-    pub fn read_from_socket(&mut self) -> io::Result<ReadOutcome> {
-        self.prepare_net_in()?;
-        let cap = self.net_in.capacity();
-        let len = self.net_in.len();
-        unsafe {
-            self.net_in.set_len(cap);
-        }
-        let result = self.stream.read(&mut self.net_in[len..]);
-        match result {
-            Ok(0) => {
-                unsafe {
-                    self.net_in.set_len(len);
-                }
-                Ok(ReadOutcome::Eof)
-            }
+        let (spare, _) = self.net_in.spare_capacity_mut();
+        match self.stream.read(spare) {
+            Ok(0) => Ok(ReadOutcome::Eof),
             Ok(n) => {
-                unsafe {
-                    self.net_in.set_len(len + n);
-                }
+                self.net_in.commit_write(n);
                 Ok(ReadOutcome::Bytes)
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                unsafe {
-                    self.net_in.set_len(len);
-                }
-                Ok(ReadOutcome::WouldBlock)
-            }
-            Err(e) => {
-                unsafe {
-                    self.net_in.set_len(len);
-                }
-                Err(e)
-            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(ReadOutcome::WouldBlock),
+            Err(e) => Err(e),
         }
     }
 
@@ -515,10 +517,12 @@ impl TcpConnection {
     /// this must never look at or consume bytes belonging to the
     /// connection's real traffic.
     fn process_proxy_protocol(&mut self) -> io::Result<()> {
-        match proxy_protocol::try_parse_proxy_header(&self.net_in)? {
+        // Nothing has been consumed yet, so the ring has not wrapped.
+        let (header, _) = self.net_in.readable_spans();
+        match proxy_protocol::try_parse_proxy_header(header)? {
             ProxyHeaderOutcome::Incomplete => Ok(()),
             ProxyHeaderOutcome::Parsed { consumed, peer } => {
-                self.net_in.drain(..consumed);
+                self.net_in.advance(consumed);
                 if let Some(peer) = peer {
                     self.remote = peer;
                 }
@@ -528,47 +532,70 @@ impl TcpConnection {
         }
     }
 
+    /// Feeds the ciphertext in `net_in` to the TLS engine a chunk at a time,
+    /// as long as the plaintext ring has room for what it may decrypt to,
+    /// handing the plaintext to the handler after each.
     fn process_tls_inbound(&mut self) -> io::Result<()> {
-        let mut input = std::mem::take(&mut self.net_in);
-        let mut outcome = TlsPumpOutcome::default();
-        {
-            let tls = self.tls.as_mut().expect("process_tls_inbound called with tls active");
-            let mut adapter = TlsSinkAdapter {
-                net_out: &mut self.net_out,
-                app_in: &mut self.app_in,
-                outcome: &mut outcome,
+        loop {
+            let room = self.app_in.spare_len();
+            if room <= TLS_PLAINTEXT_RESERVE || self.net_in.is_empty() {
+                break;
+            }
+            let mut outcome = TlsPumpOutcome::default();
+            let (chunk, consumed) = {
+                let tls = self.tls.as_mut().expect("process_tls_inbound called with tls active");
+                let mut adapter = TlsSinkAdapter {
+                    net_out: &mut self.net_out,
+                    app_in: &mut self.app_in,
+                    outcome: &mut outcome,
+                };
+                let (first, _) = self.net_in.readable_spans();
+                let chunk = first.len().min(room - TLS_PLAINTEXT_RESERVE);
+                let mut slice = &first[..chunk];
+                tls.feed_ciphertext(&mut slice, &mut adapter);
+                (chunk, chunk - slice.len())
             };
-            let mut slice = input.as_slice();
-            tls.feed_ciphertext(&mut slice, &mut adapter);
-        }
-        input.clear();
-        self.net_in = input;
+            self.net_in.advance(consumed);
 
-        // Chain verification: this pass doesn't wire an async StorageExecutor
-        // gate, so any trust decision must already be baked into the engine's
-        // HandshakeConfig::trust_store (resolved inline before this fires — see
-        // HandshakeEngine::on_certificate) or the connector is deliberately
-        // insecure (crate::tls::insecure_connector). Either way, resolving the
-        // gate here is always safe: a trust_store-backed verification has
-        // already settled verify_pending by the time we get here, making this
-        // call an inert no-op; only the insecure/no-trust_store case actually
-        // needs it to unblock the handshake.
-        if let Some(id) = outcome.verification_id.take() {
-            let tls = self.tls.as_mut().expect("process_tls_inbound called with tls active");
-            let mut adapter = TlsSinkAdapter {
-                net_out: &mut self.net_out,
-                app_in: &mut self.app_in,
-                outcome: &mut outcome,
-            };
-            tls.feed_verification_result(VerifyResult { id, ok: true }, &mut adapter);
-        }
+            // Chain verification: this pass doesn't wire an async StorageExecutor
+            // gate, so any trust decision must already be baked into the engine's
+            // HandshakeConfig::trust_store (resolved inline before this fires - see
+            // HandshakeEngine::on_certificate) or the connector is deliberately
+            // insecure (crate::tls::insecure_connector). Either way, resolving the
+            // gate here is always safe: a trust_store-backed verification has
+            // already settled verify_pending by the time we get here, making this
+            // call an inert no-op; only the insecure/no-trust_store case actually
+            // needs it to unblock the handshake.
+            if let Some(id) = outcome.verification_id.take() {
+                let tls = self.tls.as_mut().expect("process_tls_inbound called with tls active");
+                let mut adapter = TlsSinkAdapter {
+                    net_out: &mut self.net_out,
+                    app_in: &mut self.app_in,
+                    outcome: &mut outcome,
+                };
+                tls.feed_verification_result(VerifyResult { id, ok: true }, &mut adapter);
+            }
 
-        self.apply_tls_outcome(outcome)
+            self.apply_tls_outcome(outcome)?;
+            if !self.open || consumed < chunk || consumed == 0 {
+                break;
+            }
+        }
+        if self.net_in.is_empty() {
+            self.net_in.clear();
+        }
+        Ok(())
     }
 
     fn apply_tls_outcome(&mut self, outcome: TlsPumpOutcome) -> io::Result<()> {
         if let Some(msg) = outcome.error {
             return Err(io::Error::new(ErrorKind::InvalidData, msg));
+        }
+        if outcome.app_in_overflow {
+            return Err(io::Error::new(
+                ErrorKind::OutOfMemory,
+                "plaintext buffer overflow",
+            ));
         }
         if self.net_out.len() > self.max_net_out {
             return Err(io::Error::new(ErrorKind::OutOfMemory, "outbound buffer overflow during TLS flush"));
@@ -617,28 +644,17 @@ impl TcpConnection {
         let Some(mut handler) = self.handler.take() else {
             return;
         };
-        let mut buf = std::mem::take(&mut self.app_in);
+        let mut ring = std::mem::replace(&mut self.app_in, placeholder_ring());
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut slice = buf.as_slice();
-            handler.receive(self, &mut slice);
-            let remaining = slice.len();
-            let consumed = buf.len() - remaining;
-            if consumed > 0 {
-                buf.drain(..consumed);
-            }
+            handler.receive(self, &mut ring);
         }));
-        self.app_in = buf;
-        self.handler = Some(handler);
-        if let Err(payload) = outcome {
-            self.log_runtime_error(
-                "connection.handler.panic",
-                format!(
-                    "protocol handler panicked in receive on {}: {payload:?}",
-                    self.remote
-                ),
-            );
-            self.force_close();
+        if ring.is_empty() {
+            // Back to the start, so the same few pages are used.
+            ring.clear();
         }
+        self.app_in = ring;
+        self.handler = Some(handler);
+        self.after_receive(outcome);
     }
 
     fn deliver_plaintext_buffer(&mut self) {
@@ -648,18 +664,19 @@ impl TcpConnection {
         let Some(mut handler) = self.handler.take() else {
             return;
         };
-        let mut buf = std::mem::take(&mut self.net_in);
+        let mut ring = std::mem::replace(&mut self.net_in, placeholder_ring());
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut slice = buf.as_slice();
-            handler.receive(self, &mut slice);
-            let remaining = slice.len();
-            let consumed = buf.len() - remaining;
-            if consumed > 0 {
-                buf.drain(..consumed);
-            }
+            handler.receive(self, &mut ring);
         }));
-        self.net_in = buf;
+        if ring.is_empty() {
+            ring.clear();
+        }
+        self.net_in = ring;
         self.handler = Some(handler);
+        self.after_receive(outcome);
+    }
+
+    fn after_receive(&mut self, outcome: std::thread::Result<()>) {
         if let Err(payload) = outcome {
             self.log_runtime_error(
                 "connection.handler.panic",
@@ -801,11 +818,12 @@ impl TcpConnection {
     }
 
     pub fn release_buffers(&mut self) {
-        let inn = std::mem::take(&mut self.net_in);
+        let inn = std::mem::replace(&mut self.net_in, placeholder_ring());
         let out = std::mem::take(&mut self.net_out);
-        self.pool.release(inn);
+        self.pool.release_ring(inn);
         self.pool.release(out);
-        self.app_in.clear();
+        let app = std::mem::replace(&mut self.app_in, placeholder_ring());
+        self.pool.release_ring(app);
     }
 
     fn append_out(&mut self, data: &[u8]) {
@@ -927,6 +945,7 @@ impl Endpoint for TcpConnection {
             return Err(StartTlsError::Unsupported);
         };
         self.tls = Some(acceptor.accept());
+        self.ensure_app_in();
         self.security_notified = false;
         self.interest_dirty = true;
         self.pump_tls_start();
@@ -943,6 +962,7 @@ impl Endpoint for TcpConnection {
         }
         let engine = connector.connect(server_name).map_err(StartTlsError::Io)?;
         self.tls = Some(engine);
+        self.ensure_app_in();
         self.security_notified = false;
         self.interest_dirty = true;
         self.pump_tls_start();
@@ -1003,8 +1023,17 @@ impl Endpoint for TcpConnection {
         // unconsumed while paused); otherwise call receive with no data so
         // deferred replies / queued commands can be flushed.
         if self.tls.is_some() {
-            if !self.app_in.is_empty() {
+            if !self.app_in.is_empty() || !self.net_in.is_empty() {
+                // Plaintext the handler left, then the ciphertext that
+                // waited for room to decrypt into.
                 self.deliver_app_in();
+                if self.open && !self.net_in.is_empty() {
+                    if let Err(e) = self.process_tls_inbound() {
+                        self.call_error(&e);
+                        self.force_close();
+                    }
+                }
+                self.interest_dirty = true;
                 return;
             }
         } else if !self.net_in.is_empty() {
@@ -1016,20 +1045,11 @@ impl Endpoint for TcpConnection {
             return;
         };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut slice: &[u8] = &[];
-            handler.receive(self, &mut slice);
+            let mut empty = placeholder_ring();
+            handler.receive(self, &mut empty);
         }));
         self.handler = Some(handler);
-        if let Err(payload) = outcome {
-            self.log_runtime_error(
-                "connection.handler.panic",
-                format!(
-                    "protocol handler panicked in receive on {}: {payload:?}",
-                    self.remote
-                ),
-            );
-            self.force_close();
-        }
+        self.after_receive(outcome);
     }
 }
 

@@ -746,7 +746,7 @@ impl ProtocolHandler for Pop3ClientEndpoint {
         self.arm_stage_timer(ep);
     }
 
-    fn receive(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
         if matches!(self.proto_state, ProtoState::Closed | ProtoState::Error) {
             *data = &[];
             return;
@@ -1250,7 +1250,7 @@ mod tests {
 
     fn feed(ep: &mut Pop3ClientEndpoint, fake: &mut FakeEp, wire: &[u8]) {
         let mut data = wire;
-        ProtocolHandler::receive(ep, fake, &mut data);
+        ProtocolHandler::receive_slice(ep, fake, &mut data);
     }
 
     /// A poke from another thread re-enters `receive` with no data. Before

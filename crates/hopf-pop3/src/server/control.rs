@@ -1304,7 +1304,7 @@ impl ProtocolHandler for Pop3ControlHandler {
         }
     }
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         self.sync_pending_open();
         self.sync_pending_auth_check(endpoint);
         self.take_txn_slot();

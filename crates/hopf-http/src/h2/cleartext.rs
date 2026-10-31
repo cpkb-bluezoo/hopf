@@ -117,7 +117,7 @@ impl CleartextHttpEndpoint {
                 if !self.buf.is_empty() {
                     let remainder = std::mem::take(&mut self.buf);
                     let mut slice: &[u8] = &remainder;
-                    h2ep.receive(endpoint, &mut slice);
+                    h2ep.receive_slice(endpoint, &mut slice);
                 }
                 self.phase = Phase::H2(h2ep);
                 return true;
@@ -155,7 +155,7 @@ impl CleartextHttpEndpoint {
                         h1ep.connected(endpoint);
                     }
                     let mut slice: &[u8] = &buffered;
-                    h1ep.receive(endpoint, &mut slice);
+                    h1ep.receive_slice(endpoint, &mut slice);
                     self.phase = Phase::H1(h1ep);
                     return true;
                 }
@@ -167,7 +167,7 @@ impl CleartextHttpEndpoint {
                 h1ep.connected(endpoint);
             }
             let mut slice: &[u8] = &buffered;
-            h1ep.receive(endpoint, &mut slice);
+            h1ep.receive_slice(endpoint, &mut slice);
             self.phase = Phase::H1(h1ep);
             return true;
         }
@@ -207,7 +207,7 @@ impl CleartextHttpEndpoint {
         if !self.buf.is_empty() {
             let remainder = std::mem::take(&mut self.buf);
             let mut slice: &[u8] = &remainder;
-            h2ep.receive(endpoint, &mut slice);
+            h2ep.receive_slice(endpoint, &mut slice);
         }
 
         self.phase = Phase::H2(h2ep);
@@ -237,13 +237,13 @@ impl ProtocolHandler for CleartextHttpEndpoint {
         }
     }
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         match &mut self.phase {
             Phase::H1(ep) => {
-                ep.receive(endpoint, data);
+                ep.receive_slice(endpoint, data);
             }
             Phase::H2(ep) => {
-                ep.receive(endpoint, data);
+                ep.receive_slice(endpoint, data);
             }
             Phase::Sniff => {
                 self.buf.extend_from_slice(data);

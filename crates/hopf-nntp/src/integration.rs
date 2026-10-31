@@ -216,7 +216,7 @@ impl ProtocolHandler for Server {
         }
     }
 
-    fn receive(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
         self.lines.push(data);
         *data = &[];
         while let Some(line) = self.lines.next_line() {

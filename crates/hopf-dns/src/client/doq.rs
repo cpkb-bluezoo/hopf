@@ -243,7 +243,7 @@ impl ProtocolHandler for DoqQueryHandler {
         }
     }
 
-    fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         self.buf.extend_from_slice(data);
         *data = &[];
         if self.buf.len() >= 2 {

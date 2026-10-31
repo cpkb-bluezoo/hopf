@@ -216,7 +216,7 @@ impl ProtocolHandler for MqttClientEndpoint {
         self.send_connect(ep);
     }
 
-    fn receive(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
         // `parser.push` calls back into `self` (it implements
         // `MqttFrameHandler` directly below) — take it out of `self` first
         // so that isn't a simultaneous double borrow of the same field.

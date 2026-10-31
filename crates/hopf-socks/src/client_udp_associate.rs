@@ -263,7 +263,7 @@ impl ProtocolHandler for SocksUdpAssociateHandler {
         self.state = UdpClientState::AwaitingMethodSelection;
     }
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         if self.state == UdpClientState::AwaitingUdpSocket {
             self.poll_udp_socket_outcome(endpoint);
         }

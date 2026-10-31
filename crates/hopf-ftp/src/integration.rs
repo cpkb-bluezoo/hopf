@@ -350,7 +350,7 @@ fn active_mode_prot_p_actually_encrypts_the_data_connection() {
         fn security_established(&mut self, _endpoint: &mut dyn Endpoint, _info: &hopf_core::SecurityInfo) {
             self.secured.store(true, Ordering::SeqCst);
         }
-        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             self.buf.lock().unwrap().extend_from_slice(data);
             *data = &[];
         }
@@ -776,7 +776,7 @@ fn async_client_greeting_timeout() {
     struct Silent;
     impl ProtocolHandler for Silent {
         fn connected(&mut self, _: &mut dyn Endpoint) {}
-        fn receive(&mut self, _: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, _: &mut dyn Endpoint, data: &mut &[u8]) {
             *data = &[];
         }
         fn disconnected(&mut self, _: &mut dyn Endpoint) {}
@@ -821,7 +821,7 @@ fn connect_timeout_fires_for_unreachable_peer() {
     }
     impl ProtocolHandler for Watch {
         fn connected(&mut self, _: &mut dyn Endpoint) {}
-        fn receive(&mut self, _: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, _: &mut dyn Endpoint, data: &mut &[u8]) {
             *data = &[];
         }
         fn disconnected(&mut self, _: &mut dyn Endpoint) {}

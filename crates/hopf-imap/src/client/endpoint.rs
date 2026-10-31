@@ -1584,7 +1584,7 @@ impl ProtocolHandler for ImapClientEndpoint {
         self.arm_greeting_timer(ep);
     }
 
-    fn receive(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
         if matches!(self.session, SessionState::Closed | SessionState::Error) {
             *data = &[];
             return;
@@ -2335,7 +2335,7 @@ mod tests {
 
     fn feed(ep: &mut ImapClientEndpoint, fake: &mut FakeEp, wire: &[u8]) {
         let mut data = wire;
-        ProtocolHandler::receive(ep, fake, &mut data);
+        ProtocolHandler::receive_slice(ep, fake, &mut data);
     }
 
     /// A poke from another thread re-enters `receive` with no data. The

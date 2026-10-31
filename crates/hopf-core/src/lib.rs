@@ -61,7 +61,8 @@ pub use connector::{TcpConnParams, TcpConnectorConfig, UnixConnectorConfig};
 pub use endpoint::{Endpoint, TimerHandle, WriteReadyCallback};
 pub use error::StartTlsError;
 pub use handle::{ConnHandle, ConnHandleBackend, EndpointTask, ExecuteFn, Task};
-pub use handler::{NopHandler, ProtocolHandler};
+pub use loopbuf::LoopBuf;
+pub use handler::{forward_slice, with_slice, NopHandler, ProtocolHandler};
 pub use listener::{
     HandlerFactory, Listener, TcpListenerConfig, UnixListenerConfig, DEFAULT_BUFFER_SIZE,
     DEFAULT_MAX_NET_IN, DEFAULT_MAX_NET_OUT,
@@ -131,7 +132,7 @@ mod tests {
     impl ProtocolHandler for EchoHandler {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
-        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             endpoint.send(data);
             *data = &[];
         }
@@ -152,7 +153,7 @@ mod tests {
             endpoint.send(self.payload);
         }
 
-        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             self.got.lock().unwrap().extend_from_slice(data);
             *data = &[];
         }
@@ -171,7 +172,7 @@ mod tests {
     impl ProtocolHandler for RemoteAddrOnReceive {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
-        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             *data = &[];
             let addr = endpoint.remote_addr().unwrap().to_string();
             endpoint.send(addr.as_bytes());
@@ -197,7 +198,7 @@ mod tests {
     impl ProtocolHandler for LineEcho {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
-        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             while let Some(pos) = data.iter().position(|&b| b == b'\n') {
                 let line = &data[..=pos];
                 endpoint.send(line);
@@ -217,7 +218,7 @@ mod tests {
     impl ProtocolHandler for PanicOnce {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
-        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             *data = &[];
             let mut g = self.done.lock().unwrap();
             if !*g {
@@ -242,7 +243,7 @@ mod tests {
     impl ProtocolHandler for FileOffload {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
-        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             *data = &[];
             let path = self.path.clone();
             let work_thread = Arc::clone(&self.work_thread);
@@ -278,7 +279,7 @@ mod tests {
     impl ProtocolHandler for StreamOffload {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
-        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             *data = &[];
             let callback_fired = Arc::clone(&self.callback_fired);
             let handle_for_close = endpoint.handle();
@@ -755,7 +756,7 @@ mod tests {
             }
         }
 
-        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             *data = &[];
         }
 
@@ -924,7 +925,7 @@ mod tests {
                 self.sent = true;
             }
 
-            fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
                 self.got.lock().unwrap().extend_from_slice(data);
                 *data = &[];
                 endpoint.close();
@@ -1035,7 +1036,7 @@ mod tests {
                 self.count.fetch_add(1, Ordering::SeqCst);
             }
 
-            fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
                 endpoint.send(data);
                 *data = &[];
             }
@@ -1058,7 +1059,7 @@ mod tests {
                 *self.handle_slot.lock().unwrap() = Some(endpoint.handle());
             }
 
-            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
                 self.got.lock().unwrap().extend_from_slice(data);
                 *data = &[];
             }
@@ -1178,7 +1179,7 @@ mod tests {
                 *self.established.lock().unwrap() = true;
                 endpoint.send(b"ping-through-real-tls-socket");
             }
-            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
                 self.echoed.lock().unwrap().extend_from_slice(data);
                 *data = &[];
             }
@@ -1280,7 +1281,7 @@ mod tests {
             fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {
                 endpoint.send(b"ping");
             }
-            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
                 if !data.is_empty() {
                     self.0.lock().unwrap().echoed = true;
                 }

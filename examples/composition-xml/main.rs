@@ -17,16 +17,18 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use hopf_core::{Composition, CompositionRegistry, Endpoint, ProtocolHandler};
+use hopf_core::{LoopBuf, Composition, CompositionRegistry, Endpoint, ProtocolHandler};
 
 struct Echo;
 
 impl ProtocolHandler for Echo {
     fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        endpoint.send(data);
-        *data = &[];
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut LoopBuf) {
+        let (first, second) = buf.readable_spans();
+        endpoint.send(first);
+        endpoint.send(second);
+        buf.advance(buf.len());
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
@@ -38,9 +40,11 @@ struct Shout;
 impl ProtocolHandler for Shout {
     fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        endpoint.send(&data.to_ascii_uppercase());
-        *data = &[];
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut LoopBuf) {
+        let (first, second) = buf.readable_spans();
+        endpoint.send(&first.to_ascii_uppercase());
+        endpoint.send(&second.to_ascii_uppercase());
+        buf.advance(buf.len());
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
@@ -56,13 +60,15 @@ impl ProtocolHandler for DialGreet {
         endpoint.send(b"hello from dial-tcp");
     }
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut LoopBuf) {
+        let (first, second) = buf.readable_spans();
         let _ = writeln!(
             io::stderr(),
-            "dial-tcp got back: {}",
-            String::from_utf8_lossy(data)
+            "dial-tcp got back: {}{}",
+            String::from_utf8_lossy(first),
+            String::from_utf8_lossy(second)
         );
-        *data = &[];
+        buf.advance(buf.len());
         endpoint.close();
     }
 

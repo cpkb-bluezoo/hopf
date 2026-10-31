@@ -124,7 +124,7 @@ impl HttpClientConnection {
             let buf = std::mem::take(&mut self.pending_receive);
             let mut slice: &[u8] = &buf;
             if let Some(inner) = self.inner.as_mut() {
-                inner.receive(endpoint, &mut slice);
+                inner.receive_slice(endpoint, &mut slice);
             }
         }
     }
@@ -154,9 +154,9 @@ impl ProtocolHandler for HttpClientConnection {
         self.start_tls(endpoint, info);
     }
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         if let Some(inner) = self.inner.as_mut() {
-            inner.receive(endpoint, data);
+            inner.receive_slice(endpoint, data);
         } else {
             self.pending_receive.extend_from_slice(data);
             *data = &[];

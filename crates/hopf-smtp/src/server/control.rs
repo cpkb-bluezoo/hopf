@@ -1413,7 +1413,7 @@ impl ProtocolHandler for SmtpControlHandler {
         }
     }
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         self.sync_deferred();
         self.sync_pending_auth_check(endpoint);
         self.sync_pending_finish(endpoint);
@@ -2089,7 +2089,7 @@ mod pending_finish_tests {
 
     fn feed(h: &mut SmtpControlHandler, ep: &mut MockEndpoint, line: &[u8]) {
         let mut data = line;
-        h.receive(ep, &mut data);
+        h.receive_slice(ep, &mut data);
     }
 
     /// Numeric code of the last CRLF-terminated reply line seen so far.

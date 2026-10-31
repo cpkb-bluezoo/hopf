@@ -471,7 +471,7 @@ impl ProtocolHandler for NntpClientEndpoint {
         }
     }
 
-    fn receive(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
         if !data.is_empty() {
             self.lines.push(data);
             *data = &[];

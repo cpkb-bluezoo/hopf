@@ -42,7 +42,7 @@ struct DoqServerHandler {
 impl ProtocolHandler for DoqServerHandler {
     fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         self.buf.extend_from_slice(data);
         *data = &[];
         while self.buf.len() >= 2 {

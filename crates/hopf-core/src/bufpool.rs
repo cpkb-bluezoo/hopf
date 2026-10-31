@@ -12,6 +12,7 @@ const DEFAULT_PER_BUCKET: usize = 64;
 pub struct BufferPool {
     buckets: Mutex<Vec<Vec<Vec<u8>>>>,
     max_per_bucket: usize,
+    rings: loopbuf::LoopBufPool,
 }
 
 impl BufferPool {
@@ -21,7 +22,20 @@ impl BufferPool {
         Self {
             buckets: Mutex::new((0..n).map(|_| Vec::new()).collect()),
             max_per_bucket,
+            rings: loopbuf::LoopBufPool::new(max_per_bucket),
         }
+    }
+
+    /// Acquire an empty inbound ring of at least `min_capacity` bytes
+    /// (rounded up to a power of two, between 4 KiB and 1 MiB). Its size is
+    /// fixed for as long as it is held.
+    pub fn acquire_ring(&self, min_capacity: usize) -> loopbuf::LoopBuf {
+        self.rings.acquire(min_capacity)
+    }
+
+    /// Return a ring to the pool.
+    pub fn release_ring(&self, ring: loopbuf::LoopBuf) {
+        self.rings.release(ring);
     }
 
     /// Acquire a cleared buffer with capacity at least `min_capacity` (rounded up).

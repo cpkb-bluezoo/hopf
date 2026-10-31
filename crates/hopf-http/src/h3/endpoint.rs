@@ -834,7 +834,7 @@ impl ProtocolHandler for H3RequestStream {
         self.bind_execute_conn();
     }
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         self.bind_execute_conn();
         let mut parser = std::mem::take(&mut self.parser);
         parser.push(data, self);
@@ -1369,7 +1369,7 @@ impl H3FrameHandler for H3UniStream {
 impl ProtocolHandler for H3UniStream {
     fn connected(&mut self, _: &mut dyn Endpoint) {}
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         if matches!(self.kind, UniKind::Unclassified) {
             self.pending_type.extend_from_slice(data);
             *data = &[];
@@ -1387,7 +1387,7 @@ impl ProtocolHandler for H3UniStream {
 
             if !remainder.is_empty() {
                 let mut rem: &[u8] = &remainder;
-                self.receive(endpoint, &mut rem);
+                self.receive_slice(endpoint, &mut rem);
             }
             return;
         }
@@ -1519,11 +1519,11 @@ mod uni_stream_tests {
         ep: &mut RecordingEndpoint,
     ) {
         let mut type_byte: &[u8] = &[0x00];
-        uni.receive(ep, &mut type_byte);
+        uni.receive_slice(ep, &mut type_byte);
         let mut settings = Vec::new();
         frame::write_settings(&mut settings, qpack::MAX_TABLE_CAPACITY as u64, 0, frame::DEFAULT_MAX_FIELD_SECTION_SIZE);
         let mut data: &[u8] = &settings;
-        uni.receive(ep, &mut data);
+        uni.receive_slice(ep, &mut data);
         assert!(!ep.closed, "SETTINGS alone must not close the connection");
     }
 
@@ -1537,7 +1537,7 @@ mod uni_stream_tests {
         let mut bytes = vec![0x00]; // control stream type
         frame::write_settings(&mut bytes, qpack::MAX_TABLE_CAPACITY as u64, 0, frame::DEFAULT_MAX_FIELD_SECTION_SIZE);
         let mut data: &[u8] = &bytes;
-        uni.receive(&mut ep, &mut data);
+        uni.receive_slice(&mut ep, &mut data);
 
         assert!(data.is_empty());
         assert!(!ep.closed);
@@ -1561,7 +1561,7 @@ mod uni_stream_tests {
         super::super::varint::encode(&mut payload, 2);
         frame::write_frame(&mut bytes, frame::SETTINGS, &payload);
         let mut data: &[u8] = &bytes;
-        uni.receive(&mut ep, &mut data);
+        uni.receive_slice(&mut ep, &mut data);
 
         assert!(ep.closed);
         assert_eq!(ep.close_connection_code, Some(frame::H3_SETTINGS_ERROR));
@@ -1580,12 +1580,12 @@ mod uni_stream_tests {
         frame::write_settings(&mut settings_bytes, qpack::MAX_TABLE_CAPACITY as u64, 0, frame::DEFAULT_MAX_FIELD_SECTION_SIZE);
 
         let mut type_byte: &[u8] = &[0x00];
-        uni.receive(&mut ep, &mut type_byte);
+        uni.receive_slice(&mut ep, &mut type_byte);
         assert!(state.lock().unwrap().control_seen, "type byte alone must classify the stream");
 
         for byte in &settings_bytes {
             let mut one: &[u8] = std::slice::from_ref(byte);
-            uni.receive(&mut ep, &mut one);
+            uni.receive_slice(&mut ep, &mut one);
         }
 
         assert_eq!(state.lock().unwrap().peer_enable_connect_protocol, Some(true));
@@ -1599,14 +1599,14 @@ mod uni_stream_tests {
         let mut encoder = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
         let mut ep1 = RecordingEndpoint::default();
         let mut d1: &[u8] = &[0x02];
-        encoder.receive(&mut ep1, &mut d1);
+        encoder.receive_slice(&mut ep1, &mut d1);
         assert!(!ep1.closed);
         assert!(state.lock().unwrap().qpack_encoder_seen);
 
         let mut decoder = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
         let mut ep2 = RecordingEndpoint::default();
         let mut d2: &[u8] = &[0x03];
-        decoder.receive(&mut ep2, &mut d2);
+        decoder.receive_slice(&mut ep2, &mut d2);
         assert!(!ep2.closed);
         assert!(state.lock().unwrap().qpack_decoder_seen);
     }
@@ -1621,11 +1621,11 @@ mod uni_stream_tests {
         let mut ep = RecordingEndpoint::default();
 
         let mut type_byte: &[u8] = &[0x03];
-        uni.receive(&mut ep, &mut type_byte);
+        uni.receive_slice(&mut ep, &mut type_byte);
 
         let bad = vec![0x00u8]; // Insert Count Increment with Increment=0
         let mut data: &[u8] = &bad;
-        uni.receive(&mut ep, &mut data);
+        uni.receive_slice(&mut ep, &mut data);
 
         assert!(ep.closed);
         assert_eq!(
@@ -1646,14 +1646,14 @@ mod uni_stream_tests {
             let mut first = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
             let mut ep = RecordingEndpoint::default();
             let mut d: &[u8] = &[0x00];
-            first.receive(&mut ep, &mut d);
+            first.receive_slice(&mut ep, &mut d);
             assert!(!ep.closed);
         }
 
         let mut second = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
         let mut ep = RecordingEndpoint::default();
         let mut d: &[u8] = &[0x00];
-        second.receive(&mut ep, &mut d);
+        second.receive_slice(&mut ep, &mut d);
         assert!(ep.closed, "a duplicate control stream must be rejected");
         assert_eq!(
             ep.close_connection_code,
@@ -1670,13 +1670,13 @@ mod uni_stream_tests {
             let mut first = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
             let mut ep = RecordingEndpoint::default();
             let mut d: &[u8] = &[0x02];
-            first.receive(&mut ep, &mut d);
+            first.receive_slice(&mut ep, &mut d);
         }
 
         let mut second = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
         let mut ep = RecordingEndpoint::default();
         let mut d: &[u8] = &[0x02];
-        second.receive(&mut ep, &mut d);
+        second.receive_slice(&mut ep, &mut d);
         assert!(ep.closed);
         assert_eq!(ep.close_connection_code, Some(frame::H3_STREAM_CREATION_ERROR));
     }
@@ -1696,7 +1696,7 @@ mod uni_stream_tests {
         super::super::varint::encode(&mut bytes, 1000);
         bytes.extend_from_slice(b"whatever-payload-comes-next");
         let mut data: &[u8] = &bytes;
-        uni.receive(&mut ep, &mut data);
+        uni.receive_slice(&mut ep, &mut data);
 
         assert!(data.is_empty());
         assert!(!ep.closed);
@@ -1719,7 +1719,7 @@ mod uni_stream_tests {
         let mut bad_frame = Vec::new();
         frame::write_data(&mut bad_frame, b"not allowed here");
         let mut data: &[u8] = &bad_frame;
-        uni.receive(&mut ep, &mut data);
+        uni.receive_slice(&mut ep, &mut data);
 
         assert!(ep.closed);
         assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
@@ -1734,12 +1734,12 @@ mod uni_stream_tests {
         let mut ep = RecordingEndpoint::default();
 
         let mut type_byte: &[u8] = &[0x00];
-        uni.receive(&mut ep, &mut type_byte);
+        uni.receive_slice(&mut ep, &mut type_byte);
 
         let mut goaway_frame = Vec::new();
         frame::write_goaway(&mut goaway_frame, 8);
         let mut data: &[u8] = &goaway_frame;
-        uni.receive(&mut ep, &mut data);
+        uni.receive_slice(&mut ep, &mut data);
 
         assert!(ep.closed);
         assert_eq!(ep.close_connection_code, Some(frame::H3_MISSING_SETTINGS));
@@ -1757,7 +1757,7 @@ mod uni_stream_tests {
         let mut second = Vec::new();
         frame::write_settings(&mut second, 0, 0, frame::DEFAULT_MAX_FIELD_SECTION_SIZE);
         let mut data: &[u8] = &second;
-        uni.receive(&mut ep, &mut data);
+        uni.receive_slice(&mut ep, &mut data);
 
         assert!(ep.closed);
         assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
@@ -1777,7 +1777,7 @@ mod uni_stream_tests {
             let mut frame_bytes = Vec::new();
             frame::write_frame(&mut frame_bytes, ty, b"");
             let mut data: &[u8] = &frame_bytes;
-            uni.receive(&mut ep, &mut data);
+            uni.receive_slice(&mut ep, &mut data);
 
             assert!(
                 ep.closed,
@@ -1800,7 +1800,7 @@ mod uni_stream_tests {
         let mut grease = Vec::new();
         frame::write_frame(&mut grease, 0x21, b"ignored");
         let mut data: &[u8] = &grease;
-        uni.receive(&mut ep, &mut data);
+        uni.receive_slice(&mut ep, &mut data);
 
         assert!(!ep.closed);
         assert_eq!(ep.close_connection_code, None);
@@ -1817,7 +1817,7 @@ mod uni_stream_tests {
             let mut ep = RecordingEndpoint::default();
 
             let mut type_byte: &[u8] = &[0x00];
-            uni.receive(&mut ep, &mut type_byte);
+            uni.receive_slice(&mut ep, &mut type_byte);
 
             let mut payload = Vec::new();
             super::super::varint::encode(&mut payload, id);
@@ -1825,7 +1825,7 @@ mod uni_stream_tests {
             let mut frame_bytes = Vec::new();
             frame::write_frame(&mut frame_bytes, frame::SETTINGS, &payload);
             let mut data: &[u8] = &frame_bytes;
-            uni.receive(&mut ep, &mut data);
+            uni.receive_slice(&mut ep, &mut data);
 
             assert!(
                 ep.closed,
@@ -1848,7 +1848,7 @@ mod uni_stream_tests {
         let mut goaway_frame = Vec::new();
         frame::write_goaway(&mut goaway_frame, 8);
         let mut data: &[u8] = &goaway_frame;
-        uni.receive(&mut ep, &mut data);
+        uni.receive_slice(&mut ep, &mut data);
 
         assert!(!ep.closed, "GOAWAY reception alone doesn't close anything");
         assert_eq!(state.lock().unwrap().goaway_received, Some(8));
@@ -1867,14 +1867,14 @@ mod uni_stream_tests {
         let mut first = Vec::new();
         frame::write_goaway(&mut first, 4);
         let mut data: &[u8] = &first;
-        uni.receive(&mut ep, &mut data);
+        uni.receive_slice(&mut ep, &mut data);
         assert!(!ep.closed);
         assert_eq!(state.lock().unwrap().goaway_received, Some(4));
 
         let mut second = Vec::new();
         frame::write_goaway(&mut second, 8);
         let mut data: &[u8] = &second;
-        uni.receive(&mut ep, &mut data);
+        uni.receive_slice(&mut ep, &mut data);
 
         assert!(ep.closed);
         assert_eq!(ep.close_connection_code, Some(frame::H3_ID_ERROR));
@@ -1897,12 +1897,12 @@ mod uni_stream_tests {
         let mut first = Vec::new();
         frame::write_goaway(&mut first, 8);
         let mut data: &[u8] = &first;
-        uni.receive(&mut ep, &mut data);
+        uni.receive_slice(&mut ep, &mut data);
 
         let mut second = Vec::new();
         frame::write_goaway(&mut second, 4);
         let mut data: &[u8] = &second;
-        uni.receive(&mut ep, &mut data);
+        uni.receive_slice(&mut ep, &mut data);
 
         assert!(!ep.closed);
         assert_eq!(state.lock().unwrap().goaway_received, Some(4));
@@ -1922,7 +1922,7 @@ mod uni_stream_tests {
         let mut bad = Vec::new();
         frame::write_goaway(&mut bad, 1);
         let mut data: &[u8] = &bad;
-        uni.receive(&mut ep, &mut data);
+        uni.receive_slice(&mut ep, &mut data);
 
         assert!(ep.closed);
         assert_eq!(ep.close_connection_code, Some(frame::H3_ID_ERROR));
@@ -1942,7 +1942,7 @@ mod uni_stream_tests {
         let mut frame_bytes = Vec::new();
         frame::write_cancel_push(&mut frame_bytes, 0);
         let mut data: &[u8] = &frame_bytes;
-        uni.receive(&mut ep, &mut data);
+        uni.receive_slice(&mut ep, &mut data);
 
         assert!(ep.closed);
         assert_eq!(ep.close_connection_code, Some(frame::H3_ID_ERROR));
@@ -1961,7 +1961,7 @@ mod uni_stream_tests {
         let mut frame_bytes = Vec::new();
         frame::write_push_promise(&mut frame_bytes, 0, b"");
         let mut data: &[u8] = &frame_bytes;
-        uni.receive(&mut ep, &mut data);
+        uni.receive_slice(&mut ep, &mut data);
 
         assert!(ep.closed);
         assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
@@ -1978,14 +1978,14 @@ mod uni_stream_tests {
         let mut first = Vec::new();
         frame::write_max_push_id(&mut first, 8);
         let mut data: &[u8] = &first;
-        uni.receive(&mut ep, &mut data);
+        uni.receive_slice(&mut ep, &mut data);
         assert!(!ep.closed);
         assert_eq!(state.lock().unwrap().peer_max_push_id, Some(8));
 
         let mut second = Vec::new();
         frame::write_max_push_id(&mut second, 4);
         let mut data: &[u8] = &second;
-        uni.receive(&mut ep, &mut data);
+        uni.receive_slice(&mut ep, &mut data);
 
         assert!(ep.closed);
         assert_eq!(ep.close_connection_code, Some(frame::H3_ID_ERROR));
@@ -2001,7 +2001,7 @@ mod uni_stream_tests {
         let mut ep = RecordingEndpoint::default();
 
         let mut type_byte: &[u8] = &[0x01]; // STREAM_TYPE_PUSH
-        uni.receive(&mut ep, &mut type_byte);
+        uni.receive_slice(&mut ep, &mut type_byte);
 
         assert!(ep.closed);
         assert_eq!(ep.close_connection_code, Some(frame::H3_ID_ERROR));
@@ -2021,7 +2021,7 @@ mod uni_stream_tests {
         let mut grease = Vec::new();
         frame::write_frame(&mut grease, 0x21, b"pad");
         let mut data: &[u8] = &grease;
-        uni.receive(&mut ep, &mut data);
+        uni.receive_slice(&mut ep, &mut data);
 
         assert!(!ep.closed);
         assert_eq!(ep.close_connection_code, None);
@@ -2037,12 +2037,12 @@ mod uni_stream_tests {
         let mut ep = RecordingEndpoint::default();
 
         let mut type_byte: &[u8] = &[0x00];
-        uni.receive(&mut ep, &mut type_byte);
+        uni.receive_slice(&mut ep, &mut type_byte);
 
         let mut grease = Vec::new();
         frame::write_frame(&mut grease, 0x21, b"pad");
         let mut data: &[u8] = &grease;
-        uni.receive(&mut ep, &mut data);
+        uni.receive_slice(&mut ep, &mut data);
 
         assert!(ep.closed);
         assert_eq!(ep.close_connection_code, Some(frame::H3_MISSING_SETTINGS));
@@ -2058,7 +2058,7 @@ mod uni_stream_tests {
         let mut ep = RecordingEndpoint::default();
 
         let mut type_byte: &[u8] = &[0x00];
-        uni.receive(&mut ep, &mut type_byte);
+        uni.receive_slice(&mut ep, &mut type_byte);
         assert!(!ep.closed);
 
         uni.disconnected(&mut ep);
@@ -2079,7 +2079,7 @@ mod uni_stream_tests {
         let mut ep = RecordingEndpoint::default();
 
         let mut type_byte: &[u8] = &[0x02];
-        uni.receive(&mut ep, &mut type_byte);
+        uni.receive_slice(&mut ep, &mut type_byte);
         uni.disconnected(&mut ep);
 
         assert_eq!(
@@ -2098,7 +2098,7 @@ mod uni_stream_tests {
         let mut ep = RecordingEndpoint::default();
 
         let mut type_byte: &[u8] = &[0x03];
-        uni.receive(&mut ep, &mut type_byte);
+        uni.receive_slice(&mut ep, &mut type_byte);
         uni.disconnected(&mut ep);
 
         assert_eq!(
@@ -2117,7 +2117,7 @@ mod uni_stream_tests {
         let mut ep = RecordingEndpoint::default();
 
         let mut type_byte: &[u8] = &[0x00];
-        uni.receive(&mut ep, &mut type_byte);
+        uni.receive_slice(&mut ep, &mut type_byte);
         uni.error(
             &mut ep,
             &io::Error::new(io::ErrorKind::ConnectionReset, "reset"),
@@ -2141,7 +2141,7 @@ mod uni_stream_tests {
         let mut type_bytes = Vec::new();
         super::super::varint::encode(&mut type_bytes, 0x21);
         let mut data: &[u8] = &type_bytes;
-        uni.receive(&mut ep, &mut data);
+        uni.receive_slice(&mut ep, &mut data);
         uni.disconnected(&mut ep);
 
         assert!(!ep.closed);
@@ -2318,7 +2318,7 @@ mod request_validation_tests {
         stream.headers_frame(&payload);
         let mut ep = RecordingEndpoint::default();
         let mut empty: &[u8] = &[];
-        stream.receive(&mut ep, &mut empty);
+        stream.receive_slice(&mut ep, &mut empty);
         stream.error(&mut ep, &io::Error::new(io::ErrorKind::ConnectionReset, "late reset"));
         assert_eq!(rec.lock().unwrap().aborted, 0);
     }
@@ -2345,7 +2345,7 @@ mod request_validation_tests {
         assert!(stream.writer.upgrade(h, Box::new(TunnelHandler(Arc::clone(&tunnel)))), "late upgrade refused");
         let mut ep = RecordingEndpoint::default();
         let mut empty: &[u8] = &[];
-        stream.receive(&mut ep, &mut empty);
+        stream.receive_slice(&mut ep, &mut empty);
 
         assert_eq!(tunnel.lock().unwrap().received, b"hello", "tunnel bytes did not reach the upgrade handler");
         assert!(rec.lock().unwrap().body.is_empty(), "tunnel bytes delivered as request body");
@@ -2379,7 +2379,7 @@ mod request_validation_tests {
 
         let mut ep = RecordingEndpoint::default();
         let mut empty: &[u8] = &[];
-        stream.receive(&mut ep, &mut empty);
+        stream.receive_slice(&mut ep, &mut empty);
         assert!(ep.closed, "receive() must close the stream once malformed is set");
         assert_eq!(
             ep.abort_code,
@@ -2488,7 +2488,7 @@ mod request_validation_tests {
 
         let mut ep = RecordingEndpoint::default();
         let mut empty: &[u8] = &[];
-        stream.receive(&mut ep, &mut empty);
+        stream.receive_slice(&mut ep, &mut empty);
         assert_eq!(ep.abort_code, Some(frame::H3_EXCESSIVE_LOAD));
     }
 
@@ -2632,7 +2632,7 @@ mod request_validation_tests {
 
         let mut ep = RecordingEndpoint::default();
         let mut empty: &[u8] = &[];
-        stream.receive(&mut ep, &mut empty);
+        stream.receive_slice(&mut ep, &mut empty);
         assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
     }
 
@@ -2644,7 +2644,7 @@ mod request_validation_tests {
 
         let mut ep = RecordingEndpoint::default();
         let mut data: &[u8] = &frame_bytes;
-        stream.receive(&mut ep, &mut data);
+        stream.receive_slice(&mut ep, &mut data);
         assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
     }
 
@@ -2656,7 +2656,7 @@ mod request_validation_tests {
 
         let mut ep = RecordingEndpoint::default();
         let mut data: &[u8] = &frame_bytes;
-        stream.receive(&mut ep, &mut data);
+        stream.receive_slice(&mut ep, &mut data);
         assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
     }
 
@@ -2674,7 +2674,7 @@ mod request_validation_tests {
         let mut ep = RecordingEndpoint::default();
         let third = encode(&[("grpc-message", "late")]);
         let mut data: &[u8] = &third;
-        stream.receive(&mut ep, &mut data);
+        stream.receive_slice(&mut ep, &mut data);
         assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
     }
 
@@ -2692,7 +2692,7 @@ mod request_validation_tests {
 
         let mut ep = RecordingEndpoint::default();
         let mut empty: &[u8] = &[];
-        stream.receive(&mut ep, &mut empty);
+        stream.receive_slice(&mut ep, &mut empty);
         assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
     }
 
@@ -2704,7 +2704,7 @@ mod request_validation_tests {
 
         let mut ep = RecordingEndpoint::default();
         let mut data: &[u8] = &bytes;
-        stream.receive(&mut ep, &mut data);
+        stream.receive_slice(&mut ep, &mut data);
         assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_ERROR));
     }
 }
@@ -2862,14 +2862,14 @@ mod non_incremental_slot_tests {
         let mut b_ep = RecordingEndpoint::default();
         let req = request_headers_frame();
 
-        a.receive(&mut a_ep, &mut &req[..]);
+        a.receive_slice(&mut a_ep, &mut &req[..]);
         let mut large_data = Vec::new();
         frame::write_data(&mut large_data, &large);
         assert!(a_ep.sent.ends_with(&large_data), "first response body goes straight out");
         assert!(!a_ep.closed);
         assert_eq!(peer_state.lock().unwrap().non_inc_active[3], Some(0));
 
-        b.receive(&mut b_ep, &mut &req[..]);
+        b.receive_slice(&mut b_ep, &mut &req[..]);
         let mut small_data = Vec::new();
         frame::write_data(&mut small_data, b"hi");
         assert!(!b_ep.sent.is_empty(), "second response headers go out");
@@ -2880,13 +2880,13 @@ mod non_incremental_slot_tests {
         // The first response ends from a deferred task, as a file streamed
         // off a worker would, and its stream is re-driven.
         a.writer.response_handle().execute(|w| w.complete());
-        a.receive(&mut a_ep, &mut &[][..]);
+        a.receive_slice(&mut a_ep, &mut &[][..]);
         assert!(a_ep.closed);
         assert_eq!(peer_state.lock().unwrap().non_inc_active[3], None);
         assert_eq!(b_ep.pokes(), 1, "releasing the slot wakes the waiting stream");
 
         // The poke re-runs the waiting stream's receive on the driver.
-        b.receive(&mut b_ep, &mut &[][..]);
+        b.receive_slice(&mut b_ep, &mut &[][..]);
         assert!(b_ep.sent.ends_with(&small_data), "held body is sent once the slot is free");
         assert!(b_ep.closed);
         assert_eq!(peer_state.lock().unwrap().non_inc_active[3], None);

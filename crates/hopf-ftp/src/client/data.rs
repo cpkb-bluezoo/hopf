@@ -183,7 +183,7 @@ impl FtpDataRetrHandler {
 impl ProtocolHandler for FtpDataRetrHandler {
     fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         let keep_going = self.transfer.lock().unwrap().push_content(data);
         *data = &[];
         if !keep_going {
@@ -268,7 +268,7 @@ impl ProtocolHandler for FtpDataStorHandler {
         }
     }
 
-    fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         *data = &[]; // server sends nothing on the data channel for STOR
     }
 
@@ -319,8 +319,8 @@ impl ProtocolHandler for ActiveAcceptGuard {
         self.inner.connected(endpoint);
     }
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        self.inner.receive(endpoint, data);
+    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        self.inner.receive_slice(endpoint, data);
     }
 
     fn disconnected(&mut self, endpoint: &mut dyn Endpoint) {

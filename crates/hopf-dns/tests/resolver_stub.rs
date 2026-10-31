@@ -704,7 +704,7 @@ fn literal_connect_by_name_skips_dns() {
     struct Echo;
     impl ProtocolHandler for Echo {
         fn connected(&mut self, _: &mut dyn Endpoint) {}
-        fn receive(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
             ep.send(data);
             *data = &[];
         }
@@ -721,7 +721,7 @@ fn literal_connect_by_name_skips_dns() {
         fn connected(&mut self, ep: &mut dyn Endpoint) {
             ep.send(b"hi");
         }
-        fn receive(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
             self.got.lock().unwrap().extend_from_slice(data);
             *data = &[];
             ep.close();
@@ -1201,7 +1201,7 @@ fn dot_connection_pool_reuses_a_connection_across_queries() {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {
             self.connect_count.fetch_add(1, Ordering::SeqCst);
         }
-        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             self.buf.extend_from_slice(data);
             *data = &[];
             while self.buf.len() >= 2 {
@@ -1304,7 +1304,7 @@ fn doq_connection_pool_reuses_a_connection_across_queries() {
     }
     impl ProtocolHandler for DoqStubStream {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             self.buf.extend_from_slice(data);
             *data = &[];
             while self.buf.len() >= 2 {
@@ -1471,7 +1471,7 @@ fn doh_get_and_post_round_trip_over_a_real_tls_http_stub() {
     }
     impl ProtocolHandler for DohStubHandler {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             self.buf.extend_from_slice(data);
             *data = &[];
             let Some(header_end) = self.buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4) else {
@@ -1773,7 +1773,7 @@ fn resolver_queries_a_real_doh_server_end_to_end() {
     }
     impl ProtocolHandler for DohStubHandler {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             self.buf.extend_from_slice(data);
             *data = &[];
             let Some(header_end) = self.buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4) else {

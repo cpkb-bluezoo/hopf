@@ -678,7 +678,7 @@ impl ProtocolHandler for SmtpClientEndpoint {
         self.arm_stage_timer(ep);
     }
 
-    fn receive(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
         self.sync_pending_data(ep);
         // `lexer.feed` stops after each completed reply so `dispatch_event`
         // can call `expect()` for the *next* reply's shape before any more

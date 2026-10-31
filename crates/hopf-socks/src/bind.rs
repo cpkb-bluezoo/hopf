@@ -195,7 +195,7 @@ impl ProtocolHandler for BindAcceptHandler {
         self.shared.set_outcome(BindOutcome::Accepted(endpoint.handle(), peer));
     }
 
-    fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         crate::relay::forward(&self.shared.activity, &self.shared.client, &self.metrics.bytes_downstream, data);
         *data = &[];
     }

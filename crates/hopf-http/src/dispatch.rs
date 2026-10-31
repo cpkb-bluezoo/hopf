@@ -70,15 +70,15 @@ impl ProtocolHandler for AlpnHttpEndpoint {
         if !self.pending_receive.is_empty() {
             let buf = std::mem::take(&mut self.pending_receive);
             let mut slice: &[u8] = &buf;
-            inner.receive(endpoint, &mut slice);
+            inner.receive_slice(endpoint, &mut slice);
         }
 
         self.inner = Some(inner);
     }
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         if let Some(inner) = self.inner.as_mut() {
-            inner.receive(endpoint, data);
+            inner.receive_slice(endpoint, data);
         } else {
             // Buffer until ALPN is decided (should not normally happen for
             // TLS connections, but be defensive).

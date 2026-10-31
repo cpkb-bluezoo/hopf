@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use rcgen::generate_simple_self_signed;
-use hopf_core::{
+use hopf_core::{LoopBuf, 
     acceptor_from_pem, Endpoint, ProtocolHandler, Runtime, RuntimeConfig, SecurityInfo,
     TcpListenerConfig,
 };
@@ -44,12 +44,14 @@ impl ProtocolHandler for TlsEcho {
         }
     }
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut LoopBuf) {
         if !endpoint.is_secure() {
             return;
         }
-        endpoint.send(data);
-        *data = &[];
+        let (first, second) = buf.readable_spans();
+        endpoint.send(first);
+        endpoint.send(second);
+        buf.advance(buf.len());
     }
 
     fn disconnected(&mut self, endpoint: &mut dyn Endpoint) {

@@ -1270,7 +1270,7 @@ mod tests {
 
     fn feed(client: &mut SmtpClientEndpoint, ep: &mut MockEndpoint, line: &[u8]) {
         let mut data = line;
-        client.receive(ep, &mut data);
+        client.receive_slice(ep, &mut data);
     }
 
     /// Feed `line`, retrying (to let a poked-but-not-really-poked async
@@ -1284,14 +1284,14 @@ mod tests {
         max_ms: u64,
     ) {
         let mut data = line;
-        client.receive(ep, &mut data);
+        client.receive_slice(ep, &mut data);
         for _ in 0..(max_ms / 5).max(1) {
             if ready(&ep.sent()) {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
             let mut empty: &[u8] = &[];
-            client.receive(ep, &mut empty);
+            client.receive_slice(ep, &mut empty);
         }
         assert!(ready(&ep.sent()), "condition never satisfied: {:?}", String::from_utf8_lossy(&ep.sent()));
     }

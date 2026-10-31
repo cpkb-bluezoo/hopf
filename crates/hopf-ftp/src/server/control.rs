@@ -1505,7 +1505,7 @@ impl ProtocolHandler for FtpControlHandler {
         self.send_welcome(endpoint);
     }
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         // Dispatch first so an `ABOR` in this burst can mark the bridge
         // aborted before [`sync_pending_open`] applies a RETR/STOR that
         // finished on the storage pool between commands (otherwise a
@@ -1734,7 +1734,7 @@ mod open_offload_tests {
                     None if self.poked => {
                         self.poked = false;
                         let mut empty: &[u8] = &[];
-                        handler.receive(self, &mut empty);
+                        handler.receive_slice(self, &mut empty);
                     }
                     None => break,
                 }
@@ -1825,7 +1825,7 @@ mod open_offload_tests {
 
     fn feed(h: &mut FtpControlHandler, ep: &mut MockEndpoint, line: &[u8]) {
         let mut data = line;
-        h.receive(ep, &mut data);
+        h.receive_slice(ep, &mut data);
     }
 
     fn wait_for(mut pred: impl FnMut() -> bool, max_ms: u64) -> bool {

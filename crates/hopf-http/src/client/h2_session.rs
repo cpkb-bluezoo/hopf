@@ -658,8 +658,8 @@ impl ProtocolHandler for H2HttpClientSession {
         self.maybe_notify_connected(endpoint);
     }
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        self.inner.receive(endpoint, data);
+    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        self.inner.receive_slice(endpoint, data);
         self.maybe_notify_connected(endpoint);
         self.flush_session(endpoint);
         // Inbound frames (a WINDOW_UPDATE above all) can free room in the

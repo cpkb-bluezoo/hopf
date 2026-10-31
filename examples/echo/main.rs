@@ -12,7 +12,7 @@ use std::env;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 
-use hopf_core::{
+use hopf_core::{LoopBuf, 
     Endpoint, ProtocolHandler, Runtime, RuntimeConfig, TcpListenerConfig,
 };
 
@@ -25,9 +25,11 @@ impl ProtocolHandler for Echo {
         }
     }
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        endpoint.send(data);
-        *data = &[];
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut LoopBuf) {
+        let (first, second) = buf.readable_spans();
+        endpoint.send(first);
+        endpoint.send(second);
+        buf.advance(buf.len());
     }
 
     fn disconnected(&mut self, endpoint: &mut dyn Endpoint) {

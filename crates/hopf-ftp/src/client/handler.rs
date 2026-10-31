@@ -1006,7 +1006,7 @@ impl ProtocolHandler for FtpControlHandler {
         self.arm_timer(endpoint, self.timeouts.stage);
     }
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         self.process_all_replies(endpoint, data);
     }
 

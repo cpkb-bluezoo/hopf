@@ -193,7 +193,7 @@ mod integration_tests {
             *self.ready.lock().unwrap() = true;
         }
 
-        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             if !*self.ready.lock().unwrap() {
                 return;
             }
@@ -273,7 +273,7 @@ mod integration_tests {
             endpoint.send(b"SECURE\n");
         }
 
-        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             if let Some(pos) = data.iter().position(|&b| b == b'\n') {
                 let line = &data[..=pos];
                 if line.starts_with(b"STARTTLS") {
@@ -336,7 +336,7 @@ mod integration_tests {
         fn security_established(&mut self, _endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {
             *self.established.lock().unwrap() = true;
         }
-        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             *data = &[];
         }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
@@ -346,7 +346,7 @@ mod integration_tests {
     struct NoopServer;
     impl ProtocolHandler for NoopServer {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             *data = &[];
         }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
@@ -579,7 +579,7 @@ mod integration_tests {
             fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {
                 endpoint.send(b"hopf-tls12-client");
             }
-            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
                 self.echoed.lock().unwrap().extend_from_slice(data);
                 *data = &[];
             }
@@ -718,7 +718,7 @@ mod integration_tests {
                 *self.alpn.lock().unwrap() = info.alpn().map(<[u8]>::to_vec);
                 endpoint.send(b"hopf-alpn-client");
             }
-            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
                 self.echoed.lock().unwrap().extend_from_slice(data);
                 *data = &[];
             }
@@ -1011,7 +1011,7 @@ mod integration_tests {
             fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {
                 endpoint.send(b"hopf-tls13-mtls-client");
             }
-            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
                 self.echoed.lock().unwrap().extend_from_slice(data);
                 *data = &[];
             }
@@ -1149,7 +1149,7 @@ mod integration_tests {
             fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {
                 endpoint.send(b"hopf-tls12-mtls-client");
             }
-            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
                 self.echoed.lock().unwrap().extend_from_slice(data);
                 *data = &[];
             }
@@ -1323,7 +1323,7 @@ mod integration_tests {
             fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {
                 endpoint.send(b"hopf-tls12-keys");
             }
-            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
                 self.echoed.lock().unwrap().extend_from_slice(data);
                 *data = &[];
             }
@@ -1502,7 +1502,7 @@ mod integration_tests {
             fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {
                 endpoint.send(b"hopf-tls13-chacha-client");
             }
-            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
                 self.echoed.lock().unwrap().extend_from_slice(data);
                 *data = &[];
             }
@@ -1621,7 +1621,7 @@ mod integration_tests {
             fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {
                 endpoint.send(b"hopf-tls12-chacha-client");
             }
-            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
                 self.echoed.lock().unwrap().extend_from_slice(data);
                 *data = &[];
             }
@@ -1699,7 +1699,7 @@ mod integration_tests {
                 *self.protocol.lock().unwrap() = info.protocol().map(str::to_owned);
                 endpoint.send(b"hopf-negotiate-fallback");
             }
-            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
                 self.echoed.lock().unwrap().extend_from_slice(data);
                 *data = &[];
             }

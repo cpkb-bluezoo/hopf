@@ -2494,7 +2494,7 @@ impl ProtocolHandler for H2Endpoint {
         }
     }
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         self.bind_server_stream_controls(endpoint);
         // Take the parser so frame callbacks can borrow `self` without overlapping
         // the parser buffer.
@@ -3623,7 +3623,7 @@ mod client_connection_specific_header_tests {
         ep.client_wants_close = true;
 
         let mut endpoint = RecordingEndpoint::default();
-        ep.receive(&mut endpoint, &mut &[][..]);
+        ep.receive_slice(&mut endpoint, &mut &[][..]);
 
         assert!(endpoint.closed);
     }
@@ -3638,7 +3638,7 @@ mod client_connection_specific_header_tests {
         insert_client_stream(&mut ep, 1);
 
         let mut endpoint = RecordingEndpoint::default();
-        ep.receive(&mut endpoint, &mut &[][..]);
+        ep.receive_slice(&mut endpoint, &mut &[][..]);
 
         assert!(!endpoint.closed);
     }
@@ -3651,7 +3651,7 @@ mod client_connection_specific_header_tests {
         ep.state = ConnState::Open;
 
         let mut endpoint = RecordingEndpoint::default();
-        ep.receive(&mut endpoint, &mut &[][..]);
+        ep.receive_slice(&mut endpoint, &mut &[][..]);
 
         assert!(!endpoint.closed);
     }

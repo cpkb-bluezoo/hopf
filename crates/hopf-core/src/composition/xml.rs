@@ -664,7 +664,7 @@ mod tests {
     struct Echo;
     impl ProtocolHandler for Echo {
         fn connected(&mut self, _: &mut dyn Endpoint) {}
-        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             endpoint.send(data);
             *data = &[];
         }

@@ -469,7 +469,7 @@ impl ProtocolHandler for SocksConnectionHandler {
         );
     }
 
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         match &self.phase {
             Phase::AwaitingUpstream(..) => self.poll_connect_outcome(endpoint),
             Phase::AwaitingBindPeer(..) => self.poll_bind_outcome(endpoint),
