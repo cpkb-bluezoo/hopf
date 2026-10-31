@@ -294,7 +294,7 @@ impl ScriptDriver {
         if let Some(mech) = choose_mechanism(&caps.sasl_mechs) {
             let mut client = create_client(mech, &user, &pass, "", "pop", None);
             if client.has_initial_response() {
-                if let SaslClientStep::Response(initial) = client.evaluate(None) {
+                if let SaslClientStep::Response(initial) | SaslClientStep::Complete(initial) = client.evaluate(None) {
                     st.sasl_client = Some(client);
                     drop(st);
                     auth.auth(mech.name(), Some(&initial));
@@ -321,7 +321,7 @@ impl ScriptDriver {
         if let Some(mech) = choose_mechanism(&caps.sasl_mechs) {
             let mut client = create_client(mech, &user, &pass, "", "pop", None);
             if client.has_initial_response() {
-                if let SaslClientStep::Response(initial) = client.evaluate(None) {
+                if let SaslClientStep::Response(initial) | SaslClientStep::Complete(initial) = client.evaluate(None) {
                     st.sasl_client = Some(client);
                     drop(st);
                     post_stls.auth(mech.name(), Some(&initial));

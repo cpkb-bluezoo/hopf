@@ -4,7 +4,6 @@
 
 use std::sync::Arc;
 
-use crate::crypto::{decode_base64, encode_base64};
 use crate::mechanism::SaslMechanism;
 use crate::session::{SaslClient, SaslClientStep, SaslServer, SaslServerStep};
 use crate::store::CredentialStore;
@@ -58,12 +57,12 @@ impl SaslServer for LoginServer {
         };
         cb(match self.phase {
             Phase::ExpectUsername => {
-                self.username = decode_utf8_or_b64(raw);
+                self.username = String::from_utf8_lossy(raw).into_owned();
                 self.phase = Phase::ExpectPassword;
                 SaslServerStep::Challenge(b"Password:".to_vec())
             }
             Phase::ExpectPassword => {
-                let pass = decode_utf8_or_b64(raw);
+                let pass = String::from_utf8_lossy(raw).into_owned();
                 self.phase = Phase::Done;
                 if self.store.password_match(&self.username, &pass) {
                     SaslServerStep::Complete {
@@ -77,18 +76,6 @@ impl SaslServer for LoginServer {
             Phase::Done => SaslServerStep::Failure,
         });
     }
-}
-
-fn decode_utf8_or_b64(raw: &[u8]) -> String {
-    if let Ok(s) = std::str::from_utf8(raw) {
-        if let Some(decoded) = decode_base64(s) {
-            if let Ok(u) = String::from_utf8(decoded) {
-                return u;
-            }
-        }
-        return s.to_string();
-    }
-    String::from_utf8_lossy(raw).into_owned()
 }
 
 pub(crate) struct LoginClient {
@@ -122,12 +109,12 @@ impl SaslClient for LoginClient {
         match self.step {
             0 => {
                 self.step = 1;
-                SaslClientStep::Response(encode_base64(self.username.as_bytes()).into_bytes())
+                SaslClientStep::Response(self.username.as_bytes().to_vec())
             }
             1 => {
                 self.step = 2;
                 self.complete = true;
-                SaslClientStep::Complete(encode_base64(self.password.as_bytes()).into_bytes())
+                SaslClientStep::Complete(self.password.as_bytes().to_vec())
             }
             _ => SaslClientStep::Failure,
         }
@@ -135,5 +122,47 @@ impl SaslClient for LoginClient {
 
     fn is_complete(&self) -> bool {
         self.complete
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::PasswordStore;
+
+    fn step(server: &mut LoginServer, response: Option<&[u8]>) -> SaslServerStep {
+        let (tx, rx) = std::sync::mpsc::channel();
+        server.step(response, Box::new(move |s| {
+            let _ = tx.send(s);
+        }));
+        rx.recv().unwrap()
+    }
+
+    #[test]
+    fn client_answers_with_the_raw_credentials() {
+        // The transport does the base64; the mechanism must not.
+        let mut client = LoginClient::new("alice", "s3cret");
+        match client.evaluate(Some(b"Username:")) {
+            SaslClientStep::Response(r) => assert_eq!(r, b"alice"),
+            other => panic!("{other:?}"),
+        }
+        match client.evaluate(Some(b"Password:")) {
+            SaslClientStep::Complete(r) => assert_eq!(r, b"s3cret"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_takes_a_password_that_looks_like_base64_literally() {
+        for password in ["abcd", "YWxpY2U=", "Zm9v"] {
+            let store: Arc<dyn CredentialStore> = Arc::new(PasswordStore::new().with_user("abcd", password));
+            let mut server = LoginServer::new(store);
+            assert!(matches!(step(&mut server, None), SaslServerStep::Challenge(_)));
+            assert!(matches!(step(&mut server, Some(b"abcd")), SaslServerStep::Challenge(_)));
+            match step(&mut server, Some(password.as_bytes())) {
+                SaslServerStep::Complete { username, .. } => assert_eq!(username, "abcd"),
+                other => panic!("password {password:?}: {other:?}"),
+            }
+        }
     }
 }

@@ -64,6 +64,9 @@ pub use timeout::Pop3ClientTimeouts;
 pub use unstuff::Pop3DotUnstuffer;
 
 #[cfg(test)]
+mod session_tests;
+
+#[cfg(test)]
 mod tests {
     use super::timeout::Pop3ClientTimeouts;
     use std::time::Duration;

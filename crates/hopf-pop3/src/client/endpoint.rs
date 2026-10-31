@@ -780,6 +780,7 @@ impl ProtocolHandler for Pop3ClientEndpoint {
                         }
                         None => {
                             // All input consumed by the body; wait for more bytes.
+                            *data = &[];
                             return;
                         }
                     }

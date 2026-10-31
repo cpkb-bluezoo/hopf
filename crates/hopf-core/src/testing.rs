@@ -121,6 +121,10 @@ pub struct Peer<H: ProtocolHandler> {
     /// Is the handler waiting for something it started (a storage operation,
     /// a queued command)? The peer keeps playing the reactor until it is not.
     busy: fn(&H) -> bool,
+    /// The last `receive` consumed nothing: the handler is waiting for more
+    /// bytes (a partial line it leaves in the ring), so it is not run again
+    /// until some arrive, it is poked, or a job has run.
+    stalled: bool,
 }
 
 impl<H: ProtocolHandler> Peer<H> {
@@ -134,6 +138,7 @@ impl<H: ProtocolHandler> Peer<H> {
             wire,
             input: LoopBuf::with_capacity(1 << 20),
             busy,
+            stalled: false,
         };
         peer.handler.connected(&mut peer.endpoint);
         peer.pump();
@@ -148,6 +153,7 @@ impl<H: ProtocolHandler> Peer<H> {
     /// Writes `wire` and returns what the handler answered by the time it is idle.
     pub fn run(&mut self, wire: &str) -> String {
         self.input.extend_from_slice(wire.as_bytes());
+        self.stalled = false;
         self.pump();
         self.take()
     }
@@ -156,6 +162,7 @@ impl<H: ProtocolHandler> Peer<H> {
     pub fn run_chunked(&mut self, wire: &str, chunk: usize) -> String {
         for piece in wire.as_bytes().chunks(chunk) {
             self.input.extend_from_slice(piece);
+            self.stalled = false;
             self.pump();
         }
         self.take()
@@ -165,6 +172,7 @@ impl<H: ProtocolHandler> Peer<H> {
     /// to finish: for tests that step through what it does.
     pub fn write_and_receive_once(&mut self, bytes: &[u8]) {
         self.input.extend_from_slice(bytes);
+        self.stalled = false;
         self.handler.receive(&mut self.endpoint, &mut self.input);
     }
 
@@ -192,14 +200,19 @@ impl<H: ProtocolHandler> Peer<H> {
             loop {
                 let job = self.wire.jobs.lock().unwrap().pop_front();
                 match job {
-                    Some(job) => job(&mut self.endpoint),
+                    Some(job) => {
+                        self.stalled = false;
+                        job(&mut self.endpoint)
+                    }
                     None => break,
                 }
             }
             let poked = self.wire.poked.swap(false, Ordering::Relaxed);
             let paused = self.wire.paused.load(Ordering::Relaxed);
-            if poked || (!paused && !self.input.is_empty()) {
+            if poked || (!paused && !self.stalled && !self.input.is_empty()) {
+                let before = self.input.len();
                 self.handler.receive(&mut self.endpoint, &mut self.input);
+                self.stalled = !poked && self.input.len() == before;
                 continue;
             }
             let working = (self.busy)(&self.handler) || !self.wire.jobs.lock().unwrap().is_empty();

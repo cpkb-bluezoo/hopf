@@ -102,6 +102,8 @@ impl Pop3DotUnstuffer {
                     if b == b'\r' {
                         self.state = DotState::SawDotCr;
                         i += 1;
+                        // Held back with the dot: emitted only if no `\n` follows.
+                        chunk_start = i;
                     } else if b == b'\n' {
                         // Lenient: bare LF terminates (some servers do this).
                         flush!(chunk_start);
@@ -211,5 +213,24 @@ mod tests {
         let (chunks, d2) = u.feed(b"msg2\r\n.\r\n");
         assert!(d2.is_some());
         assert_eq!(collect(chunks), b"msg2\r\n");
+    }
+
+    #[test]
+    fn a_split_terminator_leaves_no_trace_in_the_content() {
+        // Every way of cutting `A\r\n.\r\n` in two gives the same content.
+        let whole = b"A\r\n.\r\n";
+        for cut in 0..=whole.len() {
+            let mut u = Pop3DotUnstuffer::new();
+            let mut content = Vec::new();
+            let (chunks, done) = u.feed(&whole[..cut]);
+            content.extend(chunks.concat());
+            assert!(done.is_none() || cut == whole.len(), "cut {cut}");
+            if done.is_none() {
+                let (chunks, done) = u.feed(&whole[cut..]);
+                content.extend(chunks.concat());
+                assert_eq!(done, Some(whole.len() - cut), "cut {cut}");
+            }
+            assert_eq!(content, b"A\r\n", "cut {cut}");
+        }
     }
 }
