@@ -181,11 +181,15 @@ fn placeholder_ring() -> LoopBuf {
     LoopBuf::with_capacity(1)
 }
 
+/// The smallest inbound ring a connection gets: a TLS record is up to 16 KiB
+/// and the ring must hold one whole.
+const MIN_NET_IN_BYTES: usize = 32 * 1024;
+
 /// Size of the plaintext ring of a connection that has TLS.
 const APP_IN_BYTES: usize = 64 * 1024;
 
-/// Room the plaintext ring must keep free beyond the ciphertext fed next:
-/// the record the engine may be holding part of decrypts to up to 16 KiB.
+/// Room the plaintext ring must keep free before the next record is
+/// decrypted into it: a record carries at most 16 KiB of plaintext.
 const TLS_PLAINTEXT_RESERVE: usize = 16 * 1024 + 512;
 
 pub(crate) enum ReadOutcome {
@@ -273,7 +277,7 @@ impl TcpConnection {
         let local = stream
             .local_addr()
             .unwrap_or_else(|_| PeerAddr::Inet(SocketAddr::from(([0, 0, 0, 0], 0))));
-        let net_in = pool.acquire_ring(params.max_net_in);
+        let net_in = pool.acquire_ring(params.max_net_in.max(MIN_NET_IN_BYTES));
         let net_out = pool.acquire(DEFAULT_BUFFER_SIZE);
         let tls = if params.secure {
             if let Some(connector) = params.tls_connector.as_ref() {
@@ -532,30 +536,24 @@ impl TcpConnection {
         }
     }
 
-    /// Feeds the ciphertext in `net_in` to the TLS engine a chunk at a time,
-    /// as long as the plaintext ring has room for what it may decrypt to,
-    /// handing the plaintext to the handler after each.
+    /// Feeds the TLS engine the records in `net_in` one at a time, as long as
+    /// the plaintext ring has room for what one may decrypt to, handing the
+    /// plaintext to the handler after each.
     fn process_tls_inbound(&mut self) -> io::Result<()> {
         loop {
-            let room = self.app_in.spare_len();
-            if room <= TLS_PLAINTEXT_RESERVE || self.net_in.is_empty() {
+            if self.app_in.spare_len() < TLS_PLAINTEXT_RESERVE || self.net_in.is_empty() {
                 break;
             }
             let mut outcome = TlsPumpOutcome::default();
-            let (chunk, consumed) = {
+            let consumed = {
                 let tls = self.tls.as_mut().expect("process_tls_inbound called with tls active");
                 let mut adapter = TlsSinkAdapter {
                     net_out: &mut self.net_out,
                     app_in: &mut self.app_in,
                     outcome: &mut outcome,
                 };
-                let (first, _) = self.net_in.readable_spans();
-                let chunk = first.len().min(room - TLS_PLAINTEXT_RESERVE);
-                let mut slice = &first[..chunk];
-                tls.feed_ciphertext(&mut slice, &mut adapter);
-                (chunk, chunk - slice.len())
+                tls.feed_ciphertext(&mut self.net_in, &mut adapter)
             };
-            self.net_in.advance(consumed);
 
             // Chain verification: this pass doesn't wire an async StorageExecutor
             // gate, so any trust decision must already be baked into the engine's
@@ -577,7 +575,7 @@ impl TcpConnection {
             }
 
             self.apply_tls_outcome(outcome)?;
-            if !self.open || consumed < chunk || consumed == 0 {
+            if !self.open || !consumed {
                 break;
             }
         }

@@ -4,6 +4,7 @@
 //! flight (prefer 1.3), then run exactly one record engine for the rest.
 
 use bytes::Bytes;
+use loopbuf::LoopBuf;
 
 use super::engine::{
     handshake_config_tcp_record_layer, ClientAuthPolicy, HandshakeConfig, HandshakeRole,
@@ -94,7 +95,6 @@ impl ServerTlsMaterial {
 /// Server-side version negotiation before a concrete record engine is chosen.
 pub(crate) struct ServerNegotiator {
     material: ServerTlsMaterial,
-    buffer: Vec<u8>,
     alpn: Option<Vec<Bytes>>,
     require_supported_versions: bool,
     record_size_limit: Option<u16>,
@@ -109,7 +109,6 @@ impl ServerNegotiator {
         let version_policy = material.version_policy;
         Self {
             material,
-            buffer: Vec::new(),
             alpn: None,
             require_supported_versions: false,
             record_size_limit: None,
@@ -133,18 +132,21 @@ impl ServerNegotiator {
         )
     }
 
-    fn try_activate<S: TlsRecordSink + ?Sized>(&mut self, sink: &mut S) -> bool {
+    /// Looks at the first flight in the ring (without consuming it) for the
+    /// `ClientHello`, and once it has the version, makes the engine that
+    /// will read the ring from then on.
+    fn try_activate<S: TlsRecordSink + ?Sized>(&mut self, buf: &mut LoopBuf, sink: &mut S) -> Activation {
         if self.active.is_some() {
-            return true;
+            return Activation::Active;
         }
-        match find_client_hello_in_records(&self.buffer) {
+        match find_client_hello_in_records(&super::peek_front(buf, FIRST_FLIGHT_LOOK)) {
             Ok(Some((pick, _))) => {
                 if !self.version_policy.allows_server_pick(pick) {
                     sink.protocol_error(super::sink::TlsProtocolError::new(
                         super::sink::AlertDescription::ProtocolVersion,
                         "TLS version not permitted by local policy",
                     ));
-                    return true;
+                    return Activation::Failed;
                 }
                 let mut engine = self.materialize(pick);
                 if let Some(alpn) = &self.alpn {
@@ -152,19 +154,16 @@ impl ServerNegotiator {
                     engine.set_alpn(&refs);
                 }
                 engine.start(sink);
-                let mut rest = self.buffer.as_slice();
-                engine.feed_ciphertext(&mut rest, sink);
-                self.buffer.clear();
                 self.active = Some(Box::new(engine));
-                true
+                Activation::Active
             }
-            Ok(None) => false,
+            Ok(None) => Activation::NeedMore,
             Err(()) => {
                 sink.protocol_error(super::sink::TlsProtocolError::new(
                     super::sink::AlertDescription::ProtocolVersion,
                     "unsupported TLS version in ClientHello",
                 ));
-                true
+                Activation::Failed
             }
         }
     }
@@ -177,7 +176,6 @@ pub(crate) struct ClientNegotiator {
     config_v12: Tls12Config,
     version_policy: TcpTlsVersionPolicy,
     v13_probe: Option<TlsRecordEngine>,
-    buffer: Vec<u8>,
     active: Option<Box<TlsVariant>>,
 }
 
@@ -192,25 +190,25 @@ impl ClientNegotiator {
             config_v12,
             version_policy,
             v13_probe: None,
-            buffer: Vec::new(),
             active: None,
         }
     }
 
-    fn try_activate<S: TlsRecordSink + ?Sized>(&mut self, sink: &mut S) -> bool {
+    /// As [`ServerNegotiator::try_activate`], for the `ServerHello`.
+    fn try_activate<S: TlsRecordSink + ?Sized>(&mut self, buf: &mut LoopBuf, sink: &mut S) -> Activation {
         if self.active.is_some() {
-            return true;
+            return Activation::Active;
         }
-        match find_server_hello_in_records(&self.buffer) {
+        match find_server_hello_in_records(&super::peek_front(buf, FIRST_FLIGHT_LOOK)) {
             Ok(Some((pick, _))) => {
                 if !self.version_policy.allows_client_pick(pick) {
                     sink.protocol_error(super::sink::TlsProtocolError::new(
                         super::sink::AlertDescription::ProtocolVersion,
                         "TLS version not permitted by local policy",
                     ));
-                    return true;
+                    return Activation::Failed;
                 }
-                let mut engine = match pick {
+                let engine = match pick {
                     PickedTls::V13 => {
                         let probe = self.v13_probe.take().expect("client hello probe");
                         TlsVariant::V13(probe)
@@ -223,23 +221,34 @@ impl ClientNegotiator {
                         TlsVariant::V12(v12)
                     }
                 };
-                let mut rest = self.buffer.as_slice();
-                engine.feed_ciphertext(&mut rest, sink);
-                self.buffer.clear();
                 self.active = Some(Box::new(engine));
-                true
+                Activation::Active
             }
-            Ok(None) => false,
+            Ok(None) => Activation::NeedMore,
             Err(()) => {
                 sink.protocol_error(super::sink::TlsProtocolError::new(
                     super::sink::AlertDescription::ProtocolVersion,
                     "unsupported TLS version in ServerHello",
                 ));
-                true
+                Activation::Failed
             }
         }
     }
 }
+
+/// What looking at the first flight came to.
+enum Activation {
+    /// The version is not known yet: more must arrive.
+    NeedMore,
+    /// An engine is making the connection's records.
+    Active,
+    /// The version is unacceptable; the error has been reported.
+    Failed,
+}
+
+/// How much of the front of the ring is looked at for the hello: the
+/// largest record plus a header, and a little more for a second.
+const FIRST_FLIGHT_LOOK: usize = 2 * 16_645;
 
 /// Combined negotiator stored in [`TlsVariant::Negotiating`].
 ///
@@ -420,31 +429,30 @@ impl NegotiatingTls {
         }
     }
 
-    pub(crate) fn feed_ciphertext<S: TlsRecordSink + ?Sized>(&mut self, input: &mut &[u8], sink: &mut S) {
-        match self {
+    /// Consumes at most one record of the ring; see
+    /// [`TlsRecordEngine::feed_ciphertext`](super::TlsRecordEngine::feed_ciphertext).
+    /// Until the version is known the first flight is only looked at.
+    pub(crate) fn feed_ciphertext<S: TlsRecordSink + ?Sized>(&mut self, buf: &mut LoopBuf, sink: &mut S) -> bool {
+        let (active, activation) = match self {
             NegotiatingTls::Server(s) => {
-                if s.active.is_none() {
-                    s.buffer.extend_from_slice(input);
-                    *input = &[];
-                    if !s.try_activate(sink) {
-                        return;
-                    }
-                }
-                let mut engine = s.active.take().expect("negotiating server: no active engine");
-                engine.feed_ciphertext(input, sink);
-                s.active = Some(engine);
+                let a = s.try_activate(buf, sink);
+                (&mut s.active, a)
             }
             NegotiatingTls::Client(c) => {
-                if c.active.is_none() {
-                    c.buffer.extend_from_slice(input);
-                    *input = &[];
-                    if !c.try_activate(sink) {
-                        return;
-                    }
-                }
-                let mut engine = c.active.take().expect("negotiating client: no active engine");
-                engine.feed_ciphertext(input, sink);
-                c.active = Some(engine);
+                let a = c.try_activate(buf, sink);
+                (&mut c.active, a)
+            }
+        };
+        match activation {
+            Activation::NeedMore => false,
+            Activation::Failed => {
+                // Nothing valid can follow; the error has been reported.
+                buf.advance(buf.len());
+                false
+            }
+            Activation::Active => {
+                let engine = active.as_mut().expect("negotiating: no active engine");
+                engine.feed_ciphertext(buf, sink)
             }
         }
     }

@@ -8,6 +8,7 @@
 //! protection replaces it); this module is TCP/DTLS-family only.
 
 use bytes::Bytes;
+use loopbuf::LoopBuf;
 
 use crate::crypto::aead::{AeadError, Aes128GcmKey, AesGcmKey, ChaCha20Poly1305Key};
 use crate::crypto::hkdf::expand_label;
@@ -387,7 +388,6 @@ impl<S: TlsRecordSink + ?Sized> TlsEventSink for InnerSink<'_, S> {
 pub struct TlsRecordEngine {
     engine: HandshakeEngine,
     state: RecordState,
-    inbound: Vec<u8>,
     failed: bool,
 }
 
@@ -399,7 +399,6 @@ impl TlsRecordEngine {
         Self {
             engine: HandshakeEngine::new(config),
             state: RecordState::new(role),
-            inbound: Vec::new(),
             failed: false,
         }
     }
@@ -463,18 +462,19 @@ impl TlsRecordEngine {
         self.engine.record_size_limits()
     }
 
-    /// Consume raw bytes off the TCP stream — any number of complete or
-    /// partial records. Buffers a trailing partial record for the next call.
-    pub fn feed_ciphertext<S: TlsRecordSink + ?Sized>(&mut self, input: &mut &[u8], sink: &mut S) {
-        self.inbound.extend_from_slice(input);
-        *input = &[];
+    /// Consume the record at the front of the connection's inbound ring, if
+    /// all of it is there: at most one per call, so the caller can stop when
+    /// the plaintext has nowhere to go. A partial record stays in the ring.
+    /// Returns whether a record was consumed (call again to see if another
+    /// is there); once the engine has failed the ring is drained unread.
+    pub fn feed_ciphertext<S: TlsRecordSink + ?Sized>(&mut self, buf: &mut LoopBuf, sink: &mut S) -> bool {
         if self.failed {
-            self.inbound.clear();
-            return;
+            buf.advance(buf.len());
+            return false;
         }
         loop {
-            match self.take_one_record() {
-                Ok(None) => break,
+            match self.take_one_record(buf) {
+                Ok(None) => return false,
                 Ok(Some((content_type, payload))) => {
                     // RFC 8446 §5.5 / RFC 9325 §4.4: our read key has
                     // protected close to its AES-GCM confidentiality
@@ -487,20 +487,28 @@ impl TlsRecordEngine {
                         self.state.read_update_requested = true;
                         self.request_key_update(sink, true);
                     }
-                    if !self.dispatch_record(content_type, payload, sink) {
-                        break;
-                    }
+                    self.dispatch_record(content_type, payload, sink);
+                    return true;
                 }
                 Err(AlertDescription::RecordOverflow) => {
                     self.fail(sink, AlertDescription::RecordOverflow, "record exceeds the advertised record_size_limit");
-                    break;
+                    return true;
                 }
                 Err(alert) => {
                     self.fail(sink, alert, "malformed or unauthenticated TLS record");
-                    break;
+                    return true;
                 }
             }
         }
+    }
+
+    /// Feeds every record in `wire`, for a caller that holds the bytes in a
+    /// slice rather than a ring (a test, a one-shot exchange). Whatever is
+    /// left of a final partial record is dropped.
+    pub fn feed_ciphertext_all<S: TlsRecordSink + ?Sized>(&mut self, wire: &[u8], sink: &mut S) {
+        let mut ring = LoopBuf::with_capacity(wire.len().max(1));
+        ring.extend_from_slice(wire);
+        while self.feed_ciphertext(&mut ring, sink) {}
     }
 
     /// Encrypt and frame application data. Only valid once [`Self::is_complete`].
@@ -564,7 +572,6 @@ impl TlsRecordEngine {
     fn fail<S: TlsRecordSink + ?Sized>(&mut self, sink: &mut S, alert: AlertDescription, msg: &str) {
         if !self.failed {
             self.failed = true;
-            self.inbound.clear();
             send_fatal_alert(&mut self.state, alert, sink);
             sink.protocol_error(TlsProtocolError::new(alert, msg));
         }
@@ -623,25 +630,17 @@ impl TlsRecordEngine {
         }
     }
 
-    /// Pop one record off `self.inbound`, decrypting it if the current read
+    /// Pop one record off the ring, decrypting it if the current read
     /// epoch requires it. Returns the record's *inner* content type — for an
     /// encrypted record this is the last non-zero-padding byte of the
     /// decrypted plaintext, not the on-wire opaque type (RFC 8446 §5.2).
-    fn take_one_record(&mut self) -> Result<Option<(u8, Vec<u8>)>, AlertDescription> {
-        if self.inbound.len() < 5 {
-            return Ok(None);
-        }
-        let hdr_type = self.inbound[0];
-        let len = u16::from_be_bytes([self.inbound[3], self.inbound[4]]) as usize;
-        if len > MAX_CIPHERTEXT_RECORD {
-            return Err(AlertDescription::BadRecordMac);
-        }
-        if self.inbound.len() < 5 + len {
-            return Ok(None);
-        }
-        let body = self.inbound[5..5 + len].to_vec();
-        let header = [self.inbound[0], self.inbound[1], self.inbound[2], self.inbound[3], self.inbound[4]];
-        self.inbound.drain(..5 + len);
+    fn take_one_record(&mut self, buf: &mut LoopBuf) -> Result<Option<(u8, Vec<u8>)>, AlertDescription> {
+        let (header, body) = match super::take_record(buf, MAX_CIPHERTEXT_RECORD) {
+            Ok(Some(record)) => record,
+            Ok(None) => return Ok(None),
+            Err(()) => return Err(AlertDescription::BadRecordMac),
+        };
+        let hdr_type = header[0];
 
         if hdr_type == CONTENT_CHANGE_CIPHER_SPEC {
             return Ok(Some((CONTENT_CHANGE_CIPHER_SPEC, Vec::new())));
@@ -792,7 +791,7 @@ mod tests {
     fn relay(from: &mut RecordingSink, to_engine: &mut TlsRecordEngine, to_sink: &mut RecordingSink) {
         let wire = std::mem::take(&mut from.outbound);
         if !wire.is_empty() {
-            to_engine.feed_ciphertext(&mut wire.as_slice(), to_sink);
+            to_engine.feed_ciphertext_all(wire.as_slice(), to_sink);
         }
     }
 
@@ -1099,7 +1098,7 @@ mod tests {
             "an AES-256-GCM write key must rotate at the limit too"
         );
         let wire = std::mem::take(&mut sink_c.outbound);
-        server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
+        server.feed_ciphertext_all(wire.as_slice(), &mut sink_s);
         assert_eq!(sink_s.app_data, vec![b"the record that crosses the limit".to_vec()], "{:?}", sink_s.events);
     }
 
@@ -1138,7 +1137,7 @@ mod tests {
         client.send_application_data(b"pipelined-hello", &mut sink_c);
         let combined = std::mem::take(&mut sink_c.outbound);
         assert!(!combined.is_empty());
-        server.feed_ciphertext(&mut combined.as_slice(), &mut sink_s);
+        server.feed_ciphertext_all(combined.as_slice(), &mut sink_s);
 
         assert!(server.is_complete(), "server must complete the handshake: {:?}", sink_s.events);
         let hs_idx = sink_s
@@ -1165,12 +1164,12 @@ mod tests {
         client.send_application_data(b"hello from client", &mut sink_c);
         let wire = std::mem::take(&mut sink_c.outbound);
         assert!(!wire.is_empty());
-        server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
+        server.feed_ciphertext_all(wire.as_slice(), &mut sink_s);
         assert_eq!(sink_s.app_data, vec![b"hello from client".to_vec()]);
 
         server.send_application_data(b"hello back", &mut sink_s);
         let wire = std::mem::take(&mut sink_s.outbound);
-        client.feed_ciphertext(&mut wire.as_slice(), &mut sink_c);
+        client.feed_ciphertext_all(wire.as_slice(), &mut sink_c);
         assert_eq!(sink_c.app_data, vec![b"hello back".to_vec()]);
     }
 
@@ -1187,13 +1186,13 @@ mod tests {
 
         client.send_application_data(b"before update", &mut sink_c);
         let wire = std::mem::take(&mut sink_c.outbound);
-        server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
+        server.feed_ciphertext_all(wire.as_slice(), &mut sink_s);
         assert_eq!(sink_s.app_data, vec![b"before update".to_vec()]);
 
         assert!(client.request_key_update(&mut sink_c, false), "{:?}", sink_c.events);
         let wire = std::mem::take(&mut sink_c.outbound);
         assert!(!wire.is_empty(), "KeyUpdate message must be emitted");
-        server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
+        server.feed_ciphertext_all(wire.as_slice(), &mut sink_s);
         assert!(
             !sink_s.events.iter().any(|e| e.starts_with("protocol_error")),
             "server must accept a well-formed KeyUpdate: {:?}",
@@ -1204,7 +1203,7 @@ mod tests {
         sink_s.app_data.clear();
         client.send_application_data(b"after update", &mut sink_c);
         let wire = std::mem::take(&mut sink_c.outbound);
-        server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
+        server.feed_ciphertext_all(wire.as_slice(), &mut sink_s);
         assert_eq!(
             sink_s.app_data,
             vec![b"after update".to_vec()],
@@ -1222,7 +1221,7 @@ mod tests {
 
         assert!(client.request_key_update(&mut sink_c, true), "{:?}", sink_c.events);
         let wire = std::mem::take(&mut sink_c.outbound);
-        server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
+        server.feed_ciphertext_all(wire.as_slice(), &mut sink_s);
         assert!(
             !sink_s.events.iter().any(|e| e.starts_with("protocol_error")),
             "server must accept and reciprocate: {:?}",
@@ -1233,7 +1232,7 @@ mod tests {
         // the client's read key also rotates to match.
         let wire = std::mem::take(&mut sink_s.outbound);
         assert!(!wire.is_empty(), "server must send a reciprocal KeyUpdate");
-        client.feed_ciphertext(&mut wire.as_slice(), &mut sink_c);
+        client.feed_ciphertext_all(wire.as_slice(), &mut sink_c);
         assert!(
             !sink_c.events.iter().any(|e| e.starts_with("protocol_error")),
             "client must accept the reciprocal: {:?}",
@@ -1242,12 +1241,12 @@ mod tests {
 
         client.send_application_data(b"client after mutual update", &mut sink_c);
         let wire = std::mem::take(&mut sink_c.outbound);
-        server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
+        server.feed_ciphertext_all(wire.as_slice(), &mut sink_s);
         assert_eq!(sink_s.app_data, vec![b"client after mutual update".to_vec()], "{:?}", sink_s.events);
 
         server.send_application_data(b"server after mutual update", &mut sink_s);
         let wire = std::mem::take(&mut sink_s.outbound);
-        client.feed_ciphertext(&mut wire.as_slice(), &mut sink_c);
+        client.feed_ciphertext_all(wire.as_slice(), &mut sink_c);
         assert_eq!(sink_c.app_data, vec![b"server after mutual update".to_vec()], "{:?}", sink_c.events);
     }
 
@@ -1273,7 +1272,7 @@ mod tests {
             "write key must have rotated (and its sequence counter reset) once the limit was crossed"
         );
         let wire = std::mem::take(&mut sink_c.outbound);
-        server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
+        server.feed_ciphertext_all(wire.as_slice(), &mut sink_s);
         assert_eq!(
             sink_s.app_data,
             vec![b"the record that crosses the limit".to_vec()],
@@ -1307,13 +1306,13 @@ mod tests {
             b"one more under the old key",
             &mut wire,
         );
-        server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
+        server.feed_ciphertext_all(wire.as_slice(), &mut sink_s);
 
         assert_eq!(sink_s.app_data, vec![b"one more under the old key".to_vec()]);
         assert!(server.state.read_update_requested);
         let wire = std::mem::take(&mut sink_s.outbound);
         assert!(!wire.is_empty(), "server must ask the client to rotate: {:?}", sink_s.events);
-        client.feed_ciphertext(&mut wire.as_slice(), &mut sink_c);
+        client.feed_ciphertext_all(wire.as_slice(), &mut sink_c);
         assert!(
             !sink_c.events.iter().any(|e| e.starts_with("protocol_error")),
             "client must accept the rotation request: {:?}",
@@ -1337,7 +1336,7 @@ mod tests {
         let (mut sink_c, mut sink_s, mut client, mut server) = run_loopback();
         client.send_close_notify(&mut sink_c);
         let wire = std::mem::take(&mut sink_c.outbound);
-        server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
+        server.feed_ciphertext_all(wire.as_slice(), &mut sink_s);
         assert!(sink_s.events.iter().any(|e| e == "peer_closed"), "{:?}", sink_s.events);
     }
 
@@ -1348,7 +1347,7 @@ mod tests {
         let mut wire = std::mem::take(&mut sink_c.outbound);
         let last = wire.len() - 1;
         wire[last] ^= 0xff; // corrupt the AEAD tag
-        server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
+        server.feed_ciphertext_all(wire.as_slice(), &mut sink_s);
         assert!(
             sink_s.events.iter().any(|e| e.starts_with("protocol_error")),
             "{:?}",
@@ -1369,7 +1368,7 @@ mod tests {
         let mut wire = std::mem::take(&mut sink_c.outbound);
         let last = wire.len() - 1;
         wire[last] ^= 0xff; // corrupt the AEAD tag
-        server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
+        server.feed_ciphertext_all(wire.as_slice(), &mut sink_s);
 
         let alert_wire = std::mem::take(&mut sink_s.outbound);
         assert!(!alert_wire.is_empty(), "server must send a fatal alert on the wire: {:?}", sink_s.events);
@@ -1377,7 +1376,7 @@ mod tests {
         // Feed the server's alert back to the client — it must decode as
         // AlertDescription::BadRecordMac (20) without the client sending
         // anything of its own in reply (no alert ping-pong).
-        client.feed_ciphertext(&mut alert_wire.as_slice(), &mut sink_c);
+        client.feed_ciphertext_all(alert_wire.as_slice(), &mut sink_c);
         assert!(
             sink_c.events.iter().any(|e| e.contains("peer sent fatal alert 20")),
             "client must surface the peer's exact alert code: {:?}",

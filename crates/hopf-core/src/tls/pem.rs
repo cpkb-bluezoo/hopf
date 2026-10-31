@@ -830,7 +830,7 @@ mod tests {
 
     fn drain(from: &mut Wire, to: &mut TlsVariant, to_wire: &mut Wire) {
         let bytes = std::mem::take(&mut from.written);
-        to.feed_ciphertext(&mut bytes.as_slice(), to_wire);
+        to.feed_ciphertext_all(bytes.as_slice(), to_wire);
     }
 
     /// Sizes of the protected (application_data outer type) records in `wire`.

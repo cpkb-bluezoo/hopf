@@ -76,8 +76,8 @@ impl NegotiatingTls {
         self.inner_mut().set_ech_server(config)
     }
 
-    pub(crate) fn feed_ciphertext<S: TlsRecordSink + ?Sized>(&mut self, input: &mut &[u8], sink: &mut S) {
-        self.inner_mut().feed_ciphertext(input, sink);
+    pub(crate) fn feed_ciphertext<S: TlsRecordSink + ?Sized>(&mut self, buf: &mut loopbuf::LoopBuf, sink: &mut S) -> bool {
+        self.inner_mut().feed_ciphertext(buf, sink)
     }
 
     pub(crate) fn send_application_data<S: TlsRecordSink + ?Sized>(&mut self, plaintext: &[u8], sink: &mut S) {
@@ -246,13 +246,22 @@ impl TlsVariant {
         }
     }
 
-    /// Consume raw bytes off the TCP stream.
-    pub fn feed_ciphertext<S: TlsRecordSink + ?Sized>(&mut self, input: &mut &[u8], sink: &mut S) {
+    /// Consume the record at the front of the connection's inbound ring, if
+    /// all of it is there (at most one per call; true if one was consumed).
+    pub fn feed_ciphertext<S: TlsRecordSink + ?Sized>(&mut self, buf: &mut loopbuf::LoopBuf, sink: &mut S) -> bool {
         match self {
-            TlsVariant::V13(e) => e.feed_ciphertext(input, sink),
-            TlsVariant::V12(e) => e.feed_ciphertext(input, sink),
-            TlsVariant::Negotiating(n) => n.feed_ciphertext(input, sink),
+            TlsVariant::V13(e) => e.feed_ciphertext(buf, sink),
+            TlsVariant::V12(e) => e.feed_ciphertext(buf, sink),
+            TlsVariant::Negotiating(n) => n.feed_ciphertext(buf, sink),
         }
+    }
+
+    /// Feeds every record in `wire`, for a caller that holds the bytes in a
+    /// slice rather than a ring (see [`TlsRecordEngine::feed_ciphertext_all`]).
+    pub fn feed_ciphertext_all<S: TlsRecordSink + ?Sized>(&mut self, wire: &[u8], sink: &mut S) {
+        let mut ring = loopbuf::LoopBuf::with_capacity(wire.len().max(1));
+        ring.extend_from_slice(wire);
+        while self.feed_ciphertext(&mut ring, sink) {}
     }
 
     /// Encrypt and frame application data. Only valid once [`Self::is_complete`].
@@ -280,5 +289,112 @@ impl TlsVariant {
             TlsVariant::V12(e) => e.send_close_notify(sink),
             TlsVariant::Negotiating(n) => n.send_close_notify(sink),
         }
+    }
+}
+
+/// Takes the TLS record at the front of `buf` out of it: its 5-byte header
+/// and a copy of its body (to be decrypted in place). `Ok(None)` if the
+/// whole record is not there yet, and nothing is consumed; `Err` if it
+/// declares a body longer than `max_body`, which no valid record does.
+pub(crate) fn take_record(
+    buf: &mut loopbuf::LoopBuf,
+    max_body: usize,
+) -> Result<Option<([u8; 5], Vec<u8>)>, ()> {
+    if buf.len() < 5 {
+        return Ok(None);
+    }
+    let (first, second) = buf.readable_spans();
+    let mut header = [0u8; 5];
+    let n = first.len().min(5);
+    header[..n].copy_from_slice(&first[..n]);
+    header[n..].copy_from_slice(&second[..5 - n]);
+    let len = u16::from_be_bytes([header[3], header[4]]) as usize;
+    if len > max_body {
+        return Err(());
+    }
+    if buf.len() < 5 + len {
+        return Ok(None);
+    }
+    let mut body = Vec::with_capacity(len);
+    let skip = 5.min(first.len());
+    let from_first = &first[skip..];
+    let take_first = from_first.len().min(len);
+    body.extend_from_slice(&from_first[..take_first]);
+    if take_first < len {
+        let second_skip = 5 - skip;
+        body.extend_from_slice(&second[second_skip..second_skip + (len - take_first)]);
+    }
+    buf.advance(5 + len);
+    Ok(Some((header, body)))
+}
+
+/// A copy of up to `max` bytes at the front of `buf`, to be looked at as one
+/// slice without consuming them.
+pub(crate) fn peek_front(buf: &loopbuf::LoopBuf, max: usize) -> Vec<u8> {
+    let (first, second) = buf.readable_spans();
+    let mut out = Vec::with_capacity((first.len() + second.len()).min(max));
+    let n = first.len().min(max);
+    out.extend_from_slice(&first[..n]);
+    out.extend_from_slice(&second[..(max - n).min(second.len())]);
+    out
+}
+
+#[cfg(test)]
+mod ring_tests {
+    use super::*;
+    use loopbuf::LoopBuf;
+
+    fn record(body: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x17, 3, 3, (body.len() >> 8) as u8, body.len() as u8];
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[test]
+    fn take_record_waits_for_the_whole_record_and_leaves_it() {
+        let wire = record(b"hello");
+        for cut in 0..wire.len() {
+            let mut buf = LoopBuf::with_capacity(64);
+            buf.extend_from_slice(&wire[..cut]);
+            assert_eq!(take_record(&mut buf, 100), Ok(None), "cut={cut}");
+            assert_eq!(buf.len(), cut, "nothing consumed");
+        }
+    }
+
+    #[test]
+    fn take_record_reads_a_record_wherever_the_ring_wraps() {
+        let wire = record(b"0123456789");
+        for lead in 0..20 {
+            let mut buf = LoopBuf::with_capacity(32);
+            buf.extend_from_slice(&vec![0u8; lead]);
+            buf.advance(lead);
+            let mut two = wire.clone();
+            two.extend(record(b"next"));
+            assert_eq!(buf.extend_from_slice(&two), two.len());
+            let (header, body) = take_record(&mut buf, 100).unwrap().unwrap();
+            assert_eq!(&header[..], &wire[..5], "lead={lead}");
+            assert_eq!(body, b"0123456789", "lead={lead}");
+            let (_, body) = take_record(&mut buf, 100).unwrap().unwrap();
+            assert_eq!(body, b"next", "lead={lead}");
+            assert!(buf.is_empty());
+        }
+    }
+
+    #[test]
+    fn take_record_rejects_an_overlong_declared_body_from_its_header() {
+        let mut buf = LoopBuf::with_capacity(16);
+        buf.extend_from_slice(&[0x17, 3, 3, 0x41, 0x01]);
+        assert_eq!(take_record(&mut buf, 16_640), Err(()));
+    }
+
+    #[test]
+    fn peek_front_copies_without_consuming() {
+        let mut buf = LoopBuf::with_capacity(8);
+        buf.extend_from_slice(&[0u8; 6]);
+        buf.advance(6);
+        buf.extend_from_slice(b"abcdef");
+        assert_eq!(peek_front(&buf, 4), b"abcd");
+        assert_eq!(peek_front(&buf, 100), b"abcdef");
+        assert_eq!(buf.len(), 6);
     }
 }
