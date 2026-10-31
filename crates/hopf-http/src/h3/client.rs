@@ -6,7 +6,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use hopf_core::{Endpoint, ProtocolHandler};
+use hopf_core::{Endpoint, LoopBuf, ProtocolHandler};
 use hopf_quic::{
     connect_quic_hooks, DatagramDecode, QuicClientConfig, QuicConnApi, QuicConnection,
     QuicDriverHandle, StreamId, StreamKey,
@@ -463,7 +463,8 @@ impl ProtocolHandler for RejectServerInitiatedBiStream {
         endpoint.close_connection(frame::H3_STREAM_CREATION_ERROR);
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, _: &mut &[u8]) {
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut LoopBuf) {
+        buf.advance(buf.len());
         endpoint.close_connection(frame::H3_STREAM_CREATION_ERROR);
     }
 
@@ -1011,20 +1012,19 @@ impl ProtocolHandler for H3ClientStream {
         self.start_request(endpoint);
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut LoopBuf) {
         // Resume Extended CONNECT deferred until peer SETTINGS (poke from
         // the control-stream SETTINGS waiter lands here with empty data).
         if !self.started {
             self.start_request(endpoint);
         }
         if self.flush_deferred_request_writes(endpoint) {
-            *data = &[];
+            buf.advance(buf.len());
             return;
         }
         let mut parser = std::mem::take(&mut self.parser);
-        parser.push(data, self);
+        parser.receive(buf, self);
         self.parser = parser;
-        *data = &[];
         if let Some(up) = self.upgraded.as_mut() {
             let wants_close = up.wants_close();
             let out = up.take_outbound();
@@ -1642,7 +1642,9 @@ mod status_validation_tests {
 
         let mut log = FrameLog::default();
         let mut parser = H3Parser::new();
-        parser.push(&ep.sent, &mut log);
+        let mut ring = LoopBuf::with_capacity(ep.sent.len().max(1));
+        ring.extend_from_slice(&ep.sent);
+        parser.receive(&mut ring, &mut log);
 
         assert_eq!(
             log.types,

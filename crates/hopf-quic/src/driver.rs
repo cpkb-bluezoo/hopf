@@ -12,6 +12,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use hopf_core::LoopBuf;
 use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Token, Waker};
 use hopf_core::{
@@ -542,12 +543,12 @@ struct StreamSlot {
     send_finished: bool,
     /// [`ProtocolHandler::disconnected`] / `error` already delivered.
     app_notified: bool,
-    /// Bytes read from the stream but left unconsumed by the handler's
-    /// last `receive()` call (NIO compact-buffer semantics — mirrors
-    /// `TcpConnection`'s `net_in`/`app_in`). Without this, a handler
-    /// waiting on a token split across two QUIC STREAM frames loses the
-    /// first half the moment `read_stream` returns.
-    pending_in: Vec<u8>,
+    /// Inbound ring, fixed in size, made when the first bytes arrive: what
+    /// the handler's last `receive()` left unconsumed stays in it (a handler
+    /// waiting on a token split across two QUIC STREAM frames sees both
+    /// halves), and nothing is read from the transport beyond what it has
+    /// room for.
+    ring: Option<LoopBuf>,
 }
 
 struct ConnSlot {
@@ -655,24 +656,63 @@ struct PendingTimer {
     cancelled: Arc<AtomicBool>,
 }
 
-/// NIO compact-buffer delivery (mirrors `hopf_core::TcpConnection`'s
-/// `net_in`/`app_in` handling): append `new_data` to whatever was left
-/// unconsumed by the last call, hand `deliver` a cursor into the combined
-/// buffer, then retain only the unconsumed suffix in `pending` for next
-/// time — so a handler waiting on a token split across two separately
-/// delivered chunks (e.g. two QUIC STREAM frames) never loses the first
-/// half just because this call returned.
-fn deliver_with_residual(pending: &mut Vec<u8>, new_data: &[u8], deliver: impl FnOnce(&mut &[u8])) {
-    pending.extend_from_slice(new_data);
-    let mut buf = std::mem::take(pending);
-    let mut slice = buf.as_slice();
-    deliver(&mut slice);
-    let remaining = slice.len();
-    let consumed = buf.len() - remaining;
-    if consumed > 0 {
-        buf.drain(..consumed);
+/// What a stream's inbound ring holds at most. A token the handler needs
+/// whole (an HTTP/3 field section, say) must fit.
+const STREAM_RING_BYTES: usize = 64 * 1024;
+
+/// One step of reading a stream.
+enum ReadStep {
+    /// Bytes read (at most the room asked for).
+    Data(Bytes),
+    /// The peer finished the stream.
+    Fin,
+    /// Nothing more to read now, or the stream failed.
+    Nothing,
+}
+
+/// How [`pump_stream`] stopped.
+#[derive(Debug, PartialEq, Eq)]
+enum Pumped {
+    /// All the stream had was read and delivered.
+    Drained,
+    /// The peer has finished the stream, and all of it was delivered.
+    Finished,
+    /// The ring is full and the handler consumed none of it: what it waits
+    /// for cannot fit.
+    Stalled,
+}
+
+/// Reads the stream into `ring` as far as the ring has room, handing what
+/// is in it to `deliver` after each read. `read` is asked for no more than
+/// the room, so the rest stays in the transport (flow control pushes back on
+/// the peer) until the handler has consumed some.
+fn pump_stream(
+    ring: &mut LoopBuf,
+    mut read: impl FnMut(usize) -> ReadStep,
+    mut deliver: impl FnMut(&mut LoopBuf),
+) -> Pumped {
+    loop {
+        let room = ring.spare_len();
+        if room == 0 {
+            return Pumped::Stalled;
+        }
+        match read(room) {
+            ReadStep::Data(bytes) => {
+                ring.extend_from_slice(&bytes);
+                let before = ring.len();
+                deliver(ring);
+                if ring.is_full() && ring.len() == before {
+                    return Pumped::Stalled;
+                }
+                if ring.is_empty() {
+                    // Back to the start, so the same few pages are used.
+                    ring.clear();
+                }
+            }
+            ReadStep::Fin => return Pumped::Finished,
+            ReadStep::Nothing => return Pumped::Drained,
+        }
     }
-    *pending = buf;
 }
 
 /// Translate the soonest absolute deadline into a mio poll wait.
@@ -689,79 +729,116 @@ fn poll_wait(now: Instant, soonest: Option<Instant>) -> Option<Duration> {
 
 #[cfg(test)]
 mod residual_tests {
-    use super::{deliver_with_residual, poll_wait};
+    use super::{poll_wait, pump_stream, Bytes, LoopBuf, Pumped, ReadStep};
+    use std::collections::VecDeque;
     use std::time::{Duration, Instant};
+
+    /// A transport that has `chunks` to give, honouring the room asked for.
+    struct Source {
+        chunks: VecDeque<Vec<u8>>,
+        fin: bool,
+        asked: Vec<usize>,
+    }
+
+    impl Source {
+        fn new(chunks: &[&[u8]], fin: bool) -> Self {
+            Self {
+                chunks: chunks.iter().map(|c| c.to_vec()).collect(),
+                fin,
+                asked: Vec::new(),
+            }
+        }
+
+        fn read(&mut self, room: usize) -> ReadStep {
+            self.asked.push(room);
+            match self.chunks.pop_front() {
+                Some(mut chunk) => {
+                    if chunk.len() > room {
+                        let rest = chunk.split_off(room);
+                        self.chunks.push_front(rest);
+                    }
+                    ReadStep::Data(Bytes::from(chunk))
+                }
+                None if self.fin => ReadStep::Fin,
+                None => ReadStep::Nothing,
+            }
+        }
+    }
 
     /// Regression test for a bug where `read_stream` dropped whatever
     /// bytes the handler left unconsumed instead of preserving them for
     /// the next call. A handler that refuses to consume anything until it
     /// has seen a full 9-byte token, fed 3 bytes then 6 bytes across two
-    /// separate calls, must still see the complete, correctly-reassembled
-    /// token on the second call.
+    /// separate reads, must still see the complete, correctly-reassembled
+    /// token on the second.
     #[test]
-    fn preserves_unconsumed_bytes_across_calls() {
-        let mut pending = Vec::new();
+    fn preserves_unconsumed_bytes_across_reads() {
+        let mut ring = LoopBuf::with_capacity(64);
+        let mut src = Source::new(&[b"PIN", b"G-1234"], false);
         let mut seen: Option<Vec<u8>> = None;
-
-        deliver_with_residual(&mut pending, b"PIN", |data| {
-            if data.len() < 9 {
-                return; // not enough yet — consume nothing
+        let pumped = pump_stream(&mut ring, |r| src.read(r), |ring| {
+            let (a, b) = ring.readable_spans();
+            if a.len() + b.len() < 9 {
+                return; // not enough yet - consume nothing
             }
-            seen = Some(data.to_vec());
-            *data = &[];
+            seen = Some([a, b].concat());
+            ring.advance(ring.len());
         });
-        assert_eq!(pending, b"PIN", "unconsumed bytes must be preserved, not dropped");
-        assert!(seen.is_none());
-
-        deliver_with_residual(&mut pending, b"G-1234", |data| {
-            if data.len() < 9 {
-                return;
-            }
-            seen = Some(data.to_vec());
-            *data = &[];
-        });
+        assert_eq!(pumped, Pumped::Drained);
         assert_eq!(seen.as_deref(), Some(&b"PING-1234"[..]));
-        assert!(pending.is_empty(), "fully-consumed bytes must not linger");
+        assert!(ring.is_empty(), "fully-consumed bytes must not linger");
     }
 
     #[test]
     fn partial_consumption_retains_only_the_unconsumed_suffix() {
-        let mut pending = Vec::new();
+        let mut ring = LoopBuf::with_capacity(64);
+        let mut src = Source::new(&[b"ABCDEFG", b"HI"], false);
         let mut got = Vec::new();
-
         // Handler consumes one 3-byte record at a time, leaving any
-        // trailing partial record for next call.
-        deliver_with_residual(&mut pending, b"ABCDEFG", |data| {
-            while data.len() >= 3 {
-                got.push(data[..3].to_vec());
-                *data = &data[3..];
-            }
-        });
-        assert_eq!(got, vec![b"ABC".to_vec(), b"DEF".to_vec()]);
-        assert_eq!(pending, b"G");
-
-        deliver_with_residual(&mut pending, b"HI", |data| {
-            while data.len() >= 3 {
-                got.push(data[..3].to_vec());
-                *data = &data[3..];
+        // trailing partial record for next time.
+        pump_stream(&mut ring, |r| src.read(r), |ring| {
+            while ring.len() >= 3 {
+                let (a, b) = ring.readable_spans();
+                got.push([a, b].concat()[..3].to_vec());
+                ring.advance(3);
             }
         });
         assert_eq!(got, vec![b"ABC".to_vec(), b"DEF".to_vec(), b"GHI".to_vec()]);
-        assert!(pending.is_empty());
+        assert!(ring.is_empty());
     }
 
     #[test]
-    fn fully_consumed_each_call_never_accumulates() {
-        let mut pending = Vec::new();
+    fn reads_no_more_than_the_ring_has_room_for() {
+        // A handler that takes nothing until it has 8 bytes: the transport
+        // is asked for at most the 8 the ring holds, and keeps the rest.
+        let mut ring = LoopBuf::with_capacity(8);
+        let mut src = Source::new(&[b"0123456789abcdef"], false);
+        let pumped = pump_stream(&mut ring, |r| src.read(r), |_| {});
+        assert_eq!(pumped, Pumped::Stalled);
+        assert_eq!(src.asked, vec![8]);
+        assert_eq!(src.chunks.front().map(Vec::len), Some(8), "the rest stays in the transport");
+    }
+
+    #[test]
+    fn a_token_longer_than_the_ring_stalls_instead_of_hanging_or_dropping() {
+        let mut ring = LoopBuf::with_capacity(4);
+        let mut src = Source::new(&[b"ab", b"cd", b"ef"], false);
+        let pumped = pump_stream(&mut ring, |r| src.read(r), |_| {});
+        assert_eq!(pumped, Pumped::Stalled);
+        assert_eq!(ring.readable_spans().0, b"abcd");
+    }
+
+    #[test]
+    fn peer_fin_is_reported_once_everything_is_delivered() {
+        let mut ring = LoopBuf::with_capacity(16);
+        let mut src = Source::new(&[b"bye"], true);
         let mut total = Vec::new();
-        for chunk in [&b"foo"[..], b"bar", b"baz"] {
-            deliver_with_residual(&mut pending, chunk, |data| {
-                total.extend_from_slice(data);
-                *data = &[];
-            });
-        }
-        assert_eq!(total, b"foobarbaz");
-        assert!(pending.is_empty());
+        let pumped = pump_stream(&mut ring, |r| src.read(r), |ring| {
+            total.extend_from_slice(ring.readable_spans().0);
+            ring.advance(ring.len());
+        });
+        assert_eq!(pumped, Pumped::Finished);
+        assert_eq!(total, b"bye");
     }
 
     /// Issue #249: without a deadline the driver must not invent a 10ms
@@ -1520,7 +1597,7 @@ impl Driver {
                             recv_finished: false,
                             send_finished: false,
                             app_notified: false,
-                            pending_in: Vec::new(),
+                            ring: None,
                         },
                     );
                     slot.local_keys.insert(key, id);
@@ -1791,7 +1868,7 @@ impl Driver {
                     recv_finished: false,
                     send_finished: false,
                     app_notified: false,
-                    pending_in: Vec::new(),
+                    ring: None,
                 },
             );
         }
@@ -1836,14 +1913,14 @@ impl Driver {
                     recv_finished: false,
                     send_finished: false,
                     app_notified: false,
-                    pending_in: Vec::new(),
+                    ring: None,
                 },
             );
         }
     }
 
     fn read_stream(&mut self, ch: ConnectionHandle, id: StreamId) {
-        let (new_data, peer_finished) = {
+        let peer_finished = {
             let Some(slot) = self.connections.get_mut(&ch) else {
                 return;
             };
@@ -1861,35 +1938,34 @@ impl Driver {
                 Ok(c) => c,
                 Err(_) => return,
             };
-            let mut new_data = Vec::new();
-            let mut peer_finished = false;
-            loop {
-                match chunks.next(usize::MAX) {
-                    Ok(Some(chunk)) => {
-                        new_data.extend_from_slice(&chunk.bytes);
-                    }
-                    Ok(None) => {
-                        // Peer FIN (or reset path already freed recv).
-                        peer_finished = true;
-                        break;
-                    }
-                    Err(_) => break,
-                }
-            }
+            let Some(stream) = slot.streams.get_mut(&id) else {
+                return;
+            };
+            let ring = stream
+                .ring
+                .get_or_insert_with(|| LoopBuf::with_capacity(STREAM_RING_BYTES));
+            let handler = &mut stream.handler;
+            let endpoint = &mut stream.endpoint;
+            let pumped = pump_stream(
+                ring,
+                |room| match chunks.next(room) {
+                    Ok(Some(chunk)) => ReadStep::Data(chunk.bytes),
+                    // Peer FIN (or reset path already freed recv).
+                    Ok(None) => ReadStep::Fin,
+                    Err(_) => ReadStep::Nothing,
+                },
+                |ring| handler.receive(endpoint, ring),
+            );
             let _ = chunks.finalize();
-
-            if !new_data.is_empty() {
-                if let Some(stream) = slot.streams.get_mut(&id) {
-                    let handler = &mut stream.handler;
-                    let endpoint = &mut stream.endpoint;
-                    deliver_with_residual(&mut stream.pending_in, &new_data, |slice| {
-                        hopf_core::forward_slice(&mut **handler, endpoint, slice);
-                    });
-                }
+            if pumped == Pumped::Stalled && !endpoint.is_read_paused() && !stream.app_notified {
+                // Full, and the handler cannot use any of it: whatever it is
+                // waiting for does not fit a stream's ring.
+                stream.app_notified = true;
+                let err = io::Error::new(io::ErrorKind::OutOfMemory, "stream receive buffer full");
+                handler.error(endpoint, &err);
             }
-            (new_data, peer_finished)
+            pumped == Pumped::Finished
         };
-        let _ = new_data;
 
         if peer_finished {
             // Peer FIN: deliver half-close to the app (so H3 can flush a

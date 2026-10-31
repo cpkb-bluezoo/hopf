@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use hopf_core::{ConnHandle, Endpoint, ProtocolHandler};
+use hopf_core::{ConnHandle, Endpoint, LoopBuf, ProtocolHandler};
 use hopf_quic::{
     listen_quic_hooks, DatagramDecode, QuicConnApi, QuicConnection, QuicDriverHandle,
     QuicListenHooksConfig, QuicServerConfig, StreamId, StreamKey,
@@ -834,12 +834,11 @@ impl ProtocolHandler for H3RequestStream {
         self.bind_execute_conn();
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut LoopBuf) {
         self.bind_execute_conn();
         let mut parser = std::mem::take(&mut self.parser);
-        parser.push(data, self);
+        parser.receive(buf, self);
         self.parser = parser;
-        *data = &[];
         if self.qpack_error {
             // RFC 9204 §4.5.1: a field section this decoder can't process
             // desynchronizes the whole connection's QPACK state, not just
@@ -1048,7 +1047,6 @@ pub(crate) struct H3UniStream {
     /// Buffered bytes while the type-byte varint is still incomplete —
     /// values above the standard single-byte types (e.g. GREASE, RFC 9114
     /// §7.2.8) legitimately span multiple bytes.
-    pending_type: Vec<u8>,
     /// Buffered bytes for a QPACK critical stream while the latest
     /// instruction is still incomplete.
     qpack_buf: Vec<u8>,
@@ -1072,7 +1070,6 @@ impl H3UniStream {
             qpack,
             is_client,
             kind: UniKind::Unclassified,
-            pending_type: Vec::new(),
             qpack_buf: Vec::new(),
             connection_error: None,
             settings_received: false,
@@ -1366,60 +1363,81 @@ impl H3FrameHandler for H3UniStream {
     }
 }
 
+impl H3UniStream {
+    /// Feeds the QPACK encoder (`encoder` true) or decoder stream the
+    /// instructions in `buf`, returning how many bytes of it were used.
+    fn feed_qpack(&mut self, buf: &LoopBuf, encoder: bool) -> usize {
+        let (first, second) = buf.readable_spans();
+        self.qpack_buf.clear();
+        self.qpack_buf.extend_from_slice(first);
+        self.qpack_buf.extend_from_slice(second);
+        let total = self.qpack_buf.len();
+        let result = if encoder {
+            self.qpack.feed_encoder_stream(&mut self.qpack_buf)
+        } else {
+            self.qpack.feed_decoder_stream(&mut self.qpack_buf)
+        };
+        if result.is_err() {
+            self.connection_error.get_or_insert(if encoder {
+                frame::QPACK_ENCODER_STREAM_ERROR
+            } else {
+                frame::QPACK_DECODER_STREAM_ERROR
+            });
+        }
+        let used = total - self.qpack_buf.len();
+        self.qpack_buf.clear();
+        used
+    }
+}
+
 impl ProtocolHandler for H3UniStream {
     fn connected(&mut self, _: &mut dyn Endpoint) {}
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut LoopBuf) {
         if matches!(self.kind, UniKind::Unclassified) {
-            self.pending_type.extend_from_slice(data);
-            *data = &[];
-            let Some((ty, ty_len)) = super::varint::decode(&self.pending_type) else {
+            // The stream type is a varint of up to 8 bytes; until all of it
+            // has arrived it stays in the ring.
+            let mut head = [0u8; 8];
+            let have = buf.len().min(head.len());
+            super::parser::copy_front(buf, &mut head[..have]);
+            let Some((ty, ty_len)) = super::varint::decode(&head[..have]) else {
                 return; // need more bytes
             };
-            let remainder = self.pending_type.split_off(ty_len);
-            self.pending_type.clear();
+            buf.advance(ty_len);
 
             if let Some(code) = self.classify(ty) {
                 // Duplicate critical stream, unsolicited push stream, etc.
                 endpoint.close_connection(code);
                 return;
             }
-
-            if !remainder.is_empty() {
-                let mut rem: &[u8] = &remainder;
-                self.receive_slice(endpoint, &mut rem);
-            }
-            return;
+            // What follows the type is read as the kind the type chose.
         }
 
         match &self.kind {
             UniKind::Control(_) => {
-                // Detach the parser first — it needs `&mut self` as its
+                // Detach the parser first - it needs `&mut self` as its
                 // `H3FrameHandler` sink, which would otherwise overlap
                 // with the `&mut self.kind` borrow holding it.
                 let UniKind::Control(mut parser) = std::mem::replace(&mut self.kind, UniKind::Discard)
                 else {
                     unreachable!()
                 };
-                parser.push(data, self);
+                parser.receive(buf, self);
                 self.kind = UniKind::Control(parser);
             }
             UniKind::QpackEncoderStream => {
-                self.qpack_buf.extend_from_slice(data);
-                if self.qpack.feed_encoder_stream(&mut self.qpack_buf).is_err() {
-                    self.connection_error.get_or_insert(frame::QPACK_ENCODER_STREAM_ERROR);
-                }
+                // The QPACK instruction parsers work on a `Vec` and leave
+                // an instruction that is not all there; what they leave
+                // stays in the ring.
+                let consumed = self.feed_qpack(buf, true);
+                buf.advance(consumed);
             }
             UniKind::QpackDecoderStream => {
-                self.qpack_buf.extend_from_slice(data);
-                if self.qpack.feed_decoder_stream(&mut self.qpack_buf).is_err() {
-                    self.connection_error
-                        .get_or_insert(frame::QPACK_DECODER_STREAM_ERROR);
-                }
+                let consumed = self.feed_qpack(buf, false);
+                buf.advance(consumed);
             }
-            _ => {}
+            _ => buf.advance(buf.len()),
         }
-        *data = &[];
 
         if let Some(code) = self.connection_error.take() {
             endpoint.close_connection(code);
@@ -1579,14 +1597,16 @@ mod uni_stream_tests {
         let mut settings_bytes = Vec::new();
         frame::write_settings(&mut settings_bytes, qpack::MAX_TABLE_CAPACITY as u64, 0, frame::DEFAULT_MAX_FIELD_SECTION_SIZE);
 
-        let mut type_byte: &[u8] = &[0x00];
-        uni.receive_slice(&mut ep, &mut type_byte);
+        let mut ring = LoopBuf::with_capacity(64);
+        ring.extend_from_slice(&[0x00]);
+        uni.receive(&mut ep, &mut ring);
         assert!(state.lock().unwrap().control_seen, "type byte alone must classify the stream");
 
         for byte in &settings_bytes {
-            let mut one: &[u8] = std::slice::from_ref(byte);
-            uni.receive_slice(&mut ep, &mut one);
+            ring.extend_from_slice(std::slice::from_ref(byte));
+            uni.receive(&mut ep, &mut ring);
         }
+        assert!(ring.is_empty());
 
         assert_eq!(state.lock().unwrap().peer_enable_connect_protocol, Some(true));
     }
