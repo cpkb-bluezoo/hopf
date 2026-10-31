@@ -1304,32 +1304,34 @@ impl ProtocolHandler for Pop3ControlHandler {
         }
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        self.sync_pending_open();
-        self.sync_pending_auth_check(endpoint);
-        self.take_txn_slot();
-        self.drain_queue(endpoint);
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            self.sync_pending_open();
+            self.sync_pending_auth_check(endpoint);
+            self.take_txn_slot();
+            self.drain_queue(endpoint);
 
-        if self.busy.load(Ordering::Relaxed) {
-            // Reads are paused during storage offloads; drop any residual.
-            *data = &[];
-            return;
-        }
+            if self.busy.load(Ordering::Relaxed) {
+                // Reads are paused during storage offloads; drop any residual.
+                *data = &[];
+                return;
+            }
 
-        let cmds = self.lexer.feed(data);
-        if self.lexer.took_line_too_long() {
-            self.send(endpoint, reply::err("Line too long"));
-        }
-        for cmd in cmds {
-            // While busy, queue instead of dropping — a command already
-            // lexed out of this same buffer (e.g. pipelined right behind
-            // PASS/APOP/AUTH) must not be lost just because a prior command
-            // in this same batch started a storage offload.
-            self.enqueue_or_dispatch(endpoint, cmd);
-        }
-        self.sync_pending_open();
-        self.sync_pending_auth_check(endpoint);
-        self.drain_queue(endpoint);
+            let cmds = self.lexer.feed(data);
+            if self.lexer.took_line_too_long() {
+                self.send(endpoint, reply::err("Line too long"));
+            }
+            for cmd in cmds {
+                // While busy, queue instead of dropping — a command already
+                // lexed out of this same buffer (e.g. pipelined right behind
+                // PASS/APOP/AUTH) must not be lost just because a prior command
+                // in this same batch started a storage offload.
+                self.enqueue_or_dispatch(endpoint, cmd);
+            }
+            self.sync_pending_open();
+            self.sync_pending_auth_check(endpoint);
+            self.drain_queue(endpoint);
+        });
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {

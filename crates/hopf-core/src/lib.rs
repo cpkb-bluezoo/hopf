@@ -134,10 +134,12 @@ mod tests {
     impl ProtocolHandler for EchoHandler {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
-        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            endpoint.send(data);
-            *data = &[];
-        }
+        fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut crate::LoopBuf) {
+        crate::with_slice(buf, |data| {
+                endpoint.send(data);
+                *data = &[];
+        });
+    }
 
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
@@ -155,10 +157,12 @@ mod tests {
             endpoint.send(self.payload);
         }
 
-        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            self.got.lock().unwrap().extend_from_slice(data);
-            *data = &[];
-        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut crate::LoopBuf) {
+        crate::with_slice(buf, |data| {
+                self.got.lock().unwrap().extend_from_slice(data);
+                *data = &[];
+        });
+    }
 
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
@@ -174,11 +178,13 @@ mod tests {
     impl ProtocolHandler for RemoteAddrOnReceive {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
-        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            *data = &[];
-            let addr = endpoint.remote_addr().unwrap().to_string();
-            endpoint.send(addr.as_bytes());
-        }
+        fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut crate::LoopBuf) {
+        crate::with_slice(buf, |data| {
+                *data = &[];
+                let addr = endpoint.remote_addr().unwrap().to_string();
+                endpoint.send(addr.as_bytes());
+        });
+    }
 
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
@@ -200,13 +206,15 @@ mod tests {
     impl ProtocolHandler for LineEcho {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
-        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            while let Some(pos) = data.iter().position(|&b| b == b'\n') {
-                let line = &data[..=pos];
-                endpoint.send(line);
-                *data = &data[pos + 1..];
-            }
-        }
+        fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut crate::LoopBuf) {
+        crate::with_slice(buf, |data| {
+                while let Some(pos) = data.iter().position(|&b| b == b'\n') {
+                    let line = &data[..=pos];
+                    endpoint.send(line);
+                    *data = &data[pos + 1..];
+                }
+        });
+    }
 
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
@@ -220,14 +228,16 @@ mod tests {
     impl ProtocolHandler for PanicOnce {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
-        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            *data = &[];
-            let mut g = self.done.lock().unwrap();
-            if !*g {
-                *g = true;
-                panic!("intentional handler panic");
-            }
-        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut crate::LoopBuf) {
+        crate::with_slice(buf, |data| {
+                *data = &[];
+                let mut g = self.done.lock().unwrap();
+                if !*g {
+                    *g = true;
+                    panic!("intentional handler panic");
+                }
+        });
+    }
 
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
@@ -245,25 +255,27 @@ mod tests {
     impl ProtocolHandler for FileOffload {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
-        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            *data = &[];
-            let path = self.path.clone();
-            let work_thread = Arc::clone(&self.work_thread);
-            let callback_is_reactor = Arc::clone(&self.callback_is_reactor);
-            let handle = endpoint.handle();
-            self.storage.submit(endpoint, move || {
-                let name = std::thread::current().name().unwrap_or("").to_string();
-                *work_thread.lock().unwrap() = Some(name);
-                std::fs::read(&path).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-            }, move |result| {
-                let name = std::thread::current().name().unwrap_or("").to_string();
-                callback_is_reactor.store(name.starts_with("hopf-reactor-"), Ordering::SeqCst);
-                match result {
-                    Ok(bytes) => handle.send(bytes),
-                    Err(_) => handle.close(),
-                }
-            });
-        }
+        fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut crate::LoopBuf) {
+        crate::with_slice(buf, |data| {
+                *data = &[];
+                let path = self.path.clone();
+                let work_thread = Arc::clone(&self.work_thread);
+                let callback_is_reactor = Arc::clone(&self.callback_is_reactor);
+                let handle = endpoint.handle();
+                self.storage.submit(endpoint, move || {
+                    let name = std::thread::current().name().unwrap_or("").to_string();
+                    *work_thread.lock().unwrap() = Some(name);
+                    std::fs::read(&path).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+                }, move |result| {
+                    let name = std::thread::current().name().unwrap_or("").to_string();
+                    callback_is_reactor.store(name.starts_with("hopf-reactor-"), Ordering::SeqCst);
+                    match result {
+                        Ok(bytes) => handle.send(bytes),
+                        Err(_) => handle.close(),
+                    }
+                });
+        });
+    }
 
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
@@ -281,26 +293,28 @@ mod tests {
     impl ProtocolHandler for StreamOffload {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
-        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            *data = &[];
-            let callback_fired = Arc::clone(&self.callback_fired);
-            let handle_for_close = endpoint.handle();
-            self.storage.submit_streamed(
-                endpoint.handle(),
-                move |handle| {
-                    for chunk in [&b"one-"[..], &b"two-"[..], &b"three"[..]] {
-                        handle.send(chunk.to_vec());
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-                },
-                move |result| {
-                    assert!(result.is_ok());
-                    callback_fired.store(true, Ordering::SeqCst);
-                    handle_for_close.close();
-                },
-            );
-        }
+        fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut crate::LoopBuf) {
+        crate::with_slice(buf, |data| {
+                *data = &[];
+                let callback_fired = Arc::clone(&self.callback_fired);
+                let handle_for_close = endpoint.handle();
+                self.storage.submit_streamed(
+                    endpoint.handle(),
+                    move |handle| {
+                        for chunk in [&b"one-"[..], &b"two-"[..], &b"three"[..]] {
+                            handle.send(chunk.to_vec());
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+                    },
+                    move |result| {
+                        assert!(result.is_ok());
+                        callback_fired.store(true, Ordering::SeqCst);
+                        handle_for_close.close();
+                    },
+                );
+        });
+    }
 
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
@@ -758,9 +772,11 @@ mod tests {
             }
         }
 
-        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            *data = &[];
-        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut crate::LoopBuf) {
+        crate::with_slice(buf, |data| {
+                *data = &[];
+        });
+    }
 
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
@@ -927,11 +943,13 @@ mod tests {
                 self.sent = true;
             }
 
-            fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-                self.got.lock().unwrap().extend_from_slice(data);
-                *data = &[];
-                endpoint.close();
-            }
+            fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut crate::LoopBuf) {
+        crate::with_slice(buf, |data| {
+                    self.got.lock().unwrap().extend_from_slice(data);
+                    *data = &[];
+                    endpoint.close();
+        });
+    }
 
             fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
@@ -1038,10 +1056,12 @@ mod tests {
                 self.count.fetch_add(1, Ordering::SeqCst);
             }
 
-            fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-                endpoint.send(data);
-                *data = &[];
-            }
+            fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut crate::LoopBuf) {
+        crate::with_slice(buf, |data| {
+                    endpoint.send(data);
+                    *data = &[];
+        });
+    }
 
             fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
@@ -1061,10 +1081,12 @@ mod tests {
                 *self.handle_slot.lock().unwrap() = Some(endpoint.handle());
             }
 
-            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-                self.got.lock().unwrap().extend_from_slice(data);
-                *data = &[];
-            }
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut crate::LoopBuf) {
+        crate::with_slice(buf, |data| {
+                    self.got.lock().unwrap().extend_from_slice(data);
+                    *data = &[];
+        });
+    }
 
             fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
@@ -1181,10 +1203,12 @@ mod tests {
                 *self.established.lock().unwrap() = true;
                 endpoint.send(b"ping-through-real-tls-socket");
             }
-            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-                self.echoed.lock().unwrap().extend_from_slice(data);
-                *data = &[];
-            }
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut crate::LoopBuf) {
+        crate::with_slice(buf, |data| {
+                    self.echoed.lock().unwrap().extend_from_slice(data);
+                    *data = &[];
+        });
+    }
             fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
             fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
         }
@@ -1283,12 +1307,14 @@ mod tests {
             fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {
                 endpoint.send(b"ping");
             }
-            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-                if !data.is_empty() {
-                    self.0.lock().unwrap().echoed = true;
-                }
-                *data = &[];
-            }
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut crate::LoopBuf) {
+        crate::with_slice(buf, |data| {
+                    if !data.is_empty() {
+                        self.0.lock().unwrap().echoed = true;
+                    }
+                    *data = &[];
+        });
+    }
             fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
                 self.0.lock().unwrap().gone = true;
             }

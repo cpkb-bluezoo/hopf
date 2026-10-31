@@ -501,16 +501,18 @@ impl ProtocolHandler for LdapEndpoint {
         self.deliver_ready();
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        // Standard push-parser shape (see `hopf_core::asn1::BerDecoder::push`
-        // / `hopf_http::h2::H2Parser::push`): take the decoder out so the
-        // sink adapter can hold both `&mut self` (minus its own `decoder`
-        // field) and `&mut dyn Endpoint` at once, push, then restore it.
-        let mut decoder = std::mem::take(&mut self.decoder);
-        let mut sink = MessageSink { inner: self, endpoint, failed: false };
-        decoder.push(data, &mut sink);
-        *data = &[];
-        self.decoder = decoder;
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            // Standard push-parser shape (see `hopf_core::asn1::BerDecoder::push`
+            // / `hopf_http::h2::H2Parser::push`): take the decoder out so the
+            // sink adapter can hold both `&mut self` (minus its own `decoder`
+            // field) and `&mut dyn Endpoint` at once, push, then restore it.
+            let mut decoder = std::mem::take(&mut self.decoder);
+            let mut sink = MessageSink { inner: self, endpoint, failed: false };
+            decoder.push(data, &mut sink);
+            *data = &[];
+            self.decoder = decoder;
+        });
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
@@ -647,7 +649,7 @@ mod tests {
 
         let mut wire = bind_response_wire(1, 0); // success
         wire.extend(bind_response_wire(2, 49)); // invalidCredentials
-        ep.receive_slice(&mut fake, &mut wire.as_slice());
+        hopf_core::forward_slice(&mut ep, &mut fake, &mut wire.as_slice());
 
         let got1 = result1.lock().unwrap().take().expect("message 1 dispatched");
         let bind1 = got1.expect("message 1 decoded without error");
@@ -676,7 +678,7 @@ mod tests {
         ep.connected(&mut fake);
 
         let wire: Vec<u8> = vec![0x30, 0x80, 0x02, 0x01, 0x01, 0x00, 0x00]; // indefinite length
-        ep.receive_slice(&mut fake, &mut wire.as_slice());
+        hopf_core::forward_slice(&mut ep, &mut fake, &mut wire.as_slice());
 
         assert!(fake.closed);
     }

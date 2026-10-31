@@ -37,19 +37,21 @@ struct FixedHttpServer {
 impl ProtocolHandler for FixedHttpServer {
     fn connected(&mut self, _: &mut dyn Endpoint) {}
 
-    fn receive_slice(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
-        self.buf.extend_from_slice(data);
-        *data = &[];
-        if self.buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            let body = b"hello-http-client";
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            ep.send(resp.as_bytes());
-            ep.send(body);
-            ep.close();
-        }
+    fn receive(&mut self, ep: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            self.buf.extend_from_slice(data);
+            *data = &[];
+            if self.buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let body = b"hello-http-client";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                ep.send(resp.as_bytes());
+                ep.send(body);
+                ep.close();
+            }
+        });
     }
 
     fn disconnected(&mut self, _: &mut dyn Endpoint) {}
@@ -1033,20 +1035,22 @@ struct AltSvcAnnouncingServer {
 }
 impl ProtocolHandler for AltSvcAnnouncingServer {
     fn connected(&mut self, _: &mut dyn Endpoint) {}
-    fn receive_slice(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
-        self.buf.extend_from_slice(data);
-        *data = &[];
-        if self.buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            let body = b"hello-tcp-before-alt-svc-upgrade";
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nAlt-Svc: h3=\":{}\"\r\nConnection: close\r\n\r\n",
-                body.len(),
-                self.h3_port
-            );
-            ep.send(resp.as_bytes());
-            ep.send(body);
-            ep.close();
-        }
+    fn receive(&mut self, ep: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            self.buf.extend_from_slice(data);
+            *data = &[];
+            if self.buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let body = b"hello-tcp-before-alt-svc-upgrade";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nAlt-Svc: h3=\":{}\"\r\nConnection: close\r\n\r\n",
+                    body.len(),
+                    self.h3_port
+                );
+                ep.send(resp.as_bytes());
+                ep.send(body);
+                ep.close();
+            }
+        });
     }
     fn disconnected(&mut self, _: &mut dyn Endpoint) {}
     fn error(&mut self, _: &mut dyn Endpoint, _: &io::Error) {}
@@ -1641,25 +1645,27 @@ struct RedirectingHttpServer {
 impl ProtocolHandler for RedirectingHttpServer {
     fn connected(&mut self, _: &mut dyn Endpoint) {}
 
-    fn receive_slice(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
-        self.buf.extend_from_slice(data);
-        *data = &[];
-        if self.buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            let reason = match self.status {
-                301 => "Moved Permanently",
-                302 => "Found",
-                303 => "See Other",
-                307 => "Temporary Redirect",
-                308 => "Permanent Redirect",
-                _ => "Redirect",
-            };
-            let resp = format!(
-                "HTTP/1.1 {} {reason}\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                self.status, self.location
-            );
-            ep.send(resp.as_bytes());
-            ep.close();
-        }
+    fn receive(&mut self, ep: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            self.buf.extend_from_slice(data);
+            *data = &[];
+            if self.buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let reason = match self.status {
+                    301 => "Moved Permanently",
+                    302 => "Found",
+                    303 => "See Other",
+                    307 => "Temporary Redirect",
+                    308 => "Permanent Redirect",
+                    _ => "Redirect",
+                };
+                let resp = format!(
+                    "HTTP/1.1 {} {reason}\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    self.status, self.location
+                );
+                ep.send(resp.as_bytes());
+                ep.close();
+            }
+        });
     }
 
     fn disconnected(&mut self, _: &mut dyn Endpoint) {}
@@ -1707,21 +1713,23 @@ struct RawCapturingServer {
 impl ProtocolHandler for RawCapturingServer {
     fn connected(&mut self, _: &mut dyn Endpoint) {}
 
-    fn receive_slice(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
-        self.buf.extend_from_slice(data);
-        *data = &[];
-        if let Some(pos) = self.buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            let head = String::from_utf8_lossy(&self.buf[..pos]).to_string();
-            *self.captured.lock().unwrap() = Some(head);
-            let body = b"final-ok";
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            ep.send(resp.as_bytes());
-            ep.send(body);
-            ep.close();
-        }
+    fn receive(&mut self, ep: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            self.buf.extend_from_slice(data);
+            *data = &[];
+            if let Some(pos) = self.buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&self.buf[..pos]).to_string();
+                *self.captured.lock().unwrap() = Some(head);
+                let body = b"final-ok";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                ep.send(resp.as_bytes());
+                ep.send(body);
+                ep.close();
+            }
+        });
     }
 
     fn disconnected(&mut self, _: &mut dyn Endpoint) {}

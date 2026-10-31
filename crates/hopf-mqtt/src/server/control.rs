@@ -1425,14 +1425,14 @@ mod publish_finish_tests {
         h.connected(&mut ep);
 
         let mut data = connect_bytes("pub1").into_boxed_slice();
-        h.receive_slice(&mut ep, &mut &*data);
+        hopf_core::forward_slice(&mut h, &mut ep, &mut &*data);
         // CONNECT's own authorize() check is now offloaded too (issue
         // #210), so the CONNACK no longer lands inline within this call —
         // poll for it, same as the PUBACK further down.
         assert!(
             wait_for(
                 || {
-                    h.receive_slice(&mut ep, &mut &[][..]);
+                    hopf_core::forward_slice(&mut h, &mut ep, &mut &[][..]);
                     !ep.sent.is_empty()
                 },
                 3000
@@ -1445,7 +1445,7 @@ mod publish_finish_tests {
         let payload = vec![0x5A; 64 * 1024];
         let publish = encode::encode_publish(&encode::PublishFields { topic: "t/deferred", qos: QoS::AtLeastOnce, dup: false, retain: true, packet_id: 42, props: &Properties::new(), version: ProtocolVersion::V311 }, &payload);
         data = publish.into_boxed_slice();
-        h.receive_slice(&mut ep, &mut &*data);
+        hopf_core::forward_slice(&mut h, &mut ep, &mut &*data);
 
         // Whether the spool write's background chunks happen to have
         // already drained by the time `end_publish` runs (in which case
@@ -1458,7 +1458,7 @@ mod publish_finish_tests {
         assert!(
             wait_for(
                 || {
-                    h.receive_slice(&mut ep, &mut &[][..]);
+                    hopf_core::forward_slice(&mut h, &mut ep, &mut &[][..]);
                     ep.sent.len() > after_connack
                 },
                 3000
@@ -1490,14 +1490,14 @@ mod publish_finish_tests {
         h.connected(&mut ep);
 
         let mut data = connect_bytes("pub2").into_boxed_slice();
-        h.receive_slice(&mut ep, &mut &*data);
+        hopf_core::forward_slice(&mut h, &mut ep, &mut &*data);
         // CONNECT's own authorize() check is now offloaded too (issue
         // #210) — poll for the CONNACK before capturing the offset that
         // later PUBACK assertions are measured from.
         assert!(
             wait_for(
                 || {
-                    h.receive_slice(&mut ep, &mut &[][..]);
+                    hopf_core::forward_slice(&mut h, &mut ep, &mut &[][..]);
                     !ep.sent.is_empty()
                 },
                 3000
@@ -1511,14 +1511,14 @@ mod publish_finish_tests {
         let publish_a = encode::encode_publish(&encode::PublishFields { topic: "t/a", qos: QoS::AtLeastOnce, dup: false, retain: true, packet_id: 1, props: &Properties::new(), version: ProtocolVersion::V311 }, &payload_a);
         let publish_b = encode::encode_publish(&encode::PublishFields { topic: "t/b", qos: QoS::AtLeastOnce, dup: false, retain: true, packet_id: 2, props: &Properties::new(), version: ProtocolVersion::V311 }, &payload_b);
         data = publish_a.into_boxed_slice();
-        h.receive_slice(&mut ep, &mut &*data);
+        hopf_core::forward_slice(&mut h, &mut ep, &mut &*data);
         data = publish_b.into_boxed_slice();
-        h.receive_slice(&mut ep, &mut &*data);
+        hopf_core::forward_slice(&mut h, &mut ep, &mut &*data);
 
         assert!(
             wait_for(
                 || {
-                    h.receive_slice(&mut ep, &mut &[][..]);
+                    hopf_core::forward_slice(&mut h, &mut ep, &mut &[][..]);
                     h.pending_publish_finishes.lock().unwrap().is_empty()
                 },
                 3000

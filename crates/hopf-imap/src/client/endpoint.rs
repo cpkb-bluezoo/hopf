@@ -1584,32 +1584,34 @@ impl ProtocolHandler for ImapClientEndpoint {
         self.arm_greeting_timer(ep);
     }
 
-    fn receive_slice(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
-        if matches!(self.session, SessionState::Closed | SessionState::Error) {
+    fn receive(&mut self, ep: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            if matches!(self.session, SessionState::Closed | SessionState::Error) {
+                *data = &[];
+                return;
+            }
+            // First, before any reply is dispatched: a poke from another
+            // thread arrives here with no data, and this is its whole purpose.
+            self.wake_driver(ep);
+            if matches!(self.session, SessionState::Closed | SessionState::Error) {
+                *data = &[];
+                return;
+            }
+            if let Some(layer) = self.compress.as_mut() {
+                let plaintext = match layer.inflate(data) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        *data = &[];
+                        self.protocol_error(ep, e.to_string());
+                        return;
+                    }
+                };
+                *data = &[];
+                return self.receive_plaintext(ep, &plaintext);
+            }
+            self.receive_plaintext(ep, data);
             *data = &[];
-            return;
-        }
-        // First, before any reply is dispatched: a poke from another
-        // thread arrives here with no data, and this is its whole purpose.
-        self.wake_driver(ep);
-        if matches!(self.session, SessionState::Closed | SessionState::Error) {
-            *data = &[];
-            return;
-        }
-        if let Some(layer) = self.compress.as_mut() {
-            let plaintext = match layer.inflate(data) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    *data = &[];
-                    self.protocol_error(ep, e.to_string());
-                    return;
-                }
-            };
-            *data = &[];
-            return self.receive_plaintext(ep, &plaintext);
-        }
-        self.receive_plaintext(ep, data);
-        *data = &[];
+        });
     }
 
     fn security_established(&mut self, ep: &mut dyn Endpoint, _info: &SecurityInfo) {
@@ -2335,7 +2337,7 @@ mod tests {
 
     fn feed(ep: &mut ImapClientEndpoint, fake: &mut FakeEp, wire: &[u8]) {
         let mut data = wire;
-        ProtocolHandler::receive_slice(ep, fake, &mut data);
+        hopf_core::forward_slice(ep, fake, &mut data);
     }
 
     /// A poke from another thread re-enters `receive` with no data. The

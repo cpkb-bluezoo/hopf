@@ -1313,7 +1313,7 @@ mod status_validation_tests {
 
         let mut ep = RecordingEndpoint::default();
         let mut empty: &[u8] = &[];
-        stream.receive_slice(&mut ep, &mut empty);
+        hopf_core::forward_slice(&mut stream, &mut ep, &mut empty);
         assert!(ep.closed);
         assert_eq!(
             ep.abort_code,
@@ -1444,7 +1444,7 @@ mod status_validation_tests {
 
         let mut ep = RecordingEndpoint::default();
         let mut empty: &[u8] = &[];
-        stream.receive_slice(&mut ep, &mut empty);
+        hopf_core::forward_slice(&mut stream, &mut ep, &mut empty);
         assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
     }
 
@@ -1456,7 +1456,7 @@ mod status_validation_tests {
 
         let mut ep = RecordingEndpoint::default();
         let mut data: &[u8] = &frame_bytes;
-        stream.receive_slice(&mut ep, &mut data);
+        hopf_core::forward_slice(&mut stream, &mut ep, &mut data);
         assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
     }
 
@@ -1469,7 +1469,7 @@ mod status_validation_tests {
         let mut ep = RecordingEndpoint::default();
         let third = encode(&[("grpc-message", "late")]);
         let mut data: &[u8] = &third;
-        stream.receive_slice(&mut ep, &mut data);
+        hopf_core::forward_slice(&mut stream, &mut ep, &mut data);
         assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
     }
 
@@ -1532,7 +1532,7 @@ mod status_validation_tests {
 
         let mut ep = RecordingEndpoint::default();
         let mut empty: &[u8] = &[];
-        stream.receive_slice(&mut ep, &mut empty);
+        hopf_core::forward_slice(&mut stream, &mut ep, &mut empty);
         assert_eq!(ep.abort_code, Some(frame::H3_MESSAGE_ERROR));
     }
 
@@ -1564,7 +1564,7 @@ mod status_validation_tests {
         let mut bytes = Vec::new();
         frame::write_push_promise(&mut bytes, 0, b"");
         let mut data: &[u8] = &bytes;
-        stream.receive_slice(&mut ep, &mut data);
+        hopf_core::forward_slice(&mut stream, &mut ep, &mut data);
 
         assert!(ep.closed);
         assert_eq!(ep.close_connection_code, Some(frame::H3_ID_ERROR));
@@ -1766,7 +1766,7 @@ mod status_validation_tests {
         stream.peer_state.lock().unwrap().peer_enable_connect_protocol = Some(true);
         // Simulate the SETTINGS waiter poke → empty receive.
         let mut empty: &[u8] = &[];
-        stream.receive_slice(&mut ep, &mut empty);
+        hopf_core::forward_slice(&mut stream, &mut ep, &mut empty);
         assert!(!ep.sent.is_empty());
         assert_eq!(*failed.lock().unwrap(), 0);
         assert!(stream.started);
@@ -1830,7 +1830,7 @@ mod status_validation_tests {
         });
         assert!(ep.sent.is_empty(), "nothing goes out until the stream runs");
 
-        stream.receive_slice(&mut ep, &mut &[][..]);
+        hopf_core::forward_slice(&mut stream, &mut ep, &mut &[][..]);
 
         let mut expected = Vec::new();
         frame::write_data(&mut expected, b"hello");
@@ -1847,7 +1847,7 @@ mod status_validation_tests {
             w.request_body_content(b"never sent");
             w.cancel();
         });
-        stream.receive_slice(&mut ep, &mut &[][..]);
+        hopf_core::forward_slice(&mut stream, &mut ep, &mut &[][..]);
 
         assert!(ep.sent.is_empty(), "{:?}", ep.sent);
         assert_eq!(ep.abort_code, Some(frame::H3_REQUEST_CANCELLED));
@@ -2131,7 +2131,7 @@ mod client_upgrade_tests {
         upgrade.lock().unwrap().outbound = b"reply".to_vec();
         ep.sent.clear();
         let mut empty: &[u8] = &[];
-        stream.receive_slice(&mut ep, &mut empty);
+        hopf_core::forward_slice(&mut stream, &mut ep, &mut empty);
         assert!(
             ep.sent.windows(5).any(|w| w == b"reply"),
             "outbound bytes must go out as a DATA frame: {:?}",

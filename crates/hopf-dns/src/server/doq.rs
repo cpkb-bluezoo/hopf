@@ -42,34 +42,36 @@ struct DoqServerHandler {
 impl ProtocolHandler for DoqServerHandler {
     fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        self.buf.extend_from_slice(data);
-        *data = &[];
-        while self.buf.len() >= 2 {
-            let len = u16::from_be_bytes([self.buf[0], self.buf[1]]) as usize;
-            if self.buf.len() < 2 + len {
-                break;
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            self.buf.extend_from_slice(data);
+            *data = &[];
+            while self.buf.len() >= 2 {
+                let len = u16::from_be_bytes([self.buf[0], self.buf[1]]) as usize;
+                if self.buf.len() < 2 + len {
+                    break;
+                }
+                let payload = self.buf[2..2 + len].to_vec();
+                self.buf.drain(..2 + len);
+                let peer = endpoint
+                    .remote_addr()
+                    .ok()
+                    .and_then(|a| a.as_socket_addr())
+                    .unwrap_or_else(|| SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0));
+                let Some(responses) = self.service.process_wire(&payload, peer, DnsTransport::Doq) else {
+                    // RFC 9250 §4.3: a malformed DNS message on the stream is
+                    // a protocol violation, not something to silently drop.
+                    endpoint.abort(crate::client::doq::DOQ_PROTOCOL_ERROR);
+                    return;
+                };
+                for bytes in responses {
+                    let mut out = Vec::with_capacity(2 + bytes.len());
+                    out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+                    out.extend_from_slice(&bytes);
+                    endpoint.send(&out);
+                }
             }
-            let payload = self.buf[2..2 + len].to_vec();
-            self.buf.drain(..2 + len);
-            let peer = endpoint
-                .remote_addr()
-                .ok()
-                .and_then(|a| a.as_socket_addr())
-                .unwrap_or_else(|| SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0));
-            let Some(responses) = self.service.process_wire(&payload, peer, DnsTransport::Doq) else {
-                // RFC 9250 §4.3: a malformed DNS message on the stream is
-                // a protocol violation, not something to silently drop.
-                endpoint.abort(crate::client::doq::DOQ_PROTOCOL_ERROR);
-                return;
-            };
-            for bytes in responses {
-                let mut out = Vec::with_capacity(2 + bytes.len());
-                out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-                out.extend_from_slice(&bytes);
-                endpoint.send(&out);
-            }
-        }
+        });
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}

@@ -2065,33 +2065,35 @@ impl ProtocolHandler for ImapControlHandler {
         }
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        let Some(mut layer) = self.compress.take() else {
-            self.receive_inner(endpoint, data);
-            return;
-        };
-        // RFC 4978: once negotiated, every byte in both directions is raw
-        // DEFLATE for the rest of the session — inflate what just arrived,
-        // then let `receive_inner` process it exactly as it would an
-        // uncompressed connection, through a `CompressingEndpoint` that
-        // transparently deflates every `send()` it forwards.
-        let result = layer.inflate(data);
-        *data = &[];
-        match result {
-            Ok(plaintext) => {
-                let mut cursor: &[u8] = &plaintext;
-                {
-                    let mut wrapped = CompressingEndpoint::new(endpoint, &mut layer);
-                    self.receive_inner(&mut wrapped, &mut cursor);
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            let Some(mut layer) = self.compress.take() else {
+                self.receive_inner(endpoint, data);
+                return;
+            };
+            // RFC 4978: once negotiated, every byte in both directions is raw
+            // DEFLATE for the rest of the session — inflate what just arrived,
+            // then let `receive_inner` process it exactly as it would an
+            // uncompressed connection, through a `CompressingEndpoint` that
+            // transparently deflates every `send()` it forwards.
+            let result = layer.inflate(data);
+            *data = &[];
+            match result {
+                Ok(plaintext) => {
+                    let mut cursor: &[u8] = &plaintext;
+                    {
+                        let mut wrapped = CompressingEndpoint::new(endpoint, &mut layer);
+                        self.receive_inner(&mut wrapped, &mut cursor);
+                    }
+                    self.compress = Some(layer);
                 }
-                self.compress = Some(layer);
+                Err(_) => {
+                    // Malformed compressed data: nothing safe to recover to.
+                    self.compress = Some(layer);
+                    endpoint.close();
+                }
             }
-            Err(_) => {
-                // Malformed compressed data: nothing safe to recover to.
-                self.compress = Some(layer);
-                endpoint.close();
-            }
-        }
+        });
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {

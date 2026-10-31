@@ -217,98 +217,103 @@ impl ProtocolHandler for SocksConnectHandler {
         }
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        loop {
-            match self.state {
-                ClientState::AwaitingMethodSelection => match wire::parse_method_selection(data) {
-                    ParseResult::Incomplete => return,
-                    ParseResult::Invalid => {
-                        self.fail(endpoint, "malformed SOCKS5 method-selection reply");
-                        return;
-                    }
-                    ParseResult::Complete(method, n) => {
-                        *data = &data[n..];
-                        match method {
-                            0x00 => self.send_connect_request(endpoint),
-                            0x02 if self.config.credentials.is_some() => {
-                                let (username, password) = self.config.credentials.clone().unwrap();
-                                match wire::encode_user_password_request(&username, &password) {
-                                    Some(req) => {
-                                        endpoint.send(&req);
-                                        self.state = ClientState::AwaitingAuthReply;
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            loop {
+                match self.state {
+                    ClientState::AwaitingMethodSelection => match wire::parse_method_selection(data) {
+                        ParseResult::Incomplete => return,
+                        ParseResult::Invalid => {
+                            self.fail(endpoint, "malformed SOCKS5 method-selection reply");
+                            return;
+                        }
+                        ParseResult::Complete(method, n) => {
+                            *data = &data[n..];
+                            match method {
+                                0x00 => self.send_connect_request(endpoint),
+                                0x02 if self.config.credentials.is_some() => {
+                                    let (username, password) = self.config.credentials.clone().unwrap();
+                                    match wire::encode_user_password_request(&username, &password) {
+                                        Some(req) => {
+                                            endpoint.send(&req);
+                                            self.state = ClientState::AwaitingAuthReply;
+                                        }
+                                        None => self.fail(endpoint, "username/password too long to encode"),
                                     }
-                                    None => self.fail(endpoint, "username/password too long to encode"),
+                                }
+                                0xff => {
+                                    self.fail(endpoint, "SOCKS5 proxy rejected every offered authentication method");
+                                    return;
+                                }
+                                other => {
+                                    self.fail(
+                                        endpoint,
+                                        format!("SOCKS5 proxy selected an unsupported authentication method (0x{other:02x})"),
+                                    );
+                                    return;
                                 }
                             }
-                            0xff => {
-                                self.fail(endpoint, "SOCKS5 proxy rejected every offered authentication method");
-                                return;
-                            }
-                            other => {
-                                self.fail(
-                                    endpoint,
-                                    format!("SOCKS5 proxy selected an unsupported authentication method (0x{other:02x})"),
-                                );
-                                return;
-                            }
                         }
-                    }
-                },
-                ClientState::AwaitingAuthReply => match wire::parse_user_password_reply(data) {
-                    ParseResult::Incomplete => return,
-                    ParseResult::Invalid => {
-                        self.fail(endpoint, "malformed RFC 1929 authentication reply");
-                        return;
-                    }
-                    ParseResult::Complete(ok, n) => {
-                        *data = &data[n..];
-                        if ok {
-                            self.send_connect_request(endpoint);
-                        } else {
-                            self.fail(endpoint, "SOCKS5 proxy rejected the supplied credentials");
-                            return;
-                        }
-                    }
-                },
-                ClientState::AwaitingConnectReply => match self.config.version {
-                    SocksClientVersion::Socks4 => match wire::parse_socks4_reply(data) {
+                    },
+                    ClientState::AwaitingAuthReply => match wire::parse_user_password_reply(data) {
                         ParseResult::Incomplete => return,
                         ParseResult::Invalid => {
-                            self.fail(endpoint, "malformed SOCKS4 reply");
+                            self.fail(endpoint, "malformed RFC 1929 authentication reply");
                             return;
                         }
-                        ParseResult::Complete(reply, n) => {
+                        ParseResult::Complete(ok, n) => {
                             *data = &data[n..];
-                            if reply.granted {
-                                self.establish(endpoint);
+                            if ok {
+                                self.send_connect_request(endpoint);
                             } else {
-                                self.fail(endpoint, "SOCKS4 CONNECT rejected");
+                                self.fail(endpoint, "SOCKS5 proxy rejected the supplied credentials");
                                 return;
                             }
                         }
                     },
-                    SocksClientVersion::Socks5 => match wire::parse_socks5_reply(data) {
-                        ParseResult::Incomplete => return,
-                        ParseResult::Invalid => {
-                            self.fail(endpoint, "malformed SOCKS5 reply");
-                            return;
-                        }
-                        ParseResult::Complete(reply, n) => {
-                            *data = &data[n..];
-                            if reply.reply == 0x00 {
-                                self.establish(endpoint);
-                            } else {
-                                self.fail(endpoint, format!("SOCKS5 CONNECT rejected (reply code 0x{:02x})", reply.reply));
+                    ClientState::AwaitingConnectReply => match self.config.version {
+                        SocksClientVersion::Socks4 => match wire::parse_socks4_reply(data) {
+                            ParseResult::Incomplete => return,
+                            ParseResult::Invalid => {
+                                self.fail(endpoint, "malformed SOCKS4 reply");
                                 return;
                             }
-                        }
+                            ParseResult::Complete(reply, n) => {
+                                *data = &data[n..];
+                                if reply.granted {
+                                    self.establish(endpoint);
+                                } else {
+                                    self.fail(endpoint, "SOCKS4 CONNECT rejected");
+                                    return;
+                                }
+                            }
+                        },
+                        SocksClientVersion::Socks5 => match wire::parse_socks5_reply(data) {
+                            ParseResult::Incomplete => return,
+                            ParseResult::Invalid => {
+                                self.fail(endpoint, "malformed SOCKS5 reply");
+                                return;
+                            }
+                            ParseResult::Complete(reply, n) => {
+                                *data = &data[n..];
+                                if reply.reply == 0x00 {
+                                    self.establish(endpoint);
+                                } else {
+                                    self.fail(endpoint, format!("SOCKS5 CONNECT rejected (reply code 0x{:02x})", reply.reply));
+                                    return;
+                                }
+                            }
+                        },
                     },
-                },
-                ClientState::Established => {
-                    hopf_core::forward_slice(&mut *self.inner, endpoint, data);
-                    return;
+                    ClientState::Established => {
+                                            return;
+                    }
                 }
             }
+        });
+        // Once the handshake is done the rest of the ring is the tunnel's.
+        if matches!(self.state, ClientState::Established) {
+            self.inner.receive(endpoint, buf);
         }
     }
 

@@ -664,10 +664,12 @@ mod tests {
     struct Echo;
     impl ProtocolHandler for Echo {
         fn connected(&mut self, _: &mut dyn Endpoint) {}
-        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            endpoint.send(data);
-            *data = &[];
-        }
+        fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut crate::LoopBuf) {
+        crate::with_slice(buf, |data| {
+                endpoint.send(data);
+                *data = &[];
+        });
+    }
         fn disconnected(&mut self, _: &mut dyn Endpoint) {}
         fn error(&mut self, _: &mut dyn Endpoint, _: &io::Error) {}
     }

@@ -1252,22 +1252,24 @@ impl ProtocolHandler for AmqpClientEndpoint {
         self.arm_handshake_timer(endpoint);
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        // Take ownership of parser temporarily to avoid borrow conflicts.
-        let mut parser = std::mem::replace(
-            &mut self.parser,
-            AmqpFrameParser::new(self.negotiated_frame_max),
-        );
-        {
-            let mut handler = ReceiveHandler {
-                ep: self,
-                endpoint,
-            };
-            parser.feed(data, &mut handler);
-        }
-        self.parser = parser;
-        // Compact: consume all fed bytes (parser owns its buffer).
-        *data = &[];
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            // Take ownership of parser temporarily to avoid borrow conflicts.
+            let mut parser = std::mem::replace(
+                &mut self.parser,
+                AmqpFrameParser::new(self.negotiated_frame_max),
+            );
+            {
+                let mut handler = ReceiveHandler {
+                    ep: self,
+                    endpoint,
+                };
+                parser.feed(data, &mut handler);
+            }
+            self.parser = parser;
+            // Compact: consume all fed bytes (parser owns its buffer).
+            *data = &[];
+        });
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
@@ -1524,7 +1526,7 @@ mod tests {
         data.extend_from_slice(&body2);
 
         let mut slice: &[u8] = &data;
-        ep.receive_slice(&mut fake, &mut slice);
+        hopf_core::forward_slice(&mut ep, &mut fake, &mut slice);
 
         let s = state.lock().unwrap();
         assert_eq!(s.body_by_channel.get(&1).map(Vec::as_slice), Some(&b"one-A"[..]));

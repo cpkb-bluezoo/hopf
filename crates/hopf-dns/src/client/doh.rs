@@ -169,19 +169,21 @@ impl ProtocolHandler for DohClientHandler {
         endpoint.send(&req);
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        self.buf.extend_from_slice(data);
-        *data = &[];
-        if let Some(header_end) = find_header_end(&self.buf) {
-            if let Some(content_length) = find_content_length(&self.buf[..header_end]) {
-                let body_end = header_end + content_length;
-                if self.buf.len() >= body_end {
-                    let body = self.buf[header_end..body_end].to_vec();
-                    self.deliver_ok(body);
-                    endpoint.close();
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            self.buf.extend_from_slice(data);
+            *data = &[];
+            if let Some(header_end) = find_header_end(&self.buf) {
+                if let Some(content_length) = find_content_length(&self.buf[..header_end]) {
+                    let body_end = header_end + content_length;
+                    if self.buf.len() >= body_end {
+                        let body = self.buf[header_end..body_end].to_vec();
+                        self.deliver_ok(body);
+                        endpoint.close();
+                    }
                 }
             }
-        }
+        });
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {

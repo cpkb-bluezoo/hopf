@@ -243,16 +243,18 @@ impl ProtocolHandler for DoqQueryHandler {
         }
     }
 
-    fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        self.buf.extend_from_slice(data);
-        *data = &[];
-        if self.buf.len() >= 2 {
-            let len = u16::from_be_bytes([self.buf[0], self.buf[1]]) as usize;
-            if self.buf.len() >= 2 + len {
-                let raw = self.buf[2..2 + len].to_vec();
-                self.deliver_ok(raw);
+    fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            self.buf.extend_from_slice(data);
+            *data = &[];
+            if self.buf.len() >= 2 {
+                let len = u16::from_be_bytes([self.buf[0], self.buf[1]]) as usize;
+                if self.buf.len() >= 2 + len {
+                    let raw = self.buf[2..2 + len].to_vec();
+                    self.deliver_ok(raw);
+                }
             }
-        }
+        });
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {

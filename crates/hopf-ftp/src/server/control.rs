@@ -1505,18 +1505,20 @@ impl ProtocolHandler for FtpControlHandler {
         self.send_welcome(endpoint);
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        // Dispatch first so an `ABOR` in this burst can mark the bridge
-        // aborted before [`sync_pending_open`] applies a RETR/STOR that
-        // finished on the storage pool between commands (otherwise a
-        // completed open stashed in `pending_open` would send 150, then
-        // ABOR would reply 426/226 — the flake seen on CI for
-        // `abor_racing_ahead_of_a_pending_open_suppresses_the_transfer`).
-        let cmds = self.lexer.feed(data);
-        for cmd in cmds {
-            self.dispatch(endpoint, cmd);
-        }
-        sync_pending_open(self, endpoint);
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            // Dispatch first so an `ABOR` in this burst can mark the bridge
+            // aborted before [`sync_pending_open`] applies a RETR/STOR that
+            // finished on the storage pool between commands (otherwise a
+            // completed open stashed in `pending_open` would send 150, then
+            // ABOR would reply 426/226 — the flake seen on CI for
+            // `abor_racing_ahead_of_a_pending_open_suppresses_the_transfer`).
+            let cmds = self.lexer.feed(data);
+            for cmd in cmds {
+                self.dispatch(endpoint, cmd);
+            }
+            sync_pending_open(self, endpoint);
+        });
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
@@ -1734,7 +1736,7 @@ mod open_offload_tests {
                     None if self.poked => {
                         self.poked = false;
                         let mut empty: &[u8] = &[];
-                        handler.receive_slice(self, &mut empty);
+                        hopf_core::forward_slice(&mut *handler, self, &mut empty);
                     }
                     None => break,
                 }
@@ -1825,7 +1827,7 @@ mod open_offload_tests {
 
     fn feed(h: &mut FtpControlHandler, ep: &mut MockEndpoint, line: &[u8]) {
         let mut data = line;
-        h.receive_slice(ep, &mut data);
+        hopf_core::forward_slice(&mut *h, ep, &mut data);
     }
 
     fn wait_for(mut pred: impl FnMut() -> bool, max_ms: u64) -> bool {

@@ -1006,8 +1006,10 @@ impl ProtocolHandler for FtpControlHandler {
         self.arm_timer(endpoint, self.timeouts.stage);
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        self.process_all_replies(endpoint, data);
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            self.process_all_replies(endpoint, data);
+        });
     }
 
     fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {

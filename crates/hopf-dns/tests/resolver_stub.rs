@@ -704,10 +704,12 @@ fn literal_connect_by_name_skips_dns() {
     struct Echo;
     impl ProtocolHandler for Echo {
         fn connected(&mut self, _: &mut dyn Endpoint) {}
-        fn receive_slice(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
-            ep.send(data);
-            *data = &[];
-        }
+        fn receive(&mut self, ep: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                ep.send(data);
+                *data = &[];
+        });
+    }
         fn disconnected(&mut self, _: &mut dyn Endpoint) {}
         fn error(&mut self, _: &mut dyn Endpoint, _: &io::Error) {}
     }
@@ -721,11 +723,13 @@ fn literal_connect_by_name_skips_dns() {
         fn connected(&mut self, ep: &mut dyn Endpoint) {
             ep.send(b"hi");
         }
-        fn receive_slice(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
-            self.got.lock().unwrap().extend_from_slice(data);
-            *data = &[];
-            ep.close();
-        }
+        fn receive(&mut self, ep: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                self.got.lock().unwrap().extend_from_slice(data);
+                *data = &[];
+                ep.close();
+        });
+    }
         fn disconnected(&mut self, _: &mut dyn Endpoint) {}
         fn error(&mut self, _: &mut dyn Endpoint, _: &io::Error) {}
     }
@@ -1201,32 +1205,34 @@ fn dot_connection_pool_reuses_a_connection_across_queries() {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {
             self.connect_count.fetch_add(1, Ordering::SeqCst);
         }
-        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            self.buf.extend_from_slice(data);
-            *data = &[];
-            while self.buf.len() >= 2 {
-                let len = u16::from_be_bytes([self.buf[0], self.buf[1]]) as usize;
-                if self.buf.len() < 2 + len {
-                    break;
+        fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                self.buf.extend_from_slice(data);
+                *data = &[];
+                while self.buf.len() >= 2 {
+                    let len = u16::from_be_bytes([self.buf[0], self.buf[1]]) as usize;
+                    if self.buf.len() < 2 + len {
+                        break;
+                    }
+                    let payload = self.buf[2..2 + len].to_vec();
+                    self.buf.drain(..2 + len);
+                    let Ok(q) = DnsMessage::parse(&payload) else {
+                        continue;
+                    };
+                    let mut resp = q.response_template(0);
+                    resp.flags |= FLAG_QR;
+                    if let Some(question) = q.questions.first() {
+                        resp.answers
+                            .push(DnsResourceRecord::a(&question.name, 60, Ipv4Addr::new(198, 51, 100, 20)));
+                    }
+                    let bytes = resp.serialize().unwrap();
+                    let mut out = Vec::with_capacity(2 + bytes.len());
+                    out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+                    out.extend_from_slice(&bytes);
+                    endpoint.send(&out);
                 }
-                let payload = self.buf[2..2 + len].to_vec();
-                self.buf.drain(..2 + len);
-                let Ok(q) = DnsMessage::parse(&payload) else {
-                    continue;
-                };
-                let mut resp = q.response_template(0);
-                resp.flags |= FLAG_QR;
-                if let Some(question) = q.questions.first() {
-                    resp.answers
-                        .push(DnsResourceRecord::a(&question.name, 60, Ipv4Addr::new(198, 51, 100, 20)));
-                }
-                let bytes = resp.serialize().unwrap();
-                let mut out = Vec::with_capacity(2 + bytes.len());
-                out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-                out.extend_from_slice(&bytes);
-                endpoint.send(&out);
-            }
-        }
+        });
+    }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
     }
@@ -1304,36 +1310,38 @@ fn doq_connection_pool_reuses_a_connection_across_queries() {
     }
     impl ProtocolHandler for DoqStubStream {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            self.buf.extend_from_slice(data);
-            *data = &[];
-            while self.buf.len() >= 2 {
-                let len = u16::from_be_bytes([self.buf[0], self.buf[1]]) as usize;
-                if self.buf.len() < 2 + len {
-                    break;
+        fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                self.buf.extend_from_slice(data);
+                *data = &[];
+                while self.buf.len() >= 2 {
+                    let len = u16::from_be_bytes([self.buf[0], self.buf[1]]) as usize;
+                    if self.buf.len() < 2 + len {
+                        break;
+                    }
+                    let payload = self.buf[2..2 + len].to_vec();
+                    self.buf.drain(..2 + len);
+                    let Ok(q) = DnsMessage::parse(&payload) else {
+                        continue;
+                    };
+                    let mut resp = q.response_template(0);
+                    resp.id = 0;
+                    resp.flags |= FLAG_QR;
+                    if let Some(question) = q.questions.first() {
+                        resp.answers.push(DnsResourceRecord::a(
+                            &question.name,
+                            60,
+                            Ipv4Addr::new(198, 51, 100, 30),
+                        ));
+                    }
+                    let bytes = resp.serialize().unwrap();
+                    let mut out = Vec::with_capacity(2 + bytes.len());
+                    out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+                    out.extend_from_slice(&bytes);
+                    endpoint.send(&out);
                 }
-                let payload = self.buf[2..2 + len].to_vec();
-                self.buf.drain(..2 + len);
-                let Ok(q) = DnsMessage::parse(&payload) else {
-                    continue;
-                };
-                let mut resp = q.response_template(0);
-                resp.id = 0;
-                resp.flags |= FLAG_QR;
-                if let Some(question) = q.questions.first() {
-                    resp.answers.push(DnsResourceRecord::a(
-                        &question.name,
-                        60,
-                        Ipv4Addr::new(198, 51, 100, 30),
-                    ));
-                }
-                let bytes = resp.serialize().unwrap();
-                let mut out = Vec::with_capacity(2 + bytes.len());
-                out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-                out.extend_from_slice(&bytes);
-                endpoint.send(&out);
-            }
-        }
+        });
+    }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
     }
@@ -1471,52 +1479,54 @@ fn doh_get_and_post_round_trip_over_a_real_tls_http_stub() {
     }
     impl ProtocolHandler for DohStubHandler {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            self.buf.extend_from_slice(data);
-            *data = &[];
-            let Some(header_end) = self.buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4) else {
-                return;
-            };
-            let head = std::str::from_utf8(&self.buf[..header_end]).unwrap().to_string();
-            let request_line = head.lines().next().unwrap();
-            let mut parts = request_line.split_whitespace();
-            let method = parts.next().unwrap();
-            let target = parts.next().unwrap();
-
-            let body: Vec<u8> = if method == "GET" {
-                let dns_param = target.split("dns=").nth(1).expect("dns= query param");
-                base64url_decode(dns_param)
-            } else {
-                let content_length: usize = head
-                    .lines()
-                    .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().to_string()))
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-                if self.buf.len() < header_end + content_length {
-                    // Body not fully arrived yet — wait for more data.
+        fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                self.buf.extend_from_slice(data);
+                *data = &[];
+                let Some(header_end) = self.buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4) else {
                     return;
-                }
-                self.buf[header_end..header_end + content_length].to_vec()
-            };
+                };
+                let head = std::str::from_utf8(&self.buf[..header_end]).unwrap().to_string();
+                let request_line = head.lines().next().unwrap();
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap();
+                let target = parts.next().unwrap();
 
-            let Ok(q) = DnsMessage::parse(&body) else {
-                return;
-            };
-            let mut resp = q.response_template(0);
-            resp.flags |= FLAG_QR;
-            if let Some(question) = q.questions.first() {
-                resp.answers.push(DnsResourceRecord::a(&question.name, 60, Ipv4Addr::new(198, 51, 100, 30)));
-            }
-            let resp_bytes = resp.serialize().unwrap();
-            let http_resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\n\r\n",
-                resp_bytes.len()
-            );
-            let mut out = http_resp.into_bytes();
-            out.extend_from_slice(&resp_bytes);
-            endpoint.send(&out);
-            self.buf.clear();
-        }
+                let body: Vec<u8> = if method == "GET" {
+                    let dns_param = target.split("dns=").nth(1).expect("dns= query param");
+                    base64url_decode(dns_param)
+                } else {
+                    let content_length: usize = head
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().to_string()))
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    if self.buf.len() < header_end + content_length {
+                        // Body not fully arrived yet — wait for more data.
+                        return;
+                    }
+                    self.buf[header_end..header_end + content_length].to_vec()
+                };
+
+                let Ok(q) = DnsMessage::parse(&body) else {
+                    return;
+                };
+                let mut resp = q.response_template(0);
+                resp.flags |= FLAG_QR;
+                if let Some(question) = q.questions.first() {
+                    resp.answers.push(DnsResourceRecord::a(&question.name, 60, Ipv4Addr::new(198, 51, 100, 30)));
+                }
+                let resp_bytes = resp.serialize().unwrap();
+                let http_resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\n\r\n",
+                    resp_bytes.len()
+                );
+                let mut out = http_resp.into_bytes();
+                out.extend_from_slice(&resp_bytes);
+                endpoint.send(&out);
+                self.buf.clear();
+        });
+    }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
     }
@@ -1773,42 +1783,44 @@ fn resolver_queries_a_real_doh_server_end_to_end() {
     }
     impl ProtocolHandler for DohStubHandler {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            self.buf.extend_from_slice(data);
-            *data = &[];
-            let Some(header_end) = self.buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4) else {
-                return;
-            };
-            let head = std::str::from_utf8(&self.buf[..header_end]).unwrap().to_string();
-            let content_length: usize = head
-                .lines()
-                .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().to_string()))
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            if self.buf.len() < header_end + content_length {
-                return; // body not fully arrived yet
-            }
-            let body = self.buf[header_end..header_end + content_length].to_vec();
-            let Ok(q) = DnsMessage::parse(&body) else {
-                return;
-            };
-            self.hits.fetch_add(1, Ordering::SeqCst);
-            let mut resp = q.response_template(0);
-            resp.flags |= FLAG_QR;
-            if let Some(question) = q.questions.first() {
-                resp.answers
-                    .push(DnsResourceRecord::a(&question.name, 60, Ipv4Addr::new(198, 51, 100, 60)));
-            }
-            let resp_bytes = resp.serialize().unwrap();
-            let http_resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\n\r\n",
-                resp_bytes.len()
-            );
-            let mut out = http_resp.into_bytes();
-            out.extend_from_slice(&resp_bytes);
-            endpoint.send(&out);
-            self.buf.clear();
-        }
+        fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                self.buf.extend_from_slice(data);
+                *data = &[];
+                let Some(header_end) = self.buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4) else {
+                    return;
+                };
+                let head = std::str::from_utf8(&self.buf[..header_end]).unwrap().to_string();
+                let content_length: usize = head
+                    .lines()
+                    .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().to_string()))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                if self.buf.len() < header_end + content_length {
+                    return; // body not fully arrived yet
+                }
+                let body = self.buf[header_end..header_end + content_length].to_vec();
+                let Ok(q) = DnsMessage::parse(&body) else {
+                    return;
+                };
+                self.hits.fetch_add(1, Ordering::SeqCst);
+                let mut resp = q.response_template(0);
+                resp.flags |= FLAG_QR;
+                if let Some(question) = q.questions.first() {
+                    resp.answers
+                        .push(DnsResourceRecord::a(&question.name, 60, Ipv4Addr::new(198, 51, 100, 60)));
+                }
+                let resp_bytes = resp.serialize().unwrap();
+                let http_resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\n\r\n",
+                    resp_bytes.len()
+                );
+                let mut out = http_resp.into_bytes();
+                out.extend_from_slice(&resp_bytes);
+                endpoint.send(&out);
+                self.buf.clear();
+        });
+    }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
     }

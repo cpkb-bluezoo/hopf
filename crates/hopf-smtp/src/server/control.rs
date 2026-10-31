@@ -1413,58 +1413,60 @@ impl ProtocolHandler for SmtpControlHandler {
         }
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        self.sync_deferred();
-        self.sync_pending_auth_check(endpoint);
-        self.sync_pending_finish(endpoint);
-        if self.pending_finish {
-            // Spool writes from the just-finished message are still
-            // draining (issue #184) — soft reject pipelined commands, same
-            // precedent as the `Delivering`/`busy` checks below. Must come
-            // before the `session` dispatch in `receive_inner`: `session`
-            // is still `Data`/`Bdat` at this point (deferring
-            // `finish_message` leaves it untouched), so without this check
-            // a later `receive()` call could have its bytes misinterpreted
-            // as more DATA content instead of a new command.
-            if !data.is_empty() {
-                self.send_enhanced(
-                    endpoint,
-                    451,
-                    "4.3.2",
-                    "Message processing in progress, try again later",
-                );
-                *data = &[];
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            self.sync_deferred();
+            self.sync_pending_auth_check(endpoint);
+            self.sync_pending_finish(endpoint);
+            if self.pending_finish {
+                // Spool writes from the just-finished message are still
+                // draining (issue #184) — soft reject pipelined commands, same
+                // precedent as the `Delivering`/`busy` checks below. Must come
+                // before the `session` dispatch in `receive_inner`: `session`
+                // is still `Data`/`Bdat` at this point (deferring
+                // `finish_message` leaves it untouched), so without this check
+                // a later `receive()` call could have its bytes misinterpreted
+                // as more DATA content instead of a new command.
+                if !data.is_empty() {
+                    self.send_enhanced(
+                        endpoint,
+                        451,
+                        "4.3.2",
+                        "Message processing in progress, try again later",
+                    );
+                    *data = &[];
+                }
+                return;
             }
-            return;
-        }
-        if self.session == SmtpSessionState::Delivering {
-            // Still waiting for outbound relay to finish — soft reject pipelined cmds.
-            if !data.is_empty() {
-                self.send_enhanced(
-                    endpoint,
-                    451,
-                    "4.3.2",
-                    "Delivery in progress, try again later",
-                );
-                *data = &[];
+            if self.session == SmtpSessionState::Delivering {
+                // Still waiting for outbound relay to finish — soft reject pipelined cmds.
+                if !data.is_empty() {
+                    self.send_enhanced(
+                        endpoint,
+                        451,
+                        "4.3.2",
+                        "Delivery in progress, try again later",
+                    );
+                    *data = &[];
+                }
+                return;
             }
-            return;
-        }
-        if self.busy.load(Ordering::Relaxed) {
-            // A SASL step is offloaded — soft reject pipelined commands
-            // (issue #181), same precedent as the `Delivering` check above.
-            if !data.is_empty() {
-                self.send_enhanced(
-                    endpoint,
-                    451,
-                    "4.7.0",
-                    "Authentication in progress, try again later",
-                );
-                *data = &[];
+            if self.busy.load(Ordering::Relaxed) {
+                // A SASL step is offloaded — soft reject pipelined commands
+                // (issue #181), same precedent as the `Delivering` check above.
+                if !data.is_empty() {
+                    self.send_enhanced(
+                        endpoint,
+                        451,
+                        "4.7.0",
+                        "Authentication in progress, try again later",
+                    );
+                    *data = &[];
+                }
+                return;
             }
-            return;
-        }
-        self.receive_inner(endpoint, data);
+            self.receive_inner(endpoint, data);
+        });
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
@@ -2089,7 +2091,7 @@ mod pending_finish_tests {
 
     fn feed(h: &mut SmtpControlHandler, ep: &mut MockEndpoint, line: &[u8]) {
         let mut data = line;
-        h.receive_slice(ep, &mut data);
+        hopf_core::forward_slice(&mut *h, ep, &mut data);
     }
 
     /// Numeric code of the last CRLF-terminated reply line seen so far.

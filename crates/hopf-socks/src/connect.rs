@@ -181,9 +181,11 @@ impl ProtocolHandler for SocksUpstreamHandler {
         self.shared.set_outcome(ConnectOutcome::Connected(endpoint.handle()));
     }
 
-    fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        crate::relay::forward(&self.shared.activity, &self.client, &self.metrics.bytes_downstream, data);
-        *data = &[];
+    fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            crate::relay::forward(&self.shared.activity, &self.client, &self.metrics.bytes_downstream, data);
+            *data = &[];
+        });
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {

@@ -263,83 +263,85 @@ impl ProtocolHandler for SocksUdpAssociateHandler {
         self.state = UdpClientState::AwaitingMethodSelection;
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        if self.state == UdpClientState::AwaitingUdpSocket {
-            self.poll_udp_socket_outcome(endpoint);
-        }
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            if self.state == UdpClientState::AwaitingUdpSocket {
+                self.poll_udp_socket_outcome(endpoint);
+            }
 
-        loop {
-            match self.state {
-                UdpClientState::AwaitingMethodSelection => match wire::parse_method_selection(data) {
-                    ParseResult::Incomplete => return,
-                    ParseResult::Invalid => {
-                        self.fail(endpoint);
-                        return;
-                    }
-                    ParseResult::Complete(method, n) => {
-                        *data = &data[n..];
-                        match method {
-                            0x00 => self.send_associate_request(endpoint),
-                            0x02 if self.config.credentials().is_some() => {
-                                let (username, password) = self.config.credentials().cloned().unwrap();
-                                match wire::encode_user_password_request(&username, &password) {
-                                    Some(req) => {
-                                        endpoint.send(&req);
-                                        self.state = UdpClientState::AwaitingAuthReply;
-                                    }
-                                    None => {
-                                        self.fail(endpoint);
-                                        return;
+            loop {
+                match self.state {
+                    UdpClientState::AwaitingMethodSelection => match wire::parse_method_selection(data) {
+                        ParseResult::Incomplete => return,
+                        ParseResult::Invalid => {
+                            self.fail(endpoint);
+                            return;
+                        }
+                        ParseResult::Complete(method, n) => {
+                            *data = &data[n..];
+                            match method {
+                                0x00 => self.send_associate_request(endpoint),
+                                0x02 if self.config.credentials().is_some() => {
+                                    let (username, password) = self.config.credentials().cloned().unwrap();
+                                    match wire::encode_user_password_request(&username, &password) {
+                                        Some(req) => {
+                                            endpoint.send(&req);
+                                            self.state = UdpClientState::AwaitingAuthReply;
+                                        }
+                                        None => {
+                                            self.fail(endpoint);
+                                            return;
+                                        }
                                     }
                                 }
+                                _ => {
+                                    self.fail(endpoint);
+                                    return;
+                                }
                             }
-                            _ => {
+                        }
+                    },
+                    UdpClientState::AwaitingAuthReply => match wire::parse_user_password_reply(data) {
+                        ParseResult::Incomplete => return,
+                        ParseResult::Invalid => {
+                            self.fail(endpoint);
+                            return;
+                        }
+                        ParseResult::Complete(ok, n) => {
+                            *data = &data[n..];
+                            if ok {
+                                self.send_associate_request(endpoint);
+                            } else {
                                 self.fail(endpoint);
                                 return;
                             }
                         }
-                    }
-                },
-                UdpClientState::AwaitingAuthReply => match wire::parse_user_password_reply(data) {
-                    ParseResult::Incomplete => return,
-                    ParseResult::Invalid => {
-                        self.fail(endpoint);
-                        return;
-                    }
-                    ParseResult::Complete(ok, n) => {
-                        *data = &data[n..];
-                        if ok {
-                            self.send_associate_request(endpoint);
-                        } else {
+                    },
+                    UdpClientState::AwaitingAssociateReply => match wire::parse_socks5_reply(data) {
+                        ParseResult::Incomplete => return,
+                        ParseResult::Invalid => {
                             self.fail(endpoint);
                             return;
                         }
-                    }
-                },
-                UdpClientState::AwaitingAssociateReply => match wire::parse_socks5_reply(data) {
-                    ParseResult::Incomplete => return,
-                    ParseResult::Invalid => {
-                        self.fail(endpoint);
-                        return;
-                    }
-                    ParseResult::Complete(reply, n) => {
-                        *data = &data[n..];
-                        if reply.reply != 0x00 {
-                            self.fail(endpoint);
+                        ParseResult::Complete(reply, n) => {
+                            *data = &data[n..];
+                            if reply.reply != 0x00 {
+                                self.fail(endpoint);
+                                return;
+                            }
+                            let SocksAddress::Ip(ip) = reply.address else {
+                                self.fail(endpoint);
+                                return;
+                            };
+                            self.relay_addr = Some(SocketAddr::new(ip, reply.port));
+                            self.begin_udp_socket_setup(endpoint);
                             return;
                         }
-                        let SocksAddress::Ip(ip) = reply.address else {
-                            self.fail(endpoint);
-                            return;
-                        };
-                        self.relay_addr = Some(SocketAddr::new(ip, reply.port));
-                        self.begin_udp_socket_setup(endpoint);
-                        return;
-                    }
-                },
-                UdpClientState::AwaitingUdpSocket | UdpClientState::Established => return,
+                    },
+                    UdpClientState::AwaitingUdpSocket | UdpClientState::Established => return,
+                }
             }
-        }
+        });
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {

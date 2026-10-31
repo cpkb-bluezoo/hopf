@@ -33,23 +33,7 @@ pub trait ProtocolHandler: Send {
     /// While the ring is full and the handler consumes nothing, the
     /// connection stops reading (backpressure) or, with nothing more to
     /// wait for, fails.
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut LoopBuf) {
-        with_slice(buf, |data| self.receive_slice(endpoint, data));
-    }
-
-    /// Stepping stone for handlers not yet converted to read the ring
-    /// directly: the same as [`Self::receive`] but over a contiguous cursor.
-    /// A handler implements exactly one of the two; this goes once every
-    /// handler has been converted.
-    #[doc(hidden)]
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        // A handler already converted to read the ring is reached through a
-        // copy of the cursor in one.
-        let mut ring = LoopBuf::with_capacity(data.len().max(1));
-        ring.extend_from_slice(data);
-        self.receive(endpoint, &mut ring);
-        *data = &data[data.len() - ring.len()..];
-    }
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut LoopBuf);
 
     /// Peer closed the connection or the endpoint finished closing.
     fn disconnected(&mut self, endpoint: &mut dyn Endpoint);
@@ -94,10 +78,13 @@ impl ProtocolHandler for NopHandler {
 }
 
 /// Presents `data` to a handler that reads the ring, from code that still
-/// has a cursor: copies it into a ring, and advances `data` past what the
-/// handler consumed. A stepping stone for forwarders not yet converted to
-/// pass their own ring on.
-pub fn forward_slice(inner: &mut dyn ProtocolHandler, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+/// has a cursor (a test, say): copies it into a ring, and advances `data` past
+/// what the handler consumed.
+pub fn forward_slice<H: ProtocolHandler + ?Sized>(
+    inner: &mut H,
+    endpoint: &mut dyn Endpoint,
+    data: &mut &[u8],
+) {
     let mut ring = LoopBuf::with_capacity(data.len().max(1));
     ring.extend_from_slice(data);
     inner.receive(endpoint, &mut ring);

@@ -141,141 +141,146 @@ impl ProtocolHandler for SocksBindHandler {
         }
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        loop {
-            match self.state {
-                BindClientState::AwaitingMethodSelection => match wire::parse_method_selection(data) {
-                    ParseResult::Incomplete => return,
-                    ParseResult::Invalid => {
-                        self.fail(endpoint, "malformed SOCKS5 method-selection reply");
-                        return;
-                    }
-                    ParseResult::Complete(method, n) => {
-                        *data = &data[n..];
-                        match method {
-                            0x00 => self.send_bind_request(endpoint),
-                            0x02 if self.config.credentials().is_some() => {
-                                let (username, password) = self.config.credentials().cloned().unwrap();
-                                match wire::encode_user_password_request(&username, &password) {
-                                    Some(req) => {
-                                        endpoint.send(&req);
-                                        self.state = BindClientState::AwaitingAuthReply;
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            loop {
+                match self.state {
+                    BindClientState::AwaitingMethodSelection => match wire::parse_method_selection(data) {
+                        ParseResult::Incomplete => return,
+                        ParseResult::Invalid => {
+                            self.fail(endpoint, "malformed SOCKS5 method-selection reply");
+                            return;
+                        }
+                        ParseResult::Complete(method, n) => {
+                            *data = &data[n..];
+                            match method {
+                                0x00 => self.send_bind_request(endpoint),
+                                0x02 if self.config.credentials().is_some() => {
+                                    let (username, password) = self.config.credentials().cloned().unwrap();
+                                    match wire::encode_user_password_request(&username, &password) {
+                                        Some(req) => {
+                                            endpoint.send(&req);
+                                            self.state = BindClientState::AwaitingAuthReply;
+                                        }
+                                        None => self.fail(endpoint, "username/password too long to encode"),
                                     }
-                                    None => self.fail(endpoint, "username/password too long to encode"),
+                                }
+                                0xff => {
+                                    self.fail(endpoint, "SOCKS5 proxy rejected every offered authentication method");
+                                    return;
+                                }
+                                other => {
+                                    self.fail(
+                                        endpoint,
+                                        format!("SOCKS5 proxy selected an unsupported authentication method (0x{other:02x})"),
+                                    );
+                                    return;
                                 }
                             }
-                            0xff => {
-                                self.fail(endpoint, "SOCKS5 proxy rejected every offered authentication method");
-                                return;
-                            }
-                            other => {
-                                self.fail(
-                                    endpoint,
-                                    format!("SOCKS5 proxy selected an unsupported authentication method (0x{other:02x})"),
-                                );
-                                return;
-                            }
                         }
-                    }
-                },
-                BindClientState::AwaitingAuthReply => match wire::parse_user_password_reply(data) {
-                    ParseResult::Incomplete => return,
-                    ParseResult::Invalid => {
-                        self.fail(endpoint, "malformed RFC 1929 authentication reply");
-                        return;
-                    }
-                    ParseResult::Complete(ok, n) => {
-                        *data = &data[n..];
-                        if ok {
-                            self.send_bind_request(endpoint);
-                        } else {
-                            self.fail(endpoint, "SOCKS5 proxy rejected the supplied credentials");
-                            return;
-                        }
-                    }
-                },
-                BindClientState::AwaitingFirstReply => match self.config.version() {
-                    SocksClientVersion::Socks4 => match wire::parse_socks4_reply(data) {
+                    },
+                    BindClientState::AwaitingAuthReply => match wire::parse_user_password_reply(data) {
                         ParseResult::Incomplete => return,
                         ParseResult::Invalid => {
-                            self.fail(endpoint, "malformed SOCKS4 reply");
+                            self.fail(endpoint, "malformed RFC 1929 authentication reply");
                             return;
                         }
-                        ParseResult::Complete(reply, n) => {
+                        ParseResult::Complete(ok, n) => {
                             *data = &data[n..];
-                            if reply.granted {
-                                (self.on_bound)(SocketAddr::new(reply.address.into(), reply.port));
-                                self.state = BindClientState::AwaitingSecondReply;
+                            if ok {
+                                self.send_bind_request(endpoint);
                             } else {
-                                self.fail(endpoint, "SOCKS4 BIND rejected");
+                                self.fail(endpoint, "SOCKS5 proxy rejected the supplied credentials");
                                 return;
                             }
                         }
                     },
-                    SocksClientVersion::Socks5 => match wire::parse_socks5_reply(data) {
-                        ParseResult::Incomplete => return,
-                        ParseResult::Invalid => {
-                            self.fail(endpoint, "malformed SOCKS5 reply");
-                            return;
-                        }
-                        ParseResult::Complete(reply, n) => {
-                            *data = &data[n..];
-                            if reply.reply == 0x00 {
-                                let SocksAddress::Ip(ip) = reply.address else {
-                                    self.fail(endpoint, "SOCKS5 BIND reply named a domain, not an address");
+                    BindClientState::AwaitingFirstReply => match self.config.version() {
+                        SocksClientVersion::Socks4 => match wire::parse_socks4_reply(data) {
+                            ParseResult::Incomplete => return,
+                            ParseResult::Invalid => {
+                                self.fail(endpoint, "malformed SOCKS4 reply");
+                                return;
+                            }
+                            ParseResult::Complete(reply, n) => {
+                                *data = &data[n..];
+                                if reply.granted {
+                                    (self.on_bound)(SocketAddr::new(reply.address.into(), reply.port));
+                                    self.state = BindClientState::AwaitingSecondReply;
+                                } else {
+                                    self.fail(endpoint, "SOCKS4 BIND rejected");
                                     return;
-                                };
-                                (self.on_bound)(SocketAddr::new(ip, reply.port));
-                                self.state = BindClientState::AwaitingSecondReply;
-                            } else {
-                                self.fail(endpoint, format!("SOCKS5 BIND rejected (reply code 0x{:02x})", reply.reply));
+                                }
+                            }
+                        },
+                        SocksClientVersion::Socks5 => match wire::parse_socks5_reply(data) {
+                            ParseResult::Incomplete => return,
+                            ParseResult::Invalid => {
+                                self.fail(endpoint, "malformed SOCKS5 reply");
                                 return;
                             }
-                        }
+                            ParseResult::Complete(reply, n) => {
+                                *data = &data[n..];
+                                if reply.reply == 0x00 {
+                                    let SocksAddress::Ip(ip) = reply.address else {
+                                        self.fail(endpoint, "SOCKS5 BIND reply named a domain, not an address");
+                                        return;
+                                    };
+                                    (self.on_bound)(SocketAddr::new(ip, reply.port));
+                                    self.state = BindClientState::AwaitingSecondReply;
+                                } else {
+                                    self.fail(endpoint, format!("SOCKS5 BIND rejected (reply code 0x{:02x})", reply.reply));
+                                    return;
+                                }
+                            }
+                        },
                     },
-                },
-                BindClientState::AwaitingSecondReply => match self.config.version() {
-                    SocksClientVersion::Socks4 => match wire::parse_socks4_reply(data) {
-                        ParseResult::Incomplete => return,
-                        ParseResult::Invalid => {
-                            self.fail(endpoint, "malformed SOCKS4 reply");
-                            return;
-                        }
-                        ParseResult::Complete(reply, n) => {
-                            *data = &data[n..];
-                            if reply.granted {
-                                self.establish(endpoint);
-                            } else {
-                                self.fail(endpoint, "SOCKS4 BIND: no peer connection accepted");
+                    BindClientState::AwaitingSecondReply => match self.config.version() {
+                        SocksClientVersion::Socks4 => match wire::parse_socks4_reply(data) {
+                            ParseResult::Incomplete => return,
+                            ParseResult::Invalid => {
+                                self.fail(endpoint, "malformed SOCKS4 reply");
                                 return;
                             }
-                        }
-                    },
-                    SocksClientVersion::Socks5 => match wire::parse_socks5_reply(data) {
-                        ParseResult::Incomplete => return,
-                        ParseResult::Invalid => {
-                            self.fail(endpoint, "malformed SOCKS5 reply");
-                            return;
-                        }
-                        ParseResult::Complete(reply, n) => {
-                            *data = &data[n..];
-                            if reply.reply == 0x00 {
-                                self.establish(endpoint);
-                            } else {
-                                self.fail(
-                                    endpoint,
-                                    format!("SOCKS5 BIND: no peer connection accepted (reply code 0x{:02x})", reply.reply),
-                                );
+                            ParseResult::Complete(reply, n) => {
+                                *data = &data[n..];
+                                if reply.granted {
+                                    self.establish(endpoint);
+                                } else {
+                                    self.fail(endpoint, "SOCKS4 BIND: no peer connection accepted");
+                                    return;
+                                }
+                            }
+                        },
+                        SocksClientVersion::Socks5 => match wire::parse_socks5_reply(data) {
+                            ParseResult::Incomplete => return,
+                            ParseResult::Invalid => {
+                                self.fail(endpoint, "malformed SOCKS5 reply");
                                 return;
                             }
-                        }
+                            ParseResult::Complete(reply, n) => {
+                                *data = &data[n..];
+                                if reply.reply == 0x00 {
+                                    self.establish(endpoint);
+                                } else {
+                                    self.fail(
+                                        endpoint,
+                                        format!("SOCKS5 BIND: no peer connection accepted (reply code 0x{:02x})", reply.reply),
+                                    );
+                                    return;
+                                }
+                            }
+                        },
                     },
-                },
-                BindClientState::Established => {
-                    hopf_core::forward_slice(&mut *self.inner, endpoint, data);
-                    return;
+                    BindClientState::Established => {
+                                            return;
+                    }
                 }
             }
+        });
+        // Once the handshake is done the rest of the ring is the tunnel's.
+        if matches!(self.state, BindClientState::Established) {
+            self.inner.receive(endpoint, buf);
         }
     }
 

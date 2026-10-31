@@ -183,12 +183,14 @@ impl FtpDataRetrHandler {
 impl ProtocolHandler for FtpDataRetrHandler {
     fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        let keep_going = self.transfer.lock().unwrap().push_content(data);
-        *data = &[];
-        if !keep_going {
-            endpoint.close();
-        }
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            let keep_going = self.transfer.lock().unwrap().push_content(data);
+            *data = &[];
+            if !keep_going {
+                endpoint.close();
+            }
+        });
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
@@ -268,8 +270,10 @@ impl ProtocolHandler for FtpDataStorHandler {
         }
     }
 
-    fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        *data = &[]; // server sends nothing on the data channel for STOR
+    fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            *data = &[]; // server sends nothing on the data channel for STOR
+        });
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
@@ -319,8 +323,10 @@ impl ProtocolHandler for ActiveAcceptGuard {
         self.inner.connected(endpoint);
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        self.inner.receive_slice(endpoint, data);
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            hopf_core::forward_slice(&mut *self.inner, endpoint, data);
+        });
     }
 
     fn disconnected(&mut self, endpoint: &mut dyn Endpoint) {

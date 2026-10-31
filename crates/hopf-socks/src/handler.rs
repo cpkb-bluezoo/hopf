@@ -469,160 +469,162 @@ impl ProtocolHandler for SocksConnectionHandler {
         );
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        match &self.phase {
-            Phase::AwaitingUpstream(..) => self.poll_connect_outcome(endpoint),
-            Phase::AwaitingBindPeer(..) => self.poll_bind_outcome(endpoint),
-            Phase::AwaitingUdpAssociate(..) => self.poll_udp_associate_outcome(endpoint),
-            _ => {}
-        }
-
-        loop {
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
             match &self.phase {
-                Phase::VersionDetect => {
-                    let Some(&first) = data.first() else {
-                        return;
-                    };
-                    self.phase = match first {
-                        wire::VERSION_4 => Phase::Socks4Request,
-                        wire::VERSION_5 => Phase::Socks5Greeting,
-                        _ => {
-                            endpoint.close();
+                Phase::AwaitingUpstream(..) => self.poll_connect_outcome(endpoint),
+                Phase::AwaitingBindPeer(..) => self.poll_bind_outcome(endpoint),
+                Phase::AwaitingUdpAssociate(..) => self.poll_udp_associate_outcome(endpoint),
+                _ => {}
+            }
+
+            loop {
+                match &self.phase {
+                    Phase::VersionDetect => {
+                        let Some(&first) = data.first() else {
                             return;
-                        }
-                    };
-                }
-                Phase::Socks4Request => match wire::parse_socks4_request(data) {
-                    ParseResult::Incomplete => return,
-                    ParseResult::Invalid => {
-                        endpoint.close();
-                        return;
-                    }
-                    ParseResult::Complete(req, n) => {
-                        *data = &data[n..];
-                        if self.authenticator.is_some() {
-                            // SOCKS4 carries no credential field, so a
-                            // configured authenticator can never be
-                            // honored for it — reject outright rather than
-                            // silently treating USERID as an identity.
-                            self.send_reply(endpoint, ReplyKind::Socks4, Socks5Reply::NotAllowed, ZERO_ADDR);
-                            endpoint.close();
-                            return;
-                        }
-                        match req.command {
-                            SocksCommand::Connect => {
-                                self.dispatch_connect(endpoint, req.address, req.port, ReplyKind::Socks4);
-                            }
-                            SocksCommand::Bind => {
-                                self.dispatch_bind(endpoint, req.address, ReplyKind::Socks4);
-                            }
-                            SocksCommand::UdpAssociate => {
-                                // No SOCKS4 equivalent; tracked separately
-                                // for SOCKS5 only.
-                                self.send_reply(endpoint, ReplyKind::Socks4, Socks5Reply::CommandNotSupported, ZERO_ADDR);
+                        };
+                        self.phase = match first {
+                            wire::VERSION_4 => Phase::Socks4Request,
+                            wire::VERSION_5 => Phase::Socks5Greeting,
+                            _ => {
                                 endpoint.close();
+                                return;
+                            }
+                        };
+                    }
+                    Phase::Socks4Request => match wire::parse_socks4_request(data) {
+                        ParseResult::Incomplete => return,
+                        ParseResult::Invalid => {
+                            endpoint.close();
+                            return;
+                        }
+                        ParseResult::Complete(req, n) => {
+                            *data = &data[n..];
+                            if self.authenticator.is_some() {
+                                // SOCKS4 carries no credential field, so a
+                                // configured authenticator can never be
+                                // honored for it — reject outright rather than
+                                // silently treating USERID as an identity.
+                                self.send_reply(endpoint, ReplyKind::Socks4, Socks5Reply::NotAllowed, ZERO_ADDR);
+                                endpoint.close();
+                                return;
+                            }
+                            match req.command {
+                                SocksCommand::Connect => {
+                                    self.dispatch_connect(endpoint, req.address, req.port, ReplyKind::Socks4);
+                                }
+                                SocksCommand::Bind => {
+                                    self.dispatch_bind(endpoint, req.address, ReplyKind::Socks4);
+                                }
+                                SocksCommand::UdpAssociate => {
+                                    // No SOCKS4 equivalent; tracked separately
+                                    // for SOCKS5 only.
+                                    self.send_reply(endpoint, ReplyKind::Socks4, Socks5Reply::CommandNotSupported, ZERO_ADDR);
+                                    endpoint.close();
+                                }
+                            }
+                            return;
+                        }
+                    },
+                    Phase::Socks5Greeting => match wire::parse_socks5_greeting(data) {
+                        ParseResult::Incomplete => return,
+                        ParseResult::Invalid => {
+                            endpoint.close();
+                            return;
+                        }
+                        ParseResult::Complete(greeting, n) => {
+                            *data = &data[n..];
+                            match self.select_socks5_method(&greeting.methods) {
+                                Some(0x02) => {
+                                    endpoint.send(&wire::encode_method_selection(0x02));
+                                    self.phase = Phase::Socks5Auth;
+                                }
+                                Some(_) => {
+                                    endpoint.send(&wire::encode_method_selection(0x00));
+                                    self.phase = Phase::Socks5Request;
+                                }
+                                None => {
+                                    endpoint.send(&wire::encode_method_selection(0xff));
+                                    endpoint.close();
+                                    return;
+                                }
                             }
                         }
-                        return;
-                    }
-                },
-                Phase::Socks5Greeting => match wire::parse_socks5_greeting(data) {
-                    ParseResult::Incomplete => return,
-                    ParseResult::Invalid => {
-                        endpoint.close();
-                        return;
-                    }
-                    ParseResult::Complete(greeting, n) => {
-                        *data = &data[n..];
-                        match self.select_socks5_method(&greeting.methods) {
-                            Some(0x02) => {
-                                endpoint.send(&wire::encode_method_selection(0x02));
-                                self.phase = Phase::Socks5Auth;
-                            }
-                            Some(_) => {
-                                endpoint.send(&wire::encode_method_selection(0x00));
+                    },
+                    Phase::Socks5Auth => match wire::parse_user_password_request(data) {
+                        ParseResult::Incomplete => return,
+                        ParseResult::Invalid => {
+                            endpoint.close();
+                            return;
+                        }
+                        ParseResult::Complete(req, n) => {
+                            *data = &data[n..];
+                            // `authenticator` is always `Some` here: it's the
+                            // only way `select_socks5_method` selects 0x02.
+                            let ok = self
+                                .authenticator
+                                .as_ref()
+                                .is_some_and(|a| a.verify(&req.username, &req.password));
+                            endpoint.send(&wire::encode_user_password_reply(ok));
+                            if ok {
+                                SocksServerMetrics::add(&self.metrics.auth_ok, 1);
                                 self.phase = Phase::Socks5Request;
-                            }
-                            None => {
-                                endpoint.send(&wire::encode_method_selection(0xff));
+                            } else {
+                                SocksServerMetrics::add(&self.metrics.auth_fail, 1);
                                 endpoint.close();
                                 return;
                             }
                         }
-                    }
-                },
-                Phase::Socks5Auth => match wire::parse_user_password_request(data) {
-                    ParseResult::Incomplete => return,
-                    ParseResult::Invalid => {
-                        endpoint.close();
-                        return;
-                    }
-                    ParseResult::Complete(req, n) => {
-                        *data = &data[n..];
-                        // `authenticator` is always `Some` here: it's the
-                        // only way `select_socks5_method` selects 0x02.
-                        let ok = self
-                            .authenticator
-                            .as_ref()
-                            .is_some_and(|a| a.verify(&req.username, &req.password));
-                        endpoint.send(&wire::encode_user_password_reply(ok));
-                        if ok {
-                            SocksServerMetrics::add(&self.metrics.auth_ok, 1);
-                            self.phase = Phase::Socks5Request;
-                        } else {
-                            SocksServerMetrics::add(&self.metrics.auth_fail, 1);
+                    },
+                    Phase::Socks5Request => match wire::parse_socks5_request(data) {
+                        ParseResult::Incomplete => return,
+                        ParseResult::Invalid => {
+                            // The dominant real-world cause is an ATYP outside
+                            // {IPv4, domain name, IPv6} — send the specific
+                            // RFC 1928 §6 reply for that rather than a bare
+                            // close, matching how a malformed/unsupported
+                            // request is reported once version and command
+                            // framing are already known-good (both were
+                            // already committed to by reaching this phase).
+                            endpoint.send(&wire::encode_socks5_reply(Socks5Reply::AddressTypeNotSupported, ZERO_ADDR));
                             endpoint.close();
                             return;
                         }
-                    }
-                },
-                Phase::Socks5Request => match wire::parse_socks5_request(data) {
-                    ParseResult::Incomplete => return,
-                    ParseResult::Invalid => {
-                        // The dominant real-world cause is an ATYP outside
-                        // {IPv4, domain name, IPv6} — send the specific
-                        // RFC 1928 §6 reply for that rather than a bare
-                        // close, matching how a malformed/unsupported
-                        // request is reported once version and command
-                        // framing are already known-good (both were
-                        // already committed to by reaching this phase).
-                        endpoint.send(&wire::encode_socks5_reply(Socks5Reply::AddressTypeNotSupported, ZERO_ADDR));
-                        endpoint.close();
-                        return;
-                    }
-                    ParseResult::Complete(req, n) => {
-                        *data = &data[n..];
-                        match req.command {
-                            SocksCommand::Connect => {
-                                self.dispatch_connect(endpoint, req.address, req.port, ReplyKind::Socks5);
+                        ParseResult::Complete(req, n) => {
+                            *data = &data[n..];
+                            match req.command {
+                                SocksCommand::Connect => {
+                                    self.dispatch_connect(endpoint, req.address, req.port, ReplyKind::Socks5);
+                                }
+                                SocksCommand::Bind => {
+                                    self.dispatch_bind(endpoint, req.address, ReplyKind::Socks5);
+                                }
+                                SocksCommand::UdpAssociate => {
+                                    self.dispatch_udp_associate(endpoint, req.address);
+                                }
                             }
-                            SocksCommand::Bind => {
-                                self.dispatch_bind(endpoint, req.address, ReplyKind::Socks5);
-                            }
-                            SocksCommand::UdpAssociate => {
-                                self.dispatch_udp_associate(endpoint, req.address);
-                            }
+                            return;
                         }
+                    },
+                    Phase::AwaitingUpstream(..) | Phase::AwaitingBindPeer(..) | Phase::AwaitingUdpAssociate(..) => {
                         return;
                     }
-                },
-                Phase::AwaitingUpstream(..) | Phase::AwaitingBindPeer(..) | Phase::AwaitingUdpAssociate(..) => {
-                    return;
-                }
-                Phase::Relay(other, activity) => {
-                    crate::relay::forward(activity, other, &self.metrics.bytes_upstream, data);
-                    *data = &[];
-                    return;
-                }
-                Phase::UdpAssociated(..) => {
-                    // No further protocol traffic is expected on this
-                    // connection (RFC 1928 §7) — discard rather than
-                    // error, in case a client sends an innocuous keepalive.
-                    *data = &[];
-                    return;
+                    Phase::Relay(other, activity) => {
+                        crate::relay::forward(activity, other, &self.metrics.bytes_upstream, data);
+                        *data = &[];
+                        return;
+                    }
+                    Phase::UdpAssociated(..) => {
+                        // No further protocol traffic is expected on this
+                        // connection (RFC 1928 §7) — discard rather than
+                        // error, in case a client sends an innocuous keepalive.
+                        *data = &[];
+                        return;
+                    }
                 }
             }
-        }
+        });
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {

@@ -518,26 +518,28 @@ impl ProtocolHandler for HqServerStream {
 
     fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        self.buf.extend_from_slice(data);
-        *data = &[];
-        if self.sent {
-            return;
-        }
-        if let Some(pos) = self.buf.windows(2).position(|w| w == b"\r\n") {
-            let line = String::from_utf8_lossy(&self.buf[..pos]).to_string();
-            self.buf.clear();
-            let path = line.strip_prefix("GET ").and_then(|s| s.split_whitespace().next());
-            if let Some(p) = path {
-                if let Some(file) = resolve_www(&self.www, p) {
-                    if let Ok(bytes) = fs::read(&file) {
-                        endpoint.send(&bytes);
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            self.buf.extend_from_slice(data);
+            *data = &[];
+            if self.sent {
+                return;
+            }
+            if let Some(pos) = self.buf.windows(2).position(|w| w == b"\r\n") {
+                let line = String::from_utf8_lossy(&self.buf[..pos]).to_string();
+                self.buf.clear();
+                let path = line.strip_prefix("GET ").and_then(|s| s.split_whitespace().next());
+                if let Some(p) = path {
+                    if let Some(file) = resolve_www(&self.www, p) {
+                        if let Ok(bytes) = fs::read(&file) {
+                            endpoint.send(&bytes);
+                        }
                     }
                 }
+                endpoint.close();
+                self.sent = true;
             }
-            endpoint.close();
-            self.sent = true;
-        }
+        });
     }
 }
 
@@ -571,13 +573,15 @@ impl ProtocolHandler for HqClientStream {
         self.state = ClientStreamState::Receiving { path, file };
     }
 
-    fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        if let ClientStreamState::Receiving { file, .. } = &mut self.state {
-            if !data.is_empty() {
-                file.write_all(data).ok();
-                *data = &[];
+    fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            if let ClientStreamState::Receiving { file, .. } = &mut self.state {
+                if !data.is_empty() {
+                    file.write_all(data).ok();
+                    *data = &[];
+                }
             }
-        }
+        });
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {

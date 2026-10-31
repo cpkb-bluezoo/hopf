@@ -953,9 +953,11 @@ impl ProtocolHandler for ClientProbe {
         }
     }
 
-    fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        self.received.lock().unwrap().extend_from_slice(data);
-        *data = &[];
+    fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            self.received.lock().unwrap().extend_from_slice(data);
+            *data = &[];
+        });
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}

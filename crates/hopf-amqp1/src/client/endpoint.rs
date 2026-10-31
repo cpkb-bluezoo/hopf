@@ -625,14 +625,16 @@ impl ProtocolHandler for Amqp1ClientEndpoint {
         self.arm_handshake_timeout(endpoint);
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        let mut parser = std::mem::replace(&mut self.parser, Amqp1FrameParser::new(0));
-        {
-            let mut rh = ReceiveHandler { ep: self, io: endpoint };
-            parser.feed(data, &mut rh);
-        }
-        self.parser = parser;
-        *data = &[];
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            let mut parser = std::mem::replace(&mut self.parser, Amqp1FrameParser::new(0));
+            {
+                let mut rh = ReceiveHandler { ep: self, io: endpoint };
+                parser.feed(data, &mut rh);
+            }
+            self.parser = parser;
+            *data = &[];
+        });
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {

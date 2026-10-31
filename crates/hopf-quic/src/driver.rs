@@ -2393,10 +2393,12 @@ mod tests {
 
     impl ProtocolHandler for Echo {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            endpoint.send(data);
-            *data = &[];
-        }
+        fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                endpoint.send(data);
+                *data = &[];
+        });
+    }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
     }
@@ -2413,11 +2415,13 @@ mod tests {
                 self.sent = true;
             }
         }
-        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            self.got.lock().unwrap().extend_from_slice(data);
-            *data = &[];
-            endpoint.close();
-        }
+        fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                self.got.lock().unwrap().extend_from_slice(data);
+                *data = &[];
+                endpoint.close();
+        });
+    }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
     }
@@ -2866,9 +2870,11 @@ mod tests {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {
             *self.connected.lock().unwrap() = true;
         }
-        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            *data = &[];
-        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                *data = &[];
+        });
+    }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
     }
@@ -3151,13 +3157,15 @@ mod tests {
 
     impl ProtocolHandler for SplitTokenProbe {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            if data.len() < self.expected.len() {
-                return; // not enough yet — consume nothing, wait for more
-            }
-            *self.done.lock().unwrap() = Some(data.to_vec());
-            *data = &[];
-        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                if data.len() < self.expected.len() {
+                    return; // not enough yet — consume nothing, wait for more
+                }
+                *self.done.lock().unwrap() = Some(data.to_vec());
+                *data = &[];
+        });
+    }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
     }
@@ -3184,9 +3192,11 @@ mod tests {
                 }),
             );
         }
-        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            *data = &[];
-        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                *data = &[];
+        });
+    }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
     }
@@ -3255,20 +3265,22 @@ mod tests {
 
     impl ProtocolHandler for DefersThenPokesSelf {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-        fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            let first_call = self.calls.lock().unwrap().is_empty();
-            self.calls.lock().unwrap().push(data.len());
-            *data = &[];
-            if first_call {
-                let handle = endpoint.handle();
-                endpoint.schedule_timer(
-                    Duration::from_millis(40),
-                    Box::new(move || {
-                        handle.poke();
-                    }),
-                );
-            }
-        }
+        fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                let first_call = self.calls.lock().unwrap().is_empty();
+                self.calls.lock().unwrap().push(data.len());
+                *data = &[];
+                if first_call {
+                    let handle = endpoint.handle();
+                    endpoint.schedule_timer(
+                        Duration::from_millis(40),
+                        Box::new(move || {
+                            handle.poke();
+                        }),
+                    );
+                }
+        });
+    }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
     }
@@ -3335,9 +3347,11 @@ mod tests {
             // so the server side sees it and its own connected() fires.
             endpoint.send(b"x");
         }
-        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            *data = &[];
-        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                *data = &[];
+        });
+    }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
     }
@@ -3406,9 +3420,11 @@ mod tests {
             // observed by the peer at all).
             endpoint.send(b"x");
         }
-        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            *data = &[];
-        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                *data = &[];
+        });
+    }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
             self.disconnected.store(true, std::sync::atomic::Ordering::SeqCst);
         }
@@ -3633,9 +3649,11 @@ mod tests {
                 endpoint.send(b"x");
                 endpoint.close_connection(APP_CODE as u32);
             }
-            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-                *data = &[];
-            }
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                    *data = &[];
+        });
+    }
             fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
             fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
         }
@@ -3779,9 +3797,11 @@ mod tests {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             Self::arm_poll(endpoint, Arc::clone(&self.release));
         }
-        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            *data = &[];
-        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                *data = &[];
+        });
+    }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
     }
@@ -3796,10 +3816,12 @@ mod tests {
         struct EchoCloseOnPeerFin;
         impl ProtocolHandler for EchoCloseOnPeerFin {
             fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-            fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-                endpoint.send(data);
-                *data = &[];
-            }
+            fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                    endpoint.send(data);
+                    *data = &[];
+        });
+    }
             fn disconnected(&mut self, endpoint: &mut dyn Endpoint) {
                 endpoint.close();
             }
@@ -3895,9 +3917,11 @@ mod tests {
         }
         impl ProtocolHandler for DelayedReplyAfterPeerFin {
             fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-                *data = &[];
-            }
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                    *data = &[];
+        });
+    }
             fn disconnected(&mut self, endpoint: &mut dyn Endpoint) {
                 let handle = endpoint.handle();
                 let payload = self.payload.to_vec();
@@ -3922,11 +3946,13 @@ mod tests {
                 endpoint.send(b"request");
                 endpoint.close(); // send FIN immediately after request bytes
             }
-            fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-                self.got.lock().unwrap().extend_from_slice(data);
-                *data = &[];
-                endpoint.close();
-            }
+            fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                    self.got.lock().unwrap().extend_from_slice(data);
+                    *data = &[];
+                    endpoint.close();
+        });
+    }
             fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
             fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
         }
@@ -3977,9 +4003,11 @@ mod tests {
             endpoint.send(b"second");
             endpoint.close();
         }
-        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            *data = &[];
-        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                *data = &[];
+        });
+    }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
     }
@@ -4110,10 +4138,12 @@ mod tests {
 
     impl ProtocolHandler for RecordsUniBytes {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            self.got.lock().unwrap().extend_from_slice(data);
-            *data = &[];
-        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                self.got.lock().unwrap().extend_from_slice(data);
+                *data = &[];
+        });
+    }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
     }
@@ -4214,9 +4244,11 @@ mod tests {
         }
         impl ProtocolHandler for IdleClient {
             fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-                *data = &[];
-            }
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                    *data = &[];
+        });
+    }
             fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
                 self.disconnected.store(true, std::sync::atomic::Ordering::SeqCst);
             }
@@ -4296,9 +4328,11 @@ mod tests {
             fn connected(&mut self, endpoint: &mut dyn Endpoint) {
                 let _ = endpoint.send_datagram(b"ping");
             }
-            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-                *data = &[];
-            }
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                    *data = &[];
+        });
+    }
             fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
             fn error(&mut self, _endpoint: &mut dyn Endpoint, err: &io::Error) {
                 *self.got.lock().unwrap() = crate::datagram_send_error(err);
@@ -4352,9 +4386,11 @@ mod tests {
                 let huge = vec![0u8; 65535];
                 let _ = endpoint.send_datagram(&huge);
             }
-            fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-                *data = &[];
-            }
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                    *data = &[];
+        });
+    }
             fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
             fn error(&mut self, _endpoint: &mut dyn Endpoint, err: &io::Error) {
                 *self.got.lock().unwrap() = crate::datagram_send_error(err);
@@ -4392,10 +4428,12 @@ mod tests {
 
     impl ProtocolHandler for CountsBytes {
         fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            self.total.fetch_add(data.len(), std::sync::atomic::Ordering::SeqCst);
-            *data = &[];
-        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                self.total.fetch_add(data.len(), std::sync::atomic::Ordering::SeqCst);
+                *data = &[];
+        });
+    }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
     }
@@ -4412,9 +4450,11 @@ mod tests {
                 self.sent = true;
             }
         }
-        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            *data = &[];
-        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                *data = &[];
+        });
+    }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
     }

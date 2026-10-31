@@ -635,19 +635,21 @@ impl ProtocolHandler for FtpDataHandler {
         }
     }
 
-    fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        self.take_stor();
-        if let Some(state) = &self.stor_state {
-            let handle = self.data_handle.clone().expect("receive() only runs after arm()");
-            if self.stor_ascii {
-                let mut out = Vec::with_capacity(data.len());
-                self.stor_denorm.feed(data, &mut out);
-                enqueue_stor_chunk(state, &self.storage, &handle, out);
-            } else {
-                enqueue_stor_chunk(state, &self.storage, &handle, data.to_vec());
+    fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            self.take_stor();
+            if let Some(state) = &self.stor_state {
+                let handle = self.data_handle.clone().expect("receive() only runs after arm()");
+                if self.stor_ascii {
+                    let mut out = Vec::with_capacity(data.len());
+                    self.stor_denorm.feed(data, &mut out);
+                    enqueue_stor_chunk(state, &self.storage, &handle, out);
+                } else {
+                    enqueue_stor_chunk(state, &self.storage, &handle, data.to_vec());
+                }
             }
-        }
-        *data = &[];
+            *data = &[];
+        });
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
@@ -912,7 +914,7 @@ mod tests {
             let chunk = vec![i; 500];
             expected_bytes.extend_from_slice(&chunk);
             let mut data: &[u8] = &chunk;
-            handler.receive_slice(&mut ep, &mut data);
+            hopf_core::forward_slice(&mut handler, &mut ep, &mut data);
         }
         handler.disconnected(&mut ep);
 
@@ -959,9 +961,9 @@ mod tests {
 
         // First chunk succeeds (call 1), second chunk fails (call 2).
         let mut first: &[u8] = b"first chunk ok";
-        handler.receive_slice(&mut ep, &mut first);
+        hopf_core::forward_slice(&mut handler, &mut ep, &mut first);
         let mut second: &[u8] = b"second chunk fails";
-        handler.receive_slice(&mut ep, &mut second);
+        hopf_core::forward_slice(&mut handler, &mut ep, &mut second);
         handler.disconnected(&mut ep);
 
         assert!(

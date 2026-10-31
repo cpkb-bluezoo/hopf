@@ -395,7 +395,7 @@ mod tests {
 
         let mut response: &[u8] =
             b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n";
-        ep.receive_slice(&mut endpoint, &mut response);
+        hopf_core::forward_slice(&mut ep, &mut endpoint, &mut response);
         assert!(response.is_empty(), "the whole 101 response head must be consumed");
 
         assert!(matches!(ep.phase, Phase::H2(_)), "must have promoted to H2");
@@ -429,7 +429,7 @@ mod tests {
 
         let mut response: &[u8] =
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-        ep.receive_slice(&mut endpoint, &mut response);
+        hopf_core::forward_slice(&mut ep, &mut endpoint, &mut response);
         assert!(response.is_empty());
 
         assert!(matches!(ep.phase, Phase::H1(_)), "must stay on HTTP/1.1");

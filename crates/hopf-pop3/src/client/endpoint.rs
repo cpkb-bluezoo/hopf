@@ -746,71 +746,73 @@ impl ProtocolHandler for Pop3ClientEndpoint {
         self.arm_stage_timer(ep);
     }
 
-    fn receive_slice(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
-        if matches!(self.proto_state, ProtoState::Closed | ProtoState::Error) {
-            *data = &[];
-            return;
-        }
-        // First, before any reply is dispatched: a poke from another
-        // thread arrives here with no data, and this is its whole purpose.
-        self.wake_driver(ep);
-        // The outer loop handles transitions between body mode and status/listing
-        // mode that may happen mid-buffer (e.g. +OK\r\n<body> in a single TCP segment).
-        loop {
-            if data.is_empty() || matches!(self.proto_state, ProtoState::Closed | ProtoState::Error) {
-                break;
+    fn receive(&mut self, ep: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+            if matches!(self.proto_state, ProtoState::Closed | ProtoState::Error) {
+                *data = &[];
+                return;
             }
-
-            // Body mode: feed bytes to the dot-unstuffer.
-            if matches!(self.proto_state, ProtoState::RetrBody(_) | ProtoState::TopBody(_)) {
-                let (chunks, complete) = self.unstuffer.feed(data);
-                for chunk in &chunks {
-                    if let Some(mut driver) = self.driver.take() {
-                        driver.on_message_content(chunk, ep);
-                        self.driver = Some(driver);
-                    }
-                }
-                match complete {
-                    Some(consumed) => {
-                        *data = &data[consumed..];
-                        self.handle_body_complete(ep);
-                        self.flush_outbound(ep);
-                        // Continue loop: remaining bytes go back to status/listing mode.
-                    }
-                    None => {
-                        // All input consumed by the body; wait for more bytes.
-                        return;
-                    }
-                }
-                continue;
-            }
-
-            // Status / listing mode: feed to the reply lexer. The lexer
-            // updates *data after each event batch (and immediately on
-            // RetrStart/TopStart), so remaining bytes are available for
-            // the next iteration after a body-mode transition.
-            let events = match self.lexer.feed(data) {
-                Ok(e) => e,
-                Err(e) => {
-                    self.protocol_error(ep, e.to_string());
-                    return;
-                }
-            };
-
-            if events.is_empty() {
-                break; // no complete field yet; wait for more bytes
-            }
-
-            for event in events {
-                if matches!(self.proto_state, ProtoState::Closed | ProtoState::Error) {
+            // First, before any reply is dispatched: a poke from another
+            // thread arrives here with no data, and this is its whole purpose.
+            self.wake_driver(ep);
+            // The outer loop handles transitions between body mode and status/listing
+            // mode that may happen mid-buffer (e.g. +OK\r\n<body> in a single TCP segment).
+            loop {
+                if data.is_empty() || matches!(self.proto_state, ProtoState::Closed | ProtoState::Error) {
                     break;
                 }
-                self.dispatch_event(event, ep);
-                self.flush_outbound(ep);
-                self.arm_stage_timer(ep);
+
+                // Body mode: feed bytes to the dot-unstuffer.
+                if matches!(self.proto_state, ProtoState::RetrBody(_) | ProtoState::TopBody(_)) {
+                    let (chunks, complete) = self.unstuffer.feed(data);
+                    for chunk in &chunks {
+                        if let Some(mut driver) = self.driver.take() {
+                            driver.on_message_content(chunk, ep);
+                            self.driver = Some(driver);
+                        }
+                    }
+                    match complete {
+                        Some(consumed) => {
+                            *data = &data[consumed..];
+                            self.handle_body_complete(ep);
+                            self.flush_outbound(ep);
+                            // Continue loop: remaining bytes go back to status/listing mode.
+                        }
+                        None => {
+                            // All input consumed by the body; wait for more bytes.
+                            return;
+                        }
+                    }
+                    continue;
+                }
+
+                // Status / listing mode: feed to the reply lexer. The lexer
+                // updates *data after each event batch (and immediately on
+                // RetrStart/TopStart), so remaining bytes are available for
+                // the next iteration after a body-mode transition.
+                let events = match self.lexer.feed(data) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        self.protocol_error(ep, e.to_string());
+                        return;
+                    }
+                };
+
+                if events.is_empty() {
+                    break; // no complete field yet; wait for more bytes
+                }
+
+                for event in events {
+                    if matches!(self.proto_state, ProtoState::Closed | ProtoState::Error) {
+                        break;
+                    }
+                    self.dispatch_event(event, ep);
+                    self.flush_outbound(ep);
+                    self.arm_stage_timer(ep);
+                }
+                // After processing events, loop back: may have entered body mode.
             }
-            // After processing events, loop back: may have entered body mode.
-        }
+        });
     }
 
     fn security_established(&mut self, ep: &mut dyn Endpoint, _info: &SecurityInfo) {
@@ -1250,7 +1252,7 @@ mod tests {
 
     fn feed(ep: &mut Pop3ClientEndpoint, fake: &mut FakeEp, wire: &[u8]) {
         let mut data = wire;
-        ProtocolHandler::receive_slice(ep, fake, &mut data);
+        hopf_core::forward_slice(ep, fake, &mut data);
     }
 
     /// A poke from another thread re-enters `receive` with no data. Before

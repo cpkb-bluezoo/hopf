@@ -350,10 +350,12 @@ fn active_mode_prot_p_actually_encrypts_the_data_connection() {
         fn security_established(&mut self, _endpoint: &mut dyn Endpoint, _info: &hopf_core::SecurityInfo) {
             self.secured.store(true, Ordering::SeqCst);
         }
-        fn receive_slice(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            self.buf.lock().unwrap().extend_from_slice(data);
-            *data = &[];
-        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                self.buf.lock().unwrap().extend_from_slice(data);
+                *data = &[];
+        });
+    }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
     }
@@ -776,9 +778,11 @@ fn async_client_greeting_timeout() {
     struct Silent;
     impl ProtocolHandler for Silent {
         fn connected(&mut self, _: &mut dyn Endpoint) {}
-        fn receive_slice(&mut self, _: &mut dyn Endpoint, data: &mut &[u8]) {
-            *data = &[];
-        }
+        fn receive(&mut self, _: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                *data = &[];
+        });
+    }
         fn disconnected(&mut self, _: &mut dyn Endpoint) {}
         fn error(&mut self, _: &mut dyn Endpoint, _: &std::io::Error) {}
     }
@@ -821,9 +825,11 @@ fn connect_timeout_fires_for_unreachable_peer() {
     }
     impl ProtocolHandler for Watch {
         fn connected(&mut self, _: &mut dyn Endpoint) {}
-        fn receive_slice(&mut self, _: &mut dyn Endpoint, data: &mut &[u8]) {
-            *data = &[];
-        }
+        fn receive(&mut self, _: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        hopf_core::with_slice(buf, |data| {
+                *data = &[];
+        });
+    }
         fn disconnected(&mut self, _: &mut dyn Endpoint) {}
         fn error(&mut self, _: &mut dyn Endpoint, err: &std::io::Error) {
             *self.errored.lock().unwrap() = Some(err.kind());
