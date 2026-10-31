@@ -25,6 +25,7 @@ use hopf_mailbox::{MessageRange, MessageSet, WILDCARD};
 use super::codec::{ArgToken, BTreeSetFlags};
 use super::fetch_format::{BodySection, FetchItem, FetchModifiers};
 use super::handler::StoreAction;
+use super::list_ext::{ListCommand, ListReturnOptions, ListSelectOption};
 use super::status_items::StatusItem;
 
 /// The largest literal that may stand for a name (a mailbox, a user, a
@@ -106,6 +107,8 @@ pub enum Request {
     Status { mailbox: String, items: BTreeSet<StatusItem> },
     /// `[UID] FETCH set items [(modifiers)]`
     Fetch { set: MessageSet, items: Vec<FetchItem>, modifiers: FetchModifiers, by_uid: bool },
+    /// `LIST [(select)] reference pattern [RETURN (options)]` / `LSUB reference pattern`
+    List { command: ListCommand, lsub: bool },
 }
 
 /// The machine for one command's arguments.
@@ -156,6 +159,8 @@ pub fn grammar_for(verb: &str, by_uid: bool) -> Option<Box<dyn Grammar>> {
         "STORE" => pattern(STORE, "Invalid flag list", build_store),
         "STATUS" => pattern(STATUS, "Invalid STATUS arguments", build_status),
         "FETCH" => Some(Box::new(Fetch::new(false))),
+        "LIST" => Some(Box::new(List::new(false))),
+        "LSUB" => Some(Box::new(List::new(true))),
         _ => None,
     }
 }
@@ -1021,6 +1026,145 @@ impl Grammar for Fetch {
     }
 }
 
+// ── LIST ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListAt {
+    /// The selection options' `(`, or the reference.
+    Start,
+    /// A selection option, or the `)` that ends them.
+    SelectOptions,
+    /// The reference.
+    Reference,
+    /// The pattern.
+    Pattern,
+    /// After the pattern: the end, or `RETURN`.
+    AfterPattern,
+    /// `RETURN`'s `(`.
+    ReturnOpen,
+    /// A return option, or the `)` that ends them.
+    ReturnOptions,
+    /// `STATUS`'s `(`.
+    StatusOpen,
+    /// A status item, or the `)` that ends them.
+    StatusItems,
+    /// After the return options' `)`: nothing more.
+    Done,
+}
+
+/// `LIST [(select ...)] reference pattern [RETURN (option ...)]`, and the
+/// plain `LSUB reference pattern`.
+struct List {
+    lsub: bool,
+    at: ListAt,
+    command: ListCommand,
+    status: BTreeSet<StatusItem>,
+}
+
+impl List {
+    fn new(lsub: bool) -> Self {
+        Self {
+            lsub,
+            at: ListAt::Start,
+            command: ListCommand {
+                select: BTreeSet::new(),
+                reference: String::new(),
+                pattern: String::new(),
+                ret: ListReturnOptions::default(),
+            },
+            status: BTreeSet::new(),
+        }
+    }
+
+    fn bad(&self, message: &'static str) -> Reject {
+        Reject::new(if self.lsub { "Invalid LSUB" } else { message })
+    }
+
+    /// A reference or pattern: like an astring, but `%` and `*` may be written bare.
+    fn mailbox(&self, tok: Tok<'_>) -> Result<String, Reject> {
+        let wildcard_char = |b: u8| b >= 0x80 || (b.is_ascii_graphic() && !b"(){\"\\]".contains(&b));
+        match tok {
+            Tok::Atom(a) if !a.is_empty() && a.bytes().all(wildcard_char) => Ok(a.to_string()),
+            Tok::Quoted(q) => Ok(q.to_string()),
+            Tok::Literal(l) => Ok(String::from_utf8_lossy(l).into_owned()),
+            _ => Err(self.bad("expected astring")),
+        }
+    }
+}
+
+impl Grammar for List {
+    fn token(&mut self, tok: Tok<'_>) -> Result<(), Reject> {
+        match (self.at, tok) {
+            (ListAt::Start, Tok::Open) if !self.lsub => self.at = ListAt::SelectOptions,
+            (ListAt::Start | ListAt::Reference, tok) => {
+                self.command.reference = self.mailbox(tok)?;
+                self.at = ListAt::Pattern;
+            }
+            (ListAt::SelectOptions, Tok::Atom(a)) => {
+                let option = ListSelectOption::parse(a)
+                    .ok_or_else(|| Reject(Cow::Owned(format!("unknown LIST selection option {a}"))))?;
+                self.command.select.insert(option);
+            }
+            (ListAt::SelectOptions, Tok::Close) => self.at = ListAt::Reference,
+            (ListAt::Pattern, tok) => {
+                self.command.pattern = self.mailbox(tok)?;
+                self.at = ListAt::AfterPattern;
+            }
+            (ListAt::AfterPattern, Tok::Atom(a)) if !self.lsub && a.eq_ignore_ascii_case("RETURN") => self.at = ListAt::ReturnOpen,
+            (ListAt::AfterPattern, _) => return Err(self.bad("unexpected trailing LIST arguments")),
+            (ListAt::ReturnOpen, Tok::Open) => self.at = ListAt::ReturnOptions,
+            (ListAt::ReturnOpen, _) => return Err(Reject::new("RETURN requires a parenthesized list")),
+            (ListAt::ReturnOptions, Tok::Atom(a)) => {
+                if a.eq_ignore_ascii_case("CHILDREN") {
+                    self.command.ret.children = true;
+                } else if a.eq_ignore_ascii_case("SUBSCRIBED") {
+                    self.command.ret.subscribed = true;
+                } else if a.eq_ignore_ascii_case("STATUS") {
+                    self.at = ListAt::StatusOpen;
+                } else {
+                    return Err(Reject(Cow::Owned(format!("unknown LIST RETURN option {}", a.to_ascii_uppercase()))));
+                }
+            }
+            (ListAt::ReturnOptions, Tok::Open) => return Err(Reject::new("unexpected nested list in RETURN")),
+            (ListAt::ReturnOptions, Tok::Close) => self.at = ListAt::Done,
+            (ListAt::StatusOpen, Tok::Open) => self.at = ListAt::StatusItems,
+            (ListAt::StatusOpen, _) => return Err(Reject::new("STATUS return option requires (items)")),
+            (ListAt::StatusItems, Tok::Atom(a)) => {
+                let item = StatusItem::parse(a).ok_or_else(|| Reject(Cow::Owned(format!("unknown STATUS item {a}"))))?;
+                self.status.insert(item);
+            }
+            (ListAt::StatusItems, Tok::Close) => {
+                if self.status.is_empty() {
+                    return Err(Reject::new("empty STATUS list"));
+                }
+                self.command.ret.status = std::mem::take(&mut self.status);
+                self.at = ListAt::ReturnOptions;
+            }
+            (ListAt::Done, _) => return Err(Reject::new("trailing junk after LIST RETURN")),
+            _ => return Err(self.bad("Invalid LIST arguments")),
+        }
+        Ok(())
+    }
+
+    fn literal(&mut self, size: u64) -> Result<(), Reject> {
+        match self.at {
+            ListAt::Start | ListAt::Reference | ListAt::Pattern if size > MAX_NAME_LITERAL => Err(Reject::new("Literal too large")),
+            ListAt::Start | ListAt::Reference | ListAt::Pattern => Ok(()),
+            _ => Err(Reject::new("Literal not allowed here")),
+        }
+    }
+
+    fn finish(self: Box<Self>) -> Result<Request, Reject> {
+        match self.at {
+            ListAt::Start | ListAt::Reference | ListAt::Pattern => Err(self.bad("expected astring")),
+            ListAt::SelectOptions | ListAt::ReturnOptions | ListAt::StatusItems => Err(self.bad("unclosed parenthesis")),
+            ListAt::ReturnOpen => Err(Reject::new("RETURN requires a parenthesized list")),
+            ListAt::StatusOpen => Err(Reject::new("STATUS return option requires (items)")),
+            ListAt::AfterPattern | ListAt::Done => Ok(Request::List { command: self.command, lsub: self.lsub }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1349,5 +1493,78 @@ mod tests {
         assert_eq!(fetch("a FETCH 1 FLAGS extra\r\n"), Err("FETCH modifiers must be parenthesized".to_string()));
         let got = outcomes("a FETCH 1 {5}\r\n", 1000);
         assert!(matches!(&got[..], [Err(_)]), "{got:?}");
+    }
+
+    fn list(wire: &str) -> Result<(ListCommand, bool), String> {
+        match one(wire)? {
+            Request::List { command, lsub } => Ok((command, lsub)),
+            other => panic!("not a LIST: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_agrees_with_the_text_parser() {
+        use crate::server::list_ext::parse_list_command;
+        let corpus = [
+            "\"\" INBOX",
+            "\"\" *",
+            "\"\" %",
+            "INBOX/ %",
+            "\"\" \"Sent Items\"",
+            "\"\" \"\"",
+            "() \"\" *",
+            "(SUBSCRIBED) \"\" *",
+            "(subscribed remote) \"\" *",
+            "(SUBSCRIBED RECURSIVEMATCH) \"\" % RETURN (CHILDREN)",
+            "(SPECIAL-USE) \"\" *",
+            "\"\" * RETURN (SUBSCRIBED CHILDREN)",
+            "\"\" * return (children)",
+            "\"\" * RETURN (STATUS (MESSAGES UIDNEXT))",
+            "\"\" * RETURN (CHILDREN STATUS (UNSEEN) SUBSCRIBED)",
+            "\"\" * RETURN ()",
+            "\"\" * RETURN (STATUS ())",
+            "\"\" * RETURN (STATUS (NOPE))",
+            "\"\" * RETURN (STATUS)",
+            "\"\" * RETURN (NOPE)",
+            "\"\" * RETURN (CHILDREN (X))",
+            "\"\" * RETURN CHILDREN",
+            "\"\" * RETURN (CHILDREN) extra",
+            "\"\" * extra",
+            "(NOPE) \"\" *",
+            "(SUBSCRIBED \"\" *",
+            "\"\" ",
+            "\"\"",
+            "",
+            "(",
+            "()",
+            "INBOX",
+        ];
+        for args in corpus {
+            let mine = list(&format!("a LIST {args}\r\n"));
+            let old = parse_list_command(args);
+            match (&mine, &old) {
+                (Ok((m, false)), Ok(o)) => assert_eq!(m, o, "{args:?}"),
+                (Err(_), Err(_)) => {}
+                _ => panic!("{args:?}: new {mine:?}, old {old:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn lsub_and_literals_and_early_refusal() {
+        let (c, lsub) = list("a LSUB \"\" INBOX/%\r\n").unwrap();
+        assert!(lsub);
+        assert_eq!((c.reference.as_str(), c.pattern.as_str()), ("", "INBOX/%"));
+        assert_eq!(list("a LSUB \"\" * RETURN (CHILDREN)\r\n"), Err("Invalid LSUB".to_string()));
+        assert_eq!(list("a LSUB (SUBSCRIBED) \"\" *\r\n"), Err("Invalid LSUB".to_string()));
+        // A literal may stand for the reference or the pattern.
+        let (c, _) = list("a LIST {2}\r\nab {1+}\r\n*\r\n").unwrap();
+        assert_eq!((c.reference.as_str(), c.pattern.as_str()), ("ab", "*"));
+        // Refused before the continuation, and the next command is unharmed.
+        let got = outcomes("a LIST \"\" * RETURN {4+}\r\nCHIL\r\nb LIST \"\" *\r\n", 1);
+        assert!(got[0].is_err() && matches!(got.last(), Some(Ok(_))), "{got:?}");
+        let got = outcomes("a LIST (NOPE) \"\" *\r\nb LIST \"\" *\r\n", 1);
+        assert_eq!(got[0], Err("unknown LIST selection option NOPE".to_string()));
+        assert!(matches!(got[1], Ok(_)), "{got:?}");
     }
 }

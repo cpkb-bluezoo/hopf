@@ -23,6 +23,7 @@ use crate::compress::{CompressingEndpoint, ImapCompressLayer};
 use crate::enable::EnabledExtensions;
 use crate::server::capability::build_capabilities;
 use crate::server::grammar::Request;
+use crate::server::list_ext::ListCommand;
 use crate::server::handler::StoreAction;
 use hopf_mailbox::MessageSet;
 use crate::server::codec::{
@@ -814,8 +815,6 @@ impl ImapControlHandler {
             "ID" => self.cmd_id(endpoint, cmd),
             "CLOSE" => self.cmd_close(endpoint, &cmd.tag, true),
             "UNSELECT" => self.cmd_close(endpoint, &cmd.tag, false),
-            "LIST" => self.cmd_list(endpoint, cmd, false),
-            "LSUB" => self.cmd_list(endpoint, cmd, true),
             "NAMESPACE" => self.cmd_namespace(endpoint, &cmd.tag),
             "IDLE" => self.cmd_idle(endpoint, &cmd.tag),
             "SETQUOTA" => self.cmd_setquota(endpoint, cmd),
@@ -867,6 +866,7 @@ impl ImapControlHandler {
                 self.cmd_store(endpoint, tag, set, action, silent, flags, by_uid)
             }
             Request::Status { mailbox, items } => self.cmd_status(endpoint, tag, mailbox, items),
+            Request::List { command, lsub } => self.cmd_list(endpoint, tag, command, lsub),
             Request::Fetch { set, items, modifiers, by_uid } => {
                 self.cmd_fetch(endpoint, tag, set, items, modifiers, by_uid)
             }
@@ -1356,37 +1356,14 @@ impl ImapControlHandler {
         );
     }
 
-    fn cmd_list(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand, lsub: bool) {
-        if !self.require_auth(endpoint, &cmd.tag) {
+    fn cmd_list(&mut self, endpoint: &mut dyn Endpoint, tag: String, parsed: ListCommand, lsub: bool) {
+        if !self.require_auth(endpoint, &tag) {
             return;
         }
         if lsub {
-            let Ok((reference, rest)) = parse_astring(&cmd.args) else {
-                self.send(endpoint, tagged_bad(&cmd.tag, "Invalid LSUB"));
-                return;
-            };
-            let Ok((pattern, _)) = parse_astring(rest) else {
-                self.send(endpoint, tagged_bad(&cmd.tag, "Invalid LSUB"));
-                return;
-            };
-            self.run_mgmt(
-                endpoint,
-                &cmd.tag,
-                String::new(),
-                None,
-                reference,
-                pattern,
-                MgmtOp::Lsub,
-            );
+            self.run_mgmt(endpoint, &tag, String::new(), None, parsed.reference, parsed.pattern, MgmtOp::Lsub);
             return;
         }
-        let parsed = match crate::server::list_ext::parse_list_command(&cmd.args) {
-            Ok(p) => p,
-            Err(e) => {
-                self.send(endpoint, tagged_bad(&cmd.tag, &e));
-                return;
-            }
-        };
         let subscribed = parsed
             .select
             .contains(&crate::server::list_ext::ListSelectOption::Subscribed)
@@ -1398,7 +1375,7 @@ impl ImapControlHandler {
         if !extended {
             self.run_mgmt(
                 endpoint,
-                &cmd.tag,
+                &tag,
                 String::new(),
                 None,
                 parsed.reference,
@@ -1411,7 +1388,7 @@ impl ImapControlHandler {
             );
             return;
         }
-        self.run_list_ext(endpoint, &cmd.tag, parsed, subscribed);
+        self.run_list_ext(endpoint, &tag, parsed, subscribed);
     }
 
     fn cmd_fetch(

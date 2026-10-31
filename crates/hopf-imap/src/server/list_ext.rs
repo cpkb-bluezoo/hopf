@@ -44,7 +44,7 @@ pub struct ListCommand {
 }
 
 impl ListSelectOption {
-    fn parse(name: &str) -> Option<Self> {
+    pub(crate) fn parse(name: &str) -> Option<Self> {
         Some(match name.to_ascii_uppercase().as_str() {
             "SUBSCRIBED" => Self::Subscribed,
             "REMOTE" => Self::Remote,
