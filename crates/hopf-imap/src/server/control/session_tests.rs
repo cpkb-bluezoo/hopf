@@ -1093,3 +1093,107 @@ fn modseq_is_only_sent_once_condstore_is_enabled() {
     s.run("a SELECT INBOX (CONDSTORE)\r\n");
     assert!(s.run("b STORE 1 +FLAGS (\\Answered)\r\n").contains("MODSEQ ("));
 }
+
+fn b64(bytes: &[u8]) -> String {
+    rmimeparser::charset::base64::encode(bytes)
+}
+
+/// RFC 3501 §6.2.2 / RFC 4959: AUTHENTICATE with no initial response is
+/// answered with an empty `+`, and the client's first message is its reply.
+#[test]
+fn authenticate_without_an_initial_response_prompts_for_one() {
+    let plain = |user: &str, pass: &str| b64(format!("\0{user}\0{pass}").as_bytes());
+    let secure = || {
+        let mut s = Session::new();
+        s.h.tls = true;
+        s
+    };
+    // The prompt, then the response.
+    let mut s = secure();
+    assert_eq!(s.run("a AUTHENTICATE PLAIN\r\n"), "+ \r\n");
+    let out = s.run(&format!("{}\r\n", plain("u", "p")));
+    assert!(status(&out, "a").starts_with("a OK [CAPABILITY "), "{out}");
+    assert!(status(&s.run("b LIST \"\" INBOX\r\n"), "b").starts_with("b OK "), "logged in");
+
+    // Wrong password, and the connection stays usable.
+    let mut s = secure();
+    assert_eq!(s.run("a AUTHENTICATE PLAIN\r\n"), "+ \r\n");
+    assert!(status(&s.run(&format!("{}\r\n", plain("u", "wrong"))), "a").starts_with("a NO "));
+    assert!(status(&s.run("b LOGIN u p\r\n"), "b").starts_with("b OK "));
+
+    // The client may cancel with `*`.
+    let mut s = secure();
+    assert_eq!(s.run("a AUTHENTICATE PLAIN\r\n"), "+ \r\n");
+    assert!(status(&s.run("*\r\n"), "a").starts_with("a BAD "));
+    assert!(status(&s.run("b NOOP\r\n"), "b").starts_with("b OK "));
+
+    // With the response on the command line (SASL-IR) nothing is prompted for.
+    let mut s = secure();
+    let out = s.run(&format!("a AUTHENTICATE PLAIN {}\r\n", plain("u", "p")));
+    assert!(status(&out, "a").starts_with("a OK "), "{out}");
+    let mut s = secure();
+    let out = s.run(&format!("a AUTHENTICATE PLAIN {}\r\n", plain("u", "nope")));
+    assert!(status(&out, "a").starts_with("a NO "), "{out}");
+    // `=` is an explicit empty response, which PLAIN refuses.
+    let mut s = secure();
+    assert!(status(&s.run("a AUTHENTICATE PLAIN =\r\n"), "a").starts_with("a NO "));
+}
+
+/// A full SCRAM-SHA-256 exchange against the server, with hopf's own client:
+/// the server's final data goes out as a `+`, the client acknowledges it with
+/// an empty line, and only then is the command completed (RFC 4422 §3.5).
+#[test]
+fn scram_sha_256_authenticates_end_to_end() {
+    use hopf_auth::{create_client, SaslClientStep, SaslMechanism};
+    let decode = |line: &str| rmimeparser::charset::base64::decode(line.trim().trim_start_matches("+ ")).unwrap();
+    for initial_response in [true, false] {
+        for (password, ok) in [("p", true), ("wrong", false)] {
+            let mut client = create_client(SaslMechanism::ScramSha256, "u", password, "localhost", "imap", None);
+            let SaslClientStep::Response(first) = client.evaluate(None) else { panic!("client-first") };
+            let mut s = Session::new();
+            let out = if initial_response {
+                s.run(&format!("a AUTHENTICATE SCRAM-SHA-256 {}\r\n", b64(&first)))
+            } else {
+                assert_eq!(s.run("a AUTHENTICATE SCRAM-SHA-256\r\n"), "+ \r\n");
+                s.run(&format!("{}\r\n", b64(&first)))
+            };
+            assert!(out.starts_with("+ ") && !out.contains("a NO"), "server-first: {out}");
+            let (SaslClientStep::Response(last) | SaslClientStep::Complete(last)) = client.evaluate(Some(&decode(&out))) else {
+                panic!("client-final")
+            };
+            let out = s.run(&format!("{}\r\n", b64(&last)));
+            if !ok {
+                assert!(status(&out, "a").starts_with("a NO "), "wrong password: {out}");
+                continue;
+            }
+            // The server's proof goes out as data, and the command is not yet complete.
+            assert!(out.starts_with("+ v=") || out.starts_with("+ "), "{out}");
+            assert!(!out.contains("a OK") && !out.contains("a NO"), "completed before the client acknowledged: {out}");
+            assert!(matches!(client.evaluate(Some(&decode(&out))), SaslClientStep::Complete(ref m) if m.is_empty()));
+            let out = s.run("\r\n");
+            assert!(status(&out, "a").starts_with("a OK [CAPABILITY "), "{out}");
+            assert!(status(&s.run("b LIST \"\" INBOX\r\n"), "b").starts_with("b OK "), "logged in");
+        }
+    }
+    // The client may refuse the server's proof by cancelling.
+    let mut client = create_client(SaslMechanism::ScramSha256, "u", "p", "localhost", "imap", None);
+    let SaslClientStep::Response(first) = client.evaluate(None) else { panic!() };
+    let mut s = Session::new();
+    let out = s.run(&format!("a AUTHENTICATE SCRAM-SHA-256 {}\r\n", b64(&first)));
+    let (SaslClientStep::Response(last) | SaslClientStep::Complete(last)) = client.evaluate(Some(&decode(&out))) else { panic!() };
+    s.run(&format!("{}\r\n", b64(&last)));
+    assert!(status(&s.run("*\r\n"), "a").starts_with("a BAD "));
+    assert!(status(&s.run("b LIST \"\" INBOX\r\n"), "b").starts_with("b NO "), "not logged in after a cancel");
+}
+
+#[test]
+fn a_mechanism_where_the_server_speaks_first_is_unaffected() {
+    let mut s = Session::new();
+    s.h.tls = true;
+    let out = s.run("a AUTHENTICATE LOGIN\r\n");
+    assert_eq!(out, format!("+ {}\r\n", b64(b"Username:")));
+    let out = s.run(&format!("{}\r\n", b64(b"u")));
+    assert_eq!(out, format!("+ {}\r\n", b64(b"Password:")));
+    let out = s.run(&format!("{}\r\n", b64(b"p")));
+    assert!(status(&out, "a").starts_with("a OK [CAPABILITY "), "{out}");
+}

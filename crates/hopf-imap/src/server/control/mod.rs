@@ -128,6 +128,10 @@ pub(crate) struct PendingOpen {
 struct PendingAuth {
     tag: String,
     server: Box<dyn SaslServer>,
+    /// The mechanism has succeeded for this user, and its final data has been
+    /// sent as a `+`: the client's empty line is all that is awaited before
+    /// the command completes (RFC 4422 §3.5).
+    completed: Option<String>,
 }
 
 /// Result of a credential check offloaded to the storage pool (issue #181)
@@ -1034,6 +1038,16 @@ impl ImapControlHandler {
             self.sasl_step(endpoint, tag, server, None, true);
             return;
         }
+        if initial_response.is_none() {
+            // A mechanism where the client speaks first, and the client has not
+            // (RFC 4959): an empty challenge asks for its first message, which
+            // is the next line (RFC 3501 §6.2.2). Stepping the mechanism with
+            // nothing would only fail it.
+            self.send(endpoint, continuation(""));
+            self.pending_auth = Some(PendingAuth { tag, server, completed: None });
+            self.lexer.expect_sasl_response();
+            return;
+        }
         self.sasl_step(endpoint, tag, server, initial_response.as_deref(), false);
     }
 
@@ -1116,20 +1130,23 @@ impl ImapControlHandler {
                 Ok((server, step)) => match step {
                     SaslServerStep::Challenge(c) => {
                         self.send(endpoint, continuation(&base64::encode(&c)));
-                        self.pending_auth = Some(PendingAuth { tag, server });
+                        self.pending_auth = Some(PendingAuth { tag, server, completed: None });
                         self.lexer.expect_sasl_response();
                     }
                     SaslServerStep::Complete {
                         username,
                         final_message,
-                    } if !first_step => {
-                        if let Some(fm) = final_message {
-                            if !fm.is_empty() {
-                                self.send(endpoint, continuation(&base64::encode(&fm)));
-                            }
+                    } if !first_step => match final_message.filter(|fm| !fm.is_empty()) {
+                        Some(fm) => {
+                            // Data for the client goes out as a continuation, and
+                            // the client answers it with an empty line; only then
+                            // is the command complete.
+                            self.send(endpoint, continuation(&base64::encode(&fm)));
+                            self.pending_auth = Some(PendingAuth { tag, server, completed: Some(username) });
+                            self.lexer.expect_sasl_response();
                         }
-                        self.finish_auth(endpoint, &tag, username);
-                    }
+                        None => self.finish_auth(endpoint, &tag, username),
+                    },
                     SaslServerStep::Complete { .. } | SaslServerStep::Failure => {
                         self.auth_failed(endpoint, &tag);
                     }
@@ -1890,11 +1907,19 @@ impl ImapControlHandler {
     }
 
     fn feed_auth_line(&mut self, endpoint: &mut dyn Endpoint, line: &[u8]) {
-        let Some(PendingAuth { tag, server }) = self.pending_auth.take() else {
+        let Some(PendingAuth { tag, server, completed }) = self.pending_auth.take() else {
             return;
         };
         if line == b"*" {
             self.send(endpoint, tagged_bad(&tag, "Authentication cancelled"));
+            return;
+        }
+        if let Some(username) = completed {
+            if line.is_empty() {
+                self.finish_auth(endpoint, &tag, username);
+            } else {
+                self.send(endpoint, tagged_bad(&tag, "Expected an empty response"));
+            }
             return;
         }
         match std::str::from_utf8(line)
