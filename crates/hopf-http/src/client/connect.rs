@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hopf_core::{
-    subsystem_log, Endpoint, LogLevel, ProtocolHandler, Runtime, SecurityInfo,
+    subsystem_log, Endpoint, LogLevel, LoopBuf, ProtocolHandler, Runtime, SecurityInfo,
     SharedTlsConnector, TcpConnectorConfig, UnixConnectorConfig,
 };
 use hopf_dns::{parse_literal_ip, DnsResolver};
@@ -200,7 +200,6 @@ struct TlsAlpnClientEndpoint {
     factory: Arc<dyn ClientHandlerFactory>,
     limits: HttpLimits,
     inner: Option<Box<dyn ProtocolHandler>>,
-    pending_receive: Vec<u8>,
 }
 
 impl TlsAlpnClientEndpoint {
@@ -209,7 +208,6 @@ impl TlsAlpnClientEndpoint {
             factory,
             limits,
             inner: None,
-            pending_receive: Vec::new(),
         }
     }
 
@@ -235,22 +233,13 @@ impl ProtocolHandler for TlsAlpnClientEndpoint {
         let inner = self.inner.as_mut().expect("just installed");
         inner.connected(endpoint);
         inner.security_established(endpoint, info);
-        if !self.pending_receive.is_empty() {
-            let buf = std::mem::take(&mut self.pending_receive);
-            let mut slice: &[u8] = &buf;
-            inner.receive_slice(endpoint, &mut slice);
-        }
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut LoopBuf) {
+        // Data that arrives before the TLS handshake has told us the ALPN
+        // protocol is left in the ring, not buffered here.
         if let Some(inner) = self.inner.as_mut() {
-            inner.receive_slice(endpoint, data);
-        } else {
-            // Arrived before the TLS handshake finished informing us of
-            // ALPN — buffer it (matches the same-shaped race
-            // `HttpClientConnection::receive` already has to handle).
-            self.pending_receive.extend_from_slice(data);
-            *data = &[];
+            inner.receive(endpoint, buf);
         }
     }
 

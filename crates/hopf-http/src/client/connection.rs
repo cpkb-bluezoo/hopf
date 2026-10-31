@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use hopf_core::{Endpoint, ProtocolHandler, SecurityInfo};
+use hopf_core::{Endpoint, LoopBuf, ProtocolHandler, SecurityInfo};
 
 use crate::h1::{H1Endpoint, H1SessionClientCodec};
 use crate::limits::HttpLimits;
@@ -58,7 +58,6 @@ pub struct HttpClientConnection {
     secure: bool,
     h2_prior_knowledge: bool,
     inner: Option<Box<dyn ProtocolHandler>>,
-    pending_receive: Vec<u8>,
 }
 
 impl HttpClientConnection {
@@ -78,7 +77,6 @@ impl HttpClientConnection {
             secure,
             h2_prior_knowledge,
             inner: None,
-            pending_receive: Vec::new(),
         }
     }
 
@@ -120,13 +118,6 @@ impl HttpClientConnection {
             inner.connected(endpoint);
             inner.security_established(endpoint, info);
         }
-        if !self.pending_receive.is_empty() {
-            let buf = std::mem::take(&mut self.pending_receive);
-            let mut slice: &[u8] = &buf;
-            if let Some(inner) = self.inner.as_mut() {
-                inner.receive_slice(endpoint, &mut slice);
-            }
-        }
     }
 }
 
@@ -154,12 +145,11 @@ impl ProtocolHandler for HttpClientConnection {
         self.start_tls(endpoint, info);
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut LoopBuf) {
+        // Before a session is installed nothing is consumed: what has
+        // arrived waits in the ring until there is one to read it.
         if let Some(inner) = self.inner.as_mut() {
-            inner.receive_slice(endpoint, data);
-        } else {
-            self.pending_receive.extend_from_slice(data);
-            *data = &[];
+            inner.receive(endpoint, buf);
         }
     }
 

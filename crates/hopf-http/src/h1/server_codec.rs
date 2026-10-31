@@ -57,7 +57,7 @@ impl<H: ServerHandler> H1ServerCodec<H> {
     ///
     /// Everything is consumed unless the connection has switched protocols,
     /// in which case the remainder belongs to the upgrade handler.
-    pub fn receive(&mut self, data: &mut &[u8]) -> HttpResult<()> {
+    pub fn receive_bytes(&mut self, data: &mut &[u8]) -> HttpResult<()> {
         if let Some(err) = self.driver.fatal.clone() {
             *data = &[];
             return Err(err);
@@ -741,7 +741,7 @@ mod tests {
     fn feed_all(p: &mut H1ServerCodec<Arc<Mutex<Rec>>>, chunks: &[&[u8]]) {
         for c in chunks {
             let mut slice: &[u8] = c;
-            p.receive(&mut slice).unwrap();
+            p.receive_bytes(&mut slice).unwrap();
             assert!(
                 slice.is_empty(),
                 "codec left {} byte(s) unconsumed from {:?}",
@@ -761,7 +761,7 @@ mod tests {
             let mut p = H1ServerCodec::new(Arc::clone(&rec), HttpLimits::default(), false);
             for part in [&msg[..split], &msg[split..]] {
                 let mut slice: &[u8] = part;
-                p.receive(&mut slice).unwrap();
+                p.receive_bytes(&mut slice).unwrap();
                 assert!(slice.is_empty(), "split {split} retained bytes");
             }
             let g = rec.lock().unwrap();
@@ -800,7 +800,7 @@ mod tests {
         pending.extend_from_slice(b"GET /myresource H");
         let mut slice = pending.as_slice();
         let before = slice.len();
-        p.receive(&mut slice).unwrap();
+        p.receive_bytes(&mut slice).unwrap();
         let consumed = before - slice.len();
         pending.drain(..consumed);
 
@@ -811,7 +811,7 @@ mod tests {
         pending.extend_from_slice(b"TTP/1.1\r\nHost: x\r\n\r\n");
         let mut slice = pending.as_slice();
         let before = slice.len();
-        p.receive(&mut slice).unwrap();
+        p.receive_bytes(&mut slice).unwrap();
         let consumed = before - slice.len();
         pending.drain(..consumed);
         assert!(pending.is_empty());
@@ -857,7 +857,7 @@ mod tests {
         let mut p = H1ServerCodec::new(Arc::clone(&rec), HttpLimits::default(), false);
         let mut data: &[u8] =
             b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\nhello";
-        let err = p.receive(&mut data).unwrap_err();
+        let err = p.receive_bytes(&mut data).unwrap_err();
         assert_eq!(err.status, 400);
         assert!(rec.lock().unwrap().events.is_empty(), "must not reach the app handler");
     }
@@ -867,7 +867,7 @@ mod tests {
         let rec = Arc::new(Mutex::new(Rec::default()));
         let mut p = H1ServerCodec::new(Arc::clone(&rec), HttpLimits::default(), false);
         let mut data: &[u8] = b"GET / HTTP/1.1\r\n\r\n";
-        let err = p.receive(&mut data).unwrap_err();
+        let err = p.receive_bytes(&mut data).unwrap_err();
         assert_eq!(err.status, 400);
     }
 
@@ -876,7 +876,7 @@ mod tests {
         let rec = Arc::new(Mutex::new(Rec::default()));
         let mut p = H1ServerCodec::new(Arc::clone(&rec), HttpLimits::default(), false);
         let mut data: &[u8] = b"TRACE / HTTP/1.1\r\nHost: x\r\n\r\n";
-        let err = p.receive(&mut data).unwrap_err();
+        let err = p.receive_bytes(&mut data).unwrap_err();
         assert_eq!(err.status, 501);
         assert!(rec.lock().unwrap().events.is_empty());
     }
@@ -898,7 +898,7 @@ mod tests {
         let mut p = H1ServerCodec::new(Arc::clone(&rec), HttpLimits::default(), false);
         let mut data: &[u8] =
             b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello";
-        let err = p.receive(&mut data).unwrap_err();
+        let err = p.receive_bytes(&mut data).unwrap_err();
         assert_eq!(err.status, 400);
     }
 
@@ -907,7 +907,7 @@ mod tests {
         let rec = Arc::new(Mutex::new(Rec::default()));
         let mut p = H1ServerCodec::new(Arc::clone(&rec), HttpLimits::default(), false);
         let mut data: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\nX-Bad: a\x01b\r\n\r\n";
-        let err = p.receive(&mut data).unwrap_err();
+        let err = p.receive_bytes(&mut data).unwrap_err();
         assert_eq!(err.status, 400);
     }
 
@@ -973,7 +973,7 @@ mod tests {
             false,
         );
         let mut data: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
-        p.receive(&mut data).unwrap();
+        p.receive_bytes(&mut data).unwrap();
         // from_execute path: bytes land in the shared session; take_outbound sees them.
         let out = String::from_utf8(p.take_outbound()).unwrap();
         assert!(out.contains("HTTP/1.1 200"), "{out}");
@@ -991,7 +991,7 @@ mod tests {
         // Explicit from_execute (same as default, documents the contract).
         p.bind_conn_handle(ConnHandle::from_execute(Arc::new(|task| task())));
         let mut data: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
-        p.receive(&mut data).unwrap();
+        p.receive_bytes(&mut data).unwrap();
         let out = String::from_utf8(p.take_outbound()).unwrap();
         assert!(out.contains("deferred"), "{out}");
     }
@@ -1014,7 +1014,7 @@ mod tests {
         }
         let mut p = H1ServerCodec::new(CompleteDeferred, HttpLimits::default(), false);
         let mut data: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
-        p.receive(&mut data).unwrap();
+        p.receive_bytes(&mut data).unwrap();
         let out = String::from_utf8(p.take_outbound()).unwrap();
         assert!(out.contains("HTTP/1.1 201"), "{out}");
     }
@@ -1043,7 +1043,7 @@ mod tests {
         let slow = Arc::new(Mutex::new(Slow::default()));
         let mut p = H1ServerCodec::new(Arc::clone(&slow), HttpLimits::default(), false);
         let mut req: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
-        p.receive(&mut req).unwrap();
+        p.receive_bytes(&mut req).unwrap();
         assert_eq!(slow.lock().unwrap().completed, 1);
         let _ = p.close();
         assert_eq!(slow.lock().unwrap().aborted, 1, "the open response was not told the connection went away");
@@ -1051,7 +1051,7 @@ mod tests {
         let done = Arc::new(Mutex::new(Rec::default()));
         let mut p = H1ServerCodec::new(Arc::clone(&done), HttpLimits::default(), false);
         let mut req: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
-        p.receive(&mut req).unwrap();
+        p.receive_bytes(&mut req).unwrap();
         let _ = p.take_outbound();
         let _ = p.close();
         // `Rec` answers in `headers`, so nothing was open: no abort.

@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use hopf_core::{Endpoint, ProtocolHandler, SecurityInfo};
+use hopf_core::{Endpoint, LoopBuf, ProtocolHandler, SecurityInfo};
 
 use crate::h1::H1Endpoint;
 use crate::h2::H2Endpoint;
@@ -26,7 +26,6 @@ pub struct AlpnHttpEndpoint {
     factory: Arc<dyn ServerHandlerFactory>,
     limits: HttpLimits,
     inner: Option<Box<dyn ProtocolHandler>>,
-    pending_receive: Vec<u8>,
 }
 
 impl AlpnHttpEndpoint {
@@ -37,7 +36,6 @@ impl AlpnHttpEndpoint {
             factory,
             limits,
             inner: None,
-            pending_receive: Vec::new(),
         }
     }
 }
@@ -66,24 +64,15 @@ impl ProtocolHandler for AlpnHttpEndpoint {
         inner.connected(endpoint);
         inner.security_established(endpoint, info);
 
-        // Replay any data that arrived before security was established.
-        if !self.pending_receive.is_empty() {
-            let buf = std::mem::take(&mut self.pending_receive);
-            let mut slice: &[u8] = &buf;
-            inner.receive_slice(endpoint, &mut slice);
-        }
-
         self.inner = Some(inner);
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut LoopBuf) {
+        // Until ALPN has chosen the protocol nothing is consumed: what has
+        // arrived waits in the ring for the inner handler (the connection
+        // delivers it again once security is established).
         if let Some(inner) = self.inner.as_mut() {
-            inner.receive_slice(endpoint, data);
-        } else {
-            // Buffer until ALPN is decided (should not normally happen for
-            // TLS connections, but be defensive).
-            self.pending_receive.extend_from_slice(data);
-            *data = &[];
+            inner.receive(endpoint, buf);
         }
     }
 

@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use hopf_core::{Endpoint, ProtocolHandler, TimerHandle};
+use hopf_core::{Endpoint, LoopBuf, ProtocolHandler, TimerHandle};
 
 use crate::client::api::{
     HttpClientError, HttpClientSessionHandle, HttpResponseHandler,
@@ -658,8 +658,8 @@ impl ProtocolHandler for H2HttpClientSession {
         self.maybe_notify_connected(endpoint);
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        self.inner.receive_slice(endpoint, data);
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut LoopBuf) {
+        self.inner.receive(endpoint, buf);
         self.maybe_notify_connected(endpoint);
         self.flush_session(endpoint);
         // Inbound frames (a WINDOW_UPDATE above all) can free room in the

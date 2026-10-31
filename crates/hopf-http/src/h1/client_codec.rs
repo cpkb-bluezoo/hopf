@@ -70,7 +70,7 @@ impl<H: ClientHandler> H1ClientCodec<H> {
     /// installed via [`ClientWriter::upgrade`]) — see [`Self::take_handler`]
     /// for the older, h2c-Upgrade-specific handoff that instead reclaims the
     /// [`ClientHandler`] itself.
-    pub fn receive(&mut self, data: &mut &[u8]) -> HttpResult<()> {
+    pub fn receive_bytes(&mut self, data: &mut &[u8]) -> HttpResult<()> {
         if let Some(err) = self.driver.fatal.clone() {
             *data = &[];
             return Err(err);
@@ -744,7 +744,7 @@ mod tests {
 
         let mut data: &[u8] =
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-        c.receive(&mut data).unwrap();
+        c.receive_bytes(&mut data).unwrap();
         assert!(data.is_empty());
         let g = rec.lock().unwrap();
         assert_eq!(g.status, 200);
@@ -768,7 +768,7 @@ mod tests {
 
         let mut data: &[u8] =
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!";
-        assert!(c.receive(&mut data).is_err());
+        assert!(c.receive_bytes(&mut data).is_err());
     }
 
     /// A `100 Continue` sent before the real response must not be delivered
@@ -790,7 +790,7 @@ mod tests {
 
         let mut data: &[u8] =
             b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-        c.receive(&mut data).unwrap();
+        c.receive_bytes(&mut data).unwrap();
         assert!(data.is_empty());
 
         let g = rec.lock().unwrap();
@@ -817,13 +817,13 @@ mod tests {
         let _ = c.take_outbound();
 
         let mut first: &[u8] = b"HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\n";
-        c.receive(&mut first).unwrap();
+        c.receive_bytes(&mut first).unwrap();
         assert!(first.is_empty());
         assert_eq!(rec.lock().unwrap().informational, vec![103]);
         assert_eq!(rec.lock().unwrap().status, 0, "no terminal response yet");
 
         let mut second: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
-        c.receive(&mut second).unwrap();
+        c.receive_bytes(&mut second).unwrap();
         assert!(second.is_empty());
 
         let g = rec.lock().unwrap();
@@ -917,7 +917,7 @@ mod tests {
 
         let mut response: &[u8] =
             b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: example\r\nConnection: Upgrade\r\n\r\nextra";
-        c.receive(&mut response).unwrap();
+        c.receive_bytes(&mut response).unwrap();
         assert!(response.is_empty(), "the whole response head, plus the trailing extra bytes, must be consumed");
         assert_eq!(upgrade.lock().unwrap().received, b"extra", "bytes left over after the 101 head belong to the upgrade handler");
 
@@ -931,7 +931,7 @@ mod tests {
         assert_eq!(c.take_outbound(), b"pong");
 
         let mut more: &[u8] = b" more bytes belong to the upgraded protocol";
-        c.receive(&mut more).unwrap();
+        c.receive_bytes(&mut more).unwrap();
         assert!(more.is_empty());
         assert_eq!(upgrade.lock().unwrap().received, b"extra more bytes belong to the upgraded protocol");
 

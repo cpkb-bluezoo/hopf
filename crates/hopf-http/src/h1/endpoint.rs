@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use hopf_core::{Endpoint, ProtocolHandler};
+use hopf_core::{Endpoint, LoopBuf, ProtocolHandler};
 
 use crate::limits::HttpLimits;
 use crate::stream::{
@@ -12,6 +12,7 @@ use crate::stream::{
 };
 
 use super::client_codec::H1ClientCodec;
+use super::over_ring;
 use super::server_codec::H1ServerCodec;
 use super::session_client_codec::H1SessionClientCodec;
 
@@ -195,21 +196,21 @@ impl ProtocolHandler for H1Endpoint {
         }
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut LoopBuf) {
         self.bind_server_handle(endpoint);
         match self.role {
             HttpRole::Server => {
                 if let Some(codec) = self.server.as_mut() {
-                    let _ = codec.receive(data);
+                    let _ = over_ring(buf, |data| codec.receive_bytes(data));
                 }
                 self.flush_server(endpoint);
             }
             HttpRole::Client => {
                 if let Some(codec) = self.client.as_mut() {
-                    let _ = codec.receive(data);
+                    let _ = over_ring(buf, |data| codec.receive_bytes(data));
                 }
                 if let Some(codec) = self.session.as_mut() {
-                    let _ = codec.receive(data);
+                    let _ = over_ring(buf, |data| codec.receive_bytes(data));
                 }
                 self.flush_client(endpoint);
             }

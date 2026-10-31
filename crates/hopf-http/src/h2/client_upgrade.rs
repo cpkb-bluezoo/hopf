@@ -12,9 +12,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use hopf_core::{Endpoint, ProtocolHandler, SecurityInfo};
+use hopf_core::{Endpoint, LoopBuf, ProtocolHandler, SecurityInfo};
 
-use crate::h1::H1ClientCodec;
+use crate::h1::{over_ring, H1ClientCodec};
 use crate::headers::Headers;
 use crate::limits::HttpLimits;
 use crate::stream::{ClientHandler, ClientHandlerFactory, ClientWriter};
@@ -181,7 +181,7 @@ impl H2cUpgradeClientEndpoint {
     /// Promote from the H1 probe to a full H2 connection after observing
     /// `101 Switching Protocols`, sending the client preface + SETTINGS and
     /// feeding it whatever bytes arrived after the `101` response.
-    fn promote_to_h2(&mut self, endpoint: &mut dyn Endpoint, remainder: &mut &[u8]) {
+    fn promote_to_h2(&mut self, endpoint: &mut dyn Endpoint, remainder: &mut LoopBuf) {
         let Phase::H1(codec) = &mut self.phase else {
             return;
         };
@@ -193,7 +193,7 @@ impl H2cUpgradeClientEndpoint {
         ));
         h2ep.connected(endpoint);
         if !remainder.is_empty() {
-            h2ep.receive_slice(endpoint, remainder);
+            h2ep.receive(endpoint, remainder);
         }
         self.phase = Phase::H2(h2ep);
     }
@@ -214,23 +214,23 @@ impl ProtocolHandler for H2cUpgradeClientEndpoint {
         // h2c Upgrade is cleartext-only; this endpoint is never dialed over TLS.
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut LoopBuf) {
         match &mut self.phase {
             Phase::H1(codec) => {
-                let _ = codec.receive(data);
+                let _ = over_ring(buf, |data| codec.receive_bytes(data));
                 let out = codec.take_outbound();
                 if !out.is_empty() {
                     endpoint.send(&out);
                 }
                 if self.upgraded.load(Ordering::SeqCst) {
-                    self.promote_to_h2(endpoint, data);
+                    self.promote_to_h2(endpoint, buf);
                     return;
                 }
                 if codec.wants_close() {
                     endpoint.close();
                 }
             }
-            Phase::H2(ep) => ep.receive_slice(endpoint, data),
+            Phase::H2(ep) => ep.receive(endpoint, buf),
         }
     }
 

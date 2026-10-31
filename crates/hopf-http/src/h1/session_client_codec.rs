@@ -89,7 +89,7 @@ impl H1SessionClientCodec {
         }
     }
 
-    pub fn receive(&mut self, data: &mut &[u8]) -> HttpResult<()> {
+    pub fn receive_bytes(&mut self, data: &mut &[u8]) -> HttpResult<()> {
         // Completion and failure reach the response handler only after the
         // lock is released: the handler commonly sends the next request
         // from there, which takes the lock again.
@@ -841,7 +841,7 @@ mod tests {
 
         let mut data: &[u8] =
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-        codec.receive(&mut data).unwrap();
+        codec.receive_bytes(&mut data).unwrap();
         let g = rec.lock().unwrap();
         assert_eq!(g.status, 200);
         assert_eq!(g.body, b"hello");
@@ -1034,7 +1034,7 @@ mod tests {
         session.get("/one").send(Box::new(TurnHandler(Arc::clone(&first)))).unwrap();
         assert!(String::from_utf8(codec.take_outbound()).unwrap().starts_with("GET /one HTTP/1.1\r\n"));
         let mut data: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\none\r\n0\r\n\r\n";
-        codec.receive(&mut data).unwrap();
+        codec.receive_bytes(&mut data).unwrap();
         assert!(first.lock().unwrap().done, "first response delivered");
         assert_eq!(first.lock().unwrap().body, b"one");
 
@@ -1048,7 +1048,7 @@ mod tests {
         assert!(out.starts_with("PUT /two HTTP/1.1\r\n"), "{out}");
         assert!(out.ends_with("two"));
         let mut data: &[u8] = b"HTTP/1.1 201 Created\r\nContent-Length: 3\r\n\r\ntwo";
-        codec.receive(&mut data).unwrap();
+        codec.receive_bytes(&mut data).unwrap();
         let g = second.lock().unwrap();
         assert!(!g.failed);
         assert!(g.done, "second response delivered on the reused session");
@@ -1099,12 +1099,12 @@ mod tests {
             .unwrap();
         assert!(String::from_utf8(codec.take_outbound()).unwrap().starts_with("GET /one HTTP/1.1\r\n"));
         let mut data: &[u8] = b"HTTP/1.1 204 No Content\r\n\r\n";
-        codec.receive(&mut data).unwrap();
+        codec.receive_bytes(&mut data).unwrap();
         assert!(*closed.lock().unwrap(), "first response closed");
         let out = String::from_utf8(codec.take_outbound()).unwrap();
         assert!(out.starts_with("GET /two HTTP/1.1\r\n"), "chained request on the wire: {out:?}");
         let mut data: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo";
-        codec.receive(&mut data).unwrap();
+        codec.receive_bytes(&mut data).unwrap();
         let g = second.lock().unwrap();
         assert!(g.done && !g.failed, "chained response delivered");
         assert_eq!(g.body, b"two");
