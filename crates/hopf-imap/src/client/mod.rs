@@ -61,6 +61,7 @@ pub mod reply;
 mod sinks;
 pub mod state;
 pub mod structure;
+mod structure_sink;
 pub mod timeout;
 mod tokens;
 

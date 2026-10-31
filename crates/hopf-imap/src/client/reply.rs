@@ -16,20 +16,16 @@
 //! `FETCH` responses are walked attribute-by-attribute — recognised
 //! attributes (`FLAGS`, `UID`, `RFC822.SIZE`, `MODSEQ`, literal-bearing
 //! `BODY[...]`/`RFC822`/`RFC822.TEXT`/`RFC822.HEADER`) are parsed directly
-//! into [`super::state::ImapFetchData`], while unrecognised substructure
-//! (`ENVELOPE`, `BODYSTRUCTURE`, `INTERNALDATE`, bare `BODY`, …) is
-//! skip-scanned by paren/bracket/quote depth rather than buffered, since
-//! hopf doesn't expose that structurally today.
-//!
-//! A few naturally small, bounded, literal-free substructures — response
-//! codes (`[COPYUID …]` etc.) and the rarely-used `NAMESPACE`/`QUOTA`/
-//! `QUOTAROOT`/`ID` payloads — are captured into a bounded scratch buffer
-//! and parsed once complete, the same convention SMTP uses for its
-//! AUTH-challenge/queue-id text: never a growing whole-line buffer, but not
-//! worth a bespoke incremental grammar either. (Truly unrecognised untagged
-//! response types — future/vendor extensions hopf doesn't know about — are
-//! scanned to the next CRLF without literal-marker detection; only the
-//! response types hopf actually understands are guaranteed literal-safe.)
+//! into [`super::state::ImapFetchData`]. The structured values - `ENVELOPE`,
+//! `BODYSTRUCTURE` and bare `BODY`, `INTERNALDATE`, and the untagged
+//! `NAMESPACE`/`QUOTA`/`QUOTAROOT`/`ID`/`THREAD`/`METADATA` payloads - are
+//! read by a tokenizer that gives atoms, strings, literals and
+//! parentheses to a small machine for the payload, which builds the typed
+//! value as they arrive; a literal is a string like any other. An attribute
+//! hopf does not know is read the same way and dropped. (Response codes,
+//! `[COPYUID …]` and the like, are still captured as bounded text, and truly
+//! unrecognised untagged response types - future/vendor extensions - are
+//! scanned to the next CRLF without literal-marker detection.)
 //!
 //! IMAP's own grammar is self-describing (the leading word after `* `/tag
 //! says what kind of response this is), so unlike POP3/SMTP/FTP there is no
@@ -41,7 +37,8 @@
 //! already correct before this rewrite and is unchanged in spirit.
 
 use super::error::ImapError;
-use super::sinks::{IdSink, MetadataSink, NamespaceSink, QuotaRootSink, QuotaSink, ThreadSink};
+use super::sinks::{Discard, IdSink, MetadataSink, NamespaceSink, QuotaRootSink, QuotaSink, ThreadSink};
+use super::structure_sink::{DateSink, StructureSink};
 use super::state::{
     ImapCapabilities, ImapFetchData, ImapListEntry, ImapMetadataData, ImapNamespaceData, ImapQuotaData,
     ImapQuotaRootData, ImapStatusData, ImapThreadNode,
@@ -413,20 +410,9 @@ enum State {
     /// Streaming literal octets (count in `literal_remaining`); handled by
     /// [`ImapReplyLexer::feed`] directly, not `feed_byte`.
     FetchLiteral,
-    /// An unrecognised attribute's value — skip-scanned by depth — or a
-    /// structured one (`ENVELOPE`, `BODYSTRUCTURE`, `INTERNALDATE`) being
-    /// captured verbatim for `super::structure`.
-    FetchSkipValue { depth: i32, in_quote: bool, escape: bool },
-    /// `{` seen inside a skipped (captured) value: reading the octet count.
-    FetchSkipLiteralSize { depth: i32 },
-    /// `}` seen: expect CR.
-    FetchSkipLiteralCr { depth: i32 },
-    /// Expect LF, then the literal's octets follow.
-    FetchSkipLiteralLf { depth: i32 },
-    /// Consuming a literal's octets inside a skipped value — handled in
-    /// `feed()` like `FetchLiteral`, but re-encoded into the capture as a
-    /// quoted string instead of being streamed.
-    FetchSkipLiteral { depth: i32 },
+    /// A structured attribute's value (`ENVELOPE`, `BODYSTRUCTURE`, `INTERNALDATE`),
+    /// or an unrecognised one, being read by its machine.
+    FetchValue,
     /// Just closed a value: expect SP (next attribute) or `)` (list done).
     FetchAfterValue,
     /// `)` closed the FETCH list: expect CRLF.
@@ -474,13 +460,6 @@ pub struct ImapReplyLexer {
     /// for `RFC822`/`RFC822.TEXT`/`RFC822.HEADER`. Read by
     /// `FetchLiteralBegin` once a literal marker for this value is seen.
     fetch_section: Vec<u8>,
-    /// Which FETCH item the skip scanner is currently capturing verbatim
-    /// (`ENVELOPE`, `BODYSTRUCTURE`/`BODY`, `INTERNALDATE`), if any.
-    fetch_capture_kind: Option<FetchCaptureKind>,
-    /// The captured value's bytes; literals inside it are re-encoded as
-    /// quoted strings so the result is one line the structure parsers
-    /// (`super::structure`) can read.
-    fetch_capture: Vec<u8>,
     /// The payload being read by `State::Payload`.
     payload: Option<Payload>,
 }
@@ -491,19 +470,11 @@ struct Payload {
     sink: Box<dyn Sink>,
 }
 
-/// FETCH items whose structured value is captured rather than parsed inline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FetchCaptureKind {
-    Envelope,
-    BodyStructure,
-    InternalDate,
-}
-
-/// Upper bound on a captured `ENVELOPE` / `BODYSTRUCTURE` value — large
-/// enough for any real message's structure (one line per MIME part, a few
-/// hundred bytes each), small enough that a hostile server cannot make the
-/// client buffer without limit.
-pub const MAX_CAPTURED_STRUCTURE: usize = 1024 * 1024;
+/// Upper bound on one structured value (`ENVELOPE`, `BODYSTRUCTURE`, a
+/// `METADATA` response ...): large enough for any real message's structure,
+/// small enough that a hostile server cannot make the client buffer without
+/// limit.
+pub const MAX_CAPTURED_STRUCTURE: usize = super::tokens::MAX_PAYLOAD;
 
 impl Default for ImapReplyLexer {
     fn default() -> Self {
@@ -530,8 +501,6 @@ impl ImapReplyLexer {
             list_close_kind: None,
             flags_is_fetch_attr: false,
             fetch_section: Vec::with_capacity(16),
-            fetch_capture_kind: None,
-            fetch_capture: Vec::new(),
             payload: None,
         }
     }
@@ -543,7 +512,8 @@ impl ImapReplyLexer {
 
     /// Is the payload in `State::Payload` in the middle of a literal's octets?
     fn payload_in_literal(&self) -> bool {
-        self.state == State::Payload && self.payload.as_ref().is_some_and(|p| p.tokens.in_literal())
+        matches!(self.state, State::Payload | State::FetchValue)
+            && self.payload.as_ref().is_some_and(|p| p.tokens.in_literal())
     }
 
     /// Feed inbound bytes, returning every event completed so far.
@@ -579,27 +549,10 @@ impl ImapReplyLexer {
                 let payload = self.payload.as_mut().expect("checked above");
                 let (take, out) = payload.tokens.literal_octets(rest, &mut *payload.sink);
                 rest = &rest[take..];
-                if out == Out::Eol {
-                    events.push(self.finish_payload());
-                }
-                continue;
-            }
-            if let State::FetchSkipLiteral { depth } = self.state {
-                // A literal inside a captured structure (an ENVELOPE with a
-                // non-ASCII subject, say): take as much as is available and
-                // re-encode it into the capture as a quoted string.
-                let take = rest.len().min(self.literal_remaining as usize);
-                for &c in &rest[..take] {
-                    if c == b'"' || c == b'\\' {
-                        self.push_capture(b'\\')?;
-                    }
-                    self.push_capture(c)?;
-                }
-                rest = &rest[take..];
-                self.literal_remaining -= take as u64;
-                if self.literal_remaining == 0 {
-                    self.push_capture(b'"')?;
-                    self.state = State::FetchSkipValue { depth, in_quote: false, escape: false };
+                match out {
+                    Out::Eol => events.push(self.finish_payload()),
+                    Out::Done { .. } => self.finish_fetch_value(),
+                    Out::More => {}
                 }
                 continue;
             }
@@ -721,13 +674,7 @@ impl ImapReplyLexer {
             State::FetchLiteralCr => self.on_fetch_literal_cr(b),
             State::FetchLiteralLf => self.on_fetch_literal_lf(b),
             State::FetchLiteral => unreachable!("handled in feed()"),
-            State::FetchSkipValue { depth, in_quote, escape } => {
-                self.on_fetch_skip_value(depth, in_quote, escape, b)
-            }
-            State::FetchSkipLiteralSize { depth } => self.on_fetch_skip_literal_size(depth, b),
-            State::FetchSkipLiteralCr { depth } => self.on_fetch_skip_literal_cr(depth, b),
-            State::FetchSkipLiteralLf { depth } => self.on_fetch_skip_literal_lf(depth, b),
-            State::FetchSkipLiteral { .. } => unreachable!("handled in feed()"),
+            State::FetchValue => self.on_fetch_value(b),
             State::FetchAfterValue => self.on_fetch_after_value(b),
             State::FetchListCloseCr => self.on_fetch_list_close_cr(b),
             State::FlagsListCloseCr => self.on_flags_list_close_cr(b),
@@ -1650,18 +1597,18 @@ impl ImapReplyLexer {
             }
             (_, b' ') => {
                 // ENVELOPE / BODYSTRUCTURE / INTERNALDATE / bare BODY are
-                // captured verbatim for the structure parsers; any other
-                // unrecognised atom is skipped. Either way the value may be
-                // a quoted string, an atom, a literal, or a parenthesized
-                // structure with any of those nested inside it.
-                self.fetch_capture_kind = match name {
-                    "ENVELOPE" => Some(FetchCaptureKind::Envelope),
-                    "BODYSTRUCTURE" | "BODY" => Some(FetchCaptureKind::BodyStructure),
-                    "INTERNALDATE" => Some(FetchCaptureKind::InternalDate),
-                    _ => None,
+                // built by their machines; any other unrecognised attribute
+                // is read and dropped. Either way the value may be a quoted
+                // string, an atom, a literal, or a parenthesized structure
+                // with any of those nested inside it.
+                let sink: Box<dyn Sink> = match name {
+                    "ENVELOPE" => Box::new(StructureSink::envelope()),
+                    "BODYSTRUCTURE" | "BODY" => Box::new(StructureSink::body()),
+                    "INTERNALDATE" => Box::new(DateSink::default()),
+                    _ => Box::new(Discard),
                 };
-                self.fetch_capture.clear();
-                self.state = State::FetchSkipValue { depth: 0, in_quote: false, escape: false };
+                self.payload = Some(Payload { tokens: Tokenizer::value(), sink });
+                self.state = State::FetchValue;
                 Ok(None)
             }
             (_, b')') => {
@@ -2047,147 +1994,37 @@ impl ImapReplyLexer {
         Err(ImapError::Parse("expected LF after literal size marker's CR".into()))
     }
 
-    /// Append one byte to the capture buffer, if a capture is active.
-    fn push_capture(&mut self, b: u8) -> Result<(), ImapError> {
-        if self.fetch_capture_kind.is_none() {
-            return Ok(());
+    /// A byte of a FETCH attribute's value.
+    fn on_fetch_value(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
+        let payload = self.payload.as_mut().ok_or_else(|| ImapError::Parse("internal: no payload".into()))?;
+        match payload.tokens.byte(b, &mut *payload.sink)? {
+            Out::Done { reprocess } => {
+                self.finish_fetch_value();
+                if reprocess {
+                    // The delimiter after a bare word belongs to the list.
+                    return self.feed_byte(b);
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
         }
-        if self.fetch_capture.len() >= MAX_CAPTURED_STRUCTURE {
-            return Err(ImapError::Parse("FETCH structure value too large".into()));
-        }
-        self.fetch_capture.push(b);
-        Ok(())
     }
 
-    /// The skipped value is complete: file the capture under its item.
-    fn finish_capture(&mut self) {
-        let Some(kind) = self.fetch_capture_kind.take() else {
+    /// The attribute's value is complete: file it, unless it was refused.
+    fn finish_fetch_value(&mut self) {
+        self.state = State::FetchAfterValue;
+        let Some(Payload { tokens, sink }) = self.payload.take() else {
             return;
         };
-        let raw = std::mem::take(&mut self.fetch_capture);
-        let text = String::from_utf8_lossy(&raw).into_owned();
-        match kind {
-            FetchCaptureKind::Envelope => self.fetch_data.envelope = Some(text),
-            FetchCaptureKind::BodyStructure => self.fetch_data.bodystructure = Some(text),
-            FetchCaptureKind::InternalDate => {
-                let t = text.trim();
-                let t = t.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(t);
-                self.fetch_data.internaldate = Some(t.to_string());
-            }
+        if tokens.is_bad() {
+            return;
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn on_fetch_skip_value(
-        &mut self,
-        depth: i32,
-        in_quote: bool,
-        escape: bool,
-        b: u8,
-    ) -> Result<Option<ImapEvent>, ImapError> {
-        if escape {
-            self.push_capture(b)?;
-            self.state = State::FetchSkipValue { depth, in_quote, escape: false };
-            return Ok(None);
+        match sink.finish() {
+            Ok(Output::Envelope(envelope)) => self.fetch_data.envelope = Some(envelope),
+            Ok(Output::Body(body)) => self.fetch_data.bodystructure = Some(body),
+            Ok(Output::Date(date)) => self.fetch_data.internaldate = Some(date),
+            _ => {}
         }
-        if in_quote {
-            self.push_capture(b)?;
-            match b {
-                b'\\' => self.state = State::FetchSkipValue { depth, in_quote, escape: true },
-                b'"' => self.state = State::FetchSkipValue { depth, in_quote: false, escape: false },
-                _ => self.state = State::FetchSkipValue { depth, in_quote, escape: false },
-            }
-            return Ok(None);
-        }
-        match b {
-            b'"' => {
-                self.push_capture(b)?;
-                self.state = State::FetchSkipValue { depth, in_quote: true, escape: false };
-                Ok(None)
-            }
-            b'{' => {
-                // A literal: `{n}` CRLF then n octets. The marker is not
-                // part of the capture; the octets are re-encoded as a
-                // quoted string once they arrive (see `feed()`).
-                self.state = State::FetchSkipLiteralSize { depth };
-                Ok(None)
-            }
-            b'(' | b'[' => {
-                self.push_capture(b)?;
-                self.state = State::FetchSkipValue { depth: depth + 1, in_quote: false, escape: false };
-                Ok(None)
-            }
-            b')' | b']' if depth > 1 => {
-                self.push_capture(b)?;
-                self.state = State::FetchSkipValue { depth: depth - 1, in_quote: false, escape: false };
-                Ok(None)
-            }
-            b')' | b']' if depth == 1 => {
-                self.push_capture(b)?;
-                self.finish_capture();
-                self.state = State::FetchAfterValue;
-                Ok(None)
-            }
-            b' ' if depth == 0 => {
-                self.finish_capture();
-                self.state = State::FetchAttrNameStart;
-                Ok(None)
-            }
-            b')' if depth == 0 => {
-                self.finish_capture();
-                self.state = State::FetchListCloseCr;
-                self.list_close_kind = Some(ListCloseKind::Fetch);
-                Ok(None)
-            }
-            _ => {
-                self.push_capture(b)?;
-                self.state = State::FetchSkipValue { depth, in_quote: false, escape: false };
-                Ok(None)
-            }
-        }
-    }
-
-    fn on_fetch_skip_literal_size(&mut self, depth: i32, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        match b {
-            b'+' => Ok(None), // non-synchronizing marker; irrelevant to a reply reader
-            b'}' => {
-                let w = self.take_word();
-                let n: u64 = w
-                    .parse()
-                    .map_err(|_| ImapError::Parse(format!("bad literal size: {w:?}")))?;
-                self.literal_remaining = n;
-                self.state = State::FetchSkipLiteralCr { depth };
-                Ok(None)
-            }
-            _ if b.is_ascii_digit() => {
-                self.push_word(b)?;
-                Ok(None)
-            }
-            _ => Err(ImapError::Parse("bad literal marker inside FETCH value".into())),
-        }
-    }
-
-    fn on_fetch_skip_literal_cr(&mut self, depth: i32, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        if b != b'\r' {
-            return Err(ImapError::Parse("expected CR after literal size".into()));
-        }
-        self.state = State::FetchSkipLiteralLf { depth };
-        Ok(None)
-    }
-
-    fn on_fetch_skip_literal_lf(&mut self, depth: i32, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        if b != b'\n' {
-            return Err(ImapError::Parse("expected LF after literal size".into()));
-        }
-        self.push_capture(b'"')?;
-        if self.literal_remaining == 0 {
-            // `{0}`: an empty string.
-            self.push_capture(b'"')?;
-            self.state = State::FetchSkipValue { depth, in_quote: false, escape: false };
-        } else {
-            self.state = State::FetchSkipLiteral { depth };
-        }
-        Ok(None)
     }
 
     fn on_fetch_after_value(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
@@ -2267,7 +2104,7 @@ impl ImapReplyLexer {
         }
         match sink.finish() {
             Ok(Output::Event(event)) => event,
-            Err(_) => ImapEvent::Other,
+            _ => ImapEvent::Other,
         }
     }
 
@@ -2391,6 +2228,7 @@ fn apply_status_item(data: &mut ImapStatusData, item: StatusItem, val: Option<i6
 mod tests {
     use super::*;
     use crate::client::state::{ImapNamespace, ImapQuotaResource};
+    use crate::client::structure::{ImapBodyStructure, ImapEnvelope};
 
     fn feed_all(lex: &mut ImapReplyLexer, s: &str) -> Vec<ImapEvent> {
         let mut data: &[u8] = s.as_bytes();
@@ -2884,61 +2722,57 @@ mod tests {
     }
 
     #[test]
-    fn fetch_skips_unrecognised_structure() {
-        // ENVELOPE (with a parenthesized value and a quoted string that
-        // itself contains parens) is skip-scanned, never buffered, but
-        // FLAGS after it still parses correctly.
-        let mut lex = ImapReplyLexer::new();
-        let mut data: &[u8] =
-            b"* 1 FETCH (ENVELOPE (\"date\" \"subj (with parens)\" NIL NIL) FLAGS (\\Seen))\r\n";
-        let ev = lex.feed(&mut data).unwrap();
+    fn fetch_drops_an_unrecognised_attribute_whatever_it_holds() {
+        // A value of a kind hopf does not know - lists, strings with
+        // parentheses and a literal - is read through; what follows parses.
+        let wire = b"* 1 FETCH (X-VENDOR (\"a (b\" (c {3}\r\n))))) FLAGS (\\Seen) X-NUM 12 UID 9)\r\n";
+        let ev = assert_split_matches_bulk(wire);
         match &ev[0] {
             ImapEvent::Fetch(d) => {
                 assert_eq!(d.flags, vec!["\\Seen".to_string()]);
+                assert_eq!(d.uid, Some(9));
+                assert!(d.envelope.is_none() && d.bodystructure.is_none());
             }
             other => panic!("expected Fetch, got {other:?}"),
         }
     }
 
-    /// ENVELOPE, BODYSTRUCTURE and INTERNALDATE are captured verbatim so
-    /// the structure parsers can read them; everything around them still
-    /// parses as before.
+    const ENVELOPE: &str = "(\"Wed, 17 Jul 1996 02:23:25 -0700\" \"subj (x)\" ((\"Terry\" NIL \"gray\" \"cs.washington.edu\")) NIL NIL ((NIL NIL \"imap\" \"cac.washington.edu\")) NIL NIL NIL \"<id@host>\")";
+    const BODYSTRUCTURE: &str = "(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 42 3)";
+
+    /// The structured items are built as they arrive; everything around them
+    /// still parses as before.
     #[test]
-    fn fetch_captures_structured_items() {
+    fn fetch_builds_structured_items() {
         let mut lex = ImapReplyLexer::new();
         let ev = feed_all(
             &mut lex,
-            "* 7 FETCH (UID 42 INTERNALDATE \"17-Jul-1996 02:44:25 -0700\" ENVELOPE (\"date\" \"subj (x)\" NIL NIL) BODYSTRUCTURE (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 42 3) FLAGS (\\Seen))\r\n",
+            &format!("* 7 FETCH (UID 42 INTERNALDATE \"17-Jul-1996 02:44:25 -0700\" ENVELOPE {ENVELOPE} BODYSTRUCTURE {BODYSTRUCTURE} FLAGS (\\Seen))\r\n"),
         );
         match &ev[0] {
             ImapEvent::Fetch(d) => {
                 assert_eq!(d.uid, Some(42));
                 assert_eq!(d.internaldate.as_deref(), Some("17-Jul-1996 02:44:25 -0700"));
-                assert_eq!(d.envelope.as_deref(), Some("(\"date\" \"subj (x)\" NIL NIL)"));
-                assert_eq!(
-                    d.bodystructure.as_deref(),
-                    Some("(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 42 3)")
-                );
+                assert_eq!(d.envelope, Some(ImapEnvelope::parse(ENVELOPE).unwrap()));
+                assert_eq!(d.bodystructure, Some(ImapBodyStructure::parse(BODYSTRUCTURE).unwrap()));
                 assert_eq!(d.flags, vec!["\\Seen".to_string()]);
             }
             other => panic!("expected Fetch, got {other:?}"),
         }
     }
 
-    /// A literal inside a captured structure — Dovecot sends an ENVELOPE
-    /// subject as `{n}` CRLF octets whenever it has 8-bit or quote
-    /// characters — must neither desync the lexer nor be lost: it is
-    /// re-encoded as a quoted string in the capture.
+    /// A literal inside a structure - Dovecot sends an ENVELOPE subject as
+    /// `{n}` CRLF octets whenever it has 8-bit or quote characters - is a
+    /// string like any other, and neither desyncs the lexer nor is lost.
     #[test]
-    fn fetch_literal_inside_envelope_is_captured_as_quoted_string() {
-        let wire = b"* 1 FETCH (ENVELOPE (\"date\" {16}\r\nSay \"hi\" \\ caf\xc3\xa9 NIL NIL) FLAGS (\\Seen) UID 9)\r\n";
+    fn fetch_literal_inside_envelope_is_a_string() {
+        let wire = b"* 1 FETCH (ENVELOPE (\"date\" {16}\r\nSay \"hi\" \\ caf\xc3\xa9 NIL NIL NIL NIL NIL NIL NIL NIL) FLAGS (\\Seen) UID 9)\r\n";
         let ev = assert_split_matches_bulk(wire);
         match &ev[0] {
             ImapEvent::Fetch(d) => {
-                assert_eq!(
-                    d.envelope.as_deref(),
-                    Some("(\"date\" \"Say \\\"hi\\\" \\\\ caf\u{e9}\" NIL NIL)")
-                );
+                let env = d.envelope.as_ref().expect("an envelope");
+                assert_eq!(env.date.as_deref(), Some("date"));
+                assert_eq!(env.subject.as_deref(), Some("Say \"hi\" \\ caf\u{e9}"));
                 assert_eq!(d.flags, vec!["\\Seen".to_string()]);
                 assert_eq!(d.uid, Some(9));
             }
@@ -2946,21 +2780,49 @@ mod tests {
         }
         // An empty literal is an empty string.
         let mut lex = ImapReplyLexer::new();
-        let mut data: &[u8] = b"* 2 FETCH (ENVELOPE (\"date\" {0}\r\n NIL) UID 3)\r\n";
+        let mut data: &[u8] = b"* 2 FETCH (ENVELOPE (\"date\" {0}\r\n NIL NIL NIL NIL NIL NIL NIL NIL) UID 3)\r\n";
         let ev = lex.feed(&mut data).unwrap();
         match &ev[0] {
-            ImapEvent::Fetch(d) => assert_eq!(d.envelope.as_deref(), Some("(\"date\" \"\" NIL)")),
+            ImapEvent::Fetch(d) => assert_eq!(d.envelope.as_ref().and_then(|e| e.subject.as_deref()), Some("")),
             other => panic!("expected Fetch, got {other:?}"),
         }
     }
 
+    /// A structure that is malformed, or larger than the cap, is dropped
+    /// (read through, not kept) and the rest of the response is intact.
     #[test]
-    fn fetch_capture_is_bounded() {
-        let mut lex = ImapReplyLexer::new();
+    fn fetch_structure_that_is_refused_is_dropped() {
         let huge = "x".repeat(MAX_CAPTURED_STRUCTURE + 1);
-        let line = format!("* 1 FETCH (BODYSTRUCTURE (\"{huge}\" NIL))\r\n");
-        let mut data: &[u8] = line.as_bytes();
-        assert!(lex.feed(&mut data).is_err());
+        for bad in [
+            "(\"date\" \"too few\")".to_string(),
+            format!("(\"{huge}\" NIL)"),
+            "(".to_string(),
+        ] {
+            let mut lex = ImapReplyLexer::new();
+            let line = format!("* 1 FETCH (ENVELOPE {bad} UID 5)\r\n");
+            let mut events = Vec::new();
+            for piece in line.as_bytes().chunks(65536) {
+                let mut data: &[u8] = piece;
+                match lex.feed(&mut data) {
+                    Ok(e) => events.extend(e),
+                    // An unclosed list runs into the end of the line: a protocol error.
+                    Err(_) => {
+                        assert_eq!(bad, "(");
+                        events.clear();
+                        break;
+                    }
+                }
+            }
+            if bad != "(" {
+                match &events[0] {
+                    ImapEvent::Fetch(d) => {
+                        assert!(d.envelope.is_none());
+                        assert_eq!(d.uid, Some(5));
+                    }
+                    other => panic!("expected Fetch, got {other:?}"),
+                }
+            }
+        }
     }
 
     #[test]

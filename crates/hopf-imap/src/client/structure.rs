@@ -1,14 +1,15 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! Client-side parsers for the structured FETCH items the reply lexer
-//! captures verbatim: `ENVELOPE` (RFC 9051 §7.5.2) and `BODYSTRUCTURE` /
-//! `BODY` (RFC 9051 §7.5.2, RFC 3501 §7.4.2).
+//! The structured FETCH items `ENVELOPE` (RFC 9051 §7.5.2) and
+//! `BODYSTRUCTURE` / `BODY` (RFC 9051 §7.5.2, RFC 3501 §7.4.2).
 //!
-//! The lexer hands these over as one line of IMAP syntax — parenthesized
-//! lists of quoted strings, atoms, numbers and `NIL` — with any literal the
-//! server sent already re-encoded as a quoted string, so a small
-//! S-expression reader is all that is needed here. Nothing in this module
-//! is incremental: a structure is parsed once the lexer has it whole.
+//! The reply lexer builds these as the response arrives (see
+//! `structure_sink`): [`ImapFetchData`](super::state::ImapFetchData) carries
+//! the finished [`ImapEnvelope`] and [`ImapBodyStructure`]. The readers here
+//! parse the same shapes from text - parenthesized lists of quoted strings,
+//! atoms, numbers and `NIL` - and are the reference the lexer's machines are
+//! tested against; they are also useful for a structure held as a string
+//! (a cache, say).
 //!
 //! [`ImapBodyStructure::parts`] numbers the leaf parts the way
 //! `BODY[section]` refers to them (RFC 3501 §6.4.5), which is what a mail
@@ -72,8 +73,9 @@ pub struct ImapEnvelope {
 }
 
 impl ImapEnvelope {
-    /// Parse the captured text of an `ENVELOPE` item
-    /// ([`ImapFetchData::envelope`](super::state::ImapFetchData::envelope)).
+    /// Parse the text of an `ENVELOPE` item. (The reply lexer builds
+    /// [`ImapFetchData::envelope`](super::state::ImapFetchData::envelope)
+    /// token by token and does not use this.)
     pub fn parse(text: &str) -> ImapResult<Self> {
         let expr = parse_sexpr(text)?;
         envelope_from(&expr)
@@ -195,8 +197,9 @@ pub enum ImapBodyStructure {
 }
 
 impl ImapBodyStructure {
-    /// Parse the captured text of a `BODYSTRUCTURE` or `BODY` item
-    /// ([`ImapFetchData::bodystructure`](super::state::ImapFetchData::bodystructure)).
+    /// Parse the text of a `BODYSTRUCTURE` or `BODY` item. (The reply lexer
+    /// builds [`ImapFetchData::bodystructure`](super::state::ImapFetchData::bodystructure)
+    /// token by token and does not use this.)
     pub fn parse(text: &str) -> ImapResult<Self> {
         let expr = parse_sexpr(text)?;
         body_from(&expr)

@@ -30,6 +30,23 @@ fn number<T: std::str::FromStr>(tok: Tok<'_>) -> Option<T> {
     }
 }
 
+/// A sink that reads everything and keeps nothing.
+pub(crate) struct Discard;
+
+impl Sink for Discard {
+    fn token(&mut self, _tok: Tok<'_>) -> Result<(), Bad> {
+        Ok(())
+    }
+
+    fn keeps_literals(&self) -> bool {
+        false
+    }
+
+    fn finish(self: Box<Self>) -> Result<Output, Bad> {
+        Ok(Output::Event(ImapEvent::Other))
+    }
+}
+
 // ── NAMESPACE ──────────────────────────────────────────────────────────────
 
 /// `personal other shared`, each `NIL` or `((prefix delimiter extension...) ...)`.

@@ -148,13 +148,11 @@ pub struct ImapFetchData {
     pub thread_id: Option<String>,
     /// Accumulated literal / body octets for simple RFC822 / BODY[] fetches.
     pub body: Vec<u8>,
-    /// `ENVELOPE` as sent, with any literal strings re-encoded as quoted
-    /// strings; parse with [`ImapEnvelope::parse`](super::structure::ImapEnvelope::parse).
-    pub envelope: Option<String>,
-    /// `BODYSTRUCTURE` (or the non-extensible `BODY`) as sent, literals
-    /// re-encoded as quoted strings; parse with
-    /// [`ImapBodyStructure::parse`](super::structure::ImapBodyStructure::parse).
-    pub bodystructure: Option<String>,
+    /// The `ENVELOPE`, built as it arrived (`None` if absent or malformed).
+    pub envelope: Option<super::structure::ImapEnvelope>,
+    /// The `BODYSTRUCTURE` (or the non-extensible `BODY`), built as it
+    /// arrived (`None` if absent or malformed).
+    pub bodystructure: Option<super::structure::ImapBodyStructure>,
     /// `INTERNALDATE`, without its quotes (e.g. `17-Jul-1996 02:44:25 -0700`).
     pub internaldate: Option<String>,
 }

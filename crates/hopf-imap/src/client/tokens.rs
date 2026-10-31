@@ -16,6 +16,7 @@
 
 use super::error::ImapError;
 use super::reply::ImapEvent;
+use super::structure::{ImapBodyStructure, ImapEnvelope};
 
 /// The most one payload may keep (atoms, strings and literal octets added
 /// together): a hostile server cannot make the client buffer without limit.
@@ -44,6 +45,12 @@ pub(crate) struct Bad;
 pub(crate) enum Output {
     /// An event to report.
     Event(ImapEvent),
+    /// A FETCH `ENVELOPE`.
+    Envelope(ImapEnvelope),
+    /// A FETCH `BODYSTRUCTURE` (or `BODY`).
+    Body(ImapBodyStructure),
+    /// A FETCH `INTERNALDATE`, without its quotes.
+    Date(String),
 }
 
 /// A machine for one payload.
@@ -134,6 +141,11 @@ impl Tokenizer {
     /// For a payload that is the rest of the line.
     pub(crate) fn line() -> Self {
         Self::new(false)
+    }
+
+    /// For a payload that is one value: a word, a string, or a balanced list.
+    pub(crate) fn value() -> Self {
+        Self::new(true)
     }
 
     /// Did the payload go wrong (and is it being read through only)?
