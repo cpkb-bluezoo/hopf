@@ -4,16 +4,152 @@
 
 use std::io;
 
-use tractrix::XmlWriter;
+use loopbuf::{LoopBuf, WriteError, WriteResult};
+use tractrix::{IndentConfig, XmlWriter};
 
 use crate::constants::{self, NAMESPACE, PREFIX};
 use crate::dead_props::DeadProperty;
 use crate::lock::{LockScope, WebDavLock};
 
-pub(crate) type DavWriter = XmlWriter<Vec<u8>>;
+/// What the ring [`PropXmlWriter`] writes through holds: one write's worth
+/// before it is moved to the output.
+const RING_BYTES: usize = 8192;
+
+/// An [`XmlWriter`] with the ring it writes into and the `Vec` the document
+/// collects in: each write goes through the ring, and what is in it moves to
+/// the `Vec` whenever it is full, so a document of any size is written
+/// whole.
+pub struct PropXmlWriter {
+    writer: XmlWriter,
+    ring: LoopBuf,
+    out: Vec<u8>,
+}
+
+impl PropXmlWriter {
+    pub fn new_vec() -> Self {
+        Self::around(XmlWriter::new())
+    }
+
+    pub fn with_indent(indent: IndentConfig) -> Self {
+        Self::around(XmlWriter::with_indent(indent))
+    }
+
+    fn around(writer: XmlWriter) -> Self {
+        Self {
+            writer,
+            ring: LoopBuf::with_capacity(RING_BYTES),
+            out: Vec::new(),
+        }
+    }
+
+    /// Moves what is in the ring to the output.
+    fn drain(&mut self) {
+        let (a, b) = self.ring.readable_spans();
+        self.out.extend_from_slice(a);
+        self.out.extend_from_slice(b);
+        self.ring.advance(self.ring.len());
+    }
+
+    /// Runs `write`, once more after draining the ring if it had no room.
+    /// The writer's calls are atomic, so a run that failed left nothing.
+    fn run<T>(
+        &mut self,
+        mut write: impl FnMut(&mut XmlWriter, &mut LoopBuf) -> WriteResult<T>,
+    ) -> io::Result<T> {
+        match write(&mut self.writer, &mut self.ring) {
+            Err(e) if e.is_would_block() && !self.ring.is_empty() => {
+                self.drain();
+                write(&mut self.writer, &mut self.ring).map_err(WriteError::into_io_error)
+            }
+            result => result.map_err(WriteError::into_io_error),
+        }
+    }
+
+    /// Writes all of `text` with `write`, which takes as much as fits.
+    fn run_text(
+        &mut self,
+        text: &str,
+        write: impl Fn(&mut XmlWriter, &mut LoopBuf, &str) -> WriteResult<usize>,
+    ) -> io::Result<()> {
+        let mut rest = text;
+        while !rest.is_empty() {
+            let taken = self.run(|w, ring| write(w, ring, rest))?;
+            rest = &rest[taken..];
+            if !rest.is_empty() {
+                self.drain();
+            }
+        }
+        Ok(())
+    }
+
+    pub fn write_start_element(&mut self, local_name: &str) -> io::Result<()> {
+        self.run(|w, ring| w.write_start_element(ring, local_name))
+    }
+
+    pub fn write_start_element_prefixed(
+        &mut self,
+        prefix: &str,
+        local_name: &str,
+        namespace_uri: &str,
+    ) -> io::Result<()> {
+        self.run(|w, ring| w.write_start_element_prefixed(ring, prefix, local_name, namespace_uri))
+    }
+
+    pub fn write_end_element(&mut self) -> io::Result<()> {
+        self.run(|w, ring| w.write_end_element(ring))
+    }
+
+    pub fn write_attribute(&mut self, local_name: &str, value: &str) -> io::Result<()> {
+        self.run(|w, ring| w.write_attribute(ring, local_name, value))
+    }
+
+    pub fn write_namespace(&mut self, prefix: &str, namespace_uri: &str) -> io::Result<()> {
+        self.run(|w, ring| w.write_namespace(ring, prefix, namespace_uri))
+    }
+
+    pub fn write_default_namespace(&mut self, namespace_uri: &str) -> io::Result<()> {
+        self.run(|w, ring| w.write_default_namespace(ring, namespace_uri))
+    }
+
+    pub fn write_processing_instruction_data(
+        &mut self,
+        target: &str,
+        data: Option<&str>,
+    ) -> io::Result<()> {
+        self.run(|w, ring| w.write_processing_instruction_data(ring, target, data))
+    }
+
+    pub fn write_characters(&mut self, text: &str) -> io::Result<()> {
+        self.run_text(text, |w, ring, text| w.write_characters(ring, text))
+    }
+
+    pub fn write_raw(&mut self, text: &str) -> io::Result<()> {
+        self.run_text(text, |w, ring, text| w.write_raw(ring, text))
+    }
+
+    /// Everything written so far is in the output: there is nothing else to
+    /// flush.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.drain();
+        Ok(())
+    }
+
+    /// Takes the output so far, leaving the document open to go on.
+    pub fn take_output(&mut self) -> Vec<u8> {
+        self.drain();
+        std::mem::take(&mut self.out)
+    }
+
+    pub fn into_inner(mut self) -> Vec<u8> {
+        self.drain();
+        self.out
+    }
+}
+
+pub(crate) type DavWriter = PropXmlWriter;
 
 fn dav_writer() -> DavWriter {
-    XmlWriter::new_vec()
+    PropXmlWriter::new_vec()
 }
 
 fn finish(mut w: DavWriter) -> Vec<u8> {
@@ -169,9 +305,6 @@ pub fn ensure_trailing_slash_for_collection(href: &str, is_dir: bool) -> String 
     }
 }
 
-/// Re-export for callers that build prop trees.
-pub use tractrix::XmlWriter as PropXmlWriter;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +325,21 @@ mod tests {
         assert!(xml.contains("opaquelocktoken:"));
         assert!(xml.contains("owner"));
         assert!(xml.contains("xmlns:D=\"DAV:\"") || xml.contains("xmlns:D='DAV:'"));
+    }
+
+    #[test]
+    fn text_and_raw_larger_than_the_ring_are_written_whole() {
+        let big = "a&b".repeat(RING_BYTES);
+        let mut w = PropXmlWriter::new_vec();
+        w.write_start_element("t").unwrap();
+        w.write_characters(&big).unwrap();
+        w.write_end_element().unwrap();
+        let xml = String::from_utf8(w.into_inner()).unwrap();
+        assert_eq!(xml, format!("<t>{}</t>", "a&amp;b".repeat(RING_BYTES)));
+
+        let markup = "<x/>".repeat(RING_BYTES);
+        let mut w = PropXmlWriter::new_vec();
+        w.write_raw(&markup).unwrap();
+        assert_eq!(String::from_utf8(w.into_inner()).unwrap(), markup);
     }
 }

@@ -18,6 +18,7 @@ categories = ["network-programming"]
 hopf-core = { workspace = true }
 hopf-http = { workspace = true }
 rprotobuf = { workspace = true }
+loopbuf = { workspace = true }
 getrandom = "0.2"
 
 [dev-dependencies]

@@ -104,7 +104,6 @@ aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys",
 # registry version could be satisfied by an older release without the
 # changes hopf now depends on.
 tractrix = { version = "0.3", path = "../tractrix" }
-self_cell = "1"
 rjsonparser = { version = "0.3", path = "../rjsonparser" }
 loopbuf = { version = "0.2", path = "../loopbuf" }
 rmimeparser = { version = "0.6", path = "../rmimeparser" }

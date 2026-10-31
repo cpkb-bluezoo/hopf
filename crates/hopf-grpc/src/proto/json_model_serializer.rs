@@ -4,6 +4,7 @@
 
 use std::collections::VecDeque;
 
+use loopbuf::LoopBuf;
 use rjsonparser::{WriteError, WriteResult, Writer};
 
 use super::base64;
@@ -28,36 +29,39 @@ impl JsonModelSerializer {
     }
 
     /// Starts a message (root or nested). Writes `{`.
-    pub fn start_message<W: std::io::Write>(
+    pub fn start_message(
         &mut self,
-        writer: &mut Writer<W>,
+        writer: &mut Writer,
+        ring: &mut LoopBuf,
         type_name: &str,
     ) -> WriteResult<()> {
         let msg = resolve_message(&self.proto_file, type_name).map_err(|e| {
-            WriteError::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+            WriteError::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
         })?;
         self.message_stack.push_front(msg);
-        writer.write_start_object()?;
+        writer.write_start_object(ring)?;
         self.object_open.push_front(true);
         Ok(())
     }
 
     /// Ends the current message. Writes `}`.
-    pub fn end_message<W: std::io::Write>(
+    pub fn end_message(
         &mut self,
-        writer: &mut Writer<W>,
+        writer: &mut Writer,
+        ring: &mut LoopBuf,
     ) -> WriteResult<()> {
         let _ = self.message_stack.pop_front();
         if self.object_open.pop_front().unwrap_or(false) {
-            writer.write_end_object()?;
+            writer.write_end_object(ring)?;
         }
         Ok(())
     }
 
     /// Writes a scalar field using the proto3 JSON mapping.
-    pub fn field<W: std::io::Write>(
+    pub fn field(
         &mut self,
-        writer: &mut Writer<W>,
+        writer: &mut Writer,
+        ring: &mut LoopBuf,
         name: &str,
         value: ScalarValue,
     ) -> WriteResult<()> {
@@ -66,30 +70,32 @@ impl JsonModelSerializer {
             None => return Ok(()),
         };
         let key = proto_json_name(&fd.name);
-        writer.write_key(&key)?;
-        write_scalar(writer, &fd, &self.proto_file, &value)
+        writer.write_key(ring, &key)?;
+        write_scalar(writer, ring, &fd, &self.proto_file, &value)
     }
 
     /// Starts a nested message field: writes the key and opens `{` via `start_message`.
-    pub fn start_field<W: std::io::Write>(
+    pub fn start_field(
         &mut self,
-        writer: &mut Writer<W>,
+        writer: &mut Writer,
+        ring: &mut LoopBuf,
         name: &str,
         type_name: &str,
     ) -> WriteResult<()> {
         if self.current_field(name).is_none() {
             return Ok(());
         }
-        writer.write_key(&proto_json_name(name))?;
-        self.start_message(writer, type_name)
+        writer.write_key(ring, &proto_json_name(name))?;
+        self.start_message(writer, ring, type_name)
     }
 
     /// Ends a nested message field (closes the object opened by [`start_field`]).
-    pub fn end_field<W: std::io::Write>(
+    pub fn end_field(
         &mut self,
-        writer: &mut Writer<W>,
+        writer: &mut Writer,
+        ring: &mut LoopBuf,
     ) -> WriteResult<()> {
-        self.end_message(writer)
+        self.end_message(writer, ring)
     }
 
     fn current_field(&self, name: &str) -> Option<&FieldDescriptor> {
@@ -107,8 +113,9 @@ fn resolve_message(proto: &ProtoFile, name: &str) -> Result<MessageDescriptor, S
         .ok_or_else(|| format!("Unknown message type: {name}"))
 }
 
-fn write_scalar<W: std::io::Write>(
-    writer: &mut Writer<W>,
+fn write_scalar(
+    writer: &mut Writer,
+    ring: &mut LoopBuf,
     fd: &FieldDescriptor,
     proto: &ProtoFile,
     value: &ScalarValue,
@@ -119,11 +126,11 @@ fn write_scalar<W: std::io::Write>(
                 || matches!(value, ScalarValue::U64(v) if *v != 0)
                 || matches!(value, ScalarValue::I32(v) if *v != 0)
                 || matches!(value, ScalarValue::I64(v) if *v != 0);
-            writer.write_boolean(b)
+            writer.write_boolean(ring, b)
         }
         FieldType::String => match value {
-            ScalarValue::String(s) => writer.write_string(s),
-            _ => writer.write_string(""),
+            ScalarValue::String(s) => writer.write_string(ring, s),
+            _ => writer.write_string(ring, ""),
         },
         FieldType::Bytes => {
             let bytes = match value {
@@ -131,31 +138,31 @@ fn write_scalar<W: std::io::Write>(
                 ScalarValue::String(s) => s.as_bytes(),
                 _ => &[],
             };
-            writer.write_string(&base64::encode(bytes))
+            writer.write_string(ring, &base64::encode(bytes))
         }
         FieldType::Enum => {
             let num = as_i64(value) as i32;
             if let Some(ref ename) = fd.enum_type_name {
                 if let Some(enm) = proto.enum_type(ename) {
                     if let Some(name) = enm.value_name(num) {
-                        return writer.write_string(name);
+                        return writer.write_string(ring, name);
                     }
                 }
             }
-            writer.write_i32(num)
+            writer.write_i32(ring, num)
         }
-        FieldType::Float => writer.write_f64(as_f64(value)),
-        FieldType::Double => writer.write_f64(as_f64(value)),
+        FieldType::Float => writer.write_f64(ring, as_f64(value)),
+        FieldType::Double => writer.write_f64(ring, as_f64(value)),
         FieldType::Int32 | FieldType::Sint32 | FieldType::Sfixed32 => {
-            writer.write_i32(as_i64(value) as i32)
+            writer.write_i32(ring, as_i64(value) as i32)
         }
-        FieldType::Uint32 | FieldType::Fixed32 => writer.write_i64(as_u64(value) as i64),
+        FieldType::Uint32 | FieldType::Fixed32 => writer.write_i64(ring, as_u64(value) as i64),
         // 64-bit integers are JSON strings in proto3 JSON mapping.
         FieldType::Int64 | FieldType::Sint64 | FieldType::Sfixed64 => {
-            writer.write_string(&as_i64(value).to_string())
+            writer.write_string(ring, &as_i64(value).to_string())
         }
         FieldType::Uint64 | FieldType::Fixed64 => {
-            writer.write_string(&as_u64(value).to_string())
+            writer.write_string(ring, &as_u64(value).to_string())
         }
         FieldType::Message | FieldType::Map => Ok(()),
     }
@@ -219,15 +226,16 @@ mod tests {
         )
         .unwrap();
         let mut ser = JsonModelSerializer::new(proto);
-        let mut w = Writer::buffer(64);
-        ser.start_message(&mut w, "demo.Echo").unwrap();
-        ser.field(&mut w, "text", ScalarValue::String("hi".into()))
+        let mut w = Writer::new();
+        let mut ring = LoopBuf::with_capacity(64);
+        ser.start_message(&mut w, &mut ring, "demo.Echo").unwrap();
+        ser.field(&mut w, &mut ring, "text", ScalarValue::String("hi".into()))
             .unwrap();
-        ser.field(&mut w, "foo_bar", ScalarValue::I32(7))
+        ser.field(&mut w, &mut ring, "foo_bar", ScalarValue::I32(7))
             .unwrap();
-        ser.end_message(&mut w).unwrap();
-        let bytes = w.finish().unwrap();
-        let s = String::from_utf8(bytes).unwrap();
+        ser.end_message(&mut w, &mut ring).unwrap();
+        let (a, b) = ring.readable_spans();
+        let s = String::from_utf8([a, b].concat()).unwrap();
         assert_eq!(s, r#"{"text":"hi","fooBar":7}"#);
     }
 }

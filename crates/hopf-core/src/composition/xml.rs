@@ -8,7 +8,6 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use bytes::Bytes;
 use tractrix::{FeatureSet, ParseError, ParseResult, Parser, XmlHandler};
 
 use crate::acl::{AcceptRateLimit, IpNet, PeerAcl};
@@ -94,9 +93,7 @@ fn parse_document(bytes: &[u8]) -> CompositionXmlResult<CompositionDocument> {
     {
         let mut parser = Parser::new(&mut handler, &features, None, None, None)
             .map_err(CompositionXmlError::from)?;
-        parser
-            .parse_all(Bytes::copy_from_slice(bytes))
-            .map_err(CompositionXmlError::from)?;
+        parser.parse(bytes).map_err(CompositionXmlError::from)?;
     }
     if let Some(err) = handler.error.take() {
         return Err(err);
@@ -605,14 +602,16 @@ impl XmlHandler for CompositionXmlHandler {
         Ok(())
     }
 
-    fn attribute_value_content(&mut self, value: &str, end: bool) -> ParseResult<()> {
+    fn attribute_value_content(&mut self, value: &str) -> ParseResult<()> {
         if let Some((_, ref mut buf)) = self.cur_attr {
             buf.push_str(value);
         }
-        if end {
-            if let Some((name, val)) = self.cur_attr.take() {
-                self.pending_attrs.insert(name, val);
-            }
+        Ok(())
+    }
+
+    fn end_attribute_value(&mut self) -> ParseResult<()> {
+        if let Some((name, val)) = self.cur_attr.take() {
+            self.pending_attrs.insert(name, val);
         }
         Ok(())
     }
@@ -627,7 +626,7 @@ impl XmlHandler for CompositionXmlHandler {
         self.open_element(&name, attrs)
     }
 
-    fn characters(&mut self, text: &str, _ignorable: bool, _end: bool) -> ParseResult<()> {
+    fn characters(&mut self, text: &str, _ignorable: bool) -> ParseResult<()> {
         if text.chars().any(|c| !c.is_whitespace()) {
             return self.fail(CompositionXmlError::Schema(
                 "composition XML does not allow character data".into(),

@@ -2,9 +2,7 @@
 
 //! WebDAV request XML body parser (PROPFIND / PROPPATCH / LOCK).
 
-use std::cell::UnsafeCell;
-
-use bytes::Bytes;
+use loopbuf::LoopBuf;
 use tractrix::{FeatureSet, ParseError, ParseResult, Parser, XmlHandler};
 
 use crate::constants::{self, NAMESPACE};
@@ -102,98 +100,61 @@ impl std::fmt::Display for ParseWebDavError {
 
 impl std::error::Error for ParseWebDavError {}
 
-/// Interior-mutable cell holding the [`XmlHandler`] tractrix's [`Parser`]
-/// writes SAX events into. [`self_cell`]'s builder closure only ever gets a
-/// shared `&Owner` (never `&mut`), but `Parser::new` needs `&mut dyn
-/// XmlHandler` to construct itself — this cell bridges the two.
-struct HandlerCell(UnsafeCell<WebDavXmlHandler>);
-
-impl HandlerCell {
-    fn new() -> Self {
-        Self(UnsafeCell::new(WebDavXmlHandler::default()))
-    }
-
-    /// # Safety
-    /// The returned `&mut` must not overlap with, or outlive, any other
-    /// live reference into this cell. Upheld here because the only caller
-    /// is `StreamingParser`'s builder closure (see
-    /// `WebDavRequestParser::new`), invoked exactly once per `HandlerCell`
-    /// and handing the `&mut` straight to the one `Parser` this cell is
-    /// permanently paired with — nothing else ever reaches into the cell
-    /// while that `Parser` (the `self_cell` dependent) is alive, and
-    /// `self_cell` heap-pins the owner so this pointer stays valid for as
-    /// long as the `Parser` borrowing it does.
-    // clippy's `mut_from_ref` targets accidental aliasing from casting away
-    // constness; this is the deliberate `UnsafeCell` interior-mutability
-    // pattern instead, with the single-caller invariant documented above.
-    #[allow(clippy::mut_from_ref)]
-    unsafe fn handler_mut(&self) -> &mut WebDavXmlHandler {
-        unsafe { &mut *self.0.get() }
-    }
-}
-
-self_cell::self_cell!(
-    struct StreamingParser {
-        owner: HandlerCell,
-
-        #[not_covariant]
-        dependent: Parser,
-    }
-);
-
-// SAFETY: `StreamingParser` (via `WebDavRequestParser`) is owned exclusively
-// by one `WebDavHandler` and only ever accessed through `&mut self` from
-// whichever single thread currently holds that handler — never shared
-// across threads concurrently, only moved between them, which is exactly
-// what `Send` (unlike `Sync`) promises. The parts that aren't auto-`Send`
-// are `tractrix::Parser`'s `&mut dyn XmlHandler` (our own `WebDavXmlHandler`,
-// a plain owned, already-`Send` type) and its `Option<Box<dyn
-// EntityResolver>>` (always `None` here — `WebDavRequestParser::new` never
-// supplies one).
-unsafe impl Send for StreamingParser {}
+/// Ring capacity for the caller-owned [`LoopBuf`] fed to tractrix's
+/// `Parser::receive`. The parser leaves a token it cannot finish yet in the
+/// ring, so this must hold the largest name, tag or declaration the
+/// requests carry; a bigger one is a parse error.
+const RING_CAPACITY: usize = 8192;
 
 /// Incremental parser for a single WebDAV XML request body.
 ///
 /// Holds one [`tractrix::Parser`] alive across [`Self::feed`] calls (issue
-/// #191): a prior version constructed a fresh `Parser` — and closed it —
+/// #191): a prior version constructed a fresh `Parser` - and closed it -
 /// on every `feed()` call, discarding the scanner's low-level token
 /// position between chunks, which silently broke correctness for any
 /// chunk boundary that split a tag, attribute, or entity reference.
-/// `Parser` borrows its handler (`&'a mut dyn XmlHandler`), which can't be
-/// stored alongside an owned handler in a plain struct without leaking
-/// that lifetime — [`self_cell`] pins the handler on the heap so the
-/// borrow stays valid for as long as `Self` does.
 pub struct WebDavRequestParser {
-    parser: StreamingParser,
+    parser: Parser<WebDavXmlHandler>,
+    buf: LoopBuf,
     bytes_received: usize,
     max_bytes: usize,
     /// Set by the first `feed()` error and returned by every call
-    /// afterward without touching `parser` again — unlike the old
+    /// afterward without touching `parser` again - unlike the old
     /// buffer-then-reparse design, a genuine incremental `Parser` isn't
     /// safe to keep feeding once it's reported an error.
     error: Option<ParseWebDavError>,
 }
 
+// SAFETY: `WebDavRequestParser` is owned exclusively by one `WebDavHandler`
+// and only ever accessed through `&mut self` from whichever single thread
+// currently holds that handler - never shared across threads concurrently,
+// only moved between them, which is exactly what `Send` (unlike `Sync`)
+// promises. The parts that aren't auto-`Send` are inside `tractrix::Parser`:
+// its `Option<Box<dyn EntityResolver>>` (always `None` here -
+// `WebDavRequestParser::new` never supplies one) and the `Rc`s it shares
+// between its own tables (interned names, attribute definitions), none of
+// which is ever handed out - the handler sees only `&str`s - so moving the
+// whole parser moves every owner of every `Rc` together. The handler is a
+// plain owned type.
+unsafe impl Send for WebDavRequestParser {}
+
 impl WebDavRequestParser {
     pub fn new(max_bytes: usize) -> Self {
         let features = FeatureSet::default();
-        let parser = StreamingParser::try_new(HandlerCell::new(), |owner: &HandlerCell| {
-            // SAFETY: see `HandlerCell::handler_mut`.
-            let handler = unsafe { owner.handler_mut() };
-            Parser::new(handler, &features, None, None, None)
-        })
-        // A fresh handler with no entity resolver/public/system IDs never
-        // actually fails to construct.
-        .expect("Parser::new with a fresh handler cannot fail");
+        let parser = Parser::new(WebDavXmlHandler::default(), &features, None, None, None)
+            // A fresh handler with no entity resolver/public/system IDs
+            // never actually fails to construct.
+            .expect("Parser::new with a fresh handler cannot fail");
         Self {
             parser,
+            buf: LoopBuf::with_capacity(RING_CAPACITY),
             bytes_received: 0,
             max_bytes,
             error: None,
         }
     }
 
-    pub fn feed(&mut self, data: &[u8]) -> Result<(), ParseWebDavError> {
+    pub fn feed(&mut self, mut data: &[u8]) -> Result<(), ParseWebDavError> {
         if let Some(err) = &self.error {
             return Err(err.clone());
         }
@@ -203,10 +164,23 @@ impl WebDavRequestParser {
             self.error = Some(err.clone());
             return Err(err);
         }
-        let result = self
-            .parser
-            .with_dependent_mut(|_owner, parser| parser.receive(Bytes::copy_from_slice(data)))
-            .map_err(|e| ParseWebDavError::Parse(e.to_string()));
+        let result = (|| -> ParseResult<()> {
+            while !data.is_empty() {
+                let written = self.buf.extend_from_slice(data);
+                data = &data[written..];
+                let before = self.buf.len();
+                self.parser.receive(&mut self.buf)?;
+                // A full ring the parser took nothing from holds a token
+                // longer than it can ever see whole.
+                if written == 0 && self.buf.len() == before {
+                    return Err(ParseError::new(
+                        "XML token too large for the parse buffer",
+                    ));
+                }
+            }
+            Ok(())
+        })()
+        .map_err(|e| ParseWebDavError::Parse(e.to_string()));
         if let Err(err) = &result {
             self.error = Some(err.clone());
         }
@@ -218,12 +192,9 @@ impl WebDavRequestParser {
             return Err(err);
         }
         self.parser
-            .with_dependent_mut(|_owner, parser| parser.close())
+            .close(&mut self.buf)
             .map_err(|e| ParseWebDavError::Parse(e.to_string()))?;
-        // The `Parser` (self_cell's dependent) is dropped by `into_owner`
-        // before it returns the owner, so nothing still borrows `handler`
-        // here — `UnsafeCell::into_inner` needs no unsafe.
-        let handler = self.parser.into_owner().0.into_inner();
+        let handler = self.parser.into_handler();
         Ok(WebDavParsed {
             propfind: handler.propfind,
             proppatch: handler.proppatch,
@@ -441,7 +412,7 @@ impl XmlHandler for WebDavXmlHandler {
         Ok(())
     }
 
-    fn attribute_value_content(&mut self, _value: &str, _end: bool) -> ParseResult<()> {
+    fn attribute_value_content(&mut self, _value: &str) -> ParseResult<()> {
         Ok(())
     }
 
@@ -449,7 +420,7 @@ impl XmlHandler for WebDavXmlHandler {
         Ok(())
     }
 
-    fn characters(&mut self, text: &str, _ignorable: bool, _end: bool) -> ParseResult<()> {
+    fn characters(&mut self, text: &str, _ignorable: bool) -> ParseResult<()> {
         if self.cur_name.is_some() && self.prop_value_depth > 0 {
             self.cur_value.push_str(text);
         } else if self.in_owner {
@@ -601,5 +572,30 @@ mod tests {
         let mut p = WebDavRequestParser::new(4);
         assert!(matches!(p.feed(b"12345").unwrap_err(), ParseWebDavError::TooLarge));
         assert!(matches!(p.finish().unwrap_err(), ParseWebDavError::TooLarge));
+    }
+
+    /// One chunk many times the ring is fed through it in pieces, and a
+    /// value bigger than the ring arrives whole.
+    #[test]
+    fn chunk_larger_than_the_ring_is_parsed() {
+        let value = "v".repeat(RING_CAPACITY * 5 + 3);
+        let body = format!(
+            "<D:propertyupdate xmlns:D=\"DAV:\" xmlns:x=\"urn:x\"><D:set><D:prop><x:big>{value}</x:big></D:prop></D:set></D:propertyupdate>"
+        );
+        let parsed = parse_webdav_body(body.as_bytes()).unwrap();
+        let updates = parsed.proppatch.unwrap().updates;
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].value, value);
+    }
+
+    /// A name longer than the ring can hold is an error, not a hang or a
+    /// silent truncation.
+    #[test]
+    fn token_larger_than_the_ring_is_an_error() {
+        let body = format!("<{}/>", "a".repeat(RING_CAPACITY * 2));
+        assert!(matches!(
+            parse_webdav_body(body.as_bytes()),
+            Err(ParseWebDavError::Parse(_))
+        ));
     }
 }

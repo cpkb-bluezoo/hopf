@@ -405,7 +405,7 @@ impl GrpcClientHandler {
             self.fail("no response handler");
             return;
         };
-        let mut slice = accum.buf.as_slice();
+        let slice = accum.buf.as_slice();
         let result: Result<(), String> = match self.codec {
             GrpcCodec::Proto => {
                 let mut adapter = ProtoModelAdapter::new((*self.proto_file).clone(), msg_handler);
@@ -415,8 +415,7 @@ impl GrpcClientHandler {
                     }
                     {
                         let mut pb = ProtoParser::new(&mut adapter);
-                        pb.receive(&mut slice).map_err(|e| e.to_string())?;
-                        pb.close().map_err(|e| e.to_string())?;
+                        pb.parse(slice).map_err(|e| e.to_string())?;
                     }
                     adapter.end_root_message().map_err(|e| e.to_string())
                 })()
@@ -429,8 +428,7 @@ impl GrpcClientHandler {
                     }
                     {
                         let mut jp = JsonParser::new(&mut adapter);
-                        jp.receive(&mut slice).map_err(|e| e.to_string())?;
-                        jp.close().map_err(|e| e.to_string())?;
+                        jp.parse(slice).map_err(|e| e.to_string())?;
                     }
                     adapter.end_root_message().map_err(|e| e.to_string())
                 })()

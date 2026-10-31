@@ -22,6 +22,7 @@ integration = []
 [dependencies]
 hopf-core = { workspace = true }
 hopf-http = { workspace = true }
+loopbuf = { workspace = true }
 rjsonparser = { workspace = true }
 rprotobuf = { workspace = true }
 

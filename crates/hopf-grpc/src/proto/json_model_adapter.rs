@@ -48,6 +48,9 @@ pub struct JsonModelAdapter<H: ProtoMessageHandler> {
     root_started: bool,
     root_object_open: bool,
     pub last_error: Option<ProtoParseError>,
+    /// The string value being read, gathered from the chunks the parser
+    /// delivers: converting it to a field needs the whole of it.
+    string: String,
 }
 
 impl<H: ProtoMessageHandler> JsonModelAdapter<H> {
@@ -63,6 +66,7 @@ impl<H: ProtoMessageHandler> JsonModelAdapter<H> {
             root_started: false,
             root_object_open: false,
             last_error: None,
+            string: String::new(),
         }
     }
 
@@ -604,7 +608,20 @@ impl<H: ProtoMessageHandler> ContentHandler for JsonModelAdapter<H> {
         self.finish_scalar(scalar)
     }
 
-    fn string_value(&mut self, value: &str) -> ParseResult<()> {
+    fn start_string_value(&mut self) -> ParseResult<()> {
+        self.string.clear();
+        Ok(())
+    }
+
+    fn string_value_content(&mut self, chunk: &str) -> ParseResult<()> {
+        if !self.skip_value {
+            self.string.push_str(chunk);
+        }
+        Ok(())
+    }
+
+    fn end_string_value(&mut self) -> ParseResult<()> {
+        let value = std::mem::take(&mut self.string);
         if self.skip_value {
             self.skip_scalar();
             return Ok(());
@@ -615,9 +632,9 @@ impl<H: ProtoMessageHandler> ContentHandler for JsonModelAdapter<H> {
             _ => return Err(ParseError::new("unexpected string")),
         };
         let scalar = if matches!(self.pending, Some(Pending::MapValue { .. })) {
-            map_value_from_string(&fd, value)?
+            map_value_from_string(&fd, &value)?
         } else {
-            self.convert_string(&fd, value)?
+            self.convert_string(&fd, &value)?
         };
         self.finish_scalar(scalar)
     }
@@ -726,10 +743,8 @@ mod tests {
         adapter.start_root_message("demo.Echo").unwrap();
         let json = br#"{"text":"hi","fooBar":7,"data":"Zm9v"}"#;
         {
-            let mut input = &json[..];
             let mut p = Parser::new(&mut adapter);
-            p.receive(&mut input).unwrap();
-            p.close().unwrap();
+            p.parse(&json[..]).unwrap();
         }
         adapter.end_root_message().unwrap();
         let ev = adapter.into_handler().events;
@@ -749,22 +764,22 @@ mod tests {
         )
         .unwrap();
         let mut ser = JsonModelSerializer::new(proto.clone());
-        let mut w = Writer::buffer(64);
-        ser.start_message(&mut w, "demo.Echo").unwrap();
-        ser.field(&mut w, "text", ScalarValue::String("hi".into()))
+        let mut w = Writer::new();
+        let mut ring = loopbuf::LoopBuf::with_capacity(64);
+        ser.start_message(&mut w, &mut ring, "demo.Echo").unwrap();
+        ser.field(&mut w, &mut ring, "text", ScalarValue::String("hi".into()))
             .unwrap();
-        ser.field(&mut w, "n", ScalarValue::I32(7)).unwrap();
-        ser.end_message(&mut w).unwrap();
-        let bytes = w.finish().unwrap();
+        ser.field(&mut w, &mut ring, "n", ScalarValue::I32(7)).unwrap();
+        ser.end_message(&mut w, &mut ring).unwrap();
+        let (a, b) = ring.readable_spans();
+        let bytes = [a, b].concat();
 
         let collect = Collect { events: vec![] };
         let mut adapter = JsonModelAdapter::new(proto, collect);
         adapter.start_root_message("demo.Echo").unwrap();
         {
-            let mut input = bytes.as_slice();
             let mut p = Parser::new(&mut adapter);
-            p.receive(&mut input).unwrap();
-            p.close().unwrap();
+            p.parse(bytes.as_slice()).unwrap();
         }
         adapter.end_root_message().unwrap();
         let ev = adapter.into_handler().events;

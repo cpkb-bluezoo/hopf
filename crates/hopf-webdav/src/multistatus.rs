@@ -4,17 +4,14 @@
 
 use std::io;
 
-use bytes::Bytes;
-use tractrix::{
-    FeatureSet, NamespaceFilter, ParseError, ParseResult, Parser, XmlHandler, XmlWriter,
-};
+use tractrix::{FeatureSet, NamespaceFilter, ParseError, ParseResult, Parser, XmlHandler};
 
 use crate::constants::{self, NAMESPACE, PREFIX};
-use crate::xml_out::{dav_element_text, dav_end, dav_start, write_prop_end, write_prop_start};
+use crate::xml_out::{
+    dav_element_text, dav_end, dav_start, write_prop_end, write_prop_start, DavWriter,
+};
 
-type DavWriter = XmlWriter<Vec<u8>>;
-
-/// Streaming `207 Multi-Status` document builder over one [`XmlWriter`].
+/// Streaming `207 Multi-Status` document builder over one [`PropXmlWriter`](crate::xml_out::PropXmlWriter).
 pub struct MultistatusWriter {
     w: DavWriter,
     open: bool,
@@ -23,7 +20,7 @@ pub struct MultistatusWriter {
 impl MultistatusWriter {
     pub fn new() -> Self {
         Self {
-            w: XmlWriter::new_vec(),
+            w: DavWriter::new_vec(),
             open: false,
         }
     }
@@ -71,8 +68,7 @@ impl MultistatusWriter {
     /// buffering the whole thing before sending anything). Call
     /// [`Self::finish`] once at the end for the closing tag.
     pub fn take_written(&mut self) -> Vec<u8> {
-        let _ = self.w.flush();
-        std::mem::take(self.w.get_mut())
+        self.w.take_output()
     }
 }
 
@@ -216,7 +212,7 @@ impl<H: MultiStatusHandler> MultiStatusParser<H> {
             let mut parser = Parser::new(&mut filter, &features, None, None, None)
                 .map_err(|e| MultiStatusParseError::Parse(e.to_string()))?;
             parser
-                .parse_all(Bytes::copy_from_slice(&self.buffer))
+                .parse(self.buffer.as_slice())
                 .map_err(|e| MultiStatusParseError::Parse(e.to_string()))?;
         }
         if let Some(err) = adapter.error.take() {
@@ -393,7 +389,7 @@ impl<H: MultiStatusHandler> XmlHandler for MultistatusXmlAdapter<'_, H> {
         Ok(())
     }
 
-    fn characters(&mut self, text: &str, _ignorable: bool, _end: bool) -> ParseResult<()> {
+    fn characters(&mut self, text: &str, _ignorable: bool) -> ParseResult<()> {
         match self.parent_frame() {
             Some(Frame::Href)
             | Some(Frame::Status)

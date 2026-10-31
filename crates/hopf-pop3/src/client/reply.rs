@@ -670,7 +670,7 @@ impl Pop3ReplyLexer {
             }
             Field::ContinuationText => {
                 let text = std::mem::take(&mut self.text);
-                let data = base64::decode(&text).map_err(|()| {
+                let data = base64::decode(&text).map_err(|_| {
                     Pop3Error::Parse("bad base64 in SASL continuation".into())
                 })?;
                 self.state = State::Prefix(Prefix::Start);

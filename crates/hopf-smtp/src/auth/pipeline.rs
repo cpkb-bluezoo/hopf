@@ -453,8 +453,7 @@ impl SmtpPipeline for AuthPipeline {
                 let (header_bytes, leftover_body) = self.header_buf.split_at(boundary);
                 let mut handler = NoopMessageHandler;
                 let mut parser = DkimMessageParser::new(&mut handler);
-                let mut data: &[u8] = header_bytes;
-                let _ = parser.receive(&mut data);
+                let _ = parser.parse(header_bytes);
                 let headers = parser.raw_headers().to_vec();
 
                 let mut keys = dkim::required_body_hash_keys(&headers);
@@ -497,9 +496,7 @@ impl SmtpPipeline for AuthPipeline {
             None => {
                 let mut handler = NoopMessageHandler;
                 let mut parser = DkimMessageParser::new(&mut handler);
-                let mut data: &[u8] = &self.header_buf;
-                let _ = parser.receive(&mut data);
-                let _ = parser.close();
+                let _ = parser.parse(self.header_buf.as_slice());
                 Arc::new(parser.raw_headers().to_vec())
             }
         };

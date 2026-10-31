@@ -4,7 +4,7 @@
 //! headers via `rmimeparser`.
 
 use rmimeparser::{
-    ContentId, EmailAddress, MessageHandler, MessageParser, MimeHandler, OffsetDateTime,
+    ContentId, MessageHandler, MessageIdListCollector, MessageParser, MimeHandler, OffsetDateTime,
     ParseResult,
 };
 
@@ -19,16 +19,6 @@ pub struct EnvelopeAddress {
     pub name: Option<String>,
     pub mailbox: String,
     pub host: String,
-}
-
-impl From<&EmailAddress> for EnvelopeAddress {
-    fn from(a: &EmailAddress) -> Self {
-        Self {
-            name: a.display_name().map(|s| s.to_string()),
-            mailbox: a.local_part().to_string(),
-            host: a.domain().to_string(),
-        }
-    }
 }
 
 /// Parsed RFC 9051 §7.5.2 ENVELOPE fields.
@@ -49,8 +39,7 @@ pub struct Envelope {
 /// Shared by [`EnvelopeCollector`] and `bodystructure::StructureBuilder`
 /// (which also collects the top-level message's envelope while it walks
 /// the MIME structure) so both apply RFC 5322 address headers identically.
-pub(crate) fn apply_address_header(env: &mut Envelope, name: &str, addrs: &[EmailAddress]) {
-    let list: Vec<EnvelopeAddress> = addrs.iter().map(EnvelopeAddress::from).collect();
+fn apply_address_header(env: &mut Envelope, name: &str, list: Vec<EnvelopeAddress>) {
     match name.to_ascii_lowercase().as_str() {
         "from" => env.from = list,
         "sender" => env.sender = list,
@@ -64,7 +53,7 @@ pub(crate) fn apply_address_header(env: &mut Envelope, name: &str, addrs: &[Emai
 
 /// Shared by [`EnvelopeCollector`] and `bodystructure::StructureBuilder` —
 /// see [`apply_address_header`].
-pub(crate) fn apply_message_id_header(env: &mut Envelope, name: &str, ids: &[ContentId]) {
+fn apply_message_id_header(env: &mut Envelope, name: &str, ids: &[ContentId]) {
     let joined = ids
         .iter()
         .map(|id| id.to_string())
@@ -77,35 +66,142 @@ pub(crate) fn apply_message_id_header(env: &mut Envelope, name: &str, ids: &[Con
     }
 }
 
+/// Builds an [`Envelope`] from the parser's header events, which arrive a
+/// piece at a time: the subject and each address list are held only until
+/// their header ends. The handler methods of the same names forward here.
 #[derive(Default)]
-struct EnvelopeCollector {
-    env: Envelope,
+pub(crate) struct EnvelopeBuilder {
+    pub(crate) env: Envelope,
+    in_subject: bool,
+    subject: String,
+    address_header: String,
+    addresses: Vec<EnvelopeAddress>,
+    id_header: String,
+    ids: MessageIdListCollector,
 }
 
-impl MimeHandler for EnvelopeCollector {}
-
-impl MessageHandler for EnvelopeCollector {
-    fn header(&mut self, name: &str, value: &str) -> ParseResult<()> {
-        if name.eq_ignore_ascii_case("Subject") {
-            self.env.subject = Some(value.to_string());
-        }
-        Ok(())
+impl EnvelopeBuilder {
+    pub(crate) fn start_header(&mut self, name: &str) {
+        self.in_subject = name.eq_ignore_ascii_case("Subject");
+        self.subject.clear();
     }
 
-    fn date_header(&mut self, name: &str, date: OffsetDateTime) -> ParseResult<()> {
+    pub(crate) fn header_content(&mut self, text: &str) {
+        if self.in_subject {
+            self.subject.push_str(text);
+        }
+    }
+
+    pub(crate) fn end_header(&mut self) {
+        if self.in_subject {
+            self.in_subject = false;
+            self.env.subject = Some(std::mem::take(&mut self.subject));
+        }
+    }
+
+    pub(crate) fn date_header(&mut self, name: &str, date: OffsetDateTime) {
         if name.eq_ignore_ascii_case("Date") {
             self.env.date = Some(date.to_string());
         }
+    }
+
+    pub(crate) fn start_address_header(&mut self, name: &str) {
+        self.address_header.clear();
+        self.address_header.push_str(name);
+        self.addresses.clear();
+    }
+
+    /// A mailbox of the address header, of a group's members too: an
+    /// ENVELOPE has no groups.
+    pub(crate) fn mailbox(&mut self, display_name: Option<&str>, local_part: &str, domain: &str) {
+        self.addresses.push(EnvelopeAddress {
+            name: display_name.map(str::to_string),
+            mailbox: local_part.to_string(),
+            host: domain.to_string(),
+        });
+    }
+
+    pub(crate) fn end_address_header(&mut self) {
+        let list = std::mem::take(&mut self.addresses);
+        apply_address_header(&mut self.env, &self.address_header, list);
+    }
+
+    pub(crate) fn start_message_id_header(&mut self, name: &str) {
+        self.id_header.clear();
+        self.id_header.push_str(name);
+        self.ids.clear();
+    }
+
+    pub(crate) fn message_id(&mut self, local_part: &str, domain: &str) {
+        self.ids.message_id(local_part, domain);
+    }
+
+    pub(crate) fn end_message_id_header(&mut self) {
+        let ids = self.ids.take();
+        apply_message_id_header(&mut self.env, &self.id_header, &ids);
+    }
+}
+
+#[derive(Default)]
+struct EnvelopeCollector {
+    builder: EnvelopeBuilder,
+}
+
+impl MimeHandler for EnvelopeCollector {
+    fn start_header(&mut self, name: &str) -> ParseResult<()> {
+        self.builder.start_header(name);
         Ok(())
     }
 
-    fn address_header(&mut self, name: &str, addrs: &[EmailAddress]) -> ParseResult<()> {
-        apply_address_header(&mut self.env, name, addrs);
+    fn header_content(&mut self, text: &str) -> ParseResult<()> {
+        self.builder.header_content(text);
         Ok(())
     }
 
-    fn message_id_header(&mut self, name: &str, ids: &[ContentId]) -> ParseResult<()> {
-        apply_message_id_header(&mut self.env, name, ids);
+    fn end_header(&mut self) -> ParseResult<()> {
+        self.builder.end_header();
+        Ok(())
+    }
+}
+
+impl MessageHandler for EnvelopeCollector {
+    fn date_header(&mut self, name: &str, date: OffsetDateTime) -> ParseResult<()> {
+        self.builder.date_header(name, date);
+        Ok(())
+    }
+
+    fn start_address_header(&mut self, name: &str) -> ParseResult<()> {
+        self.builder.start_address_header(name);
+        Ok(())
+    }
+
+    fn mailbox(
+        &mut self,
+        display_name: Option<&str>,
+        local_part: &str,
+        domain: &str,
+    ) -> ParseResult<()> {
+        self.builder.mailbox(display_name, local_part, domain);
+        Ok(())
+    }
+
+    fn end_address_header(&mut self) -> ParseResult<()> {
+        self.builder.end_address_header();
+        Ok(())
+    }
+
+    fn start_message_id_header(&mut self, name: &str) -> ParseResult<()> {
+        self.builder.start_message_id_header(name);
+        Ok(())
+    }
+
+    fn message_id(&mut self, local_part: &str, domain: &str) -> ParseResult<()> {
+        self.builder.message_id(local_part, domain);
+        Ok(())
+    }
+
+    fn end_message_id_header(&mut self) -> ParseResult<()> {
+        self.builder.end_message_id_header();
         Ok(())
     }
 }
@@ -117,18 +213,16 @@ impl MessageHandler for EnvelopeCollector {
 ///
 /// `header` is expected to end at (and include) the header/body blank
 /// line, matching what a header-only scan naturally produces. Parsing may
-/// report an error at `close()` if the header claims a multipart
+/// report an error at the end if the header claims a multipart
 /// `Content-Type` (since no body/boundary lines follow) — that error is
 /// intentionally ignored: every header field is dispatched to this
-/// collector as its line completes, during `receive()`, well before
-/// `close()` runs, so the ignored error never loses data.
+/// collector as it completes, well before the end, so the ignored error
+/// never loses data.
 pub fn parse_envelope(header: &[u8]) -> Envelope {
     let mut collector = EnvelopeCollector::default();
     let mut parser = MessageParser::new(&mut collector);
-    let mut data = header;
-    let _ = parser.receive(&mut data);
-    let _ = parser.close();
-    collector.env
+    let _ = parser.parse(header);
+    collector.builder.env
 }
 
 fn push_nstring_opt(out: &mut Vec<u8>, s: Option<&str>) {

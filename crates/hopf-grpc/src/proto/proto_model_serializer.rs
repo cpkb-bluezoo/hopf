@@ -3,9 +3,8 @@
 //! Serializes protobuf messages from event-driven input using a Proto model.
 
 use std::collections::VecDeque;
-use std::io::Write;
-
-use rprotobuf::{Buffer, WriteError, Writer};
+use loopbuf::LoopBuf;
+use rprotobuf::{WriteError, Writer};
 
 use super::{FieldDescriptor, FieldType, MessageDescriptor, ProtoFile, ScalarValue};
 
@@ -52,9 +51,10 @@ impl ProtoModelSerializer {
     ///
     /// Gumdrop quirks preserved: `Fixed32` / `Fixed64` / `Enum` are written as
     /// varint fields (not fixed wire types).
-    pub fn field<W: Write>(
+    pub fn field(
         &mut self,
-        writer: &mut Writer<W>,
+        writer: &mut Writer,
+        ring: &mut LoopBuf,
         name: &str,
         value: ScalarValue,
     ) -> Result<(), WriteError> {
@@ -65,10 +65,10 @@ impl ProtoModelSerializer {
         let num = fd.number as u32;
         match fd.field_type {
             FieldType::Double => {
-                writer.write_double_field(num, as_f64(&value))?;
+                writer.write_double_field(ring, num, as_f64(&value))?;
             }
             FieldType::Float => {
-                writer.write_float_field(num, as_f32(&value))?;
+                writer.write_float_field(ring, num, as_f32(&value))?;
             }
             FieldType::Int32
             | FieldType::Uint32
@@ -77,38 +77,38 @@ impl ProtoModelSerializer {
             | FieldType::Int64
             | FieldType::Uint64
             | FieldType::Fixed64 => {
-                writer.write_varint_field(num, as_u64(&value))?;
+                writer.write_varint_field(ring, num, as_u64(&value))?;
             }
             FieldType::Sint32 => {
-                writer.write_svarint_field(num, as_i64(&value))?;
+                writer.write_svarint_field(ring, num, as_i64(&value))?;
             }
             FieldType::Sint64 => {
-                writer.write_svarint_field(num, as_i64(&value))?;
+                writer.write_svarint_field(ring, num, as_i64(&value))?;
             }
             FieldType::Sfixed32 => {
-                writer.write_fixed32_field(num, as_i64(&value) as u32)?;
+                writer.write_fixed32_field(ring, num, as_i64(&value) as u32)?;
             }
             FieldType::Sfixed64 => {
-                writer.write_fixed64_field(num, as_u64(&value))?;
+                writer.write_fixed64_field(ring, num, as_u64(&value))?;
             }
             FieldType::Bool => {
                 let b = matches!(value, ScalarValue::Bool(true))
                     || matches!(value, ScalarValue::U64(v) if v != 0)
                     || matches!(value, ScalarValue::I32(v) if v != 0)
                     || matches!(value, ScalarValue::I64(v) if v != 0);
-                writer.write_bool_field(num, b)?;
+                writer.write_bool_field(ring, num, b)?;
             }
             FieldType::String => {
                 let s = match &value {
                     ScalarValue::String(s) => s.as_str(),
                     _ => return Ok(()),
                 };
-                writer.write_string_field(num, s)?;
+                writer.write_string_field(ring, num, s)?;
             }
             FieldType::Bytes => {
                 match &value {
-                    ScalarValue::Bytes(b) => writer.write_bytes_field(num, b)?,
-                    ScalarValue::String(s) => writer.write_bytes_field(num, s.as_bytes())?,
+                    ScalarValue::Bytes(b) => writer.write_bytes_field(ring, num, b)?,
+                    ScalarValue::String(s) => writer.write_bytes_field(ring, num, s.as_bytes())?,
                     _ => {}
                 }
             }
@@ -137,16 +137,16 @@ impl ProtoModelSerializer {
     }
 
     /// Writes an embedded message. The content is written via the callback.
-    pub fn message_field<W, F>(
+    pub fn message_field<F>(
         &mut self,
-        writer: &mut Writer<W>,
+        writer: &mut Writer,
+        ring: &mut LoopBuf,
         name: &str,
         type_name: &str,
         content: F,
     ) -> Result<(), WriteError>
     where
-        W: Write,
-        F: FnOnce(&mut ProtoModelSerializer, &mut Writer<Buffer>) -> Result<(), WriteError>,
+        F: FnOnce(&mut ProtoModelSerializer, &mut Writer, &mut LoopBuf) -> Result<(), WriteError>,
     {
         let fd = match self.current_field(name) {
             Some(fd) => fd.clone(),
@@ -163,7 +163,7 @@ impl ProtoModelSerializer {
         };
 
         self.message_stack.push_front(nested);
-        let result = writer.write_message_field(fd.number as u32, |w| content(self, w));
+        let result = writer.write_message_field(ring, fd.number as u32, |w, ring| content(self, w, ring));
         self.message_stack.pop_front();
         result
     }

@@ -15,20 +15,18 @@
 //!   (identity encoding — the common case, and the only encodings valid
 //!   for `message/rfc822` bodies) are unaffected: decoded and wire bytes
 //!   are the same.
-//! - Content-Language/Content-Location aren't part of `rmimeparser`'s
-//!   `MimeHandler` trait, so the corresponding BODYSTRUCTURE extension
-//!   fields are always `NIL`. Content-Disposition parameters other than
-//!   `filename` are also always omitted: `ContentDisposition` only exposes
-//!   named lookup (`get_parameter`), not enumeration, in the installed
-//!   `rmimeparser` version.
+//! - Content-Language/Content-Location aren't read, so the corresponding
+//!   BODYSTRUCTURE extension fields are always `NIL`. Content-Disposition
+//!   parameters other than `filename` are also always omitted.
 
 use hopf_mailbox::{Mailbox, MailboxResult, MessageReadCallback};
+use loopbuf::LoopBuf;
 use rmimeparser::{
-    ContentDisposition, ContentId, ContentType, EmailAddress, MessageHandler, MessageParser,
-    MimeHandler, OffsetDateTime, ParseResult,
+    ContentDisposition, ContentDispositionCollector, ContentId, ContentTypeCollector,
+    MessageHandler, MessageParser, MimeHandler, OffsetDateTime, ParseResult,
 };
 
-use crate::server::envelope::{apply_address_header, apply_message_id_header, Envelope};
+use crate::server::envelope::{Envelope, EnvelopeBuilder};
 use crate::server::fetch_format::format_nstring;
 
 /// A message/rfc822 part's encapsulated message is parsed recursively, but
@@ -91,9 +89,7 @@ fn empty_leaf() -> BodyStructureNode {
     }
 }
 
-/// Only `filename` is exposed: `ContentDisposition` (installed
-/// `rmimeparser` version) only supports named parameter lookup, not
-/// enumeration — see module docs.
+/// Only `filename` is exposed — see module docs.
 fn disposition_params(cd: &ContentDisposition) -> Vec<(String, String)> {
     match cd.get_parameter("filename") {
         Some(name) => vec![("filename".to_string(), name.to_string())],
@@ -194,7 +190,15 @@ impl PartInProgress {
 struct StructureBuilder {
     stack: Vec<PartInProgress>,
     root: Option<BodyStructureNode>,
-    envelope: Envelope,
+    envelope: EnvelopeBuilder,
+    content_type: ContentTypeCollector,
+    disposition: ContentDispositionCollector,
+    /// Whether the parameters arriving belong to the `Content-Disposition`
+    /// rather than the `Content-Type`.
+    in_disposition: bool,
+    /// The header being read is a `Content-Description`.
+    in_description: bool,
+    description: String,
 }
 
 impl StructureBuilder {
@@ -202,8 +206,18 @@ impl StructureBuilder {
         Self {
             stack: Vec::new(),
             root: None,
-            envelope: Envelope::default(),
+            envelope: EnvelopeBuilder::default(),
+            content_type: ContentTypeCollector::default(),
+            disposition: ContentDispositionCollector::default(),
+            in_disposition: false,
+            in_description: false,
+            description: String::new(),
         }
+    }
+
+    /// Whether a header event is of the message itself, not of a part.
+    fn at_top(&self) -> bool {
+        self.stack.len() == 1
     }
 }
 
@@ -213,7 +227,47 @@ impl MimeHandler for StructureBuilder {
         Ok(())
     }
 
-    fn content_type(&mut self, ct: &ContentType) -> ParseResult<()> {
+    fn start_content_type(&mut self, primary: &str, sub: &str) -> ParseResult<()> {
+        self.content_type.start(primary, sub);
+        self.in_disposition = false;
+        Ok(())
+    }
+
+    fn start_content_disposition(&mut self, kind: &str) -> ParseResult<()> {
+        self.disposition.start(kind);
+        self.in_disposition = true;
+        Ok(())
+    }
+
+    fn start_parameter(&mut self, name: &str, language: Option<&str>) -> ParseResult<()> {
+        if self.in_disposition {
+            self.disposition.start_parameter(name, language);
+        } else {
+            self.content_type.start_parameter(name, language);
+        }
+        Ok(())
+    }
+
+    fn parameter_content(&mut self, text: &str) -> ParseResult<()> {
+        if self.in_disposition {
+            self.disposition.parameter_content(text);
+        } else {
+            self.content_type.parameter_content(text);
+        }
+        Ok(())
+    }
+
+    fn end_parameter(&mut self) -> ParseResult<()> {
+        if self.in_disposition {
+            self.disposition.end_parameter();
+        } else {
+            self.content_type.end_parameter();
+        }
+        Ok(())
+    }
+
+    fn end_content_type(&mut self) -> ParseResult<()> {
+        let ct = self.content_type.finish();
         if let Some(top) = self.stack.last_mut() {
             top.primary_type = ct.primary_type().to_string();
             top.sub_type = ct.sub_type().to_string();
@@ -228,9 +282,11 @@ impl MimeHandler for StructureBuilder {
         Ok(())
     }
 
-    fn content_disposition(&mut self, cd: &ContentDisposition) -> ParseResult<()> {
+    fn end_content_disposition(&mut self) -> ParseResult<()> {
+        self.in_disposition = false;
+        let cd = self.disposition.finish();
         if let Some(top) = self.stack.last_mut() {
-            top.disposition = Some((cd.disposition_type().to_string(), disposition_params(cd)));
+            top.disposition = Some((cd.disposition_type().to_string(), disposition_params(&cd)));
         }
         Ok(())
     }
@@ -249,9 +305,34 @@ impl MimeHandler for StructureBuilder {
         Ok(())
     }
 
-    fn content_description(&mut self, description: &str) -> ParseResult<()> {
-        if let Some(top) = self.stack.last_mut() {
-            top.description = Some(description.to_string());
+    fn start_header(&mut self, name: &str) -> ParseResult<()> {
+        self.in_description = name.eq_ignore_ascii_case("Content-Description");
+        self.description.clear();
+        if self.at_top() {
+            self.envelope.start_header(name);
+        }
+        Ok(())
+    }
+
+    fn header_content(&mut self, text: &str) -> ParseResult<()> {
+        if self.in_description {
+            self.description.push_str(text);
+        }
+        if self.at_top() {
+            self.envelope.header_content(text);
+        }
+        Ok(())
+    }
+
+    fn end_header(&mut self) -> ParseResult<()> {
+        if self.in_description {
+            self.in_description = false;
+            if let Some(top) = self.stack.last_mut() {
+                top.description = Some(std::mem::take(&mut self.description));
+            }
+        }
+        if self.at_top() {
+            self.envelope.end_header();
         }
         Ok(())
     }
@@ -287,30 +368,56 @@ impl MimeHandler for StructureBuilder {
 }
 
 impl MessageHandler for StructureBuilder {
-    fn header(&mut self, name: &str, value: &str) -> ParseResult<()> {
-        if self.stack.len() == 1 && name.eq_ignore_ascii_case("Subject") {
-            self.envelope.subject = Some(value.to_string());
-        }
-        Ok(())
-    }
-
     fn date_header(&mut self, name: &str, date: OffsetDateTime) -> ParseResult<()> {
-        if self.stack.len() == 1 && name.eq_ignore_ascii_case("Date") {
-            self.envelope.date = Some(date.to_string());
+        if self.at_top() {
+            self.envelope.date_header(name, date);
         }
         Ok(())
     }
 
-    fn address_header(&mut self, name: &str, addrs: &[EmailAddress]) -> ParseResult<()> {
-        if self.stack.len() == 1 {
-            apply_address_header(&mut self.envelope, name, addrs);
+    fn start_address_header(&mut self, name: &str) -> ParseResult<()> {
+        if self.at_top() {
+            self.envelope.start_address_header(name);
         }
         Ok(())
     }
 
-    fn message_id_header(&mut self, name: &str, ids: &[ContentId]) -> ParseResult<()> {
-        if self.stack.len() == 1 {
-            apply_message_id_header(&mut self.envelope, name, ids);
+    fn mailbox(
+        &mut self,
+        display_name: Option<&str>,
+        local_part: &str,
+        domain: &str,
+    ) -> ParseResult<()> {
+        if self.at_top() {
+            self.envelope.mailbox(display_name, local_part, domain);
+        }
+        Ok(())
+    }
+
+    fn end_address_header(&mut self) -> ParseResult<()> {
+        if self.at_top() {
+            self.envelope.end_address_header();
+        }
+        Ok(())
+    }
+
+    fn start_message_id_header(&mut self, name: &str) -> ParseResult<()> {
+        if self.at_top() {
+            self.envelope.start_message_id_header(name);
+        }
+        Ok(())
+    }
+
+    fn message_id(&mut self, local_part: &str, domain: &str) -> ParseResult<()> {
+        if self.at_top() {
+            self.envelope.message_id(local_part, domain);
+        }
+        Ok(())
+    }
+
+    fn end_message_id_header(&mut self) -> ParseResult<()> {
+        if self.at_top() {
+            self.envelope.end_message_id_header();
         }
         Ok(())
     }
@@ -323,22 +430,36 @@ fn build_structure_from_slice(msg: &[u8]) -> (Envelope, BodyStructureNode) {
     let mut builder = StructureBuilder::new();
     {
         let mut parser = MessageParser::new(&mut builder);
-        let mut data = msg;
-        let _ = parser.receive(&mut data);
-        let _ = parser.close();
+        let _ = parser.parse(msg);
     }
     let node = builder.root.take().unwrap_or_else(empty_leaf);
-    (builder.envelope, node)
+    (builder.envelope.env, node)
 }
 
+/// Capacity of the ring a message is streamed through: room for the largest
+/// element the parser holds (4096 bytes) and a chunk beside it.
+const FEED_RING_BYTES: usize = 16 * 1024;
+
 struct FeedParser<'a> {
-    parser: MessageParser<'a, StructureBuilder>,
+    parser: MessageParser<&'a mut StructureBuilder>,
+    ring: LoopBuf,
+    /// The parser reported an error: the rest of the message is skipped.
+    failed: bool,
 }
 
 impl MessageReadCallback for FeedParser<'_> {
     fn message_content(&mut self, chunk: &[u8]) -> bool {
-        let mut data = chunk;
-        let _ = self.parser.receive(&mut data);
+        let mut rest = chunk;
+        while !rest.is_empty() && !self.failed {
+            let taken = self.ring.extend_from_slice(rest);
+            rest = &rest[taken..];
+            let before = self.ring.len();
+            self.failed = self.parser.receive(&mut self.ring).is_err();
+            // A full ring the parser took nothing from can never go on.
+            if taken == 0 && self.ring.len() == before {
+                self.failed = true;
+            }
+        }
         true
     }
 }
@@ -350,12 +471,16 @@ pub fn build_structure(mb: &mut dyn Mailbox, seq: u32) -> MailboxResult<(Envelop
     let mut builder = StructureBuilder::new();
     {
         let parser = MessageParser::new(&mut builder);
-        let mut cb = FeedParser { parser };
+        let mut cb = FeedParser {
+            parser,
+            ring: LoopBuf::with_capacity(FEED_RING_BYTES),
+            failed: false,
+        };
         mb.read_message(seq, &mut cb)?;
-        let _ = cb.parser.close();
+        let _ = cb.parser.close(&mut cb.ring);
     }
     let node = builder.root.take().unwrap_or_else(empty_leaf);
-    Ok((builder.envelope, node))
+    Ok((builder.envelope.env, node))
 }
 
 /// Parse a complete in-memory message — used by the `format_fetch_attrs`

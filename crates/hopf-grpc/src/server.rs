@@ -13,7 +13,8 @@ use hopf_http::{
     ServerWriter,
 };
 use rjsonparser::Parser as JsonParser;
-use rprotobuf::{Buffer, Parser as ProtoParser, Writer as ProtoWriter};
+use loopbuf::LoopBuf;
+use rprotobuf::{Parser as ProtoParser, Writer as ProtoWriter};
 
 use hopf_http::ContentCoding;
 
@@ -460,11 +461,13 @@ impl GrpcResponseChannel {
             body: match codec {
                 GrpcCodec::Proto => ResponseBody::Proto {
                     serializer: ProtoModelSerializer::new((*proto_file).clone()),
-                    writer: ProtoWriter::buffer(4096),
+                    writer: ProtoWriter::new(),
+                    ring: LoopBuf::with_capacity(RESPONSE_RING_BYTES),
                 },
                 GrpcCodec::Json => ResponseBody::Json {
                     serializer: JsonModelSerializer::new((*proto_file).clone()),
-                    writer: rjsonparser::Writer::buffer(4096),
+                    writer: rjsonparser::Writer::new(),
+                    ring: LoopBuf::with_capacity(RESPONSE_RING_BYTES),
                 },
             },
             started: false,
@@ -553,15 +556,74 @@ fn frame_message(message: &[u8], coding: Option<ContentCoding>, threshold: usize
     frame(message)
 }
 
+/// What a response message's ring starts with. A message is framed whole,
+/// so the ring holds all of it; it is doubled when a write does not fit.
+const RESPONSE_RING_BYTES: usize = 16 * 1024;
+
+/// The most a response message's ring is grown to.
+const MAX_RESPONSE_RING_BYTES: usize = 256 * 1024 * 1024;
+
 enum ResponseBody {
     Proto {
         serializer: ProtoModelSerializer,
-        writer: ProtoWriter<Buffer>,
+        writer: ProtoWriter,
+        ring: LoopBuf,
     },
     Json {
         serializer: JsonModelSerializer,
-        writer: rjsonparser::Writer<Vec<u8>>,
+        writer: rjsonparser::Writer,
+        ring: LoopBuf,
     },
+}
+
+impl ResponseBody {
+    /// Replaces the ring with one twice the size holding the same bytes.
+    /// What the writers have noted of it (where each embedded message's
+    /// length goes) is by position in the bytes, so it carries over.
+    fn grow(&mut self) -> Result<(), String> {
+        let ring = match self {
+            ResponseBody::Proto { ring, .. } | ResponseBody::Json { ring, .. } => ring,
+        };
+        let capacity = ring.capacity();
+        if capacity >= MAX_RESPONSE_RING_BYTES {
+            return Err("response message too large".into());
+        }
+        let mut bigger = LoopBuf::with_capacity(capacity * 2);
+        let (a, b) = ring.readable_spans();
+        bigger.extend_from_slice(a);
+        bigger.extend_from_slice(b);
+        *ring = bigger;
+        Ok(())
+    }
+}
+
+/// Whether a write failed for want of room, rather than for being invalid:
+/// the ring is full (`WouldBlock`) or smaller than the write (`InvalidInput`,
+/// worded as the writers do, which is how it differs from a NaN in JSON).
+fn too_small(e: &loopbuf::WriteError) -> bool {
+    e.is_would_block()
+        || (e.kind() == std::io::ErrorKind::InvalidInput
+            && e.to_string().contains("whole capacity"))
+}
+
+/// Runs `write` against the ring, growing it and running it again while it
+/// does not fit. The writers' calls are atomic, so a run that failed left
+/// nothing behind.
+fn write_growing<R>(
+    body: &mut ResponseBody,
+    mut write: impl FnMut(&mut ResponseBody) -> Result<R, loopbuf::WriteError>,
+) -> Result<R, String> {
+    loop {
+        match write(body) {
+            Ok(r) => return Ok(r),
+            Err(e) if too_small(&e) => {
+                if body.grow().is_err() {
+                    return Err(e.to_string());
+                }
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
 }
 
 /// Encoder handle for one unary response message.
@@ -583,33 +645,39 @@ impl GrpcResponseMessage {
         }
     }
 
-    /// Protobuf wire writer (only when the negotiated codec is [`GrpcCodec::Proto`]).
-    pub fn writer(&mut self) -> Result<&mut ProtoWriter<Buffer>, String> {
+    /// Protobuf wire writer and the ring it writes into (only when the
+    /// negotiated codec is [`GrpcCodec::Proto`]). A write that does not fit
+    /// the ring fails with a would-block error and writes nothing: call
+    /// [`Self::grow`] and repeat it.
+    pub fn writer(&mut self) -> Result<(&mut ProtoWriter, &mut LoopBuf), String> {
         self.ensure_started()?;
         match &mut self.body {
-            ResponseBody::Proto { writer, .. } => Ok(writer),
+            ResponseBody::Proto { writer, ring, .. } => Ok((writer, ring)),
             ResponseBody::Json { .. } => {
                 Err("protobuf writer unavailable for application/grpc+json".into())
             }
         }
     }
 
+    /// Doubles the room for the message, keeping what has been written.
+    pub fn grow(&mut self) -> Result<(), String> {
+        self.body.grow()
+    }
+
     pub fn field(&mut self, name: &str, value: ScalarValue) -> Result<(), String> {
         self.ensure_started()?;
-        match &mut self.body {
+        write_growing(&mut self.body, |body| match body {
             ResponseBody::Proto {
                 serializer,
                 writer,
-            } => serializer
-                .field(writer, name, value)
-                .map_err(|e| e.to_string()),
+                ring,
+            } => serializer.field(writer, ring, name, value.clone()),
             ResponseBody::Json {
                 serializer,
                 writer,
-            } => serializer
-                .field(writer, name, value)
-                .map_err(|e| e.to_string()),
-        }
+                ring,
+            } => serializer.field(writer, ring, name, value.clone()),
+        })
     }
 
     pub fn complete(mut self) -> Result<(), String> {
@@ -618,20 +686,29 @@ impl GrpcResponseMessage {
             ResponseBody::Proto {
                 serializer,
                 writer,
+                ring,
             } => {
                 serializer.end_message();
-                std::mem::replace(writer, ProtoWriter::buffer(0)).finish()
+                let mut out = Vec::with_capacity(ring.len() + 16);
+                writer.drain_to(ring, &mut out).map_err(|e| e.to_string())?;
+                out
             }
-            ResponseBody::Json {
-                serializer,
-                writer,
-            } => {
-                serializer
-                    .end_message(writer)
-                    .map_err(|e| e.to_string())?;
-                std::mem::replace(writer, rjsonparser::Writer::buffer(0))
-                    .finish()
-                    .map_err(|e| e.to_string())?
+            ResponseBody::Json { .. } => {
+                write_growing(&mut self.body, |body| match body {
+                    ResponseBody::Json {
+                        serializer,
+                        writer,
+                        ring,
+                    } => serializer.end_message(writer, ring),
+                    ResponseBody::Proto { .. } => Ok(()),
+                })?;
+                match &self.body {
+                    ResponseBody::Json { ring, .. } => {
+                        let (a, b) = ring.readable_spans();
+                        [a, b].concat()
+                    }
+                    ResponseBody::Proto { .. } => Vec::new(),
+                }
             }
         };
         let unary = self.channel.inner.lock().unwrap().unary;
@@ -654,13 +731,16 @@ impl GrpcResponseMessage {
                     .start_message(&self.type_name)
                     .map_err(|e| e.to_string())?;
             }
-            ResponseBody::Json {
-                serializer,
-                writer,
-            } => {
-                serializer
-                    .start_message(writer, &self.type_name)
-                    .map_err(|e| e.to_string())?;
+            ResponseBody::Json { .. } => {
+                let type_name = self.type_name.clone();
+                write_growing(&mut self.body, |body| match body {
+                    ResponseBody::Json {
+                        serializer,
+                        writer,
+                        ring,
+                    } => serializer.start_message(writer, ring, &type_name),
+                    ResponseBody::Proto { .. } => Ok(()),
+                })?;
             }
         }
         self.started = true;
@@ -900,13 +980,12 @@ impl GrpcHandler {
         if let Some(err) = accum.error {
             return Err(err);
         }
-        let mut slice = accum.buf.as_slice();
+        let slice = accum.buf.as_slice();
         match &mut decode.decoder {
             MessageDecoder::Proto(adapter) => {
                 {
-                    let mut pb = ProtoParser::new(adapter);
-                    pb.receive(&mut slice).map_err(|e| internal(e.to_string()))?;
-                    pb.close().map_err(|e| internal(e.to_string()))?;
+                    let mut pb = ProtoParser::new(&mut *adapter);
+                    pb.parse(slice).map_err(|e| internal(e.to_string()))?;
                 }
                 adapter
                     .end_root_message()
@@ -914,9 +993,8 @@ impl GrpcHandler {
             }
             MessageDecoder::Json(adapter) => {
                 {
-                    let mut jp = JsonParser::new(adapter);
-                    jp.receive(&mut slice).map_err(|e| internal(e.to_string()))?;
-                    jp.close().map_err(|e| internal(e.to_string()))?;
+                    let mut jp = JsonParser::new(&mut *adapter);
+                    jp.parse(slice).map_err(|e| internal(e.to_string()))?;
                 }
                 adapter
                     .end_root_message()
@@ -2015,6 +2093,21 @@ mod tests {
         handler.end_request_body(&mut w);
         handler.request_complete(&mut w);
         assert_eq!(texts_in(&w.body), vec!["a,b,c"]);
+        assert_eq!(w.grpc_status(), Some(0));
+    }
+
+    /// A response message bigger than the ring it starts with is written
+    /// whole: the ring grows (more than once here) and keeps what it held.
+    #[test]
+    fn response_message_larger_than_the_initial_ring_is_written_whole() {
+        let big = "x".repeat(3 * RESPONSE_RING_BYTES + 5);
+        let (mut handler, _) = streaming_handler();
+        let mut w = MockWriter::default();
+        start_call(&mut *handler, &mut w, "ClientStream");
+        handler.request_body_content(&mut w, &grpc_frame(&msg(&big)));
+        handler.end_request_body(&mut w);
+        handler.request_complete(&mut w);
+        assert_eq!(texts_in(&w.body), vec![big]);
         assert_eq!(w.grpc_status(), Some(0));
     }
 

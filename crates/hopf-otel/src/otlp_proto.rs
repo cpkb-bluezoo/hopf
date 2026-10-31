@@ -2,7 +2,8 @@
 
 //! OTLP protobuf encoding for ExportLogsServiceRequest (rprotobuf Writer).
 
-use rprotobuf::Writer;
+use loopbuf::LoopBuf;
+use rprotobuf::{WriteError, Writer};
 
 use crate::config::OtelConfig;
 use crate::log_record::{AttrValue, LogRecord};
@@ -70,95 +71,144 @@ const HDP_TIME: u32 = 3;
 const HDP_COUNT: u32 = 4;
 const HDP_SUM: u32 = 5;
 
-/// Encode a batch as `ExportLogsServiceRequest` protobuf bytes.
-pub fn encode_logs_request(config: &OtelConfig, records: &[LogRecord]) -> Vec<u8> {
-    let mut w = Writer::buffer(4096 + records.len() * 256);
-    let _ = w.write_message_field(LOGS_RESOURCE_LOGS, |rl| {
-        rl.write_message_field(RESOURCE_LOGS_RESOURCE, |res| write_resource(res, config))?;
-        // Group by scope name for ScopeLogs.
-        let mut scopes: Vec<(&str, Vec<&LogRecord>)> = Vec::new();
-        for rec in records {
-            if let Some((_, list)) = scopes.iter_mut().find(|(name, _)| *name == rec.scope.as_str())
-            {
-                list.push(rec);
-            } else {
-                scopes.push((rec.scope.as_str(), vec![rec]));
-            }
+/// The most an encoded request can take before it is given up on.
+const MAX_ENCODED_BYTES: usize = 64 * 1024 * 1024;
+
+/// Runs `write` against a ring of `hint` bytes, then one twice the size
+/// again if it does not fit, up to [`MAX_ENCODED_BYTES`]. A request that
+/// still does not fit is returned empty, which decodes as a request with
+/// nothing in it.
+fn encode(
+    hint: usize,
+    write: impl Fn(&mut Writer, &mut LoopBuf) -> Result<(), WriteError>,
+) -> Vec<u8> {
+    let mut capacity = hint;
+    loop {
+        let mut ring = LoopBuf::with_capacity(capacity);
+        let mut w = Writer::new();
+        if write(&mut w, &mut ring).is_ok() {
+            let mut out = Vec::with_capacity(ring.len() + 16);
+            // a Vec never refuses a write
+            let _ = w.drain_to(&mut ring, &mut out);
+            return out;
         }
-        for (scope_name, scoped) in scopes {
-            rl.write_message_field(RESOURCE_LOGS_SCOPE_LOGS, |sl| {
-                sl.write_message_field(SCOPE_LOGS_SCOPE, |scope| {
-                    scope.write_string_field(SCOPE_NAME, scope_name)?;
-                    scope.write_string_field(SCOPE_VERSION, env!("CARGO_PKG_VERSION"))?;
-                    Ok(())
-                })?;
-                for rec in scoped {
-                    sl.write_message_field(SCOPE_LOGS_LOG_RECORDS, |lr| write_log_record(lr, rec))?;
-                }
-                Ok(())
-            })?;
+        if capacity >= MAX_ENCODED_BYTES {
+            return Vec::new();
         }
-        Ok(())
-    });
-    w.finish()
+        capacity = (capacity * 2).min(MAX_ENCODED_BYTES);
+    }
 }
 
-fn write_resource(w: &mut Writer<rprotobuf::Buffer>, config: &OtelConfig) -> Result<(), rprotobuf::WriteError> {
-    write_kv(w, RESOURCE_ATTRIBUTES, "service.name", &config.service_name)?;
+/// Encode a batch as `ExportLogsServiceRequest` protobuf bytes.
+pub fn encode_logs_request(config: &OtelConfig, records: &[LogRecord]) -> Vec<u8> {
+    encode(4096 + records.len() * 256, |w, ring| {
+        w.write_message_field(ring, LOGS_RESOURCE_LOGS, |rl, ring| {
+            rl.write_message_field(ring, RESOURCE_LOGS_RESOURCE, |res, ring| {
+                write_resource(res, ring, config)
+            })?;
+            // Group by scope name for ScopeLogs.
+            let mut scopes: Vec<(&str, Vec<&LogRecord>)> = Vec::new();
+            for rec in records {
+                if let Some((_, list)) = scopes
+                    .iter_mut()
+                    .find(|(name, _)| *name == rec.scope.as_str())
+                {
+                    list.push(rec);
+                } else {
+                    scopes.push((rec.scope.as_str(), vec![rec]));
+                }
+            }
+            for (scope_name, scoped) in scopes {
+                rl.write_message_field(ring, RESOURCE_LOGS_SCOPE_LOGS, |sl, ring| {
+                    sl.write_message_field(ring, SCOPE_LOGS_SCOPE, |scope, ring| {
+                        scope.write_string_field(ring, SCOPE_NAME, scope_name)?;
+                        scope.write_string_field(ring, SCOPE_VERSION, env!("CARGO_PKG_VERSION"))?;
+                        Ok(())
+                    })?;
+                    for rec in scoped {
+                        sl.write_message_field(ring, SCOPE_LOGS_LOG_RECORDS, |lr, ring| {
+                            write_log_record(lr, ring, rec)
+                        })?;
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })
+    })
+}
+
+fn write_resource(
+    w: &mut Writer,
+    ring: &mut LoopBuf,
+    config: &OtelConfig,
+) -> Result<(), WriteError> {
+    write_kv(
+        w,
+        ring,
+        RESOURCE_ATTRIBUTES,
+        "service.name",
+        &config.service_name,
+    )?;
     if let Some(v) = &config.service_version {
-        write_kv(w, RESOURCE_ATTRIBUTES, "service.version", v)?;
+        write_kv(w, ring, RESOURCE_ATTRIBUTES, "service.version", v)?;
     }
     if let Some(ns) = &config.service_namespace {
-        write_kv(w, RESOURCE_ATTRIBUTES, "service.namespace", ns)?;
+        write_kv(w, ring, RESOURCE_ATTRIBUTES, "service.namespace", ns)?;
     }
     Ok(())
 }
 
-fn write_log_record(
-    w: &mut Writer<rprotobuf::Buffer>,
-    rec: &LogRecord,
-) -> Result<(), rprotobuf::WriteError> {
-    w.write_fixed64_field(LOG_TIME, rec.time_unix_nano)?;
-    w.write_varint_field(LOG_SEVERITY_NUMBER, rec.level.severity_number() as u64)?;
-    w.write_string_field(LOG_SEVERITY_TEXT, rec.level.severity_text())?;
+fn write_log_record(w: &mut Writer, ring: &mut LoopBuf, rec: &LogRecord) -> Result<(), WriteError> {
+    w.write_fixed64_field(ring, LOG_TIME, rec.time_unix_nano)?;
+    w.write_varint_field(
+        ring,
+        LOG_SEVERITY_NUMBER,
+        rec.level.severity_number() as u64,
+    )?;
+    w.write_string_field(ring, LOG_SEVERITY_TEXT, rec.level.severity_text())?;
     if let Some(body) = &rec.body {
-        w.write_message_field(LOG_BODY, |any| any.write_string_field(ANY_STRING, body))?;
+        w.write_message_field(ring, LOG_BODY, |any, ring| {
+            any.write_string_field(ring, ANY_STRING, body)
+        })?;
     }
-    write_kv(w, LOG_ATTRIBUTES, "event.name", &rec.name)?;
+    write_kv(w, ring, LOG_ATTRIBUTES, "event.name", &rec.name)?;
     for (key, value) in &rec.attrs {
-        write_attr(w, LOG_ATTRIBUTES, key, value)?;
+        write_attr(w, ring, LOG_ATTRIBUTES, key, value)?;
     }
     if let Some(trace_id) = &rec.trace_id {
-        w.write_bytes_field(LOG_TRACE_ID, trace_id)?;
+        w.write_bytes_field(ring, LOG_TRACE_ID, trace_id)?;
     }
     if let Some(span_id) = &rec.span_id {
-        w.write_bytes_field(LOG_SPAN_ID, span_id)?;
+        w.write_bytes_field(ring, LOG_SPAN_ID, span_id)?;
     }
     Ok(())
 }
 
 fn write_kv(
-    w: &mut Writer<rprotobuf::Buffer>,
+    w: &mut Writer,
+    ring: &mut LoopBuf,
     field: u32,
     key: &str,
     value: &str,
-) -> Result<(), rprotobuf::WriteError> {
-    write_attr(w, field, key, &AttrValue::String(value.to_string()))
+) -> Result<(), WriteError> {
+    write_attr(w, ring, field, key, &AttrValue::String(value.to_string()))
 }
 
 fn write_attr(
-    w: &mut Writer<rprotobuf::Buffer>,
+    w: &mut Writer,
+    ring: &mut LoopBuf,
     field: u32,
     key: &str,
     value: &AttrValue,
-) -> Result<(), rprotobuf::WriteError> {
-    w.write_message_field(field, |kv| {
-        kv.write_string_field(KV_KEY, key)?;
-        kv.write_message_field(KV_VALUE, |any| match value {
-            AttrValue::String(s) => any.write_string_field(ANY_STRING, s),
-            AttrValue::Bool(v) => any.write_bool_field(2, *v),
-            AttrValue::Int(v) => any.write_varint_field(3, *v as u64),
-            AttrValue::Double(v) => any.write_double_field(4, *v),
+) -> Result<(), WriteError> {
+    w.write_message_field(ring, field, |kv, ring| {
+        kv.write_string_field(ring, KV_KEY, key)?;
+        kv.write_message_field(ring, KV_VALUE, |any, ring| match value {
+            AttrValue::String(s) => any.write_string_field(ring, ANY_STRING, s),
+            AttrValue::Bool(v) => any.write_bool_field(ring, 2, *v),
+            AttrValue::Int(v) => any.write_varint_field(ring, 3, *v as u64),
+            AttrValue::Double(v) => any.write_double_field(ring, 4, *v),
         })?;
         Ok(())
     })
@@ -166,46 +216,47 @@ fn write_attr(
 
 /// Encode `ExportTraceServiceRequest`.
 pub fn encode_traces_request(config: &OtelConfig, spans: &[FinishedSpan]) -> Vec<u8> {
-    let mut w = Writer::buffer(4096 + spans.len() * 512);
-    let _ = w.write_message_field(TRACES_RESOURCE_SPANS, |rs| {
-        rs.write_message_field(RESOURCE_SPANS_RESOURCE, |res| write_resource(res, config))?;
-        rs.write_message_field(RESOURCE_SPANS_SCOPE_SPANS, |ss| {
-            ss.write_message_field(SCOPE_SPANS_SCOPE, |scope| {
-                scope.write_string_field(SCOPE_NAME, "hopf")?;
-                scope.write_string_field(SCOPE_VERSION, env!("CARGO_PKG_VERSION"))?;
+    encode(4096 + spans.len() * 512, |w, ring| {
+        w.write_message_field(ring, TRACES_RESOURCE_SPANS, |rs, ring| {
+            rs.write_message_field(ring, RESOURCE_SPANS_RESOURCE, |res, ring| {
+                write_resource(res, ring, config)
+            })?;
+            rs.write_message_field(ring, RESOURCE_SPANS_SCOPE_SPANS, |ss, ring| {
+                ss.write_message_field(ring, SCOPE_SPANS_SCOPE, |scope, ring| {
+                    scope.write_string_field(ring, SCOPE_NAME, "hopf")?;
+                    scope.write_string_field(ring, SCOPE_VERSION, env!("CARGO_PKG_VERSION"))?;
+                    Ok(())
+                })?;
+                for span in spans {
+                    ss.write_message_field(ring, SCOPE_SPANS_SPANS, |sp, ring| {
+                        write_span(sp, ring, span)
+                    })?;
+                }
                 Ok(())
             })?;
-            for span in spans {
-                ss.write_message_field(SCOPE_SPANS_SPANS, |sp| write_span(sp, span))?;
-            }
             Ok(())
-        })?;
-        Ok(())
-    });
-    w.finish()
+        })
+    })
 }
 
-fn write_span(
-    w: &mut Writer<rprotobuf::Buffer>,
-    span: &FinishedSpan,
-) -> Result<(), rprotobuf::WriteError> {
-    w.write_bytes_field(SPAN_TRACE_ID, &span.context.trace_id)?;
-    w.write_bytes_field(SPAN_SPAN_ID, &span.context.span_id)?;
+fn write_span(w: &mut Writer, ring: &mut LoopBuf, span: &FinishedSpan) -> Result<(), WriteError> {
+    w.write_bytes_field(ring, SPAN_TRACE_ID, &span.context.trace_id)?;
+    w.write_bytes_field(ring, SPAN_SPAN_ID, &span.context.span_id)?;
     if let Some(parent) = &span.parent_span_id {
-        w.write_bytes_field(SPAN_PARENT_SPAN_ID, parent)?;
+        w.write_bytes_field(ring, SPAN_PARENT_SPAN_ID, parent)?;
     }
-    w.write_string_field(SPAN_NAME, &span.name)?;
-    w.write_varint_field(SPAN_KIND, span.kind as u64)?;
-    w.write_fixed64_field(SPAN_START, span.start_time_unix_nano)?;
-    w.write_fixed64_field(SPAN_END, span.end_time_unix_nano)?;
+    w.write_string_field(ring, SPAN_NAME, &span.name)?;
+    w.write_varint_field(ring, SPAN_KIND, span.kind as u64)?;
+    w.write_fixed64_field(ring, SPAN_START, span.start_time_unix_nano)?;
+    w.write_fixed64_field(ring, SPAN_END, span.end_time_unix_nano)?;
     for (k, v) in &span.attributes {
-        write_kv(w, SPAN_ATTRIBUTES, k, v)?;
+        write_kv(w, ring, SPAN_ATTRIBUTES, k, v)?;
     }
-    w.write_message_field(SPAN_STATUS, |st| {
+    w.write_message_field(ring, SPAN_STATUS, |st, ring| {
         if !span.status_message.is_empty() {
-            st.write_string_field(STATUS_MESSAGE, &span.status_message)?;
+            st.write_string_field(ring, STATUS_MESSAGE, &span.status_message)?;
         }
-        st.write_varint_field(STATUS_CODE, span.status_code as u64)?;
+        st.write_varint_field(ring, STATUS_CODE, span.status_code as u64)?;
         Ok(())
     })?;
     Ok(())
@@ -217,45 +268,50 @@ pub fn encode_metrics_request(config: &OtelConfig, points: &[MetricPoint]) -> Ve
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    let mut w = Writer::buffer(4096 + points.len() * 256);
-    let _ = w.write_message_field(METRICS_RESOURCE_METRICS, |rm| {
-        rm.write_message_field(RESOURCE_METRICS_RESOURCE, |res| write_resource(res, config))?;
-        rm.write_message_field(RESOURCE_METRICS_SCOPE_METRICS, |sm| {
-            sm.write_message_field(SCOPE_METRICS_SCOPE, |scope| {
-                scope.write_string_field(SCOPE_NAME, "org.bluezoo.hopf")?;
+    encode(4096 + points.len() * 256, |w, ring| {
+        w.write_message_field(ring, METRICS_RESOURCE_METRICS, |rm, ring| {
+            rm.write_message_field(ring, RESOURCE_METRICS_RESOURCE, |res, ring| {
+                write_resource(res, ring, config)
+            })?;
+            rm.write_message_field(ring, RESOURCE_METRICS_SCOPE_METRICS, |sm, ring| {
+                sm.write_message_field(ring, SCOPE_METRICS_SCOPE, |scope, ring| {
+                    scope.write_string_field(ring, SCOPE_NAME, "org.bluezoo.hopf")?;
+                    Ok(())
+                })?;
+                for p in points {
+                    sm.write_message_field(ring, SCOPE_METRICS_METRICS, |m, ring| {
+                        write_metric(m, ring, p, now)
+                    })?;
+                }
                 Ok(())
             })?;
-            for p in points {
-                sm.write_message_field(SCOPE_METRICS_METRICS, |m| write_metric(m, p, now))?;
-            }
             Ok(())
-        })?;
-        Ok(())
-    });
-    w.finish()
+        })
+    })
 }
 
 fn write_metric(
-    w: &mut Writer<rprotobuf::Buffer>,
+    w: &mut Writer,
+    ring: &mut LoopBuf,
     point: &MetricPoint,
     now: u64,
-) -> Result<(), rprotobuf::WriteError> {
+) -> Result<(), WriteError> {
     match point {
         MetricPoint::Counter {
             name,
             attributes,
             value,
         } => {
-            w.write_string_field(METRIC_NAME, name)?;
-            w.write_message_field(METRIC_SUM, |sum| {
-                sum.write_varint_field(SUM_AGG_TEMPORALITY, 2)?; // cumulative
-                sum.write_bool_field(SUM_IS_MONOTONIC, true)?;
-                sum.write_message_field(SUM_DATA_POINTS, |dp| {
+            w.write_string_field(ring, METRIC_NAME, name)?;
+            w.write_message_field(ring, METRIC_SUM, |sum, ring| {
+                sum.write_varint_field(ring, SUM_AGG_TEMPORALITY, 2)?; // cumulative
+                sum.write_bool_field(ring, SUM_IS_MONOTONIC, true)?;
+                sum.write_message_field(ring, SUM_DATA_POINTS, |dp, ring| {
                     for (k, v) in attributes {
-                        write_kv(dp, NDP_ATTRIBUTES, k, v)?;
+                        write_kv(dp, ring, NDP_ATTRIBUTES, k, v)?;
                     }
-                    dp.write_fixed64_field(NDP_TIME, now)?;
-                    dp.write_varint_field(NDP_AS_INT, *value)?;
+                    dp.write_fixed64_field(ring, NDP_TIME, now)?;
+                    dp.write_varint_field(ring, NDP_AS_INT, *value)?;
                     Ok(())
                 })?;
                 Ok(())
@@ -266,14 +322,14 @@ fn write_metric(
             attributes,
             value,
         } => {
-            w.write_string_field(METRIC_NAME, name)?;
-            w.write_message_field(METRIC_GAUGE, |g| {
-                g.write_message_field(GAUGE_DATA_POINTS, |dp| {
+            w.write_string_field(ring, METRIC_NAME, name)?;
+            w.write_message_field(ring, METRIC_GAUGE, |g, ring| {
+                g.write_message_field(ring, GAUGE_DATA_POINTS, |dp, ring| {
                     for (k, v) in attributes {
-                        write_kv(dp, NDP_ATTRIBUTES, k, v)?;
+                        write_kv(dp, ring, NDP_ATTRIBUTES, k, v)?;
                     }
-                    dp.write_fixed64_field(NDP_TIME, now)?;
-                    dp.write_varint_field(NDP_AS_INT, *value as u64)?;
+                    dp.write_fixed64_field(ring, NDP_TIME, now)?;
+                    dp.write_varint_field(ring, NDP_AS_INT, *value as u64)?;
                     Ok(())
                 })?;
                 Ok(())
@@ -285,17 +341,17 @@ fn write_metric(
             attributes,
             value,
         } => {
-            w.write_string_field(METRIC_NAME, name)?;
-            w.write_string_field(METRIC_UNIT, unit)?;
-            w.write_message_field(METRIC_HISTOGRAM, |h| {
-                h.write_varint_field(HIST_AGG_TEMPORALITY, 1)?; // delta
-                h.write_message_field(HIST_DATA_POINTS, |dp| {
+            w.write_string_field(ring, METRIC_NAME, name)?;
+            w.write_string_field(ring, METRIC_UNIT, unit)?;
+            w.write_message_field(ring, METRIC_HISTOGRAM, |h, ring| {
+                h.write_varint_field(ring, HIST_AGG_TEMPORALITY, 1)?; // delta
+                h.write_message_field(ring, HIST_DATA_POINTS, |dp, ring| {
                     for (k, v) in attributes {
-                        write_kv(dp, HDP_ATTRIBUTES, k, v)?;
+                        write_kv(dp, ring, HDP_ATTRIBUTES, k, v)?;
                     }
-                    dp.write_fixed64_field(HDP_TIME, now)?;
-                    dp.write_varint_field(HDP_COUNT, 1)?;
-                    dp.write_double_field(HDP_SUM, *value)?;
+                    dp.write_fixed64_field(ring, HDP_TIME, now)?;
+                    dp.write_varint_field(ring, HDP_COUNT, 1)?;
+                    dp.write_double_field(ring, HDP_SUM, *value)?;
                     Ok(())
                 })?;
                 Ok(())
@@ -309,8 +365,8 @@ fn write_metric(
 mod tests {
     use super::*;
     use crate::config::OtelConfig;
-    use crate::event::EventKind;
     use crate::event::log_record_from_event;
+    use crate::event::EventKind;
     use crate::log_record::LogLevel;
     use crate::log_record::LogRecord;
     use crate::metrics::MetricPoint;
@@ -372,5 +428,35 @@ mod tests {
             ],
         );
         assert!(!metrics.is_empty());
+    }
+
+    /// Reads a varint from the front of `bytes`, returning it and its width.
+    fn varint(bytes: &[u8]) -> (usize, usize) {
+        let mut value = 0usize;
+        for (i, b) in bytes.iter().enumerate() {
+            value |= ((b & 0x7f) as usize) << (7 * i);
+            if b & 0x80 == 0 {
+                return (value, i + 1);
+            }
+        }
+        panic!("unterminated varint");
+    }
+
+    #[test]
+    fn request_is_one_length_delimited_field_even_when_the_ring_had_to_grow() {
+        let cfg = OtelConfig::new("cov");
+        // far more than the 4096 + 256 per record the first ring is sized for
+        let records: Vec<LogRecord> = (0..200)
+            .map(|i| {
+                LogRecord::new(LogLevel::Info, "bulk")
+                    .with_body("x".repeat(2000))
+                    .attr("n", i.to_string().as_str())
+            })
+            .collect();
+        let bytes = encode_logs_request(&cfg, &records);
+        assert_eq!(bytes[0], (LOGS_RESOURCE_LOGS << 3 | 2) as u8);
+        let (len, width) = varint(&bytes[1..]);
+        assert_eq!(1 + width + len, bytes.len());
+        assert!(bytes.len() > 4096 + records.len() * 256);
     }
 }

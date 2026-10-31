@@ -23,8 +23,7 @@ hopf-auth = { workspace = true }
 hopf-core = { workspace = true }
 hopf-http = { workspace = true }
 tractrix = { workspace = true }
-self_cell = { workspace = true }
-bytes = "1"
+loopbuf = { workspace = true }
 getrandom = "0.2"
 sha2 = "0.10"
 xattr = { version = "1", optional = true }

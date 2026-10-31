@@ -5,9 +5,9 @@
 use std::collections::BTreeSet;
 use std::io::Read;
 
+use loopbuf::LoopBuf;
 use rmimeparser::mime::MimeHandler;
-use rmimeparser::rfc5322::{EmailAddress, MessageHandler, MessageParser, OffsetDateTime};
-use rmimeparser::ContentId;
+use rmimeparser::rfc5322::{MessageHandler, MessageParser, OffsetDateTime};
 
 use crate::config::IndexConfig;
 use crate::error::MailboxResult;
@@ -40,6 +40,45 @@ struct CollectHandler {
     capture_body: bool,
     max_body: usize,
     headers_done: bool,
+    /// The field the address or message-id header being read feeds, if it
+    /// feeds one.
+    target: Target,
+    /// The unstructured header being read is the first `Subject`.
+    in_subject: bool,
+}
+
+/// Which indexed field a structured header feeds.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    #[default]
+    None,
+    From,
+    To,
+    Cc,
+    Bcc,
+    MessageId,
+    References,
+    InReplyTo,
+}
+
+impl CollectHandler {
+    /// Appends `address` (lowercased) to the field `target` names, a space
+    /// after what is already there.
+    fn add_address(&mut self, local: &str, domain: &str) {
+        let field = match self.target {
+            Target::From => &mut self.from,
+            Target::To => &mut self.to,
+            Target::Cc => &mut self.cc,
+            Target::Bcc => &mut self.bcc,
+            _ => return,
+        };
+        if !field.is_empty() {
+            field.push(' ');
+        }
+        push_lowercase(field, local);
+        field.push('@');
+        push_lowercase(field, domain);
+    }
 }
 
 impl MimeHandler for CollectHandler {
@@ -56,16 +95,35 @@ impl MimeHandler for CollectHandler {
         }
         Ok(())
     }
-}
 
-impl MessageHandler for CollectHandler {
-    fn header(&mut self, name: &str, value: &str) -> rmimeparser::ParseResult<()> {
-        if name.eq_ignore_ascii_case("Subject") && self.subject.is_empty() {
-            self.subject = value.to_ascii_lowercase();
+    // Unstructured headers arrive in pieces; only the first `Subject` is kept.
+    fn start_header(&mut self, name: &str) -> rmimeparser::ParseResult<()> {
+        self.in_subject = name.eq_ignore_ascii_case("Subject") && self.subject.is_empty();
+        Ok(())
+    }
+
+    fn header_content(&mut self, text: &str) -> rmimeparser::ParseResult<()> {
+        if self.in_subject {
+            push_lowercase(&mut self.subject, text);
         }
         Ok(())
     }
 
+    fn end_header(&mut self) -> rmimeparser::ParseResult<()> {
+        self.in_subject = false;
+        Ok(())
+    }
+
+    // A header that could not be read stops feeding its field: what was read
+    // before the bad element stays, and the rest arrives as text for
+    // `header_content`, which ignores it.
+    fn malformed_header(&mut self, _name: &str, _reason: &str) -> rmimeparser::ParseResult<()> {
+        self.target = Target::None;
+        Ok(())
+    }
+}
+
+impl MessageHandler for CollectHandler {
     fn date_header(&mut self, name: &str, date: OffsetDateTime) -> rmimeparser::ParseResult<()> {
         if name.eq_ignore_ascii_case("Date") && self.sent_millis == 0 {
             self.sent_millis = offset_to_millis(&date);
@@ -73,41 +131,79 @@ impl MessageHandler for CollectHandler {
         Ok(())
     }
 
-    fn address_header(
-        &mut self,
-        name: &str,
-        addresses: &[EmailAddress],
-    ) -> rmimeparser::ParseResult<()> {
-        let joined = join_addrs(addresses);
-        if name.eq_ignore_ascii_case("From") || name.eq_ignore_ascii_case("Sender") {
-            append_field(&mut self.from, &joined);
+    fn start_address_header(&mut self, name: &str) -> rmimeparser::ParseResult<()> {
+        self.target = if name.eq_ignore_ascii_case("From") || name.eq_ignore_ascii_case("Sender") {
+            Target::From
         } else if name.eq_ignore_ascii_case("To") {
-            append_field(&mut self.to, &joined);
+            Target::To
         } else if name.eq_ignore_ascii_case("Cc") {
-            append_field(&mut self.cc, &joined);
+            Target::Cc
         } else if name.eq_ignore_ascii_case("Bcc") {
-            append_field(&mut self.bcc, &joined);
-        }
+            Target::Bcc
+        } else {
+            Target::None
+        };
         Ok(())
     }
 
-    fn message_id_header(
+    fn mailbox(
         &mut self,
-        name: &str,
-        content_ids: &[ContentId],
+        _display_name: Option<&str>,
+        local_part: &str,
+        domain: &str,
     ) -> rmimeparser::ParseResult<()> {
-        if name.eq_ignore_ascii_case("Message-ID") && self.message_id.is_empty() {
-            if let Some(id) = content_ids.first() {
-                self.message_id = id.to_string().to_ascii_lowercase();
-            }
+        self.add_address(local_part, domain);
+        Ok(())
+    }
+
+    fn end_address_header(&mut self) -> rmimeparser::ParseResult<()> {
+        self.target = Target::None;
+        Ok(())
+    }
+
+    // The first header of each kind wins: a later one feeds nothing.
+    fn start_message_id_header(&mut self, name: &str) -> rmimeparser::ParseResult<()> {
+        self.target = if name.eq_ignore_ascii_case("Message-ID") && self.message_id.is_empty() {
+            Target::MessageId
         } else if name.eq_ignore_ascii_case("References") && self.references.is_empty() {
-            self.references = join_ids(content_ids);
+            Target::References
         } else if name.eq_ignore_ascii_case("In-Reply-To") && self.in_reply_to.is_empty() {
-            self.in_reply_to = join_ids(content_ids);
+            Target::InReplyTo
+        } else {
+            Target::None
+        };
+        Ok(())
+    }
+
+    fn message_id(&mut self, local_part: &str, domain: &str) -> rmimeparser::ParseResult<()> {
+        let field = match self.target {
+            // a message has one id: the first
+            Target::MessageId if !self.message_id.is_empty() => return Ok(()),
+            Target::MessageId => &mut self.message_id,
+            Target::References => &mut self.references,
+            Target::InReplyTo => &mut self.in_reply_to,
+            _ => return Ok(()),
+        };
+        if !field.is_empty() {
+            field.push(' ');
         }
+        field.push('<');
+        push_lowercase(field, local_part);
+        field.push('@');
+        push_lowercase(field, domain);
+        field.push('>');
+        Ok(())
+    }
+
+    fn end_message_id_header(&mut self) -> rmimeparser::ParseResult<()> {
+        self.target = Target::None;
         Ok(())
     }
 }
+
+/// Capacity of the ring the parser reads from: room for the largest header
+/// element it buffers (4096 bytes) with a read's worth to spare.
+const RING_BYTES: usize = 16 * 1024;
 
 /// Builds index entries from RFC 822 bytes.
 pub struct IndexBuilder {
@@ -177,21 +273,27 @@ impl IndexBuilder {
         };
         {
             let mut parser = MessageParser::new(&mut handler);
-            let mut carry: Vec<u8> = Vec::new();
-            let mut buf = [0u8; 8192];
+            // The parser keeps none of the message: what it cannot use yet
+            // stays in the ring, so the ring must hold the largest element.
+            let mut ring = LoopBuf::with_capacity(RING_BYTES);
             loop {
-                let n = reader.read(&mut buf)?;
+                let (spare, _) = ring.spare_capacity_mut();
+                if spare.is_empty() {
+                    // Full and the parser consumed nothing: it cannot go on.
+                    break;
+                }
+                let n = reader.read(spare)?;
                 if n == 0 {
                     break;
                 }
-                carry.extend_from_slice(&buf[..n]);
-                let mut slice = carry.as_slice();
-                // Ignore parse errors — a malformed message still gets a
+                ring.commit_write(n);
+                // Ignore parse errors - a malformed message still gets a
                 // best-effort index rather than failing indexing outright.
-                let _ = parser.receive(&mut slice);
-                carry = slice.to_vec();
+                if parser.receive(&mut ring).is_err() {
+                    break;
+                }
             }
-            let _ = parser.close();
+            let _ = parser.close(&mut ring);
         }
 
         let mut internal = internal_date_millis;
@@ -238,29 +340,9 @@ impl IndexBuilder {
     }
 }
 
-fn join_ids(ids: &[ContentId]) -> String {
-    ids.iter()
-        .map(|id| id.to_string().to_ascii_lowercase())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn join_addrs(addrs: &[EmailAddress]) -> String {
-    addrs
-        .iter()
-        .map(|a| a.address().to_ascii_lowercase())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn append_field(dst: &mut String, src: &str) {
-    if src.is_empty() {
-        return;
-    }
-    if !dst.is_empty() {
-        dst.push(' ');
-    }
-    dst.push_str(src);
+/// Appends `text` to `dst` in ASCII lowercase.
+fn push_lowercase(dst: &mut String, text: &str) {
+    dst.extend(text.chars().map(|c| c.to_ascii_lowercase()));
 }
 
 fn truncate_str(mut s: String, max: usize) -> String {

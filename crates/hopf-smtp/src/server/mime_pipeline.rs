@@ -77,10 +77,8 @@ impl<H: MessageHandler + Send> SmtpPipeline for MimeAnalysisPipeline<H> {
         if let Some(boundary) = find_header_boundary(&self.header_buf) {
             let (header_bytes, leftover_body) = self.header_buf.split_at(boundary);
             {
-                let mut data: &[u8] = header_bytes;
                 let mut parser = MessageParser::new(&mut self.handler);
-                let _ = parser.receive(&mut data);
-                let _ = parser.close();
+                let _ = parser.parse(header_bytes);
             }
             let _ = self.handler.body_content(leftover_body);
             self.headers_done = true;
@@ -101,18 +99,35 @@ impl<H: MessageHandler + Send> SmtpPipeline for MimeAnalysisPipeline<H> {
 mod tests {
     use super::*;
     use rmimeparser::mime::MimeHandler;
-    use rmimeparser::rfc5322::EmailAddress as Addr;
     use rmimeparser::rfc5322::OffsetDateTime;
-    use rmimeparser::ContentId;
 
     #[derive(Default)]
     struct Recorder {
         subject: String,
         from: String,
         body: Vec<u8>,
+        in_subject: bool,
+        in_from: bool,
     }
 
     impl MimeHandler for Recorder {
+        fn start_header(&mut self, name: &str) -> rmimeparser::ParseResult<()> {
+            self.in_subject = name.eq_ignore_ascii_case("Subject");
+            if self.in_subject {
+                self.subject.clear();
+            }
+            Ok(())
+        }
+        fn header_content(&mut self, text: &str) -> rmimeparser::ParseResult<()> {
+            if self.in_subject {
+                self.subject.push_str(text);
+            }
+            Ok(())
+        }
+        fn end_header(&mut self) -> rmimeparser::ParseResult<()> {
+            self.in_subject = false;
+            Ok(())
+        }
         fn body_content(&mut self, content: &[u8]) -> rmimeparser::ParseResult<()> {
             self.body.extend_from_slice(content);
             Ok(())
@@ -120,28 +135,26 @@ mod tests {
     }
 
     impl MessageHandler for Recorder {
-        fn header(&mut self, name: &str, value: &str) -> rmimeparser::ParseResult<()> {
-            if name.eq_ignore_ascii_case("Subject") {
-                self.subject = value.to_string();
+        fn start_address_header(&mut self, name: &str) -> rmimeparser::ParseResult<()> {
+            self.in_from = name.eq_ignore_ascii_case("From");
+            Ok(())
+        }
+        fn mailbox(
+            &mut self,
+            _display_name: Option<&str>,
+            local_part: &str,
+            domain: &str,
+        ) -> rmimeparser::ParseResult<()> {
+            if self.in_from && self.from.is_empty() {
+                self.from = format!("{local_part}@{domain}");
             }
             Ok(())
         }
-        fn address_header(&mut self, name: &str, addrs: &[Addr]) -> rmimeparser::ParseResult<()> {
-            if name.eq_ignore_ascii_case("From") {
-                if let Some(a) = addrs.first() {
-                    self.from = a.address().to_string();
-                }
-            }
+        fn end_address_header(&mut self) -> rmimeparser::ParseResult<()> {
+            self.in_from = false;
             Ok(())
         }
         fn date_header(&mut self, _name: &str, _date: OffsetDateTime) -> rmimeparser::ParseResult<()> {
-            Ok(())
-        }
-        fn message_id_header(
-            &mut self,
-            _name: &str,
-            _ids: &[ContentId],
-        ) -> rmimeparser::ParseResult<()> {
             Ok(())
         }
     }

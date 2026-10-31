@@ -5,7 +5,9 @@
 
 use std::collections::VecDeque;
 
-use rprotobuf::Handler;
+use loopbuf::LoopBuf;
+use rprotobuf::decode_helpers::BytesCollector;
+use rprotobuf::{Handler, ParseError, ParseResult};
 
 use super::{
     FieldDescriptor, FieldType, MessageDescriptor, ProtoFile, ProtoMessageHandler, ProtoParseError,
@@ -25,6 +27,9 @@ pub struct ProtoModelAdapter<H: ProtoMessageHandler> {
     root_started: bool,
     /// Last error from the high-level handler (Gumdrop wraps these in RuntimeException).
     pub last_error: Option<ProtoParseError>,
+    /// The field whose bytes are arriving, if the model knows it.
+    bytes_field: Option<String>,
+    bytes: BytesCollector,
 }
 
 impl<H: ProtoMessageHandler> ProtoModelAdapter<H> {
@@ -35,6 +40,8 @@ impl<H: ProtoMessageHandler> ProtoModelAdapter<H> {
             message_stack: VecDeque::new(),
             root_started: false,
             last_error: None,
+            bytes_field: None,
+            bytes: BytesCollector::default(),
         }
     }
 
@@ -89,18 +96,23 @@ impl<H: ProtoMessageHandler> ProtoModelAdapter<H> {
             .and_then(|ctx| ctx.message.field_by_number(field_number as i32))
     }
 
-    fn emit_field(&mut self, name: &str, value: ScalarValue) {
-        if let Err(e) = self.handler.field(name, value) {
-            self.last_error = Some(e);
-        }
+    /// Remembers `e` as the last error and stops the parse with it.
+    fn map_err(&mut self, e: ProtoParseError) -> ParseError {
+        let msg = e.message().to_string();
+        self.last_error = Some(e);
+        ParseError::new(msg)
+    }
+
+    fn emit_field(&mut self, name: &str, value: ScalarValue) -> ParseResult<()> {
+        self.handler.field(name, value).map_err(|e| self.map_err(e))
     }
 }
 
 impl<H: ProtoMessageHandler> Handler for ProtoModelAdapter<H> {
-    fn handle_varint(&mut self, field_number: u32, value: u64) {
+    fn handle_varint(&mut self, field_number: u32, value: u64) -> ParseResult<()> {
         let fd = match self.current_field(field_number) {
             Some(fd) => fd,
-            None => return,
+            None => return Ok(()),
         };
         let name = fd.name.clone();
         let field_type = fd.field_type;
@@ -120,13 +132,13 @@ impl<H: ProtoMessageHandler> Handler for ProtoModelAdapter<H> {
             // field type) all pass the raw wire value through as-is.
             _ => ScalarValue::U64(value),
         };
-        self.emit_field(&name, val);
+        self.emit_field(&name, val)
     }
 
-    fn handle_fixed64(&mut self, field_number: u32, value: u64) {
+    fn handle_fixed64(&mut self, field_number: u32, value: u64) -> ParseResult<()> {
         let fd = match self.current_field(field_number) {
             Some(fd) => fd,
-            None => return,
+            None => return Ok(()),
         };
         let name = fd.name.clone();
         let val = if fd.field_type == FieldType::Double {
@@ -134,13 +146,13 @@ impl<H: ProtoMessageHandler> Handler for ProtoModelAdapter<H> {
         } else {
             ScalarValue::U64(value)
         };
-        self.emit_field(&name, val);
+        self.emit_field(&name, val)
     }
 
-    fn handle_fixed32(&mut self, field_number: u32, value: u32) {
+    fn handle_fixed32(&mut self, field_number: u32, value: u32) -> ParseResult<()> {
         let fd = match self.current_field(field_number) {
             Some(fd) => fd,
-            None => return,
+            None => return Ok(()),
         };
         let name = fd.name.clone();
         let val = if fd.field_type == FieldType::Float {
@@ -148,21 +160,43 @@ impl<H: ProtoMessageHandler> Handler for ProtoModelAdapter<H> {
         } else {
             ScalarValue::I32(value as i32)
         };
-        self.emit_field(&name, val);
+        self.emit_field(&name, val)
     }
 
-    fn handle_bytes(&mut self, field_number: u32, data: &[u8]) {
-        let fd = match self.current_field(field_number) {
-            Some(fd) => fd,
-            None => return,
-        };
-        let name = fd.name.clone();
-        let val = if fd.field_type == FieldType::String {
-            ScalarValue::String(String::from_utf8_lossy(data).into_owned())
+    fn start_bytes(&mut self, field_number: u32, length: u64) -> ParseResult<()> {
+        // A field the model does not know is skipped, not gathered.
+        self.bytes_field = self.current_field(field_number).map(|fd| fd.name.clone());
+        if self.bytes_field.is_some() {
+            self.bytes.start(length);
+        }
+        Ok(())
+    }
+
+    fn bytes_content(&mut self, data: &mut LoopBuf) -> ParseResult<()> {
+        if self.bytes_field.is_some() {
+            self.bytes.push(data);
         } else {
-            ScalarValue::Bytes(data.to_vec())
+            data.advance(data.len());
+        }
+        Ok(())
+    }
+
+    fn end_bytes(&mut self) -> ParseResult<()> {
+        let Some(name) = self.bytes_field.take() else {
+            return Ok(());
         };
-        self.emit_field(&name, val);
+        let data = self.bytes.take();
+        let is_string = self
+            .message_stack
+            .front()
+            .and_then(|ctx| ctx.message.fields.iter().find(|fd| fd.name == name))
+            .is_some_and(|fd| fd.field_type == FieldType::String);
+        let val = if is_string {
+            ScalarValue::String(String::from_utf8_lossy(&data).into_owned())
+        } else {
+            ScalarValue::Bytes(data)
+        };
+        self.emit_field(&name, val)
     }
 
     fn is_message(&self, field_number: u32) -> bool {
@@ -171,62 +205,58 @@ impl<H: ProtoMessageHandler> Handler for ProtoModelAdapter<H> {
             .unwrap_or(false)
     }
 
-    fn start_message(&mut self, field_number: u32) {
+    fn start_message(&mut self, field_number: u32) -> ParseResult<()> {
         let (fd_name, type_name) = {
             let ctx = match self.message_stack.front() {
                 Some(ctx) => ctx,
-                None => return,
+                None => return Ok(()),
             };
             let fd = match ctx.message.field_by_number(field_number as i32) {
                 Some(fd) => fd,
-                None => return,
+                None => return Ok(()),
             };
             let type_name = match &fd.message_type_name {
                 Some(t) => t.clone(),
-                None => return,
+                None => return Ok(()),
             };
             (fd.name.clone(), type_name)
         };
 
         let nested = match self.proto_file.message(&type_name) {
             Some(m) => m.clone(),
-            None => return,
+            None => return Ok(()),
         };
 
-        if let Err(e) = self.handler.start_field(&fd_name, &type_name) {
-            self.last_error = Some(e);
-            return;
-        }
-        if let Err(e) = self.handler.start_message(&type_name) {
-            self.last_error = Some(e);
-            return;
-        }
+        self.handler
+            .start_field(&fd_name, &type_name)
+            .map_err(|e| self.map_err(e))?;
+        self.handler
+            .start_message(&type_name)
+            .map_err(|e| self.map_err(e))?;
         self.message_stack.push_front(MessageContext {
             message: nested,
             field_name: Some(fd_name),
         });
+        Ok(())
     }
 
-    fn end_message(&mut self) {
+    fn end_message(&mut self) -> ParseResult<()> {
         let ctx = match self.message_stack.pop_front() {
             Some(ctx) => ctx,
-            None => return,
+            None => return Ok(()),
         };
-        if let Err(e) = self.handler.end_message() {
-            self.last_error = Some(e);
-            return;
-        }
+        self.handler.end_message().map_err(|e| self.map_err(e))?;
         if ctx.field_name.is_some() {
-            if let Err(e) = self.handler.end_field() {
-                self.last_error = Some(e);
-            }
+            self.handler.end_field().map_err(|e| self.map_err(e))?;
         }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use rprotobuf::{Buffer, Parser, Writer};
+    use loopbuf::LoopBuf;
+    use rprotobuf::{Parser, Writer};
 
     use super::*;
     use crate::proto::{ProtoFileParser, ProtoModelSerializer, ScalarValue};
@@ -265,22 +295,23 @@ mod tests {
         )
         .unwrap();
         let mut ser = ProtoModelSerializer::new(proto.clone());
-        let mut w = Writer::<Buffer>::buffer(64);
+        let mut w = Writer::new();
+        let mut ring = LoopBuf::with_capacity(64);
         ser.start_message("demo.Echo").unwrap();
-        ser.field(&mut w, "text", ScalarValue::String("hi".into()))
+        ser.field(&mut w, &mut ring, "text", ScalarValue::String("hi".into()))
             .unwrap();
-        ser.field(&mut w, "n", ScalarValue::I32(7)).unwrap();
+        ser.field(&mut w, &mut ring, "n", ScalarValue::I32(7))
+            .unwrap();
         ser.end_message();
-        let bytes = w.finish();
+        let mut bytes = Vec::new();
+        w.drain_to(&mut ring, &mut bytes).unwrap();
 
         let collect = Collect { fields: vec![] };
         let mut adapter = ProtoModelAdapter::new(proto, collect);
         adapter.start_root_message("demo.Echo").unwrap();
         {
-            let mut slice = bytes.as_slice();
             let mut pb = Parser::new(&mut adapter);
-            pb.receive(&mut slice).unwrap();
-            pb.close().unwrap();
+            pb.parse(bytes.as_slice()).unwrap();
         }
         adapter.end_root_message().unwrap();
         let fields = adapter.into_handler().fields;

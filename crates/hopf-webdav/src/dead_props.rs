@@ -544,9 +544,10 @@ pub fn namespace_hash(ns: &str) -> String {
 }
 
 fn serialize_sidecar_xml(props: &HashMap<String, DeadProperty>) -> String {
-    use tractrix::{IndentConfig, XmlWriter};
+    use crate::xml_out::PropXmlWriter;
+    use tractrix::IndentConfig;
 
-    let mut w = XmlWriter::with_indent(Vec::new(), IndentConfig::spaces2());
+    let mut w = PropXmlWriter::with_indent(IndentConfig::spaces2());
     w.write_processing_instruction_data("xml", Some("version=\"1.0\" encoding=\"utf-8\""))
         .expect("XmlWriter");
     w.write_start_element("properties").expect("XmlWriter");

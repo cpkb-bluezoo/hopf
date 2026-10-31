@@ -1561,7 +1561,7 @@ fn collect_propfind_children(
 // Each PROPFIND property needs its own independent XML-writer input.
 #[allow(clippy::too_many_arguments)]
 fn append_propfind_props(
-    w: &mut PropXmlWriter<Vec<u8>>,
+    w: &mut PropXmlWriter,
     pf: &crate::parser::PropfindRequest,
     path: &Path,
     href: &str,
@@ -1641,7 +1641,7 @@ fn is_live_prop(name: &str, acl_enabled: bool) -> bool {
 // Each live RFC 4918 property needs its own independent XML-writer input.
 #[allow(clippy::too_many_arguments)]
 fn append_live_props(
-    w: &mut PropXmlWriter<Vec<u8>>,
+    w: &mut PropXmlWriter,
     path: &Path,
     href: &str,
     meta: &fs::Metadata,
