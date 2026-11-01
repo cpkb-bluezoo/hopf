@@ -473,17 +473,15 @@ impl Pop3ClientDriver for Pop3FetchDriver {
                 exchange.respond(&r);
             }
             SaslClientStep::Complete(r) => {
-                // Some mechanisms (e.g. SCRAM-SHA-256) send a trailing
-                // informational challenge (the server's `v=` verifier)
-                // after the exchange is otherwise done; our server sends
-                // it without waiting for a reply. Keep the client so a
-                // further `on_auth_challenge` call can absorb that
-                // instead of falling into the "no exchange" abort path.
+                // The mechanism is done: `r` is its last message, or empty
+                // when the challenge was the server's final data (SCRAM's
+                // `v=` signature). Either way the server is waiting for a
+                // line: RFC 5034 section 4 has the client answer the final
+                // data with an empty one. Keep the client in case another
+                // challenge follows.
                 st.sasl_client = Some(client);
                 drop(st);
-                if !r.is_empty() {
-                    exchange.respond(&r);
-                }
+                exchange.respond(&r);
             }
             SaslClientStep::Failure => {
                 drop(st);

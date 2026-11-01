@@ -846,8 +846,7 @@ impl BlockingTlsClient {
         if n == 0 {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed"));
         }
-        let mut slice = &buf[..n];
-        engine.feed_ciphertext(&mut slice, sink);
+        engine.feed_ciphertext_all(&buf[..n], sink);
         Self::flush_outbound(stream, sink)?;
         Self::check(sink)
     }

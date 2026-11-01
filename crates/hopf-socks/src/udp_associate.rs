@@ -72,9 +72,14 @@ pub(crate) struct UdpAssociateShared {
 }
 
 impl UdpAssociateShared {
+    /// The first outcome stands (see `ConnectShared::set_outcome`).
     fn set_outcome(&self, outcome: UdpAssociateOutcome) {
-        *self.outcome.lock().unwrap() = Some(outcome);
-        self.client.poke();
+        let mut guard = self.outcome.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(outcome);
+            drop(guard);
+            self.client.poke();
+        }
     }
 
     fn mark_activity(&self) {

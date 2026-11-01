@@ -439,11 +439,11 @@ impl Pop3ClientDriver for ScriptDriver {
                 exchange.respond(&r);
             }
             SaslClientStep::Complete(r) => {
+                // See `Pop3Fetch`: the server's final data is answered with
+                // an empty line (RFC 5034 section 4).
                 st.sasl_client = Some(client);
                 drop(st);
-                if !r.is_empty() {
-                    exchange.respond(&r);
-                }
+                exchange.respond(&r);
             }
             SaslClientStep::Failure => {
                 drop(st);

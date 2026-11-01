@@ -223,8 +223,7 @@ fn drive_handshake(stream: &mut TcpStream, engine: &mut hopf_core::TlsVariant) -
         if n == 0 {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "DoT: connection closed during handshake"));
         }
-        let mut slice = &buf[..n];
-        engine.feed_ciphertext(&mut slice, &mut sink);
+        engine.feed_ciphertext_all(&buf[..n], &mut sink);
         sink.flush_outbound(stream)?;
         sink.check()?;
     }
@@ -258,8 +257,7 @@ fn drive_tls_write_read(
         if n == 0 {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "DoT: connection closed mid-response"));
         }
-        let mut slice = &buf[..n];
-        engine.feed_ciphertext(&mut slice, &mut sink);
+        engine.feed_ciphertext_all(&buf[..n], &mut sink);
         sink.flush_outbound(stream)?;
         sink.check()?;
         response.append(&mut sink.app_data);

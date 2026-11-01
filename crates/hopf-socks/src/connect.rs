@@ -48,9 +48,17 @@ impl ConnectShared {
         })
     }
 
+    /// The first outcome stands: a failed dial can be reported more than
+    /// once (the refusal, then a follow-up error on the dead socket), and a
+    /// later report must not turn "connection refused" into a general failure
+    /// before the client side has read it.
     fn set_outcome(&self, outcome: ConnectOutcome) {
-        *self.outcome.lock().unwrap() = Some(outcome);
-        self.client.poke();
+        let mut guard = self.outcome.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(outcome);
+            drop(guard);
+            self.client.poke();
+        }
     }
 
     fn fail(&self, reply: Socks5Reply) {

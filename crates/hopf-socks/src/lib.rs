@@ -55,5 +55,8 @@ pub use service::SocksService;
 pub use udp_associate::DEFAULT_UDP_IDLE_TIMEOUT;
 pub use wire::SocksAddress;
 
+#[cfg(test)]
+mod session_tests;
+
 #[cfg(all(test, feature = "integration"))]
 mod integration;

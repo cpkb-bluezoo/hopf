@@ -180,6 +180,52 @@ fn script_authenticates_with_sasl_plain() {
     assert_eq!(outcome(&result), Pop3ScriptOutcome::Done(vec![Pop3OpResult::Stat { count: 1, octets: 5 }]));
 }
 
+/// One step of a real server-side SASL mechanism, for the test to play the server.
+fn server_step(
+    server: &mut Box<dyn hopf_auth::SaslServer>,
+    input: Option<&[u8]>,
+) -> hopf_auth::SaslServerStep {
+    let (tx, rx) = std::sync::mpsc::channel();
+    server.step(input, Box::new(move |step| {
+        let _ = tx.send(step);
+    }));
+    rx.recv().expect("the mechanism answers")
+}
+
+#[test]
+fn script_acknowledges_the_servers_final_scram_data_with_an_empty_line() {
+    // RFC 5034 section 4: data the server sends with the success of the
+    // exchange comes as one more `+` continuation, and the client must
+    // answer it with an empty line before the server says +OK.
+    use hopf_auth::{create_server, PasswordStore, SaslMechanism, SaslServerOptions, SaslServerStep};
+    let store = PasswordStore::new().with_user("alice", "secret").shared();
+    let mut server = create_server(
+        SaslMechanism::ScramSha256,
+        store,
+        SaslServerOptions { hostname: "pop".into(), realm: "pop".into(), peer_certificate: None, channel_binding: None },
+    );
+    let b64 = |b: &[u8]| rmimeparser::charset::base64::encode(b);
+    let unb64 = |s: &str| rmimeparser::charset::base64::decode(s.trim()).unwrap();
+
+    let (s, result) = script(Some(("alice", "secret")), vec![Pop3Op::Stat]);
+    let mut peer = connect(&s);
+    peer.run("+OK ready\r\n");
+    let sent = peer.run("+OK\r\nSASL SCRAM-SHA-256\r\n.\r\n");
+    let initial = sent.strip_prefix("AUTH SCRAM-SHA-256 ").expect("an AUTH with an initial response");
+    let SaslServerStep::Challenge(first) = server_step(&mut server, Some(&unb64(initial))) else {
+        panic!("the server challenges");
+    };
+    let sent = peer.run(&format!("+ {}\r\n", b64(&first)));
+    let SaslServerStep::Complete { username, final_message } = server_step(&mut server, Some(&unb64(&sent))) else {
+        panic!("the exchange completes");
+    };
+    assert_eq!(username, "alice");
+    let final_message = final_message.expect("SCRAM ends with the server's signature");
+    assert_eq!(peer.run(&format!("+ {}\r\n", b64(&final_message))), "\r\n", "the empty acknowledgement");
+    assert_eq!(peer.run("+OK welcome\r\n"), "STAT\r\n");
+    assert!(result.lock().unwrap().is_none());
+}
+
 #[test]
 fn script_answers_a_login_challenge() {
     let (s, result) = script(Some(("alice", "secret")), vec![Pop3Op::Stat]);

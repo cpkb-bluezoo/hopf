@@ -111,9 +111,9 @@ fn handshake(
     for _ in 0..6 {
         let c2s = std::mem::take(&mut cs.out);
         sent.extend_from_slice(&c2s);
-        server.feed_ciphertext(&mut &c2s[..], &mut ss);
+        server.feed_ciphertext_all(&c2s[..], &mut ss);
         let s2c = std::mem::take(&mut ss.out);
-        client.feed_ciphertext(&mut &s2c[..], &mut cs);
+        client.feed_ciphertext_all(&s2c[..], &mut cs);
         // `insecure_connector` accepts any certificate, but the engine still
         // waits for the caller to say so.
         if let Some(id) = cs.pending_verify.take() {

@@ -719,6 +719,7 @@ mod tests {
                 threads: 2,
                 queue_capacity: 16,
             },
+            fips: false,
         })
         .unwrap();
 
@@ -793,6 +794,7 @@ mod tests {
                 threads: 1,
                 queue_capacity: 1,
             },
+            fips: false,
         })
         .unwrap();
 
@@ -860,6 +862,7 @@ mod tests {
                 threads: 1,
                 queue_capacity: 3,
             },
+            fips: false,
         })
         .unwrap();
 
