@@ -46,6 +46,7 @@ use super::timeout::MqttClientTimeouts;
 /// #   fn on_suback(&mut self, _: &mut dyn MqttClientControl, _: u16, _: &[u8]) {}
 /// #   fn on_unsuback(&mut self, _: &mut dyn MqttClientControl, _: u16, _: &[u8]) {}
 /// #   fn on_publish_acked(&mut self, _: &mut dyn MqttClientControl, _: u16) {}
+/// #   fn on_publish_failed(&mut self, _: &mut dyn MqttClientControl, _: u16, _: u8, _: &Properties) {}
 /// #   fn on_ping_resp(&mut self, _: &mut dyn MqttClientControl) {}
 /// #   fn on_server_disconnect(&mut self, _: u8, _: &Properties) {}
 /// #   fn on_error(&mut self, _: &std::io::Error) {}

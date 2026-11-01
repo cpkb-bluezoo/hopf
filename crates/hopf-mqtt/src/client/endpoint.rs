@@ -273,6 +273,21 @@ struct ClientCtx<'h, 'e> {
     endpoint: &'e mut dyn Endpoint,
 }
 
+impl ClientCtx<'_, '_> {
+    /// Tell the driver how the broker answered one of our publishes: a
+    /// reason code of 0x80 or more is a refusal (MQTT 5.0 section 2.4).
+    fn publish_answered(&mut self, packet_id: u16, reason_code: u8, properties: &Properties) {
+        if let Some(mut driver) = self.handler.driver.take() {
+            if reason_code >= reason::UNSPECIFIED_ERROR {
+                driver.on_publish_failed(self, packet_id, reason_code, properties);
+            } else {
+                driver.on_publish_acked(self, packet_id);
+            }
+            self.handler.driver = Some(driver);
+        }
+    }
+}
+
 impl MqttClientControl for ClientCtx<'_, '_> {
     fn publish(&mut self, topic: &str, payload: &[u8], qos: QoS, retain: bool, properties: &Properties) -> u16 {
         let packet_id = if qos == QoS::AtMostOnce { 0 } else { self.handler.next_packet_id() };
@@ -364,16 +379,14 @@ impl MqttFrameHandler for ClientCtx<'_, '_> {
         }
     }
 
-    fn puback(&mut self, packet_id: u16, _reason_code: u8, _properties: Properties) {
-        if let Some(mut driver) = self.handler.driver.take() {
-            driver.on_publish_acked(self, packet_id);
-            self.handler.driver = Some(driver);
-        }
+    fn puback(&mut self, packet_id: u16, reason_code: u8, properties: Properties) {
+        self.publish_answered(packet_id, reason_code, &properties);
     }
 
-    fn pubrec(&mut self, packet_id: u16, reason_code: u8, _properties: Properties) {
+    fn pubrec(&mut self, packet_id: u16, reason_code: u8, properties: Properties) {
         // A refusal (0x80 and up) ends the exchange: no PUBREL follows.
         if reason_code >= reason::UNSPECIFIED_ERROR {
+            self.publish_answered(packet_id, reason_code, &properties);
             return;
         }
         // Our own outbound QoS 2 publish: broker acked receipt, complete
@@ -389,11 +402,8 @@ impl MqttFrameHandler for ClientCtx<'_, '_> {
         self.endpoint.send(&wire);
     }
 
-    fn pubcomp(&mut self, packet_id: u16, _reason_code: u8, _properties: Properties) {
-        if let Some(mut driver) = self.handler.driver.take() {
-            driver.on_publish_acked(self, packet_id);
-            self.handler.driver = Some(driver);
-        }
+    fn pubcomp(&mut self, packet_id: u16, reason_code: u8, properties: Properties) {
+        self.publish_answered(packet_id, reason_code, &properties);
     }
 
     fn subscribe(&mut self, _packet_id: u16, _properties: Properties, _filters: Vec<SubscribeFilter>) {

@@ -383,6 +383,7 @@ fn real_client_publishes_and_subscribes_against_real_server() {
         }
         fn on_unsuback(&mut self, _client: &mut dyn MqttClientControl, _packet_id: u16, _reason_codes: &[u8]) {}
         fn on_publish_acked(&mut self, _client: &mut dyn MqttClientControl, _packet_id: u16) {}
+        fn on_publish_failed(&mut self, _client: &mut dyn MqttClientControl, _packet_id: u16, _reason_code: u8, _properties: &Properties) {}
         fn on_ping_resp(&mut self, _client: &mut dyn MqttClientControl) {}
         fn on_server_disconnect(&mut self, _reason_code: u8, _properties: &Properties) {}
         fn on_error(&mut self, err: &std::io::Error) {
@@ -414,6 +415,7 @@ fn real_client_publishes_and_subscribes_against_real_server() {
         fn on_suback(&mut self, _client: &mut dyn MqttClientControl, _packet_id: u16, _reason_codes: &[u8]) {}
         fn on_unsuback(&mut self, _client: &mut dyn MqttClientControl, _packet_id: u16, _reason_codes: &[u8]) {}
         fn on_publish_acked(&mut self, _client: &mut dyn MqttClientControl, _packet_id: u16) {}
+        fn on_publish_failed(&mut self, _client: &mut dyn MqttClientControl, _packet_id: u16, _reason_code: u8, _properties: &Properties) {}
         fn on_ping_resp(&mut self, _client: &mut dyn MqttClientControl) {}
         fn on_server_disconnect(&mut self, _reason_code: u8, _properties: &Properties) {}
         fn on_error(&mut self, err: &std::io::Error) {

@@ -60,6 +60,11 @@ impl MqttClientDriver for PubSubDriver {
         eprintln!("publish {packet_id} acked");
     }
 
+    fn on_publish_failed(&mut self, client: &mut dyn MqttClientControl, packet_id: u16, reason_code: u8, _properties: &Properties) {
+        eprintln!("publish {packet_id} refused by the broker (reason 0x{reason_code:02x})");
+        client.disconnect(0);
+    }
+
     fn on_ping_resp(&mut self, _client: &mut dyn MqttClientControl) {}
 
     fn on_server_disconnect(&mut self, reason_code: u8, _properties: &Properties) {

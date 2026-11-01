@@ -87,6 +87,10 @@ impl MqttClientDriver for Driver {
         self.log(format!("acked {id}"));
         self.act(c);
     }
+    fn on_publish_failed(&mut self, c: &mut dyn MqttClientControl, id: u16, code: u8, _p: &Properties) {
+        self.log(format!("failed {id} {code}"));
+        self.act(c);
+    }
     fn on_ping_resp(&mut self, c: &mut dyn MqttClientControl) {
         self.log("pingresp".into());
         self.act(c);
@@ -369,8 +373,42 @@ fn a_pubrec_refusing_the_publish_is_not_released() {
     let (mut peer, state) = up(V5);
     state.lock().unwrap().actions = vec![Action::Publish("t", b"a", QoS::ExactlyOnce)];
     peer.run_bytes(&encode::encode_pingresp());
+    state.lock().unwrap().events.clear();
     let out = peer.run_bytes(&encode::encode_pubrec(1, reason::UNSPECIFIED_ERROR, &no_props(), V5));
     assert!(out.is_empty(), "{out:?}");
+    assert_eq!(events(&state), ["failed 1 128"], "and the driver is told");
+}
+
+#[test]
+fn a_refusing_puback_is_a_failure_not_an_acknowledgement() {
+    let (mut peer, state) = up(V5);
+    state.lock().unwrap().actions = vec![Action::Publish("t", b"a", QoS::AtLeastOnce)];
+    peer.run_bytes(&encode::encode_pingresp());
+    state.lock().unwrap().events.clear();
+    peer.run_bytes(&encode::encode_puback(1, reason::NOT_AUTHORIZED, &no_props(), V5));
+    assert_eq!(events(&state), [format!("failed 1 {}", reason::NOT_AUTHORIZED)]);
+}
+
+#[test]
+fn a_refusing_pubcomp_is_a_failure_not_an_acknowledgement() {
+    let (mut peer, state) = up(V5);
+    state.lock().unwrap().actions = vec![Action::Publish("t", b"a", QoS::ExactlyOnce)];
+    peer.run_bytes(&encode::encode_pingresp());
+    peer.run_bytes(&encode::encode_pubrec(1, 0, &no_props(), V5));
+    state.lock().unwrap().events.clear();
+    peer.run_bytes(&encode::encode_pubcomp(1, reason::PACKET_IDENTIFIER_NOT_FOUND, &no_props(), V5));
+    assert_eq!(events(&state), [format!("failed 1 {}", reason::PACKET_IDENTIFIER_NOT_FOUND)]);
+}
+
+#[test]
+fn a_puback_with_a_success_like_reason_is_an_acknowledgement() {
+    // 0x10 (no matching subscribers) is below 0x80: the publish was accepted.
+    let (mut peer, state) = up(V5);
+    state.lock().unwrap().actions = vec![Action::Publish("t", b"a", QoS::AtLeastOnce)];
+    peer.run_bytes(&encode::encode_pingresp());
+    state.lock().unwrap().events.clear();
+    peer.run_bytes(&encode::encode_puback(1, reason::NO_MATCHING_SUBSCRIBERS, &no_props(), V5));
+    assert_eq!(events(&state), ["acked 1"]);
 }
 
 // -- receiving ---------------------------------------------------------------

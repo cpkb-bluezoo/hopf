@@ -81,6 +81,13 @@ pub trait MqttClientDriver: Send {
     /// PUBCOMP at the end of the QoS 2 handshake).
     fn on_publish_acked(&mut self, client: &mut dyn MqttClientControl, packet_id: u16);
 
+    /// The broker refused a QoS 1 or QoS 2 publish the client sent: a
+    /// PUBACK, PUBREC or PUBCOMP carrying a reason code of 0x80 or more
+    /// (MQTT 5.0 only; 3.1.1 has no negative acknowledgement). The exchange
+    /// is over - the endpoint sends no PUBREL after a refusing PUBREC - and
+    /// [`on_publish_acked`](Self::on_publish_acked) is not called for it.
+    fn on_publish_failed(&mut self, client: &mut dyn MqttClientControl, packet_id: u16, reason_code: u8, properties: &Properties);
+
     /// PINGRESP received (keepalive round-trip confirmed).
     fn on_ping_resp(&mut self, client: &mut dyn MqttClientControl);
 
