@@ -66,6 +66,19 @@ pub enum SmtpSendOutcome {
     Failed(String),
 }
 
+/// What became of one envelope recipient (see [`SmtpSend::on_recipients`]).
+#[derive(Debug, Clone)]
+pub struct RecipientOutcome {
+    /// The recipient address as given to [`SmtpSend::rcpt_to`].
+    pub recipient: String,
+    /// [`SmtpSendOutcome::Delivered`] when the server took the message for
+    /// this recipient; [`SmtpSendOutcome::Rejected`] with the reply that
+    /// refused it (at `RCPT TO`, or, for a recipient the server had
+    /// accepted, at the end of the transaction); [`SmtpSendOutcome::Failed`]
+    /// when the attempt ended with no reply to classify.
+    pub outcome: SmtpSendOutcome,
+}
+
 /// Result of an offloaded DATA/BDAT chunk read (issue #184), stashed by
 /// the storage callback for [`SmtpSendDriver::resume_pending_data`] to
 /// apply once back on the reactor thread (see
@@ -133,6 +146,11 @@ struct SmtpSendState {
     /// The most recent RCPT TO refusal (recipient, code, text), reported if every
     /// recipient ends up refused so the caller sees the server's reason.
     last_rcpt_rejection: Option<(String, u16, String)>,
+    /// Every RCPT TO refusal (recipient, code, text), in the order the
+    /// replies arrived, for [`SmtpSend::on_recipients`].
+    rcpt_refusals: Vec<(String, u16, String)>,
+    /// Per-recipient completion callback — see [`SmtpSend::on_recipients`].
+    on_recipients: Option<Box<dyn FnOnce(Vec<RecipientOutcome>) + Send>>,
 }
 
 /// The `EHLO` / `HELO` argument: `hostname` as given, or, when it is empty,
@@ -208,6 +226,36 @@ pub(crate) fn no_mechanism_message(auth_methods: &[String], bearer: bool) -> Str
 /// ```
 pub struct SmtpSend(Arc<Mutex<SmtpSendState>>);
 
+impl SmtpSendState {
+    /// Each recipient's outcome given how the transaction as a whole ended:
+    /// a recipient refused at `RCPT TO` keeps that refusal, any other takes
+    /// the transaction's outcome.
+    ///
+    /// When the sender was refused in a pipelined group, the server answers
+    /// the `RCPT TO` commands already in flight with 503; that says nothing
+    /// about the recipients, so those refusals are ignored.
+    fn recipient_outcomes(&mut self, transaction: &SmtpSendOutcome) -> Vec<RecipientOutcome> {
+        let mut refusals = if self.pipeline_abort {
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.rcpt_refusals)
+        };
+        self.recipients
+            .iter()
+            .map(|(recipient, _)| {
+                let outcome = match refusals.iter().position(|(r, _, _)| r == recipient) {
+                    Some(i) => {
+                        let (_, code, message) = refusals.remove(i);
+                        SmtpSendOutcome::Rejected { code, message }
+                    }
+                    None => transaction.clone(),
+                };
+                RecipientOutcome { recipient: recipient.clone(), outcome }
+            })
+            .collect()
+    }
+}
+
 impl SmtpSend {
     /// Create a new pipeline. `hostname` is the EHLO identity.
     pub fn new(hostname: impl Into<String>) -> Self {
@@ -232,6 +280,8 @@ impl SmtpSend {
             on_result: None,
             pending_data: None,
             last_rcpt_rejection: None,
+            rcpt_refusals: Vec::new(),
+            on_recipients: None,
         })))
     }
 
@@ -383,6 +433,21 @@ impl SmtpSend {
         self
     }
 
+    /// Register a per-recipient completion callback. It fires once, just
+    /// before the [`Self::on_result`] callback, with one entry per
+    /// recipient in the order they were added.
+    ///
+    /// The single [`SmtpSendOutcome`] says how the transaction ended; this
+    /// says what that meant for each recipient. The two differ when the
+    /// server refuses some recipients at `RCPT TO` and takes the message for
+    /// the others: the transaction is [`SmtpSendOutcome::Delivered`], and
+    /// the refused recipients are only visible here. A relay needs that to
+    /// tell a recipient to retry later (4xx) from one to bounce (5xx).
+    pub fn on_recipients(self, cb: Box<dyn FnOnce(Vec<RecipientOutcome>) + Send>) -> Self {
+        self.0.lock().unwrap().on_recipients = Some(cb);
+        self
+    }
+
     /// Register a richer completion callback (issue #344) carrying the
     /// SMTP reply code when one is available — use this instead of (or
     /// alongside) [`Self::on_complete`] when the caller needs to decide
@@ -468,6 +533,13 @@ impl SmtpSendDriver {
 
     fn finish(&self, outcome: SmtpSendOutcome) {
         let ok = matches!(outcome, SmtpSendOutcome::Delivered);
+        let per_recipient = {
+            let mut st = self.state.lock().unwrap();
+            st.on_recipients.take().map(|cb| (cb, st.recipient_outcomes(&outcome)))
+        };
+        if let Some((cb, each)) = per_recipient {
+            cb(each);
+        }
         let on_result = self.state.lock().unwrap().on_result.take();
         if let Some(cb) = on_result {
             cb(outcome);
@@ -925,7 +997,11 @@ impl SmtpClientDriver for SmtpSendDriver {
         code: u16,
         message: &str,
     ) {
-        self.state.lock().unwrap().last_rcpt_rejection = Some((recipient.to_string(), code, message.to_string()));
+        {
+            let mut st = self.state.lock().unwrap();
+            st.last_rcpt_rejection = Some((recipient.to_string(), code, message.to_string()));
+            st.rcpt_refusals.push((recipient.to_string(), code, message.to_string()));
+        }
         if envelope.awaiting_more_replies() {
             return;
         }
@@ -1058,10 +1134,29 @@ impl SmtpClientDriver for SmtpSendDriver {
         code: u16,
         message: &str,
     ) {
-        // This one-shot pipeline doesn't retry itself — a caller that
-        // wants retry behavior wraps it (see `SmtpSend::on_result` /
-        // `super::RetryingSend`, issue #344).
-        self.complete_rejected(code, message);
+        // In a pipelined group the DATA reply is the last to arrive, and when
+        // the sender or every recipient was refused it is a 503/554 that only
+        // says there is nothing to send. The refusal that caused it is the
+        // outcome: a 4xx there must stay a 4xx (RFC 5321 section 4.5.4.1).
+        let (abort, refusal) = {
+            let mut st = self.state.lock().unwrap();
+            let refusal = if st.pipeline_abort || envelope.has_accepted_recipients() {
+                None
+            } else {
+                st.last_rcpt_rejection.take()
+            };
+            (st.pipeline_abort, refusal)
+        };
+        if abort {
+            self.fail_pipelined_mail();
+        } else if let Some((rcpt, code, message)) = refusal {
+            self.complete_rejected(code, &format!("{rcpt}: {message}"));
+        } else {
+            // This one-shot pipeline doesn't retry itself — a caller that
+            // wants retry behavior wraps it (see `SmtpSend::on_result` /
+            // `super::RetryingSend`, issue #344).
+            self.complete_rejected(code, message);
+        }
         envelope.quit();
     }
 

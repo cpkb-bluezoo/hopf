@@ -19,7 +19,7 @@ mod server;
 
 pub use auth::{AuthPipeline, AuthPipelineBuilder, AuthResultsHandle, AuthVerdict, AuthVerdictHandle};
 pub use client::{
-    dot_stuff, smtp_retry_policy, MailFromParams, RetryingSend, SmtpCapabilities, SmtpClient,
+    dot_stuff, smtp_retry_policy, MailFromParams, RecipientOutcome, RetryingSend, SmtpCapabilities, SmtpClient,
     SmtpClientDriver, SmtpClientEndpoint, SmtpEvent, SmtpClientHandlerFactory, SmtpClientTimeouts,
     SmtpError, SmtpReplyLexer, SmtpReplyShape, SmtpResult, SmtpSend, SmtpSendOutcome, SmtpVerify,
     SmtpVerifyOutcome, MAX_REPLY_LINE,

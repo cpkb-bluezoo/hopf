@@ -43,7 +43,7 @@ pub use endpoint::SmtpClientEndpoint;
 pub use error::{SmtpError, SmtpResult};
 pub use facade::{SmtpClient, SmtpClientTimeouts};
 pub use handlers::{SmtpClientDriver, SmtpClientHandlerFactory};
-pub use pipeline::{SmtpSend, SmtpSendOutcome};
+pub use pipeline::{RecipientOutcome, SmtpSend, SmtpSendOutcome};
 pub use reply::{SmtpEvent, SmtpReplyLexer, SmtpReplyShape, MAX_REPLY_LINE};
 pub use retry::{smtp_retry_policy, RetryingSend};
 pub use verify::{SmtpVerify, SmtpVerifyOutcome};

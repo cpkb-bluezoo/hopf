@@ -14,7 +14,7 @@ use hopf_core::{Endpoint, Runtime, RuntimeConfig};
 
 use super::endpoint::SmtpClientEndpoint;
 use super::handlers::{SmtpClientDriver, SmtpClientHandlerFactory};
-use super::pipeline::{SmtpSend, SmtpSendOutcome};
+use super::pipeline::{RecipientOutcome, SmtpSend, SmtpSendOutcome};
 use super::state::{
     MailFromParams, SmtpCapabilities, SmtpClientAuthExchange, SmtpClientEnvelope, SmtpClientHello,
     SmtpClientMessageData, SmtpClientPostTls, SmtpClientSession,
@@ -27,9 +27,29 @@ type Client = Peer<SmtpClientEndpoint>;
 struct Results {
     outcomes: Arc<Mutex<Vec<SmtpSendOutcome>>>,
     completes: Arc<Mutex<Vec<bool>>>,
+    recipients: Arc<Mutex<Vec<Vec<RecipientOutcome>>>>,
 }
 
 impl Results {
+    /// The per-recipient outcomes, as `(recipient, code)`: the reply code a
+    /// recipient was refused with, `None` for one that was delivered, and
+    /// `Some(0)` for one that ended with no reply code at all.
+    fn recipient_codes(&self) -> Vec<(String, Option<u16>)> {
+        let all = self.recipients.lock().unwrap();
+        assert_eq!(all.len(), 1, "expected one per-recipient report, got {all:?}");
+        all[0]
+            .iter()
+            .map(|r| {
+                let code = match &r.outcome {
+                    SmtpSendOutcome::Delivered => None,
+                    SmtpSendOutcome::Rejected { code, .. } => Some(*code),
+                    SmtpSendOutcome::Failed(_) => Some(0),
+                };
+                (r.recipient.clone(), code)
+            })
+            .collect()
+    }
+
     fn only_outcome(&self) -> SmtpSendOutcome {
         let o = self.outcomes.lock().unwrap();
         assert_eq!(o.len(), 1, "expected one outcome, got {o:?}");
@@ -48,7 +68,9 @@ fn runtime() -> Arc<Runtime> {
 fn with_results(send: SmtpSend) -> (SmtpSend, Results) {
     let r = Results::default();
     let (o, c) = (Arc::clone(&r.outcomes), Arc::clone(&r.completes));
+    let rc = Arc::clone(&r.recipients);
     let send = send
+        .on_recipients(Box::new(move |each| rc.lock().unwrap().push(each)))
         .on_result(Box::new(move |out| o.lock().unwrap().push(out)))
         .on_complete(Box::new(move |ok| c.lock().unwrap().push(ok)));
     (send, r)
@@ -338,6 +360,137 @@ fn a_message_goes_to_the_recipients_that_were_accepted() {
     assert_eq!(c.run("354 go\r\n"), "hi\r\n.\r\n");
     c.run("250 queued\r\n");
     assert!(results.only_outcome().is_delivered());
+}
+
+// Per-recipient outcomes --------------------------------------------------
+
+fn two_recipients(body: &'static [u8]) -> SmtpSend {
+    let mut once = Some(body.to_vec());
+    SmtpSend::new("client.example")
+        .mail_from("a@b")
+        .recipients(vec!["1@d".into(), "2@d".into()])
+        .message_with(move || once.take())
+}
+
+#[test]
+fn a_recipient_refused_for_good_is_reported_even_though_the_message_went_to_the_others() {
+    let (send, results) = with_results(two_recipients(b"hi\r\n"));
+    let (mut c, _) = after_ehlo(&send, PLAIN_EHLO);
+    c.run("250 ok\r\n");
+    c.run("550 5.1.1 no such user\r\n");
+    c.run("250 ok\r\n");
+    c.run("354 go\r\n");
+    c.run("250 queued\r\n");
+    assert!(results.only_outcome().is_delivered());
+    assert_eq!(
+        results.recipient_codes(),
+        [("1@d".to_string(), Some(550)), ("2@d".to_string(), None)]
+    );
+}
+
+#[test]
+fn a_recipient_deferred_with_a_temporary_code_keeps_that_code() {
+    let (send, results) = with_results(two_recipients(b"hi\r\n"));
+    let (mut c, _) = after_ehlo(&send, PLAIN_EHLO);
+    c.run("250 ok\r\n");
+    c.run("250 ok\r\n");
+    c.run("451 4.2.1 mailbox busy\r\n");
+    c.run("354 go\r\n");
+    c.run("250 queued\r\n");
+    assert_eq!(
+        results.recipient_codes(),
+        [("1@d".to_string(), None), ("2@d".to_string(), Some(451))]
+    );
+}
+
+#[test]
+fn a_refusal_after_the_text_applies_to_every_accepted_recipient_but_not_to_one_refused_earlier() {
+    let (send, results) = with_results(two_recipients(b"hi\r\n"));
+    let (mut c, _) = after_ehlo(&send, PLAIN_EHLO);
+    c.run("250 ok\r\n");
+    c.run("550 no such user\r\n");
+    c.run("250 ok\r\n");
+    c.run("354 go\r\n");
+    c.run("452 4.2.2 mailbox full\r\n");
+    assert_eq!(
+        results.recipient_codes(),
+        [("1@d".to_string(), Some(550)), ("2@d".to_string(), Some(452))]
+    );
+}
+
+#[test]
+fn a_refused_sender_is_every_recipients_outcome() {
+    let (send, results) = with_results(two_recipients(b"hi\r\n"));
+    let (mut c, _) = after_ehlo(&send, PLAIN_EHLO);
+    c.run("451 4.7.1 greylisted\r\n");
+    assert_eq!(
+        results.recipient_codes(),
+        [("1@d".to_string(), Some(451)), ("2@d".to_string(), Some(451))]
+    );
+}
+
+#[test]
+fn when_every_recipient_is_refused_each_keeps_its_own_code() {
+    let (send, results) = with_results(two_recipients(b"hi\r\n"));
+    let (mut c, _) = after_ehlo(&send, PLAIN_EHLO);
+    c.run("250 ok\r\n");
+    c.run("550 no such user\r\n");
+    c.run("452 too many recipients\r\n");
+    assert_eq!(
+        results.recipient_codes(),
+        [("1@d".to_string(), Some(550)), ("2@d".to_string(), Some(452))]
+    );
+}
+
+#[test]
+fn a_session_that_never_got_to_the_recipients_reports_each_as_failed() {
+    let (send, results) = with_results(two_recipients(b"hi\r\n"));
+    let mut c = connect(&send);
+    c.run("554 no service\r\n");
+    assert_eq!(
+        results.recipient_codes(),
+        [("1@d".to_string(), Some(0)), ("2@d".to_string(), Some(0))]
+    );
+}
+
+#[test]
+fn pipelined_recipient_refusals_are_matched_to_their_recipients() {
+    let (send, results) = with_results(two_recipients(b"hi\r\n"));
+    let (mut c, _) = after_ehlo(&send, PIPELINING_EHLO);
+    c.run("250 ok\r\n250 ok\r\n550 no such user\r\n354 go\r\n");
+    c.run("250 queued\r\n");
+    assert_eq!(
+        results.recipient_codes(),
+        [("1@d".to_string(), None), ("2@d".to_string(), Some(550))]
+    );
+}
+
+#[test]
+fn the_refusals_that_follow_a_pipelined_refused_sender_do_not_hide_its_code() {
+    // A server that refuses MAIL answers the RCPTs already in flight with 503.
+    // Those say nothing about the recipients, so the 451 is what each reports.
+    let (send, results) = with_results(two_recipients(b"hi\r\n"));
+    let (mut c, _) = after_ehlo(&send, PIPELINING_EHLO);
+    c.run("451 4.7.1 greylisted\r\n503 5.5.1 need MAIL\r\n503 5.5.1 need MAIL\r\n503 5.5.1 need MAIL\r\n");
+    assert!(matches!(results.only_outcome(), SmtpSendOutcome::Rejected { code: 451, .. }));
+    assert_eq!(
+        results.recipient_codes(),
+        [("1@d".to_string(), Some(451)), ("2@d".to_string(), Some(451))]
+    );
+}
+
+#[test]
+fn pipelined_recipients_that_are_all_deferred_are_deferred_not_refused_by_the_data_reply() {
+    // With every RCPT refused the server answers DATA with 503/554, which only
+    // repeats that there is nobody to send to. The reason is the RCPT replies.
+    let (send, results) = with_results(two_recipients(b"hi\r\n"));
+    let (mut c, _) = after_ehlo(&send, PIPELINING_EHLO);
+    c.run("250 ok\r\n451 4.7.1 greylisted\r\n451 4.7.1 greylisted\r\n554 5.5.1 no valid recipients\r\n");
+    assert!(matches!(results.only_outcome(), SmtpSendOutcome::Rejected { code: 451, .. }));
+    assert_eq!(
+        results.recipient_codes(),
+        [("1@d".to_string(), Some(451)), ("2@d".to_string(), Some(451))]
+    );
 }
 
 #[test]
