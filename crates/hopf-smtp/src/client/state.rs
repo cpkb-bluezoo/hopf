@@ -48,7 +48,7 @@ pub struct MailFromParams {
     /// `HOLDFOR=` (FUTURERELEASE, RFC 4865) — hold for this long before
     /// attempting delivery.
     pub hold_for: Option<Duration>,
-    /// `BY=seconds[R|N]` (DELIVERBY, RFC 2852) — deadline interval and
+    /// `BY=seconds;R|N` (DELIVERBY, RFC 2852) — deadline interval and
     /// whether the server should return (`true`) or just notify (`false`)
     /// on failure to meet it.
     pub deliver_by: Option<(Duration, bool)>,
@@ -93,7 +93,7 @@ impl MailFromParams {
         }
         if let Some((d, return_on_fail)) = self.deliver_by {
             let flag = if return_on_fail { "R" } else { "N" };
-            out.push_str(&format!(" BY={}{flag}", d.as_secs()));
+            out.push_str(&format!(" BY={};{flag}", d.as_secs()));
         }
         out
     }
@@ -250,7 +250,7 @@ mod tests {
         assert_eq!(
             params.render(),
             " SIZE=1024 BODY=8BITMIME SMTPUTF8 RET=FULL ENVID=xyz123 REQUIRETLS \
-             MT-PRIORITY=-3 HOLDFOR=300 BY=3600R"
+             MT-PRIORITY=-3 HOLDFOR=300 BY=3600;R"
         );
     }
 
@@ -260,6 +260,6 @@ mod tests {
             deliver_by: Some((Duration::from_secs(60), false)),
             ..Default::default()
         };
-        assert_eq!(params.render(), " BY=60N");
+        assert_eq!(params.render(), " BY=60;N");
     }
 }

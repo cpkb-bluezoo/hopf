@@ -51,3 +51,23 @@ impl SmtpPipeline for NullPipeline {
 /// Alias for [`NullPipeline`] — discards all notifications.
 pub type DiscardPipeline = NullPipeline;
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_null_pipeline_takes_everything_and_is_never_pending() {
+        let mut p = NullPipeline;
+        let who = EmailAddress::new(None, "a", "b.example", true);
+        p.mail_from(Some(&who));
+        p.mail_from(None);
+        p.rcpt_to(&who);
+        assert!(p.message_content(b"anything"));
+        p.end_data();
+        p.reset();
+        assert!(!p.is_pending());
+        let mut d: DiscardPipeline = NullPipeline;
+        assert!(d.message_content(b""));
+    }
+}

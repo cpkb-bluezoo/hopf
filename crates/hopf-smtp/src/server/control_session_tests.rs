@@ -207,7 +207,9 @@ fn mail_from_checks_its_parameters() {
         ("<a@b> SIZE=abc", "501 5.5.4 Invalid SIZE parameter\r\n"),
         ("<a@b> BODY=XYZ", "501 5.5.4 Invalid BODY parameter\r\n"),
         ("<a@b> RET=BAD", "501 5.5.4 Invalid RET parameter\r\n"),
-        ("<a@b> BY=60;N", "501 5.5.4 Invalid BY parameter\r\n"),
+        ("<a@b> BY=60;X", "501 5.5.4 Invalid BY parameter\r\n"),
+        ("<a@b> BY=abc;R", "501 5.5.4 Invalid BY parameter\r\n"),
+        ("<a@b> BY=-5;R", "501 5.5.4 DELIVERBY deadline has already passed\r\n"),
         ("<a@b> MT-PRIORITY=99", "501 5.5.4 MT-PRIORITY must be between -9 and 9\r\n"),
     ] {
         assert_eq!(mail_reply(arg), reply, "{arg}");
@@ -222,6 +224,9 @@ fn mail_from_accepts_the_parameters_it_advertises() {
         "<a@b> SMTPUTF8",
         "<a@b> RET=HDRS ENVID=abc",
         "<a@b> MT-PRIORITY=3",
+        "<a@b> BY=60;R",
+        "<a@b> BY=60;NT",
+        "<a@b> BY=60R",
     ] {
         assert_eq!(mail_reply(arg), "250 2.1.0 Sender OK\r\n", "{arg}");
     }

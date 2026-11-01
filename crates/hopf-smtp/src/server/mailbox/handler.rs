@@ -396,7 +396,13 @@ fn deliver_spooled(
         }
     }
 
-    let reports = DeliveryStatusNotification::filter_reports(outcomes);
+    // With no recipient delivered the client is told to try again (see the
+    // return value), so a failure notice as well would contradict that.
+    let reports = if any_success {
+        DeliveryStatusNotification::filter_reports(outcomes)
+    } else {
+        Vec::new()
+    };
     if !reports.is_empty() {
         if let Some(sender) = sender {
             let original = spool_path
@@ -751,5 +757,300 @@ mod tests {
               From: a@b\r\n\r\nhello\r\n"
                 .to_vec()
         );
+    }
+}
+
+/// The handler as a server runs it: SMTP in, a Maildir out.
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::server::control::SmtpControlHandler;
+    use crate::server::metrics::SmtpServerMetrics;
+    use crate::server::service::SmtpConfig;
+    use hopf_core::testing::Peer;
+    use hopf_mailbox::MaildirFactory;
+
+    type Server = Peer<SmtpControlHandler>;
+
+    struct Fixture {
+        peer: Server,
+        factory: Arc<MaildirFactory>,
+        dir: tempfile::TempDir,
+    }
+
+    fn fixture() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = Arc::new(Runtime::start(hopf_core::RuntimeConfig::default()).unwrap());
+        let factory = Arc::new(MaildirFactory::new(dir.path()));
+        let handler_factory =
+            LocalDeliveryHandlerFactory::new(factory.clone(), Arc::clone(&rt), "mail.example", "mx.mail.example");
+        let local: std::net::SocketAddr = "127.0.0.1:25".parse().unwrap();
+        let h = SmtpControlHandler::new(
+            handler_factory.create(),
+            SmtpServerMetrics::shared(),
+            SmtpConfig::new(local, "mx.mail.example").auth_required(false),
+            "192.0.2.5:4000".parse().unwrap(),
+            local,
+            rt,
+        );
+        let mut peer = Peer::connect(h, |_| false);
+        peer.take();
+        peer.run("EHLO c\r\n");
+        Fixture { peer, factory, dir }
+    }
+
+    impl Fixture {
+        /// The reply to the end of a message: it comes when the delivery has
+        /// run on the storage pool, so wait for it.
+        fn reply(&mut self) -> String {
+            for _ in 0..250 {
+                self.peer.pump();
+                let r = self.peer.take();
+                if !r.is_empty() {
+                    return r;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            panic!("no reply to the message");
+        }
+
+        /// Sends one message and returns the final reply.
+        fn send(&mut self, envelope: &str, text: &str) -> String {
+            self.peer.run(envelope);
+            assert!(self.peer.run("DATA\r\n").starts_with("354"));
+            let immediate = self.peer.run(&format!("{text}.\r\n"));
+            if immediate.is_empty() {
+                self.reply()
+            } else {
+                immediate
+            }
+        }
+
+        fn inbox(&self, user: &str) -> Vec<Vec<u8>> {
+            if !self.dir.path().join(user).join("cur").exists() {
+                return Vec::new();
+            }
+            let mut store = self.factory.create_store();
+            store.open(user).unwrap();
+            let mut mb = store.open_mailbox("INBOX", false).unwrap();
+            let n = mb.message_count().unwrap();
+            let mut out = Vec::new();
+            for i in 1..=n {
+                struct Collect(Vec<u8>);
+                impl hopf_mailbox::MessageReadCallback for Collect {
+                    fn message_content(&mut self, chunk: &[u8]) -> bool {
+                        self.0.extend_from_slice(chunk);
+                        true
+                    }
+                }
+                let mut cb = Collect(Vec::new());
+                mb.read_message(i, &mut cb).unwrap();
+                out.push(cb.0);
+            }
+            out
+        }
+    }
+
+    const MSG: &str = "Subject: t\r\n\r\nbody\r\n";
+
+    #[test]
+    fn a_message_is_delivered_to_every_local_recipient() {
+        let mut f = fixture();
+        let r = f.send(
+            "MAIL FROM:<sender@elsewhere.example>\r\nRCPT TO:<alice@mail.example>\r\nRCPT TO:<bob@mail.example>\r\n",
+            MSG,
+        );
+        assert_eq!(r, "250 2.0.0 Message accepted for delivery\r\n");
+        assert_eq!(f.inbox("alice"), [MSG.as_bytes()]);
+        assert_eq!(f.inbox("bob"), [MSG.as_bytes()]);
+    }
+
+    #[test]
+    fn the_reply_waits_for_the_delivery() {
+        let mut f = fixture();
+        f.peer.run("MAIL FROM:<s@x.example>\r\nRCPT TO:<alice@mail.example>\r\nDATA\r\n");
+        // Nothing yet: the mailbox work is on the storage pool.
+        let immediate = f.peer.run(&format!("{MSG}.\r\n"));
+        assert!(immediate.is_empty() || immediate.starts_with("250"), "{immediate}");
+        let r = if immediate.is_empty() { f.reply() } else { immediate };
+        assert!(r.starts_with("250 2.0.0"), "{r}");
+        assert_eq!(f.inbox("alice").len(), 1, "it is there by the time the client is told");
+    }
+
+    #[test]
+    fn the_recipient_domain_is_matched_without_regard_to_case() {
+        let mut f = fixture();
+        f.send("MAIL FROM:<s@x.example>\r\nRCPT TO:<alice@MAIL.Example>\r\n", MSG);
+        assert_eq!(f.inbox("alice").len(), 1);
+    }
+
+    #[test]
+    fn a_recipient_in_another_domain_is_refused_and_the_rest_still_delivered() {
+        let mut f = fixture();
+        f.peer.run("MAIL FROM:<s@x.example>\r\n");
+        assert_eq!(f.peer.run("RCPT TO:<alice@mail.example>\r\n"), "250 2.1.5 Recipient OK\r\n");
+        assert_eq!(f.peer.run("RCPT TO:<eve@other.example>\r\n"), "551 5.7.1 Relay denied\r\n");
+        f.peer.run("DATA\r\n");
+        f.peer.run(&format!("{MSG}.\r\n"));
+        f.reply();
+        assert_eq!(f.inbox("alice").len(), 1);
+        assert!(f.inbox("eve").is_empty());
+    }
+
+    #[test]
+    fn with_only_foreign_recipients_there_is_nothing_to_send_to() {
+        let mut f = fixture();
+        f.peer.run("MAIL FROM:<s@x.example>\r\nRCPT TO:<eve@other.example>\r\n");
+        assert_eq!(f.peer.run("DATA\r\n"), "503 5.5.1 Need RCPT (recipient)\r\n");
+    }
+
+    #[test]
+    fn messages_in_turn_are_delivered_separately() {
+        let mut f = fixture();
+        f.send("MAIL FROM:<s@x.example>\r\nRCPT TO:<alice@mail.example>\r\n", "first\r\n");
+        f.send("MAIL FROM:<s@x.example>\r\nRCPT TO:<alice@mail.example>\r\n", "second\r\n");
+        assert_eq!(f.inbox("alice"), [b"first\r\n".to_vec(), b"second\r\n".to_vec()]);
+    }
+
+    #[test]
+    fn a_reset_forgets_the_recipients() {
+        let mut f = fixture();
+        f.peer.run("MAIL FROM:<s@x.example>\r\nRCPT TO:<alice@mail.example>\r\n");
+        f.peer.run("RSET\r\n");
+        f.send("MAIL FROM:<s@x.example>\r\nRCPT TO:<bob@mail.example>\r\n", MSG);
+        assert!(f.inbox("alice").is_empty());
+        assert_eq!(f.inbox("bob").len(), 1);
+    }
+
+    #[test]
+    fn dots_in_the_text_are_unstuffed_before_it_is_stored() {
+        let mut f = fixture();
+        f.send("MAIL FROM:<s@x.example>\r\nRCPT TO:<alice@mail.example>\r\n", "a\r\n..b\r\n");
+        assert_eq!(f.inbox("alice"), [b"a\r\n.b\r\n".to_vec()]);
+    }
+
+    #[test]
+    fn a_message_sent_in_bdat_chunks_is_stored_whole() {
+        let mut f = fixture();
+        f.peer.run("MAIL FROM:<s@x.example>\r\nRCPT TO:<alice@mail.example>\r\n");
+        f.peer.run("BDAT 5\r\nhello");
+        let immediate = f.peer.run("BDAT 7 LAST\r\n world\n");
+        let r = if immediate.is_empty() { f.reply() } else { immediate };
+        assert!(r.starts_with("250"), "{r}");
+        assert_eq!(f.inbox("alice"), [b"hello world\n".to_vec()]);
+    }
+
+    #[test]
+    fn futurerelease_is_refused_because_local_delivery_cannot_hold_a_message() {
+        let mut f = fixture();
+        assert_eq!(
+            f.peer.run("MAIL FROM:<s@x.example> HOLDFOR=60\r\n"),
+            "553 FUTURERELEASE not supported by local delivery\r\n"
+        );
+    }
+
+    #[test]
+    fn requiretls_is_refused_on_a_plaintext_connection() {
+        let mut f = fixture();
+        assert_eq!(
+            f.peer.run("MAIL FROM:<s@x.example> REQUIRETLS\r\n"),
+            "530 5.7.10 REQUIRETLS requires a TLS-protected session\r\n"
+        );
+    }
+
+    // Delivery notifications ------------------------------------------------
+
+    #[test]
+    fn a_success_notification_is_delivered_to_a_local_sender_when_asked_for() {
+        let mut f = fixture();
+        f.send(
+            "MAIL FROM:<carol@mail.example> RET=HDRS ENVID=E1\r\nRCPT TO:<alice@mail.example> NOTIFY=SUCCESS ORCPT=rfc822;alice@mail.example\r\n",
+            MSG,
+        );
+        let dsns = f.inbox("carol");
+        assert_eq!(dsns.len(), 1);
+        let text = String::from_utf8_lossy(&dsns[0]).into_owned();
+        for expect in [
+            "To: carol@mail.example",
+            "Content-Type: multipart/report; report-type=delivery-status",
+            "Reporting-MTA: dns;mx.mail.example",
+            "Original-Envelope-Id: E1",
+            "Original-Recipient: rfc822;alice@mail.example",
+            "Final-Recipient: rfc822;alice@mail.example",
+            "Action: delivered",
+            "Status: 2.0.0",
+        ] {
+            assert!(text.contains(expect), "missing {expect:?} in\n{text}");
+        }
+    }
+
+    #[test]
+    fn no_notification_is_made_for_a_success_nobody_asked_about() {
+        let mut f = fixture();
+        f.send("MAIL FROM:<carol@mail.example>\r\nRCPT TO:<alice@mail.example>\r\n", MSG);
+        assert!(f.inbox("carol").is_empty());
+    }
+
+    #[test]
+    fn nothing_is_sent_to_the_null_sender() {
+        let mut f = fixture();
+        f.send("MAIL FROM:<>\r\nRCPT TO:<alice@mail.example> NOTIFY=SUCCESS\r\n", MSG);
+        assert_eq!(f.inbox("alice").len(), 1);
+    }
+
+    #[test]
+    fn a_recipient_that_cannot_be_delivered_to_is_reported_to_the_sender_while_the_others_succeed() {
+        let mut f = fixture();
+        std::fs::write(f.dir.path().join("badbox"), b"a file where a directory should be").unwrap();
+        let r = f.send(
+            "MAIL FROM:<carol@mail.example>\r\nRCPT TO:<alice@mail.example>\r\nRCPT TO:<badbox@mail.example>\r\n",
+            MSG,
+        );
+        assert_eq!(r, "250 2.0.0 Message accepted for delivery\r\n", "the client must not retry and duplicate");
+        assert_eq!(f.inbox("alice").len(), 1);
+        let dsns = f.inbox("carol");
+        assert_eq!(dsns.len(), 1);
+        let text = String::from_utf8_lossy(&dsns[0]).into_owned();
+        assert!(text.contains("Action: failed") && text.contains("badbox@mail.example"), "{text}");
+    }
+
+    #[test]
+    fn when_no_recipient_can_be_delivered_to_the_client_is_told_to_try_again_and_no_notification_is_made() {
+        let mut f = fixture();
+        std::fs::write(f.dir.path().join("badbox"), b"a file where a directory should be").unwrap();
+        let r = f.send("MAIL FROM:<carol@mail.example>\r\nRCPT TO:<badbox@mail.example>\r\n", MSG);
+        assert!(r.starts_with("450 "), "{r}");
+        // The sender is retrying: a failure notice as well would contradict that.
+        assert!(f.inbox("carol").is_empty());
+    }
+
+    // DELIVERBY ----------------------------------------------------------------
+
+    #[test]
+    fn a_message_whose_delivery_deadline_has_passed_is_deferred() {
+        let mut f = fixture();
+        assert_eq!(f.peer.run("MAIL FROM:<s@x.example> BY=1;R\r\n"), "250 2.1.0 Sender OK\r\n");
+        f.peer.run("RCPT TO:<alice@mail.example>\r\nDATA\r\n");
+        std::thread::sleep(std::time::Duration::from_millis(1300));
+        let immediate = f.peer.run(&format!("{MSG}.\r\n"));
+        let r = if immediate.is_empty() { f.reply() } else { immediate };
+        assert!(r.starts_with("450 ") && r.contains("DELIVERBY deadline exceeded"), "{r}");
+        assert!(f.inbox("alice").is_empty());
+    }
+
+    #[test]
+    fn a_message_within_its_delivery_deadline_is_delivered() {
+        let mut f = fixture();
+        let r = f.send("MAIL FROM:<s@x.example> BY=600;N\r\nRCPT TO:<alice@mail.example>\r\n", MSG);
+        assert!(r.starts_with("250"), "{r}");
+        assert_eq!(f.inbox("alice").len(), 1);
+    }
+
+    #[test]
+    fn losing_the_connection_part_way_leaves_nothing_behind() {
+        let mut f = fixture();
+        f.peer.run("MAIL FROM:<s@x.example>\r\nRCPT TO:<alice@mail.example>\r\nDATA\r\npartial");
+        f.peer.disconnect();
+        assert!(f.inbox("alice").is_empty());
     }
 }

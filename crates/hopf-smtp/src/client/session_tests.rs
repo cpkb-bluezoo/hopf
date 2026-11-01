@@ -672,3 +672,192 @@ fn a_dot_at_the_start_of_a_piece_is_stuffed_only_at_the_start_of_a_line() {
     // ".b" continues a line, so its dot is not stuffed; ".c" starts one.
     assert_eq!(data_sent_for(vec![b"a", b".b\r\n", b".c\r\n"]), "a.b\r\n..c\r\n.\r\n");
 }
+
+// Checking a server and its credentials without sending anything --------------
+
+mod verify {
+    use super::*;
+    use crate::client::verify::{SmtpVerify, SmtpVerifyOutcome};
+
+    type Outcomes = Arc<Mutex<Vec<SmtpVerifyOutcome>>>;
+
+    fn verifier(v: SmtpVerify) -> (SmtpVerify, Outcomes) {
+        let out = Outcomes::default();
+        let o = Arc::clone(&out);
+        (v.on_result(Box::new(move |r| o.lock().unwrap().push(r))), out)
+    }
+
+    fn connect(v: &SmtpVerify) -> Client {
+        let ep = SmtpClientEndpoint::new(v, &runtime(), Duration::from_secs(60), Duration::from_secs(600), None, None);
+        Peer::connect(ep, |_| false)
+    }
+
+    fn only(o: &Outcomes) -> SmtpVerifyOutcome {
+        let o = o.lock().unwrap();
+        assert_eq!(o.len(), 1, "{o:?}");
+        o[0].clone()
+    }
+
+    #[test]
+    fn a_server_that_answers_ehlo_is_verified_with_what_it_offers() {
+        let (v, out) = verifier(SmtpVerify::new("client.example"));
+        let mut c = connect(&v);
+        assert_eq!(c.run(GREETING), "EHLO client.example\r\n");
+        let sent = c.run("250-server.example\r\n250-PIPELINING\r\n250-SIZE 5000\r\n250-8BITMIME\r\n250 STARTTLS\r\n");
+        assert_eq!(sent, "QUIT\r\n", "nothing is sent but the goodbye");
+        match only(&out) {
+            SmtpVerifyOutcome::Verified(caps) => {
+                assert!(caps.pipelining && caps.eight_bit_mime && caps.starttls);
+                assert_eq!(caps.max_size, 5000);
+            }
+            other => panic!("{other:?}"),
+        }
+        c.run("221 bye\r\n");
+        assert!(c.is_closed());
+    }
+
+    #[test]
+    fn a_banner_that_does_not_say_esmtp_still_gets_ehlo() {
+        let (v, out) = verifier(SmtpVerify::new("client.example"));
+        let mut c = connect(&v);
+        assert_eq!(c.run("220 server.example ready\r\n"), "EHLO client.example\r\n");
+        c.run("250-server.example\r\n250 STARTTLS\r\n");
+        assert!(matches!(only(&out), SmtpVerifyOutcome::Verified(caps) if caps.starttls));
+    }
+
+    #[test]
+    fn a_server_without_ehlo_is_verified_for_reachability_alone() {
+        let (v, out) = verifier(SmtpVerify::new("client.example"));
+        let mut c = connect(&v);
+        c.run(GREETING);
+        assert_eq!(c.run("502 EHLO not implemented\r\n"), "QUIT\r\n");
+        assert!(matches!(only(&out), SmtpVerifyOutcome::Verified(caps) if caps == SmtpCapabilities::default()));
+    }
+
+    #[test]
+    fn credentials_cannot_be_checked_against_a_server_without_esmtp() {
+        let (v, out) = verifier(SmtpVerify::new("client.example").credentials_password("alice", "secret"));
+        let mut c = connect(&v);
+        c.run(GREETING);
+        c.run("502 EHLO not implemented\r\n");
+        assert!(matches!(only(&out), SmtpVerifyOutcome::Failed(m) if m.contains("no AUTH")));
+    }
+
+    #[test]
+    fn good_credentials_are_verified() {
+        let (v, out) = verifier(SmtpVerify::new("client.example").credentials_password("alice", "secret"));
+        let mut c = connect(&v);
+        c.run(GREETING);
+        assert_eq!(c.run("250-server.example\r\n250 AUTH PLAIN\r\n"), "AUTH PLAIN AGFsaWNlAHNlY3JldA==\r\n");
+        assert!(out.lock().unwrap().is_empty(), "not until the server has said yes");
+        assert_eq!(c.run("235 2.7.0 ok\r\n"), "QUIT\r\n");
+        assert!(only(&out).is_verified());
+    }
+
+    #[test]
+    fn refused_credentials_are_reported_with_the_servers_code() {
+        let (v, out) = verifier(SmtpVerify::new("client.example").credentials_password("alice", "wrong"));
+        let mut c = connect(&v);
+        c.run(GREETING);
+        c.run("250-server.example\r\n250 AUTH PLAIN\r\n");
+        assert_eq!(c.run("535 5.7.8 no\r\n"), "QUIT\r\n");
+        assert_eq!(only(&out), SmtpVerifyOutcome::AuthFailed { code: 535 });
+    }
+
+    #[test]
+    fn login_prompts_are_answered() {
+        let (v, out) = verifier(SmtpVerify::new("client.example").credentials_password("alice", "secret"));
+        let mut c = connect(&v);
+        c.run(GREETING);
+        assert_eq!(c.run("250-server.example\r\n250 AUTH LOGIN\r\n"), "AUTH LOGIN\r\n");
+        assert_eq!(c.run("334 VXNlcm5hbWU6\r\n"), "YWxpY2U=\r\n");
+        assert_eq!(c.run("334 UGFzc3dvcmQ6\r\n"), "c2VjcmV0\r\n");
+        c.run("235 ok\r\n");
+        assert!(only(&out).is_verified());
+    }
+
+    #[test]
+    fn credentials_with_no_common_mechanism_are_a_failure() {
+        let (v, out) = verifier(SmtpVerify::new("client.example").credentials_password("alice", "secret"));
+        let mut c = connect(&v);
+        c.run(GREETING);
+        assert_eq!(c.run("250 server.example\r\n"), "QUIT\r\n");
+        assert!(matches!(only(&out), SmtpVerifyOutcome::Failed(_)));
+    }
+
+    #[test]
+    fn starttls_that_is_required_but_not_offered_is_a_failure() {
+        let (v, out) = verifier(SmtpVerify::new("client.example").require_starttls(true));
+        let mut c = connect(&v);
+        c.run(GREETING);
+        assert_eq!(c.run("250 server.example\r\n"), "QUIT\r\n");
+        assert!(matches!(only(&out), SmtpVerifyOutcome::Failed(m) if m.contains("STARTTLS")));
+    }
+
+    #[test]
+    fn starttls_is_asked_for_when_required_or_wanted_and_offered() {
+        for v in [
+            SmtpVerify::new("client.example").require_starttls(true),
+            SmtpVerify::new("client.example").opportunistic_starttls(true),
+        ] {
+            let mut c = connect(&v);
+            c.run(GREETING);
+            assert_eq!(c.run("250-server.example\r\n250 STARTTLS\r\n"), "STARTTLS\r\n");
+        }
+    }
+
+    #[test]
+    fn a_refused_starttls_is_a_failure() {
+        let (v, out) = verifier(SmtpVerify::new("client.example").require_starttls(true));
+        let mut c = connect(&v);
+        c.run(GREETING);
+        c.run("250-server.example\r\n250 STARTTLS\r\n");
+        assert_eq!(c.run("454 4.7.0 no\r\n"), "QUIT\r\n");
+        assert!(matches!(only(&out), SmtpVerifyOutcome::Failed(m) if m.contains("STARTTLS")));
+    }
+
+    #[test]
+    fn a_refused_greeting_ehlo_or_helo_is_a_failure() {
+        let (v, out) = verifier(SmtpVerify::new("client.example"));
+        let mut c = connect(&v);
+        c.run("554 no\r\n");
+        assert!(matches!(only(&out), SmtpVerifyOutcome::Failed(m) if m.contains("service unavailable")));
+        let (v, out) = verifier(SmtpVerify::new("client.example"));
+        let mut c = connect(&v);
+        c.run(GREETING);
+        c.run("550 go away\r\n");
+        assert!(matches!(only(&out), SmtpVerifyOutcome::Failed(m) if m.contains("EHLO rejected")));
+    }
+
+    #[test]
+    fn a_hang_up_an_error_or_a_timeout_before_the_end_is_a_failure() {
+        let (v, out) = verifier(SmtpVerify::new("client.example"));
+        let mut c = connect(&v);
+        c.run(GREETING);
+        c.disconnect();
+        assert!(matches!(only(&out), SmtpVerifyOutcome::Failed(m) if m.contains("closed")));
+
+        let (v, out) = verifier(SmtpVerify::new("client.example"));
+        let mut c = connect(&v);
+        c.run(GREETING);
+        c.fail(&io::Error::new(io::ErrorKind::ConnectionReset, "reset"));
+        assert!(matches!(only(&out), SmtpVerifyOutcome::Failed(m) if m.contains("reset")));
+
+        let (v, out) = verifier(SmtpVerify::new("client.example"));
+        let mut c = connect(&v);
+        c.run(GREETING);
+        c.fail(&io::Error::new(io::ErrorKind::TimedOut, "slow"));
+        assert!(matches!(only(&out), SmtpVerifyOutcome::Failed(m) if m.contains("timed out")));
+        assert!(c.is_closed());
+    }
+
+    #[test]
+    fn hanging_up_after_the_verdict_is_not_a_second_one() {
+        let (v, out) = verifier(SmtpVerify::new("client.example"));
+        let mut c = connect(&v);
+        c.run(GREETING);
+        c.run("250 server.example\r\n");
+        c.disconnect();
+        assert!(only(&out).is_verified());
+    }
+}

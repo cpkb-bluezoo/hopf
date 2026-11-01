@@ -170,12 +170,11 @@ impl SmtpVerifyDriver {
 
 impl SmtpClientDriver for SmtpVerifyDriver {
     fn on_greeting(&mut self, hello: &mut dyn SmtpClientHello, ep: &mut dyn Endpoint, esmtp: bool) {
+        // EHLO first whatever the banner says (RFC 5321 section 4.1.1.1); a
+        // server that does not know it is then spoken to with HELO.
+        let _ = esmtp;
         let hostname = ehlo_argument(&self.state.lock().unwrap().hostname, ep);
-        if esmtp {
-            hello.ehlo(&hostname);
-        } else {
-            hello.helo(&hostname);
-        }
+        hello.ehlo(&hostname);
     }
 
     fn on_service_unavailable(&mut self, ep: &mut dyn Endpoint, message: &str) {

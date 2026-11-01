@@ -2196,3 +2196,7 @@ mod pending_finish_tests {
 #[cfg(test)]
 #[path = "control_session_tests.rs"]
 mod session_tests;
+
+#[cfg(test)]
+#[path = "control_policy_tests.rs"]
+mod policy_tests;

@@ -476,19 +476,32 @@ pub fn interpret_mail_from(args: &PathArgs) -> Result<MailFromParse, ParamParseE
                         Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
                 }
             } else if let Some(v) = upper.strip_prefix("BY=") {
-                // BY=seconds[R|N] — simplified absolute offset from now.
-                let (num, ret) = if let Some(n) = v.strip_suffix('R') {
-                    (n, true)
-                } else if let Some(n) = v.strip_suffix('N') {
-                    (n, false)
-                } else {
-                    (v, true)
+                // RFC 2852 section 4: `BY=<seconds>;<R|N>[T]`, the time
+                // possibly negative (a deadline already past). The older
+                // form with no semicolon, `BY=<seconds>[R|N]`, is read too.
+                let (num, mode) = match v.split_once(';') {
+                    Some((n, m)) => (n, m),
+                    None => match v.strip_suffix(['R', 'N']) {
+                        Some(n) => (n, &v[n.len()..]),
+                        None => (v, "R"),
+                    },
                 };
-                let secs: u64 = num
+                let ret = match mode {
+                    "R" | "RT" => true,
+                    "N" | "NT" => false,
+                    _ => return Err(ParamParseError::new("Invalid BY parameter")),
+                };
+                let secs: i64 = num
                     .parse()
                     .map_err(|_| ParamParseError::new("Invalid BY parameter"))?;
+                let now = SystemTime::now();
+                let deadline = if secs >= 0 {
+                    now + Duration::from_secs(secs as u64)
+                } else {
+                    now.checked_sub(Duration::from_secs(secs.unsigned_abs())).unwrap_or(SystemTime::UNIX_EPOCH)
+                };
                 out.delivery.deliver_by = Some(DeliverBy {
-                    deadline: SystemTime::now() + Duration::from_secs(secs),
+                    deadline,
                     return_on_fail: ret,
                 });
             }
