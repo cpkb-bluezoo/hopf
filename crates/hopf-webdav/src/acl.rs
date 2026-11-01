@@ -48,16 +48,33 @@ pub(crate) fn acl_live_property_names() -> &'static [&'static str] {
     ]
 }
 
+/// The privileges that contain `privilege` in the supported-privilege-set
+/// tree below: holding one of these holds `privilege` too (RFC 3744 section 3).
+fn containers(privilege: &str) -> &'static [&'static str] {
+    match privilege {
+        ELEM_ALL => &[],
+        PRIV_READ | ELEM_WRITE => &[ELEM_ALL],
+        PRIV_READ_ACL | PRIV_READ_CURRENT_USER_PRIVILEGE_SET => &[PRIV_READ, ELEM_ALL],
+        _ => &[ELEM_WRITE, ELEM_ALL],
+    }
+}
+
+fn has_role(roles: &dyn RolePolicy, username: &str, privilege_local: &str) -> bool {
+    roles.is_user_in_role(username, &format!("{ROLE_PREFIX}{privilege_local}"))
+}
+
+/// Does `username` hold `privilege_local`: by a role for it, or for a
+/// privilege that contains it?
 fn has_privilege(roles: &dyn RolePolicy, username: Option<&str>, privilege_local: &str) -> bool {
     let Some(username) = username else {
         return false;
     };
-    if roles.is_user_in_role(username, &format!("{ROLE_PREFIX}{ELEM_ALL}")) {
-        return true;
-    }
-    roles.is_user_in_role(username, &format!("{ROLE_PREFIX}{privilege_local}"))
+    has_role(roles, username, privilege_local)
+        || containers(privilege_local).iter().any(|c| has_role(roles, username, c))
 }
 
+/// `write` is held outright, or by holding each of the privileges it is
+/// made of.
 fn has_write_privilege(roles: &dyn RolePolicy, username: Option<&str>) -> bool {
     if has_privilege(roles, username, ELEM_WRITE) {
         return true;
@@ -66,6 +83,22 @@ fn has_write_privilege(roles: &dyn RolePolicy, username: Option<&str>) -> bool {
         && has_privilege(roles, username, PRIV_WRITE_CONTENT)
         && has_privilege(roles, username, PRIV_BIND)
         && has_privilege(roles, username, PRIV_UNBIND)
+}
+
+/// Every privilege `username` holds, aggregates first, in a stable order.
+fn held_privileges(roles: &dyn RolePolicy, username: Option<&str>) -> Vec<&'static str> {
+    let mut held = Vec::new();
+    if has_privilege(roles, username, ELEM_ALL) {
+        held.push(ELEM_ALL);
+    }
+    if has_privilege(roles, username, PRIV_READ) {
+        held.push(PRIV_READ);
+    }
+    if has_write_privilege(roles, username) {
+        held.push(ELEM_WRITE);
+    }
+    held.extend(LEAF_PRIVILEGES.iter().copied().filter(|p| *p != PRIV_READ && has_privilege(roles, username, p)));
+    held
 }
 
 fn write_privilege(w: &mut DavWriter, local: &str) -> io::Result<()> {
@@ -79,39 +112,15 @@ fn write_current_user_privilege_set(
     roles: &dyn RolePolicy,
     username: Option<&str>,
 ) -> io::Result<()> {
-    if has_privilege(roles, username, ELEM_ALL) {
-        write_privilege(w, ELEM_ALL)?;
-        return Ok(());
-    }
-    if has_write_privilege(roles, username) {
-        write_privilege(w, ELEM_WRITE)?;
-    }
-    for p in LEAF_PRIVILEGES {
-        if has_privilege(roles, username, p) {
-            write_privilege(w, p)?;
-        }
+    for p in held_privileges(roles, username) {
+        write_privilege(w, p)?;
     }
     Ok(())
 }
 
 fn write_acl(w: &mut DavWriter, roles: &dyn RolePolicy, username: Option<&str>) -> io::Result<()> {
-    let Some(username) = username else {
-        return Ok(());
-    };
-    let mut granted: Vec<&str> = Vec::new();
-    if has_privilege(roles, Some(username), ELEM_ALL) {
-        granted.push(ELEM_ALL);
-    } else {
-        if has_write_privilege(roles, Some(username)) {
-            granted.push(ELEM_WRITE);
-        }
-        for p in LEAF_PRIVILEGES {
-            if has_privilege(roles, Some(username), p) {
-                granted.push(p);
-            }
-        }
-    }
-    if granted.is_empty() {
+    let granted = held_privileges(roles, username);
+    if username.is_none() || granted.is_empty() {
         return Ok(());
     }
     dav_start(w, ELEM_ACE)?;
@@ -215,6 +224,40 @@ mod tests {
     use super::*;
     use hopf_auth::RoleMembership;
 
+    /// The live properties for `username` as one string.
+    fn live_xml(username: Option<&str>, roles: RoleMembership) -> String {
+        let mut w = crate::xml_out::PropXmlWriter::new_vec();
+        let ctx = ctx_for(username, roles);
+        write_acl_live_properties(&mut w, &ctx).unwrap();
+        let _ = w.flush();
+        String::from_utf8(w.into_inner()).unwrap()
+    }
+
+    /// The privilege names (`<privilege><name/></privilege>`) in `xml`, in order.
+    fn privileges_in(xml: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = xml;
+        while let Some(i) = rest.find("privilege>") {
+            rest = &rest[i + "privilege>".len()..];
+            if let Some(start) = rest.find('<') {
+                let tail = &rest[start + 1..];
+                if let Some(end) = tail.find("/>") {
+                    let name = &tail[..end];
+                    if !name.contains('<') && !name.starts_with('/') {
+                        out.push(name.rsplit(':').next().unwrap().to_string());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Just the `current-user-privilege-set` part, as privilege names.
+    fn granted(username: Option<&str>, roles: RoleMembership) -> Vec<String> {
+        let xml = privilege_xml(username, roles);
+        privileges_in(&xml)
+    }
+
     fn ctx_for(username: Option<&str>, roles: RoleMembership) -> AclContext {
         AclContext {
             enabled: true,
@@ -258,5 +301,157 @@ mod tests {
         let roles = RoleMembership::new().with_role("erin", "webdav:all");
         let xml = privilege_xml(Some("erin"), roles);
         assert!(xml.contains("all"));
+    }
+
+    fn has(v: &[String], name: &str) -> bool {
+        v.iter().any(|p| p == name)
+    }
+
+    #[test]
+    fn nothing_is_granted_to_a_user_with_no_roles_or_to_nobody() {
+        assert!(granted(Some("alice"), RoleMembership::new()).is_empty());
+        assert!(granted(None, RoleMembership::new().with_role("alice", "webdav:all")).is_empty());
+    }
+
+    #[test]
+    fn read_includes_the_privileges_that_hang_off_it() {
+        // The supported-privilege-set puts read-acl and
+        // read-current-user-privilege-set under read: holding read holds them.
+        let g = granted(Some("alice"), RoleMembership::new().with_role("alice", "webdav:read"));
+        for p in ["read", "read-acl", "read-current-user-privilege-set"] {
+            assert!(has(&g, p), "{p} in {g:?}");
+        }
+        for p in ["write", "write-content", "bind", "unbind", "all"] {
+            assert!(!has(&g, p), "{p} not in {g:?}");
+        }
+    }
+
+    #[test]
+    fn write_includes_the_privileges_that_hang_off_it() {
+        let g = granted(Some("alice"), RoleMembership::new().with_role("alice", "webdav:write"));
+        for p in ["write", "write-properties", "write-content", "bind", "unbind", "write-acl", "unlock"] {
+            assert!(has(&g, p), "{p} in {g:?}");
+        }
+        assert!(!has(&g, "read") && !has(&g, "all"), "{g:?}");
+    }
+
+    #[test]
+    fn all_is_every_privilege() {
+        let g = granted(Some("erin"), RoleMembership::new().with_role("erin", "webdav:all"));
+        for p in [
+            "all", "read", "read-acl", "read-current-user-privilege-set", "write", "write-properties",
+            "write-content", "bind", "unbind", "write-acl", "unlock",
+        ] {
+            assert!(has(&g, p), "{p} in {g:?}");
+        }
+    }
+
+    #[test]
+    fn a_single_leaf_privilege_is_only_that_privilege() {
+        let g = granted(Some("alice"), RoleMembership::new().with_role("alice", "webdav:write-content"));
+        assert_eq!(g, ["write-content"]);
+    }
+
+    #[test]
+    fn holding_all_the_write_leaves_is_holding_write() {
+        let roles = RoleMembership::new()
+            .with_role("alice", "webdav:write-properties")
+            .with_role("alice", "webdav:write-content")
+            .with_role("alice", "webdav:bind")
+            .with_role("alice", "webdav:unbind");
+        let g = granted(Some("alice"), roles);
+        assert!(has(&g, "write"), "{g:?}");
+        let partial = RoleMembership::new()
+            .with_role("alice", "webdav:write-properties")
+            .with_role("alice", "webdav:write-content")
+            .with_role("alice", "webdav:bind");
+        assert!(!has(&granted(Some("alice"), partial), "write"));
+    }
+
+    #[test]
+    fn privileges_are_per_user() {
+        let roles = RoleMembership::new().with_role("alice", "webdav:read").with_role("bob", "webdav:write");
+        assert!(has(&granted(Some("alice"), roles.clone()), "read"));
+        assert!(!has(&granted(Some("bob"), roles.clone()), "read"));
+        assert!(!has(&granted(Some("carol"), roles), "read"));
+    }
+
+    #[test]
+    fn roles_without_the_webdav_prefix_grant_nothing() {
+        let roles = RoleMembership::new().with_role("alice", "read").with_role("alice", "admin");
+        assert!(granted(Some("alice"), roles).is_empty());
+    }
+
+    #[test]
+    fn the_live_properties_are_all_present_in_order() {
+        let xml = live_xml(Some("alice"), RoleMembership::new().with_role("alice", "webdav:read"));
+        let positions: Vec<usize> = ["owner", "group", "supported-privilege-set", "current-user-privilege-set", "acl", "principal-collection-set"]
+            .iter()
+            .map(|n| xml.find(&format!(":{n}")).unwrap_or_else(|| panic!("{n} missing in {xml}")))
+            .collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]), "{positions:?} in {xml}");
+    }
+
+    #[test]
+    fn the_supported_privilege_set_describes_the_whole_tree() {
+        let xml = live_xml(Some("alice"), RoleMembership::new());
+        let set = &xml[xml.find("supported-privilege-set").unwrap()..xml.rfind("supported-privilege-set").unwrap()];
+        for p in [
+            "all", "read", "read-acl", "read-current-user-privilege-set", "write", "write-properties",
+            "write-content", "bind", "unbind", "write-acl", "unlock",
+        ] {
+            assert!(set.contains(&format!(":{p}/>")), "{p} missing from {set}");
+        }
+        assert!(set.contains("All privileges") && set.contains("Write content"));
+        // every <supported-privilege> that opens is closed again
+        assert_eq!(set.matches("<D:supported-privilege>").count(), set.matches("</D:supported-privilege>").count(), "{set}");
+        // all is abstract
+        let all = &set[..set.find("Read").unwrap()];
+        assert!(all.contains(":abstract/>"), "{all}");
+    }
+
+    #[test]
+    fn the_acl_property_names_what_the_current_user_may_do() {
+        let xml = live_xml(Some("alice"), RoleMembership::new().with_role("alice", "webdav:read"));
+        let acl = &xml[xml.find("<D:acl>").unwrap()..xml.find("</D:acl>").unwrap()];
+        assert!(acl.contains("<D:ace>") && acl.contains(":authenticated/>") && acl.contains("<D:grant>"), "{acl}");
+        assert!(acl.contains(":read/>"), "{acl}");
+        assert!(!acl.contains(":write/>"), "{acl}");
+    }
+
+    #[test]
+    fn the_acl_property_is_empty_without_privileges_or_a_user() {
+        for (user, roles) in [
+            (None, RoleMembership::new().with_role("alice", "webdav:all")),
+            (Some("alice"), RoleMembership::new()),
+        ] {
+            let xml = live_xml(user, roles);
+            assert!(!xml.contains("<D:ace>"), "{xml}");
+        }
+    }
+
+    #[test]
+    fn nothing_is_written_when_acl_is_disabled() {
+        let mut w = crate::xml_out::PropXmlWriter::new_vec();
+        let ctx = AclContext { enabled: false, username: Some("alice".into()), roles: None };
+        write_acl_live_properties(&mut w, &ctx).unwrap();
+        let _ = w.flush();
+        assert!(w.into_inner().is_empty());
+    }
+
+    #[test]
+    fn enabled_acl_without_a_role_policy_is_a_server_error() {
+        let mut w = crate::xml_out::PropXmlWriter::new_vec();
+        let ctx = AclContext { enabled: true, username: Some("alice".into()), roles: None };
+        assert_eq!(write_acl_live_properties(&mut w, &ctx), Err(500));
+    }
+
+    #[test]
+    fn the_property_name_list_matches_what_is_written() {
+        let xml = live_xml(Some("alice"), RoleMembership::new());
+        for name in acl_live_property_names() {
+            assert!(xml.contains(&format!(":{name}")), "{name} not written in {xml}");
+        }
+        assert_eq!(acl_live_property_names().len(), 6);
     }
 }
