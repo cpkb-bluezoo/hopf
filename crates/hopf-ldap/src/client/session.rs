@@ -287,7 +287,8 @@ impl LdapSession {
         }
         let message_id = self.shared.alloc_message_id();
         let bytes = encode_unbind_request(message_id);
-        let _ = self.shared.send_bytes(bytes);
+        // The session is marked closed already, so `send_bytes` would refuse:
+        // the Unbind goes out on the connection handle itself, ahead of the close.
         if let Some(conn) = self
             .shared
             .conn
@@ -295,6 +296,7 @@ impl LdapSession {
             .unwrap_or_else(|e| e.into_inner())
             .take()
         {
+            conn.send(bytes);
             conn.close();
         }
         self.shared.fail_all_pending(LdapError::Closed);

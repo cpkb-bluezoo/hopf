@@ -12,6 +12,8 @@ mod filter;
 mod message;
 mod replica;
 mod session;
+#[cfg(test)]
+pub(crate) mod session_tests;
 mod sync;
 #[cfg(test)]
 mod sync_tests;

@@ -528,4 +528,274 @@ mod tests {
         store.validate_bearer("t", Box::new(move |r| { let _ = tx.send(r); }));
         assert!(rx.recv().unwrap().is_none());
     }
+
+    // -----------------------------------------------------------------
+    // Search-then-bind against a scripted LDAP server
+    // -----------------------------------------------------------------
+
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    use crate::client::session_tests::{bind_response, done, entry};
+    use crate::{Asn1Element, Asn1Type, BerDecoder};
+
+    /// Answers each request with the messages `handler` returns.
+    type Handler = Arc<dyn Fn(&Asn1Element) -> Vec<Vec<u8>> + Send + Sync>;
+
+    struct Directory {
+        port: u16,
+        requests: Arc<Mutex<Vec<Asn1Element>>>,
+    }
+
+    fn serve(handler: Handler) -> Directory {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&requests);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let handler = Arc::clone(&handler);
+                let log = Arc::clone(&log);
+                thread::spawn(move || {
+                    let mut dec = BerDecoder::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        if dec.receive(&buf[..n]).is_err() {
+                            return;
+                        }
+                        while let Some(msg) = dec.next() {
+                            let id = msg.child(0).as_i32().unwrap();
+                            let tag = Asn1Type::tag_number(msg.child(1).tag());
+                            log.lock().unwrap().push(msg.clone());
+                            if tag == 2 {
+                                return;
+                            }
+                            let _ = id;
+                            for reply in handler(&msg) {
+                                if stream.write_all(&reply).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        Directory { port, requests }
+    }
+
+    fn id(m: &Asn1Element) -> i32 {
+        m.child(0).as_i32().unwrap()
+    }
+
+    fn op(m: &Asn1Element) -> u8 {
+        Asn1Type::tag_number(m.child(1).tag())
+    }
+
+    /// A directory with one user, `alice`, whose password is `secret`.
+    fn alice() -> Handler {
+        Arc::new(|m| match op(m) {
+            0 => {
+                let dn = m.child(1).child(1).as_string().unwrap_or_default();
+                let pw = m.child(1).child(2).as_string().unwrap_or_default();
+                let ok = dn.is_empty() || (dn == "uid=alice,dc=example" && pw == "secret");
+                vec![bind_response(id(m), if ok { 0 } else { 49 }, "", "", &[])]
+            }
+            3 => {
+                let filter = m.child(1).child(6);
+                let who = filter.child(1).as_octet_string().unwrap_or_default().to_vec();
+                let mut out = Vec::new();
+                if who == b"alice" {
+                    out.push(entry(id(m), "uid=alice,dc=example", &[]));
+                }
+                out.push(done(id(m), 0, &[]));
+                out
+            }
+            _ => vec![],
+        })
+    }
+
+    fn store(port: u16) -> LdapCredentialStore {
+        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        LdapCredentialStore::new(
+            LdapStoreConfig::new("127.0.0.1", "dc=example", rt)
+                .with_port(port)
+                .with_timeout(Duration::from_secs(5)),
+        )
+    }
+
+    #[test]
+    fn the_right_password_matches() {
+        let dir = serve(alice());
+        let s = store(dir.port);
+        assert!(s.password_match("alice", "secret"));
+    }
+
+    #[test]
+    fn the_wrong_password_does_not() {
+        let dir = serve(alice());
+        assert!(!store(dir.port).password_match("alice", "nope"));
+    }
+
+    #[test]
+    fn an_unknown_user_or_an_empty_name_does_not() {
+        let dir = serve(alice());
+        let s = store(dir.port);
+        assert!(!s.password_match("bob", "secret"));
+        assert!(!s.password_match("", "secret"));
+    }
+
+    #[test]
+    fn the_search_asks_for_the_user_with_the_configured_filter() {
+        let dir = serve(alice());
+        store(dir.port).password_match("alice", "secret");
+        let requests = dir.requests.lock().unwrap();
+        let search = requests.iter().find(|m| op(m) == 3).expect("a search");
+        let op = search.child(1);
+        assert_eq!(op.child(0).as_string().as_deref(), Some("dc=example"));
+        assert_eq!(op.child(1).as_i32().unwrap(), 2, "whole subtree");
+        assert_eq!(op.child(3).as_i32().unwrap(), 1, "one entry is enough");
+    }
+
+    #[test]
+    fn a_name_with_filter_characters_is_searched_for_literally() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s2 = Arc::clone(&seen);
+        let dir = serve(Arc::new(move |m| {
+            if op(m) == 3 {
+                let value = m.child(1).child(6).child(1).as_octet_string().unwrap_or_default().to_vec();
+                s2.lock().unwrap().push(value);
+                return vec![done(id(m), 0, &[])];
+            }
+            vec![bind_response(id(m), 0, "", "", &[])]
+        }));
+        store(dir.port).password_match("a*(b)\\c", "x");
+        assert_eq!(seen.lock().unwrap().as_slice(), [b"a*(b)\\c".to_vec()]);
+    }
+
+    #[test]
+    fn a_service_account_is_bound_before_the_search() {
+        let dir = serve(alice());
+        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        let s = LdapCredentialStore::new(
+            LdapStoreConfig::new("127.0.0.1", "dc=example", rt)
+                .with_port(dir.port)
+                .with_bind("uid=alice,dc=example", "secret")
+                .with_timeout(Duration::from_secs(5)),
+        );
+        assert!(s.password_match("alice", "secret"));
+        let requests = dir.requests.lock().unwrap();
+        let ops: Vec<u8> = requests.iter().map(|m| op(m)).collect();
+        assert_eq!(&ops[..2], [0, 3], "bind then search: {ops:?}");
+    }
+
+    #[test]
+    fn a_refused_service_account_matches_nobody() {
+        let dir = serve(alice());
+        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        let s = LdapCredentialStore::new(
+            LdapStoreConfig::new("127.0.0.1", "dc=example", rt)
+                .with_port(dir.port)
+                .with_bind("uid=svc,dc=example", "wrong")
+                .with_timeout(Duration::from_secs(5)),
+        );
+        assert!(!s.password_match("alice", "secret"));
+    }
+
+    #[test]
+    fn a_failed_search_matches_nobody() {
+        let dir = serve(Arc::new(|m| match op(m) {
+            3 => vec![done(id(m), 50, &[])],
+            _ => vec![bind_response(id(m), 0, "", "", &[])],
+        }));
+        assert!(!store(dir.port).password_match("alice", "secret"));
+    }
+
+    #[test]
+    fn a_server_that_never_answers_times_out_to_no_match() {
+        let dir = serve(Arc::new(|_| vec![]));
+        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        let s = LdapCredentialStore::new(
+            LdapStoreConfig::new("127.0.0.1", "dc=example", rt)
+                .with_port(dir.port)
+                .with_timeout(Duration::from_millis(300)),
+        );
+        assert!(!s.password_match("alice", "secret"));
+    }
+
+    #[test]
+    fn nothing_listening_matches_nobody() {
+        let port = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        assert!(!store(port).password_match("alice", "secret"));
+    }
+
+    #[test]
+    fn a_referral_is_chased_to_the_directory_that_has_the_user() {
+        let real = serve(alice());
+        let real_port = real.port;
+        let front = serve(Arc::new(move |m| match op(m) {
+            3 => vec![done(id(m), 10, &[&format!("ldap://127.0.0.1:{real_port}/dc=example")])],
+            _ => vec![bind_response(id(m), 0, "", "", &[])],
+        }));
+        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        let chasing = LdapCredentialStore::new(
+            LdapStoreConfig::new("127.0.0.1", "dc=example", Arc::clone(&rt))
+                .with_port(front.port)
+                .with_chase_referrals(true)
+                .with_timeout(Duration::from_secs(5)),
+        );
+        assert!(chasing.password_match("alice", "secret"));
+        let not_chasing = LdapCredentialStore::new(
+            LdapStoreConfig::new("127.0.0.1", "dc=example", rt)
+                .with_port(front.port)
+                .with_chase_referrals(false)
+                .with_timeout(Duration::from_secs(5)),
+        );
+        assert!(!not_chasing.password_match("alice", "secret"));
+    }
+
+    #[test]
+    fn referral_chasing_stops_at_the_hop_limit() {
+        // A directory that always refers to a fresh URL on itself.
+        let port_cell = Arc::new(Mutex::new(0u16));
+        let pc = Arc::clone(&port_cell);
+        let counter = Arc::new(Mutex::new(0u32));
+        let dir = serve(Arc::new(move |m| match op(m) {
+            3 => {
+                let mut n = counter.lock().unwrap();
+                *n += 1;
+                let port = *pc.lock().unwrap();
+                vec![done(id(m), 10, &[&format!("ldap://127.0.0.1:{port}/dc=hop{n}")])]
+            }
+            _ => vec![bind_response(id(m), 0, "", "", &[])],
+        }));
+        *port_cell.lock().unwrap() = dir.port;
+        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        let s = LdapCredentialStore::new(
+            LdapStoreConfig::new("127.0.0.1", "dc=example", rt)
+                .with_port(dir.port)
+                .with_chase_referrals(true)
+                .with_max_referral_hops(2)
+                .with_timeout(Duration::from_secs(5)),
+        );
+        assert!(!s.password_match("alice", "secret"));
+        let searches = dir.requests.lock().unwrap().iter().filter(|m| op(m) == 3).count();
+        assert_eq!(searches, 3, "the first search plus two hops");
+    }
+
+    #[test]
+    fn the_unused_credential_kinds_are_not_offered() {
+        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        let s = LdapCredentialStore::new(LdapStoreConfig::new("127.0.0.1", "dc=example", rt));
+        assert!(s.authenticate_certificate("any").is_none());
+    }
 }

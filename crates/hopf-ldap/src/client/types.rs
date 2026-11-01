@@ -499,3 +499,99 @@ impl LdapClientConfig {
         self.starttls_connector.is_some()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn result_codes_round_trip_and_unknown_ones_are_kept() {
+        for code in [0, 1, 2, 3, 4, 10, 32, 49, 80, 4096, 123] {
+            assert_eq!(LdapResultCode::from_code(code).code(), code);
+        }
+        assert_eq!(LdapResultCode::from_code(123), LdapResultCode::Unknown(123));
+        assert!(LdapResultCode::Success.is_success());
+        assert!(!LdapResultCode::Referral.is_success());
+    }
+
+    #[test]
+    fn result_codes_display_their_name_and_number() {
+        assert_eq!(LdapResultCode::InvalidCredentials.to_string(), "invalidCredentials (49)");
+        assert_eq!(LdapResultCode::SyncRefreshRequired.to_string(), "e-syncRefreshRequired (4096)");
+        assert_eq!(LdapResultCode::Unknown(7).to_string(), "unknown (7)");
+    }
+
+    #[test]
+    fn errors_display_and_chain_their_causes() {
+        use std::error::Error;
+        let io = LdapError::from(io::Error::new(io::ErrorKind::BrokenPipe, "pipe"));
+        assert!(io.to_string().contains("pipe") && io.source().is_some());
+        let asn1 = LdapError::from(Asn1Error::new("bad"));
+        assert!(asn1.to_string().contains("bad") && asn1.source().is_some());
+        for (err, text) in [
+            (LdapError::Timeout, "timed out"),
+            (LdapError::Closed, "closed"),
+            (LdapError::Cancelled, "cancelled"),
+            (LdapError::BindFailed(LdapResultCode::InvalidCredentials), "bind failed: invalidCredentials"),
+            (LdapError::SearchFailed(LdapResultCode::Other), "search failed: other"),
+            (LdapError::StartTlsFailed(LdapResultCode::ProtocolError), "STARTTLS failed: protocolError"),
+            (LdapError::Protocol("x".into()), "protocol error: x"),
+            (LdapError::Referral("r".into()), "referral error: r"),
+            (LdapError::Config("c".into()), "config error: c"),
+        ] {
+            assert!(err.to_string().contains(text), "{err}");
+            assert!(err.source().is_none());
+        }
+    }
+
+    #[test]
+    fn scope_and_alias_policies_have_their_wire_values() {
+        assert_eq!(
+            [SearchScope::BaseObject, SearchScope::SingleLevel, SearchScope::WholeSubtree].map(SearchScope::value),
+            [0, 1, 2]
+        );
+        assert_eq!(
+            [DerefAliases::Never, DerefAliases::InSearching, DerefAliases::FindingBaseObj, DerefAliases::Always]
+                .map(DerefAliases::value),
+            [0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn a_new_search_is_a_subtree_search_with_no_limits() {
+        let r = SearchRequest::new("dc=x", "(a=b)");
+        assert_eq!(r.base_dn, "dc=x");
+        assert_eq!(r.filter, "(a=b)");
+        assert_eq!(r.scope, SearchScope::WholeSubtree);
+        assert_eq!((r.size_limit, r.time_limit, r.types_only), (0, 0, false));
+        assert_eq!(r.deref_aliases, DerefAliases::Never);
+        assert!(r.attributes.is_empty());
+        assert_eq!(SearchRequest::default().filter, "(objectClass=*)");
+    }
+
+    #[test]
+    fn a_config_resolves_a_literal_address_without_a_lookup() {
+        let c = LdapClientConfig::new("192.0.2.7", 1389);
+        assert_eq!(c.resolve_addr().unwrap(), "192.0.2.7:1389".parse().unwrap());
+        assert_eq!((c.host(), c.port()), (Some("192.0.2.7"), 1389));
+        let from = LdapClientConfig::from_addr("127.0.0.1:99".parse().unwrap());
+        assert_eq!(from.resolve_addr().unwrap().port(), 99);
+        assert_eq!(from.host(), None);
+    }
+
+    #[test]
+    fn a_unix_socket_config_has_no_address_to_resolve() {
+        let c = LdapClientConfig::from_unix_path("/run/ldapi");
+        assert_eq!(c.unix_path().unwrap(), Path::new("/run/ldapi"));
+        assert!(matches!(c.resolve_addr(), Err(LdapError::Config(_))));
+    }
+
+    #[test]
+    fn a_config_defaults_to_plain_with_a_connect_timeout() {
+        let c = LdapClientConfig::new("h", 389);
+        assert!(!c.is_ldaps() && !c.has_starttls());
+        assert!(c.tls().is_none() && c.starttls().is_none());
+        assert_eq!(c.connect_timeout_opt(), Some(Duration::from_secs(30)));
+        assert_eq!(c.connect_timeout(None).connect_timeout_opt(), None);
+    }
+}
