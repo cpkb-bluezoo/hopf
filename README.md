@@ -11,27 +11,22 @@ container.
 
 Hopf uses a **thread-per-core** readiness model on
 [mio](https://github.com/tokio-rs/mio) where connections are multiplexed
-over the thread and plain buffers. **Listen and dial** are equal bindings on
-one Runtime. Codecs are **incremental push parsers**: chunked, resumable
-ingress; handler-callback egress.
+over the thread and [loopbuf](https://github.com/cpkb-bluezoo/loopbuf) ring
+buffers. **Listen and dial** are equal bindings on one Runtime.
+Codecs are **incremental push parsers**: chunked, resumable
+ingress also using loopbuf buffers; handler-callback egress.
 
 **Security:** cryptography is consolidated under
 [`hopf-core`](crates/hopf-core) on **AWS-LC** (BoringSSL lineage, reached
 through `aws-lc-rs`/`aws-lc-sys`), with TLS, DTLS, and QUIC implemented
-in-tree on the same thread-per-core reactor model — TCP TLS 1.2/1.3
+in-tree on the same thread-per-core reactor model: TCP TLS 1.2/1.3
 (`hopf-core::tls`), UDP DTLS 1.2/1.3 with per-peer version negotiation
 (`hopf-core::dtls`/`dtls12`), and QUIC's RFC 9000 transport plus its TLS 1.3
-handshake (`hopf-quic`), hybrid-first PQC key exchange. No `rustls` or
-`quinn-proto` dependency remains in any production crate; `hopf-tls` is
-kept only as a `rustls`-based interop test harness for `hopf-core::tls`.
-Remaining work — DTLS's generic `Endpoint` integration, optional
-GSSAPI/Kerberos SASL — is tracked in
-[Architecture](https://cpkb-bluezoo.github.io/hopf/architecture.html#security-substrate)
-and the [conformance audit](https://cpkb-bluezoo.github.io/hopf/conformance.html#security-substrate).
+handshake (`hopf-quic`), hybrid-first PQC key exchange.
 
 Sibling parsers ([crates.io](https://crates.io); local path override via
 `[patch.crates-io]` when hacking):
-[tractrix](https://crates.io/crates/tractrix) (XML — WebDAV + composition),
+[tractrix](https://crates.io/crates/tractrix) (XML - WebDAV + composition),
 [rjsonparser](https://crates.io/crates/rjsonparser) (JSON),
 [rmimeparser](https://crates.io/crates/rmimeparser) (MIME and RFC5322),
 [rprotobuf](https://crates.io/crates/rprotobuf) (Protobuf).
