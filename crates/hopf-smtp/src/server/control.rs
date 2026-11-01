@@ -46,6 +46,16 @@ struct AuthCheckOutcome {
     result: Result<(Box<dyn SaslServer>, SaslServerStep), String>,
 }
 
+/// The reply owed for a message that was aborted while the client is still
+/// sending it: the rest of the message is read and thrown away, and this is
+/// sent once, when the client has finished.
+#[derive(Clone, Copy)]
+struct DiscardReply {
+    code: u16,
+    enhanced: &'static str,
+    text: &'static str,
+}
+
 /// Control-channel SMTP protocol handler.
 pub struct SmtpControlHandler {
     client_connected: Option<Box<dyn SmtpClientConnected>>,
@@ -113,6 +123,8 @@ pub struct SmtpControlHandler {
     /// which alone isn't enough to stop a *separate* later `receive()`
     /// call from being misinterpreted as more DATA content.
     pending_finish: bool,
+    /// Set while the rest of an aborted message is being read and dropped.
+    discard: Option<DiscardReply>,
 }
 
 impl SmtpControlHandler {
@@ -178,6 +190,7 @@ impl SmtpControlHandler {
             busy: Arc::new(AtomicBool::new(false)),
             pending_auth_check: Arc::new(Mutex::new(None)),
             pending_finish: false,
+            discard: None,
         }
     }
 
@@ -408,6 +421,39 @@ impl SmtpControlHandler {
             self.session = SmtpSessionState::Ready;
         }
         self.recipient = None;
+    }
+
+    /// Abandon the message being received, because of `reply`, but keep
+    /// reading what the client is still sending: `mode` is `Data` or `Bdat`.
+    /// The reply is sent once the client has finished (see
+    /// [`Self::finish_discard`]). The handler chain cannot be resumed after an
+    /// abort, so the client greets again before its next transaction.
+    fn abort_message(&mut self, mode: SmtpSessionState, reply: DiscardReply) {
+        if let Some(m) = &mut self.message {
+            m.message_aborted();
+        }
+        if self.tx_timer.is_some() || self.tx_span.is_some() {
+            self.end_transaction_telemetry("aborted");
+        }
+        // The dot-unstuffer and the BDAT counter must go on tracking where
+        // the client is, so they survive the reset.
+        let unstuffer = std::mem::take(&mut self.unstuffer);
+        let bdat = self.bdat.take();
+        self.reset_transaction();
+        self.unstuffer = unstuffer;
+        self.bdat = bdat;
+        self.session = mode;
+        self.discard = Some(reply);
+    }
+
+    /// The client has finished sending an aborted message: say why, once.
+    fn finish_discard(&mut self, endpoint: &mut dyn Endpoint) {
+        let Some(d) = self.discard.take() else { return };
+        self.send_enhanced(endpoint, d.code, d.enhanced, d.text);
+        self.unstuffer.reset();
+        self.bdat = None;
+        self.bdat_started = false;
+        self.session = SmtpSessionState::Ready;
     }
 
     fn parse_address(&self, raw: &str) -> Option<EmailAddress> {
@@ -860,44 +906,41 @@ impl SmtpControlHandler {
 
     fn feed_data(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         let (chunks, complete_at) = self.unstuffer.feed_with_pending(data);
-        for chunk in chunks {
-            self.message_bytes += chunk.len() as u64;
-            if self.message_bytes > self.config.max_message_size {
-                if let Some(m) = &mut self.message {
-                    m.message_aborted();
+        if self.discard.is_none() {
+            for chunk in chunks {
+                self.message_bytes += chunk.len() as u64;
+                if self.message_bytes > self.config.max_message_size {
+                    self.abort_message(
+                        SmtpSessionState::Data,
+                        DiscardReply { code: 552, enhanced: "5.3.4", text: "Message size exceeds maximum" },
+                    );
+                    break;
                 }
-                self.send_enhanced(endpoint, 552, "5.3.4", "Message size exceeds maximum");
-                self.reset_transaction();
-                *data = &[];
-                return;
-            }
-            if let Some(p) = &mut self.pipeline {
-                if !p.message_content(&chunk) {
-                    // Unrecoverable pipeline error (e.g. disk full): stop
-                    // wasting the transfer on a message that's already
-                    // doomed. RFC 5321 gives no way to reply mid-DATA, so
-                    // this mirrors the max-size abort above — reply now,
-                    // reset the transaction, and discard whatever's left
-                    // in this read (the client's own eventual terminator
-                    // gets reinterpreted as a fresh command line, same as
-                    // any other mid-DATA abort here).
-                    if let Some(m) = &mut self.message {
-                        m.message_aborted();
+                if let Some(p) = &mut self.pipeline {
+                    if !p.message_content(&chunk) {
+                        // Unrecoverable pipeline error (e.g. disk full): stop
+                        // wasting the transfer on a message that's already
+                        // doomed, but let the client finish sending it.
+                        self.abort_message(
+                            SmtpSessionState::Data,
+                            DiscardReply { code: 452, enhanced: "4.3.1", text: "Insufficient system storage" },
+                        );
+                        break;
                     }
-                    self.send_enhanced(endpoint, 452, "4.3.1", "Insufficient system storage");
-                    self.reset_transaction();
-                    *data = &[];
-                    return;
+                } else if let Some(m) = &mut self.message {
+                    m.message_content(&chunk);
                 }
-            } else if let Some(m) = &mut self.message {
-                m.message_content(&chunk);
             }
         }
         if let Some(n) = complete_at {
             let rest = if n <= data.len() { &data[n..] } else { &[] };
             self.leftover = rest.to_vec();
             *data = &[];
-            self.finish_message(endpoint);
+            if self.discard.is_some() {
+                self.finish_discard(endpoint);
+            } else {
+                self.finish_message(endpoint);
+            }
         } else {
             *data = &[];
         }
@@ -912,35 +955,34 @@ impl SmtpControlHandler {
         let chunk = chunk.to_vec();
         let rest = rest.to_vec();
         let complete = self.bdat.as_ref().map(|b| b.is_complete()).unwrap_or(false);
-        self.message_bytes += chunk.len() as u64;
-        if self.message_bytes > self.config.max_message_size {
-            if let Some(m) = &mut self.message {
-                m.message_aborted();
-            }
-            self.send_enhanced(endpoint, 552, "5.3.4", "Message size exceeds maximum");
-            self.reset_transaction();
-            *data = &[];
-            return;
-        }
-        if !chunk.is_empty() {
-            if let Some(p) = &mut self.pipeline {
-                if !p.message_content(&chunk) {
-                    if let Some(m) = &mut self.message {
-                        m.message_aborted();
+        if self.discard.is_none() {
+            self.message_bytes += chunk.len() as u64;
+            if self.message_bytes > self.config.max_message_size {
+                self.abort_message(
+                    SmtpSessionState::Bdat,
+                    DiscardReply { code: 552, enhanced: "5.3.4", text: "Message size exceeds maximum" },
+                );
+            } else if !chunk.is_empty() {
+                if let Some(p) = &mut self.pipeline {
+                    if !p.message_content(&chunk) {
+                        self.abort_message(
+                            SmtpSessionState::Bdat,
+                            DiscardReply { code: 452, enhanced: "4.3.1", text: "Insufficient system storage" },
+                        );
                     }
-                    self.send_enhanced(endpoint, 452, "4.3.1", "Insufficient system storage");
-                    self.reset_transaction();
-                    *data = &[];
-                    return;
+                } else if let Some(m) = &mut self.message {
+                    m.message_content(&chunk);
                 }
-            } else if let Some(m) = &mut self.message {
-                m.message_content(&chunk);
             }
         }
         *data = &[];
         self.leftover = rest;
         if complete {
-            self.finish_bdat_chunk(endpoint);
+            if self.discard.is_some() {
+                self.finish_discard(endpoint);
+            } else {
+                self.finish_bdat_chunk(endpoint);
+            }
         }
     }
 
@@ -2150,3 +2192,7 @@ mod pending_finish_tests {
         assert_eq!(last_reply_code(&ep.sent), Some(250));
     }
 }
+
+#[cfg(test)]
+#[path = "control_session_tests.rs"]
+mod session_tests;
