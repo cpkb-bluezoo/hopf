@@ -1077,4 +1077,146 @@ mod tests {
             r#"{"nums":[1,300],"names":["a","b"],"counts":{"k":5},"innerByName":{"x":{"v":7}}}"#
         );
     }
+
+    // -- one script, both encodings ----------------------------------------------------
+
+    /// An event for a serializer: a scalar field, the start of a nested
+    /// message (or map entry, or the value of one), or its end.
+    enum Ev {
+        F(&'static str, ScalarValue),
+        S(&'static str, &'static str),
+        E,
+    }
+
+    /// The JSON the serializer writes for `script`.
+    fn json_of(script: &[Ev]) -> String {
+        let mut o = Out::new();
+        for ev in script {
+            match ev {
+                Ev::F(name, v) => o.field(name, v.clone()).unwrap(),
+                Ev::S(name, t) => o.start(name, t).unwrap(),
+                Ev::E => o.end(),
+            }
+        }
+        o.finish()
+    }
+
+    /// The JSON for `script` written as protobuf, read back and written as JSON.
+    fn json_via_protobuf(script: &[Ev]) -> String {
+        use crate::proto::{ProtoModelAdapter, ProtoModelSerializer};
+        use rprotobuf::Parser;
+        let proto = ProtoFileParser::parse(REPEATED).unwrap();
+        let mut ser = ProtoModelSerializer::new(proto.clone());
+        let mut w = rprotobuf::Writer::new();
+        let mut ring = LoopBuf::with_capacity(4096);
+        ser.start_message("demo.R").unwrap();
+        for ev in script {
+            match ev {
+                Ev::F(name, v) => ser.field(&mut w, &mut ring, name, v.clone()).unwrap(),
+                Ev::S(name, t) => ser.start_field(name, t).unwrap(),
+                Ev::E => ser.end_field(&mut w, &mut ring).unwrap(),
+            }
+        }
+        ser.end_message();
+        let mut wire = Vec::new();
+        w.drain_to(&mut ring, &mut wire).unwrap();
+
+        let mut adapter = ProtoModelAdapter::new(proto, Replay::new());
+        adapter.start_root_message("demo.R").unwrap();
+        {
+            let mut pb = Parser::new(&mut adapter);
+            pb.parse(wire.as_slice()).unwrap();
+        }
+        adapter.end_root_message().unwrap();
+        let replay = adapter.into_handler();
+        assert_eq!(replay.error, None);
+        replay.out.finish()
+    }
+
+    #[test]
+    fn a_handler_gets_the_same_message_in_either_encoding() {
+        use Ev::{E, F, S};
+        let script = [
+            F("nums", ScalarValue::I32(1)),
+            F("nums", ScalarValue::I32(-300)),
+            F("names", text("a")),
+            F("names", text("b")),
+            F("big", ScalarValue::I64(-9)),
+            F("colors", ScalarValue::U64(1)),
+            F("blobs", ScalarValue::Bytes(vec![0xfb, 0xff])),
+            F("ds", ScalarValue::F64(0.5)),
+            F("flags", ScalarValue::Bool(true)),
+            S("inners", "demo.Inner"),
+            F("v", ScalarValue::I32(5)),
+            F("tags", text("t1")),
+            F("tags", text("t2")),
+            E,
+            S("inners", "demo.Inner"),
+            E,
+            S("counts", "counts.MapEntry"),
+            F("key", text("a")),
+            F("value", ScalarValue::I32(1)),
+            E,
+            S("counts", "counts.MapEntry"),
+            F("key", text("b")),
+            F("value", ScalarValue::I32(-2)),
+            E,
+            S("by_id", "by_id.MapEntry"),
+            F("key", ScalarValue::I32(-4)),
+            F("value", text("minus four")),
+            E,
+            S("by_flag", "by_flag.MapEntry"),
+            F("key", ScalarValue::Bool(true)),
+            F("value", text("yes")),
+            E,
+            S("by_big", "by_big.MapEntry"),
+            F("key", ScalarValue::U64(u64::MAX)),
+            F("value", text("max")),
+            E,
+            S("inner_by_name", "inner_by_name.MapEntry"),
+            F("key", text("x")),
+            S("value", "demo.Inner"),
+            F("v", ScalarValue::I32(7)),
+            E,
+            E,
+            S("shades", "shades.MapEntry"),
+            F("key", text("s")),
+            F("value", ScalarValue::U64(2)),
+            E,
+            S("longs", "longs.MapEntry"),
+            F("key", text("n")),
+            F("value", ScalarValue::I64(-1)),
+            E,
+            S("raw", "raw.MapEntry"),
+            F("key", text("r")),
+            F("value", ScalarValue::Bytes(b"foo".to_vec())),
+            E,
+            F("s", text("x")),
+            S("one", "demo.Inner"),
+            F("tags", text("c")),
+            E,
+        ];
+        let json = json_of(&script);
+        assert!(json.contains(r#""counts":{"a":1,"b":-2}"#) && json.contains(r#""one":{"tags":["c"]}"#), "{json}");
+        assert_eq!(json_via_protobuf(&script), json);
+    }
+
+    #[test]
+    fn defaults_in_a_map_entry_come_out_the_same_in_either_encoding() {
+        use Ev::{E, F, S};
+        let script = [
+            S("counts", "counts.MapEntry"),
+            F("key", text("only-key")),
+            E,
+            S("counts", "counts.MapEntry"),
+            F("value", ScalarValue::I32(9)),
+            E,
+            S("by_id", "by_id.MapEntry"),
+            E,
+            S("inner_by_name", "inner_by_name.MapEntry"),
+            F("key", text("k")),
+            E,
+        ];
+        assert_eq!(json_via_protobuf(&script), json_of(&script));
+    }
 }

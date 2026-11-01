@@ -471,6 +471,7 @@ impl GrpcResponseChannel {
                 },
             },
             started: false,
+            open_fields: 0,
             channel: self.clone(),
         })
     }
@@ -597,6 +598,50 @@ impl ResponseBody {
     }
 }
 
+/// Room left in the ring for the key, brackets and separators a structural
+/// event writes around its value.
+const ROOM_FOR_STRUCTURE: usize = 512;
+
+impl ResponseBody {
+    /// Grows the ring until `bytes` more fit. A write that is several writer
+    /// calls (a key, then a value) is not atomic as a whole: one that ran
+    /// out of room part-way would, repeated, write its first part twice. With
+    /// the room made first, it cannot.
+    fn reserve(&mut self, bytes: usize) -> Result<(), String> {
+        loop {
+            let ring = match self {
+                ResponseBody::Proto { ring, .. } | ResponseBody::Json { ring, .. } => &*ring,
+            };
+            if ring.capacity() - ring.len() >= bytes {
+                return Ok(());
+            }
+            self.grow()?;
+        }
+    }
+
+    /// The most `value` can take to write: exact for the JSON text of a
+    /// string, and the base64 of bytes, so that a large value does not make
+    /// the ring larger than it needs to be.
+    fn room_for(&self, value: &ScalarValue) -> usize {
+        let json = matches!(self, ResponseBody::Json { .. });
+        ROOM_FOR_STRUCTURE
+            + match value {
+                ScalarValue::String(s) if json => s
+                    .bytes()
+                    .map(|b| match b {
+                        b'"' | b'\\' => 2,
+                        0..=0x1f => 6,
+                        _ => 1,
+                    })
+                    .sum(),
+                ScalarValue::String(s) => s.len(),
+                ScalarValue::Bytes(b) if json => b.len().div_ceil(3) * 4,
+                ScalarValue::Bytes(b) => b.len(),
+                _ => 0,
+            }
+    }
+}
+
 /// Whether a write failed for want of room, rather than for being invalid:
 /// the ring is full (`WouldBlock`) or smaller than the write (`InvalidInput`,
 /// worded as the writers do, which is how it differs from a NaN in JSON).
@@ -631,6 +676,8 @@ pub struct GrpcResponseMessage {
     type_name: String,
     body: ResponseBody,
     started: bool,
+    /// Nested messages started with [`Self::start_field`] and not yet ended.
+    open_fields: usize,
     channel: GrpcResponseChannel,
 }
 
@@ -664,8 +711,12 @@ impl GrpcResponseMessage {
         self.body.grow()
     }
 
+    /// Writes a scalar field, or one element of a repeated field (call it
+    /// once per element, with the elements together). Inside
+    /// [`Self::start_field`] it is a field of that message.
     pub fn field(&mut self, name: &str, value: ScalarValue) -> Result<(), String> {
         self.ensure_started()?;
+        self.body.reserve(self.body.room_for(&value))?;
         write_growing(&mut self.body, |body| match body {
             ResponseBody::Proto {
                 serializer,
@@ -680,7 +731,61 @@ impl GrpcResponseMessage {
         })
     }
 
+    /// Starts a nested message field: its fields follow, until
+    /// [`Self::end_field`]. Also one element of a repeated message field
+    /// (start one per element, together), and, for a map field, one entry:
+    /// write its `"key"`, then its `"value"` with [`Self::field`] or, for a
+    /// message value, another `start_field("value", ..)`; the type name given
+    /// for the entry itself is not used. The same calls write either
+    /// encoding (`application/grpc` or `application/grpc+json`).
+    ///
+    /// A field the message does not have is skipped, with everything inside it.
+    pub fn start_field(&mut self, name: &str, type_name: &str) -> Result<(), String> {
+        self.ensure_started()?;
+        self.body.reserve(ROOM_FOR_STRUCTURE)?;
+        match &mut self.body {
+            ResponseBody::Proto { serializer, .. } => {
+                serializer.start_field(name, type_name).map_err(|e| e.to_string())?;
+            }
+            ResponseBody::Json { .. } => {
+                write_growing(&mut self.body, |body| match body {
+                    ResponseBody::Json { serializer, writer, ring } => serializer.start_field(writer, ring, name, type_name),
+                    ResponseBody::Proto { .. } => Ok(()),
+                })?;
+            }
+        }
+        self.open_fields += 1;
+        Ok(())
+    }
+
+    /// Ends the nested message (or map entry) [`Self::start_field`] began.
+    pub fn end_field(&mut self) -> Result<(), String> {
+        if self.open_fields == 0 {
+            return Err("end_field without a start_field".into());
+        }
+        self.body.reserve(ROOM_FOR_STRUCTURE)?;
+        match &mut self.body {
+            ResponseBody::Proto { .. } => {
+                write_growing(&mut self.body, |body| match body {
+                    ResponseBody::Proto { serializer, writer, ring } => serializer.end_field(writer, ring),
+                    ResponseBody::Json { .. } => Ok(()),
+                })?;
+            }
+            ResponseBody::Json { .. } => {
+                write_growing(&mut self.body, |body| match body {
+                    ResponseBody::Json { serializer, writer, ring } => serializer.end_field(writer, ring),
+                    ResponseBody::Proto { .. } => Ok(()),
+                })?;
+            }
+        }
+        self.open_fields -= 1;
+        Ok(())
+    }
+
     pub fn complete(mut self) -> Result<(), String> {
+        if self.open_fields > 0 {
+            return Err(format!("{} start_field call(s) were never ended", self.open_fields));
+        }
         self.ensure_started()?;
         let bytes = match &mut self.body {
             ResponseBody::Proto {
@@ -2156,5 +2261,243 @@ mod tests {
         handler.request_body_content(&mut w, &grpc_frame(&msg("one")));
         handler.aborted(&mut w, &std::io::Error::new(std::io::ErrorKind::ConnectionReset, "RST_STREAM"));
         assert!(flags.cancelled.load(std::sync::atomic::Ordering::SeqCst), "cancelled() not called");
+    }
+
+    // -- nested messages, repeated fields and maps in a response (issue #513) --------
+
+    const NESTED_PROTO: &str = r#"
+        syntax = "proto3";
+        package test;
+        message Inner { int32 v = 1; }
+        message Req { }
+        message Rep {
+            repeated string names = 1; Inner one = 2; map<string, int32> counts = 3;
+            repeated Inner inners = 4; map<string, Inner> by_name = 5; string note = 6;
+        }
+        service Svc { rpc Call (Req) returns (Rep); }
+    "#;
+
+    /// A service that answers every call by running a script on the response.
+    struct ScriptedHandler {
+        channel: GrpcResponseChannel,
+        script: Arc<dyn Fn(&mut GrpcResponseMessage) -> Result<(), String> + Send + Sync>,
+        failed: Arc<Mutex<Option<String>>>,
+    }
+
+    impl ProtoMessageHandler for ScriptedHandler {
+        fn start_message(&mut self, _type_name: &str) -> Result<(), ProtoParseError> {
+            Ok(())
+        }
+        fn end_message(&mut self) -> Result<(), ProtoParseError> {
+            let mut m = self.channel.open_message(None).unwrap();
+            if let Err(e) = (self.script)(&mut m) {
+                *self.failed.lock().unwrap() = Some(e);
+                return Ok(());
+            }
+            if let Err(e) = m.complete() {
+                *self.failed.lock().unwrap() = Some(e);
+            }
+            Ok(())
+        }
+        fn field(&mut self, _name: &str, _value: ScalarValue) -> Result<(), ProtoParseError> {
+            Ok(())
+        }
+        fn start_field(&mut self, _name: &str, _type_name: &str) -> Result<(), ProtoParseError> {
+            Ok(())
+        }
+        fn end_field(&mut self) -> Result<(), ProtoParseError> {
+            Ok(())
+        }
+    }
+
+    struct ScriptedService {
+        script: Arc<dyn Fn(&mut GrpcResponseMessage) -> Result<(), String> + Send + Sync>,
+        failed: Arc<Mutex<Option<String>>>,
+    }
+
+    impl GrpcService for ScriptedService {
+        fn start_unary_call(&self, _path: &str, response: GrpcResponseChannel) -> Option<Box<dyn ProtoMessageHandler>> {
+            Some(Box::new(ScriptedHandler { channel: response, script: Arc::clone(&self.script), failed: Arc::clone(&self.failed) }))
+        }
+    }
+
+    /// The response payload (unframed) of a unary call answered by `script`,
+    /// in `content_type`, and what went wrong in the script if anything.
+    fn respond(content_type: &str, script: impl Fn(&mut GrpcResponseMessage) -> Result<(), String> + Send + Sync + 'static) -> (Vec<u8>, Option<String>) {
+        let failed = Arc::new(Mutex::new(None));
+        let proto = ProtoFileParser::parse(NESTED_PROTO).unwrap();
+        let factory = GrpcHandlerFactory::new(
+            proto,
+            Arc::new(ScriptedService { script: Arc::new(script), failed: Arc::clone(&failed) }),
+        );
+        let mut handler = factory.create_handler();
+        let mut w = MockWriter::default();
+        let mut h = Headers::new();
+        h.set(":method", "POST");
+        h.set(":path", "/test.Svc/Call");
+        h.set("content-type", content_type);
+        handler.headers(&mut w, &h);
+        handler.start_request_body(&mut w);
+        let request: &[u8] = if content_type.ends_with("json") { b"{}" } else { b"" };
+        handler.request_body_content(&mut w, &grpc_frame(request));
+        handler.end_request_body(&mut w);
+        handler.request_complete(&mut w);
+        let payload = w.body.get(5..).unwrap_or_default().to_vec();
+        let failed = failed.lock().unwrap().clone();
+        (payload, failed)
+    }
+
+    fn text(s: &str) -> ScalarValue {
+        ScalarValue::String(s.into())
+    }
+
+    /// A handler's way of writing a `Rep`, the same for both encodings.
+    fn write_rep(m: &mut GrpcResponseMessage) -> Result<(), String> {
+        m.field("names", text("a"))?;
+        m.field("names", text("b"))?;
+        m.start_field("one", "test.Inner")?;
+        m.field("v", ScalarValue::I32(5))?;
+        m.end_field()?;
+        m.start_field("counts", "")?;
+        m.field("key", text("x"))?;
+        m.field("value", ScalarValue::I32(1))?;
+        m.end_field()?;
+        m.start_field("counts", "")?;
+        m.field("key", text("y"))?;
+        m.field("value", ScalarValue::I32(2))?;
+        m.end_field()?;
+        for v in [1, 2] {
+            m.start_field("inners", "test.Inner")?;
+            m.field("v", ScalarValue::I32(v))?;
+            m.end_field()?;
+        }
+        m.start_field("by_name", "")?;
+        m.field("key", text("k"))?;
+        m.start_field("value", "test.Inner")?;
+        m.field("v", ScalarValue::I32(9))?;
+        m.end_field()?;
+        m.end_field()?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_handler_writes_nested_repeated_and_map_fields_as_json() {
+        let (payload, failed) = respond("application/grpc+json", write_rep);
+        assert_eq!(failed, None);
+        assert_eq!(
+            String::from_utf8(payload).unwrap(),
+            r#"{"names":["a","b"],"one":{"v":5},"counts":{"x":1,"y":2},"inners":[{"v":1},{"v":2}],"byName":{"k":{"v":9}}}"#
+        );
+    }
+
+    #[test]
+    fn the_same_calls_write_them_as_protobuf() {
+        fn len(field: u8, body: &[u8]) -> Vec<u8> {
+            [vec![field << 3 | 2, body.len() as u8], body.to_vec()].concat()
+        }
+        let (payload, failed) = respond("application/grpc", write_rep);
+        assert_eq!(failed, None);
+        let expected = [
+            len(1, b"a"),
+            len(1, b"b"),
+            len(2, &[0x08, 5]),
+            len(3, &[len(1, b"x"), vec![0x10, 1]].concat()),
+            len(3, &[len(1, b"y"), vec![0x10, 2]].concat()),
+            len(4, &[0x08, 1]),
+            len(4, &[0x08, 2]),
+            len(5, &[len(1, b"k"), len(2, &[0x08, 9])].concat()),
+        ]
+        .concat();
+        assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn values_far_bigger_than_the_ring_are_written_whole_inside_nested_messages() {
+        // The ring starts at 16 KiB; a repeated field of long strings and a
+        // map with thousands of entries make it grow in the middle of the
+        // multi-part writes (a key then its value, a bracket then an element).
+        fn big(m: &mut GrpcResponseMessage) -> Result<(), String> {
+            for i in 0..3 {
+                m.field("names", ScalarValue::String(format!("{i}{}", "x".repeat(40_000))))?;
+            }
+            for i in 0..2_000 {
+                m.start_field("counts", "")?;
+                m.field("key", ScalarValue::String(format!("key-{i}")))?;
+                m.field("value", ScalarValue::I32(i))?;
+                m.end_field()?;
+            }
+            m.start_field("one", "test.Inner")?;
+            m.field("v", ScalarValue::I32(1))?;
+            m.end_field()
+        }
+        let (json, failed) = respond("application/grpc+json", big);
+        assert_eq!(failed, None);
+        let json = String::from_utf8(json).unwrap();
+        assert!(json.starts_with(&format!(r#"{{"names":["0{}","1"#, "x".repeat(40_000))), "starts wrong");
+        assert!(json.contains(r#""key-0":0,"key-1":1,"#) && json.contains(r#""key-1999":1999}"#));
+        assert!(json.ends_with(r#""one":{"v":1}}"#));
+        assert_eq!(json.matches("key-").count(), 2_000);
+
+        let (pb, failed) = respond("application/grpc", big);
+        assert_eq!(failed, None);
+        assert!(pb.len() > 120_000 + 2_000 * 8, "{}", pb.len());
+        assert!(pb.ends_with(&[0x12, 2, 0x08, 1]), "the last field is `one`");
+    }
+
+    #[test]
+    fn a_nested_message_left_open_is_refused_at_complete_not_written_broken() {
+        for ct in ["application/grpc+json", "application/grpc"] {
+            let (payload, failed) = respond(ct, |m| {
+                m.start_field("one", "test.Inner")?;
+                m.field("v", ScalarValue::I32(1))
+            });
+            assert!(failed.as_deref().is_some_and(|f| f.contains("never ended")), "{ct}: {failed:?}");
+            assert!(payload.is_empty(), "{ct}: nothing was sent");
+        }
+    }
+
+    #[test]
+    fn ending_a_field_that_was_not_started_is_an_error() {
+        for ct in ["application/grpc+json", "application/grpc"] {
+            let (_, failed) = respond(ct, |m| m.end_field());
+            assert!(failed.as_deref().is_some_and(|f| f.contains("without a start_field")), "{ct}: {failed:?}");
+        }
+    }
+
+    #[test]
+    fn a_field_the_response_type_does_not_have_is_skipped_in_either_encoding() {
+        for (ct, expected) in [("application/grpc+json", r#"{"names":["a"]}"#.as_bytes().to_vec()), ("application/grpc", vec![0x0a, 1, b'a'])] {
+            let (payload, failed) = respond(ct, |m| {
+                m.start_field("nope", "test.Inner")?;
+                m.field("v", ScalarValue::I32(1))?;
+                m.end_field()?;
+                m.field("names", text("a"))
+            });
+            assert_eq!(failed, None, "{ct}");
+            assert_eq!(payload, expected, "{ct}");
+        }
+    }
+
+    #[test]
+    fn a_long_value_is_written_once_whatever_the_size_of_the_ring() {
+        // A key and then a value that does not fit the ring: the value's
+        // write is repeated after the ring grows, and the key must not be.
+        for ct in ["application/grpc+json", "application/grpc"] {
+            let (payload, failed) = respond(ct, |m| {
+                m.field("note", ScalarValue::String("n".repeat(100_000)))?;
+                m.start_field("counts", "")?;
+                m.field("key", ScalarValue::String("k".repeat(100_000)))?;
+                m.field("value", ScalarValue::I32(1))?;
+                m.end_field()
+            });
+            assert_eq!(failed, None, "{ct}");
+            if ct.ends_with("json") {
+                let json = String::from_utf8(payload).unwrap();
+                assert_eq!(json.matches(r#""note""#).count(), 1, "the key was written twice");
+                assert!(json.starts_with(&format!(r#"{{"note":"{}","counts":{{"{}":1}}}}"#, "n".repeat(100_000), "k".repeat(100_000))));
+            } else {
+                assert_eq!(payload.len(), 2 + 3 + 100_000 + 3 + (1 + 3 + 100_000 + 2), "{}", payload.len());
+            }
+        }
     }
 }
