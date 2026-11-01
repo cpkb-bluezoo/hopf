@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use rjsonparser::{ContentHandler, Number, ParseError, ParseResult};
 
 use super::base64;
+use super::well_known::{self, WellKnown};
 use super::{
     FieldDescriptor, FieldType, MessageDescriptor, ProtoFile, ProtoMessageHandler, ProtoParseError,
     ScalarValue,
@@ -32,6 +33,32 @@ enum Pending {
 enum AfterNested {
     RestoreArray(FieldDescriptor),
     CloseMapEntry(FieldDescriptor),
+}
+
+/// Where a bare JSON value (string, number or boolean) is going when that is
+/// a well-known type written as one.
+enum BareTarget {
+    Field { name: String, type_name: String, kind: WellKnown, in_array: bool },
+    MapValue { field: FieldDescriptor, key: ScalarValue, type_name: String, kind: WellKnown },
+    Root { kind: WellKnown },
+}
+
+enum BareInput<'a> {
+    Str(&'a str),
+    Num(&'a Number),
+    Bool(bool),
+}
+
+/// `seconds` and `nanos` as Timestamp or Duration fields, the zero ones left out.
+fn seconds_and_nanos(seconds: i64, nanos: i32) -> Vec<(&'static str, ScalarValue)> {
+    let mut fields = Vec::new();
+    if seconds != 0 {
+        fields.push(("seconds", ScalarValue::I64(seconds)));
+    }
+    if nanos != 0 {
+        fields.push(("nanos", ScalarValue::I32(nanos)));
+    }
+    fields
 }
 
 /// Adapter: JSON parse events → [`ProtoMessageHandler`] semantic events.
@@ -271,6 +298,113 @@ impl<H: ProtoMessageHandler> JsonModelAdapter<H> {
         }
     }
 
+    /// The well-known type with a bare JSON form that the value being read
+    /// stands for, if it does: a field (or element, or map value) of such a
+    /// type, or the root message when it is one.
+    fn bare_target(&self) -> Option<BareTarget> {
+        let classify = |type_name: Option<&str>| {
+            let name = type_name?;
+            well_known::classify(name).map(|kind| (name.to_string(), kind))
+        };
+        match &self.pending {
+            Some(Pending::Field(fd) | Pending::Array(fd)) if fd.field_type == FieldType::Message => {
+                classify(fd.message_type_name.as_deref()).map(|(type_name, kind)| BareTarget::Field {
+                    name: fd.name.clone(),
+                    type_name,
+                    kind,
+                    in_array: matches!(self.pending, Some(Pending::Array(_))),
+                })
+            }
+            Some(Pending::MapValue { field, key }) => classify(field.value_type_name.as_deref()).map(|(type_name, kind)| {
+                BareTarget::MapValue { field: field.clone(), key: key.clone(), type_name, kind }
+            }),
+            None if self.root_started && !self.root_object_open && self.message_stack.len() == 1 => {
+                let root = &self.message_stack.front()?.message;
+                well_known::classify(&root.full_name).map(|kind| BareTarget::Root { kind })
+            }
+            _ => None,
+        }
+    }
+
+    /// The fields of the message a bare JSON `input` stands for, as events
+    /// would give them: zeros are left out, as they are on the wire.
+    fn bare_fields(&self, kind: WellKnown, input: BareInput) -> ParseResult<Vec<(&'static str, ScalarValue)>> {
+        let text = |what: &str| match input {
+            BareInput::Str(s) => Ok(s),
+            _ => Err(ParseError::new(format!("{what} is written as a JSON string"))),
+        };
+        let err = ParseError::new;
+        match kind {
+            WellKnown::Timestamp => {
+                let (seconds, nanos) = well_known::parse_timestamp(text("a Timestamp")?).map_err(err)?;
+                Ok(seconds_and_nanos(seconds, nanos))
+            }
+            WellKnown::Duration => {
+                let (seconds, nanos) = well_known::parse_duration(text("a Duration")?).map_err(err)?;
+                Ok(seconds_and_nanos(seconds, nanos))
+            }
+            WellKnown::FieldMask => Ok(well_known::field_mask_from_json(text("a FieldMask")?)
+                .map_err(err)?
+                .into_iter()
+                .map(|path| ("paths", ScalarValue::String(path)))
+                .collect()),
+            WellKnown::Wrapper(field_type) => {
+                let value_field = FieldDescriptor::builder().number(1).name("value").field_type(field_type).build();
+                let value = match input {
+                    BareInput::Str(s) => self.convert_string(&value_field, s)?,
+                    BareInput::Num(n) => convert_number(&value_field, n)?,
+                    BareInput::Bool(b) if field_type == FieldType::Bool => ScalarValue::Bool(b),
+                    BareInput::Bool(_) => return Err(ParseError::new("unexpected boolean for a wrapper that is not a BoolValue")),
+                };
+                Ok(vec![("value", value)])
+            }
+        }
+    }
+
+    /// A bare JSON value for a well-known type, read as the message it
+    /// stands for. `Ok(false)` if what is being read is not such a type.
+    fn read_bare(&mut self, input: BareInput) -> ParseResult<bool> {
+        let Some(target) = self.bare_target() else {
+            return Ok(false);
+        };
+        match target {
+            BareTarget::Root { kind } => {
+                for (name, value) in self.bare_fields(kind, input)? {
+                    self.emit_field(name, value)?;
+                }
+            }
+            BareTarget::Field { name, type_name, kind, in_array } => {
+                let fields = self.bare_fields(kind, input)?;
+                if !in_array {
+                    self.pending = None;
+                }
+                self.emit_bare_message(&name, &type_name, fields)?;
+            }
+            BareTarget::MapValue { field, key, type_name, kind } => {
+                let fields = self.bare_fields(kind, input)?;
+                let entry_type = map_entry_type_name(&field);
+                self.handler.start_field(&field.name, &entry_type).map_err(|e| self.map_err(e))?;
+                self.handler.start_message(&entry_type).map_err(|e| self.map_err(e))?;
+                self.emit_field("key", key)?;
+                self.emit_bare_message("value", &type_name, fields)?;
+                self.handler.end_message().map_err(|e| self.map_err(e))?;
+                self.handler.end_field().map_err(|e| self.map_err(e))?;
+                self.pending = Some(Pending::Map(field));
+            }
+        }
+        Ok(true)
+    }
+
+    fn emit_bare_message(&mut self, field: &str, type_name: &str, fields: Vec<(&'static str, ScalarValue)>) -> ParseResult<()> {
+        self.handler.start_field(field, type_name).map_err(|e| self.map_err(e))?;
+        self.handler.start_message(type_name).map_err(|e| self.map_err(e))?;
+        for (name, value) in fields {
+            self.emit_field(name, value)?;
+        }
+        self.handler.end_message().map_err(|e| self.map_err(e))?;
+        self.handler.end_field().map_err(|e| self.map_err(e))
+    }
+
     fn skip_scalar(&mut self) {
         if self.skip_value && self.skip_depth == 0 {
             self.skip_value = false;
@@ -468,6 +602,9 @@ impl<H: ProtoMessageHandler> ContentHandler for JsonModelAdapter<H> {
                 return Ok(());
             }
         }
+        if self.bare_target().is_some() {
+            return Err(ParseError::new("this well-known type is written as a JSON string, number or boolean, not an object"));
+        }
         match self.pending.take() {
             Some(Pending::Field(fd)) => {
                 if fd.field_type != FieldType::Message {
@@ -619,6 +756,9 @@ impl<H: ProtoMessageHandler> ContentHandler for JsonModelAdapter<H> {
             self.skip_scalar();
             return Ok(());
         }
+        if self.read_bare(BareInput::Num(value))? {
+            return Ok(());
+        }
         let fd = match &self.pending {
             Some(Pending::Field(fd) | Pending::Array(fd)) => fd.clone(),
             Some(Pending::MapValue { field, .. }) => field.clone(),
@@ -664,6 +804,9 @@ impl<H: ProtoMessageHandler> ContentHandler for JsonModelAdapter<H> {
             self.skip_scalar();
             return Ok(());
         }
+        if self.read_bare(BareInput::Str(&value))? {
+            return Ok(());
+        }
         let fd = match &self.pending {
             Some(Pending::Field(fd) | Pending::Array(fd)) => fd.clone(),
             Some(Pending::MapValue { field, .. }) => field.clone(),
@@ -683,6 +826,9 @@ impl<H: ProtoMessageHandler> ContentHandler for JsonModelAdapter<H> {
     fn boolean_value(&mut self, value: bool) -> ParseResult<()> {
         if self.skip_value {
             self.skip_scalar();
+            return Ok(());
+        }
+        if self.read_bare(BareInput::Bool(value))? {
             return Ok(());
         }
         match &self.pending {
@@ -1054,5 +1200,190 @@ mod tests {
         let ev = a.into_handler().events;
         let vals: Vec<_> = ev.iter().filter(|e| e.starts_with("field:value=")).cloned().collect();
         assert_eq!(vals, ["field:value=U64(1)", "field:value=U64(0)"]);
+    }
+
+    // -- well-known types with a bare JSON form (issue #514) ----------------------------
+
+    const WKT: &str = r#"
+        syntax = "proto3";
+        package demo;
+        message W {
+            google.protobuf.Timestamp at = 1; google.protobuf.Duration d = 2;
+            google.protobuf.FieldMask mask = 3; google.protobuf.Int64Value i64v = 4;
+            google.protobuf.StringValue sv = 5; google.protobuf.BoolValue bv = 6;
+            google.protobuf.BytesValue bytes_v = 7; google.protobuf.DoubleValue dv = 8;
+            google.protobuf.UInt32Value u32v = 9; repeated google.protobuf.Timestamp times = 10;
+            map<string, google.protobuf.Duration> deadlines = 11; google.protobuf.Empty nothing = 12;
+            repeated google.protobuf.StringValue svs = 13; google.protobuf.Int32Value i32v = 15;
+            string plain = 20; google.protobuf.FloatValue fv = 14;
+        }
+    "#;
+
+    /// The events for `json` as a `root` message of the well-known-types fixture.
+    fn adapt_in(root: &str, json: &str) -> Result<Vec<String>, String> {
+        let proto = ProtoFileParser::parse(WKT).unwrap();
+        let mut adapter = JsonModelAdapter::new(proto, Collect { events: vec![] });
+        adapter.start_root_message(root).unwrap();
+        let result = {
+            let mut p = Parser::new(&mut adapter);
+            p.parse(json.as_bytes())
+        };
+        match result {
+            Ok(_) => {
+                adapter.end_root_message().unwrap();
+                Ok(adapter.into_handler().events)
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn wkt(json: &str) -> Result<Vec<String>, String> {
+        adapt_in("demo.W", json).map(|ev| ev[1..ev.len() - 1].to_vec())
+    }
+
+    #[test]
+    fn a_timestamp_string_becomes_a_timestamp_message() {
+        assert_eq!(
+            wkt(r#"{"at":"1972-01-01T10:00:20.021Z"}"#).unwrap(),
+            [
+                "start_field:at:google.protobuf.Timestamp",
+                "start:google.protobuf.Timestamp",
+                "field:seconds=I64(63108020)",
+                "field:nanos=I32(21000000)",
+                "end",
+                "end_field"
+            ]
+        );
+        // zero fields are left out, as they are on the wire
+        assert_eq!(wkt(r#"{"at":"1970-01-01T00:00:00Z"}"#).unwrap().len(), 4);
+        assert_eq!(wkt(r#"{"at":"1972-01-01T02:00:20-08:00"}"#).unwrap()[2], "field:seconds=I64(63108020)");
+    }
+
+    #[test]
+    fn a_duration_string_becomes_a_duration_message() {
+        assert_eq!(
+            wkt(r#"{"d":"-1.5s"}"#).unwrap(),
+            [
+                "start_field:d:google.protobuf.Duration",
+                "start:google.protobuf.Duration",
+                "field:seconds=I64(-1)",
+                "field:nanos=I32(-500000000)",
+                "end",
+                "end_field"
+            ]
+        );
+        assert_eq!(wkt(r#"{"d":"3s"}"#).unwrap()[2], "field:seconds=I64(3)");
+    }
+
+    #[test]
+    fn a_field_mask_string_becomes_its_paths() {
+        assert_eq!(
+            wkt(r#"{"mask":"fooBar,baz.qux"}"#).unwrap(),
+            [
+                "start_field:mask:google.protobuf.FieldMask",
+                "start:google.protobuf.FieldMask",
+                "field:paths=String(\"foo_bar\")",
+                "field:paths=String(\"baz.qux\")",
+                "end",
+                "end_field"
+            ]
+        );
+        assert_eq!(wkt(r#"{"mask":""}"#).unwrap().len(), 4, "no paths");
+    }
+
+    #[test]
+    fn a_wrapper_takes_the_bare_value_in_any_form_its_type_allows() {
+        let value = |json: &str| wkt(json).unwrap()[2].clone();
+        assert_eq!(value(r#"{"i64v":"5"}"#), "field:value=I64(5)");
+        assert_eq!(value(r#"{"i64v":5}"#), "field:value=I64(5)");
+        assert_eq!(value(r#"{"i32v":-7}"#), "field:value=I32(-7)");
+        assert_eq!(value(r#"{"u32v":"4000000000"}"#), "field:value=U64(4000000000)");
+        assert_eq!(value(r#"{"sv":"hi"}"#), "field:value=String(\"hi\")");
+        assert_eq!(value(r#"{"bv":true}"#), "field:value=Bool(true)");
+        assert_eq!(value(r#"{"bytesV":"Zm9v"}"#), "field:value=Bytes([102, 111, 111])");
+        assert_eq!(value(r#"{"dv":1.5}"#), "field:value=F64(1.5)");
+        assert_eq!(value(r#"{"dv":"NaN"}"#).starts_with("field:value=F64(NaN"), true);
+        assert_eq!(value(r#"{"fv":0.5}"#), "field:value=F32(0.5)");
+        // and still the events of the message around it
+        assert_eq!(wkt(r#"{"sv":"hi"}"#).unwrap()[0], "start_field:sv:google.protobuf.StringValue");
+    }
+
+    #[test]
+    fn a_wrapper_given_a_value_of_the_wrong_kind_is_an_error() {
+        for json in [r#"{"i32v":"x"}"#, r#"{"i32v":1.5}"#, r#"{"i32v":2147483648}"#, r#"{"sv":5}"#, r#"{"u32v":-1}"#] {
+            assert!(wkt(json).is_err(), "{json}");
+        }
+    }
+
+    #[test]
+    fn null_leaves_the_field_unset() {
+        assert_eq!(wkt(r#"{"at":null,"d":null,"sv":null,"mask":null,"i64v":null}"#).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn elements_and_map_values_are_converted_too() {
+        let ev = wkt(r#"{"times":["1970-01-01T00:00:00Z","1970-01-02T00:00:00Z"],"svs":["a","b"],"deadlines":{"k":"2s"}}"#).unwrap();
+        assert_eq!(
+            ev,
+            [
+                "start_field:times:google.protobuf.Timestamp", "start:google.protobuf.Timestamp", "end", "end_field",
+                "start_field:times:google.protobuf.Timestamp", "start:google.protobuf.Timestamp", "field:seconds=I64(86400)", "end", "end_field",
+                "start_field:svs:google.protobuf.StringValue", "start:google.protobuf.StringValue", "field:value=String(\"a\")", "end", "end_field",
+                "start_field:svs:google.protobuf.StringValue", "start:google.protobuf.StringValue", "field:value=String(\"b\")", "end", "end_field",
+                "start_field:deadlines:deadlines.MapEntry", "start:deadlines.MapEntry", "field:key=String(\"k\")",
+                "start_field:value:google.protobuf.Duration", "start:google.protobuf.Duration", "field:seconds=I64(2)", "end", "end_field",
+                "end", "end_field",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_field_after_a_converted_one_is_still_read() {
+        let ev = wkt(r#"{"at":"1970-01-01T00:00:00Z","plain":"x","d":"1s"}"#).unwrap();
+        assert!(ev.contains(&"field:plain=String(\"x\")".to_string()), "{ev:?}");
+        assert!(ev.contains(&"start_field:d:google.protobuf.Duration".to_string()), "{ev:?}");
+    }
+
+    #[test]
+    fn the_wrong_shape_of_json_for_a_well_known_type_is_an_error() {
+        for json in [
+            r#"{"at":{"seconds":1}}"#,
+            r#"{"at":5}"#,
+            r#"{"at":true}"#,
+            r#"{"at":["1970-01-01T00:00:00Z"]}"#,
+            r#"{"d":{"seconds":1}}"#,
+            r#"{"d":3}"#,
+            r#"{"mask":["a"]}"#,
+            r#"{"mask":"foo_bar"}"#,
+            r#"{"sv":{"value":"x"}}"#,
+            r#"{"at":"yesterday"}"#,
+            r#"{"at":"9999-12-31T23:59:59-01:00"}"#,
+            r#"{"d":"1.5"}"#,
+            r#"{"d":"315576000001s"}"#,
+        ] {
+            assert!(wkt(json).is_err(), "{json}");
+        }
+    }
+
+    #[test]
+    fn empty_is_still_an_object() {
+        assert_eq!(
+            wkt(r#"{"nothing":{}}"#).unwrap(),
+            ["start_field:nothing:google.protobuf.Empty", "start:google.protobuf.Empty", "end", "end_field"]
+        );
+        assert!(wkt(r#"{"nothing":"x"}"#).is_err());
+    }
+
+    #[test]
+    fn a_message_that_is_itself_a_well_known_type_is_read_from_a_bare_document() {
+        assert_eq!(
+            adapt_in("google.protobuf.Timestamp", r#""1972-01-01T10:00:20.5Z""#).unwrap(),
+            ["start:google.protobuf.Timestamp", "field:seconds=I64(63108020)", "field:nanos=I32(500000000)", "end"]
+        );
+        assert_eq!(
+            adapt_in("google.protobuf.StringValue", r#""hi""#).unwrap(),
+            ["start:google.protobuf.StringValue", "field:value=String(\"hi\")", "end"]
+        );
+        assert!(adapt_in("google.protobuf.Timestamp", r#"{"seconds":1}"#).is_err());
     }
 }

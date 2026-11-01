@@ -2273,6 +2273,7 @@ mod tests {
         message Rep {
             repeated string names = 1; Inner one = 2; map<string, int32> counts = 3;
             repeated Inner inners = 4; map<string, Inner> by_name = 5; string note = 6;
+            google.protobuf.Timestamp at = 7; google.protobuf.Duration took = 8;
         }
         service Svc { rpc Call (Req) returns (Rep); }
     "#;
@@ -2499,5 +2500,42 @@ mod tests {
                 assert_eq!(payload.len(), 2 + 3 + 100_000 + 3 + (1 + 3 + 100_000 + 2), "{}", payload.len());
             }
         }
+    }
+
+    #[test]
+    fn a_timestamp_and_a_duration_are_json_strings_in_json_and_messages_in_protobuf() {
+        let script = |m: &mut GrpcResponseMessage| {
+            m.start_field("at", "google.protobuf.Timestamp")?;
+            m.field("seconds", ScalarValue::I64(63_108_020))?;
+            m.field("nanos", ScalarValue::I32(21_000_000))?;
+            m.end_field()?;
+            m.start_field("took", "google.protobuf.Duration")?;
+            m.field("seconds", ScalarValue::I64(1))?;
+            m.field("nanos", ScalarValue::I32(500_000_000))?;
+            m.end_field()
+        };
+        let (json, failed) = respond("application/grpc+json", script);
+        assert_eq!(failed, None);
+        assert_eq!(String::from_utf8(json).unwrap(), r#"{"at":"1972-01-01T10:00:20.021Z","took":"1.500s"}"#);
+
+        let (pb, failed) = respond("application/grpc", script);
+        assert_eq!(failed, None);
+        // field 7 (Timestamp): seconds = 63108020, nanos = 21000000; field 8 (Duration)
+        let varint = |mut v: u64| {
+            let mut out = Vec::new();
+            loop {
+                let b = (v & 0x7f) as u8;
+                v >>= 7;
+                if v == 0 {
+                    out.push(b);
+                    return out;
+                }
+                out.push(b | 0x80);
+            }
+        };
+        let ts = [vec![0x08], varint(63_108_020), vec![0x10], varint(21_000_000)].concat();
+        let dur = [vec![0x08, 1, 0x10], varint(500_000_000)].concat();
+        let expected = [vec![7 << 3 | 2, ts.len() as u8], ts, vec![8 << 3 | 2, dur.len() as u8], dur].concat();
+        assert_eq!(pb, expected);
     }
 }

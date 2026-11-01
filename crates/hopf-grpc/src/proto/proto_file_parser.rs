@@ -1150,8 +1150,10 @@ const WELL_KNOWN: &[&str] = &[
     "BytesValue",
 ];
 
-/// Structure of a `google.protobuf` well-known type. The JSON mapping that
-/// some of them have (RFC 3339 timestamps and so on) is not applied.
+/// Structure of a `google.protobuf` well-known type. Their proto3 JSON
+/// mapping (an RFC 3339 string for a Timestamp and so on) is applied by the
+/// JSON adapter and serializer for Timestamp, Duration, FieldMask and the
+/// wrapper types; `Any` is an ordinary message there.
 fn well_known_type(simple: &str) -> Option<MessageDescriptor> {
     use FieldType::*;
     let fields: &[(&str, FieldType, i32, bool)] = match simple {

@@ -18,6 +18,7 @@ mod proto_model_serializer;
 mod proto_parse_error;
 mod rpc_descriptor;
 mod service_descriptor;
+mod well_known;
 
 pub use enum_descriptor::{EnumDescriptor, EnumDescriptorBuilder};
 pub use field_descriptor::{FieldDescriptor, FieldDescriptorBuilder};

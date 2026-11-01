@@ -8,6 +8,7 @@ use loopbuf::LoopBuf;
 use rjsonparser::{WriteError, WriteResult, Writer};
 
 use super::base64;
+use super::well_known::{self, WellKnown};
 use super::{FieldDescriptor, FieldType, MessageDescriptor, ProtoFile, ScalarValue};
 
 /// A JSON array or object the current message has open for one of its fields.
@@ -48,9 +49,37 @@ struct EntryFrame {
     held: Option<ScalarValue>,
 }
 
+/// A well-known type whose JSON form is a bare value (a `Timestamp`, a
+/// wrapper, ...). Its fields are collected, and the value is written when it
+/// ends.
+struct BareFrame {
+    kind: WellKnown,
+    seconds: i64,
+    nanos: i32,
+    paths: Vec<String>,
+    value: Option<ScalarValue>,
+}
+
+impl BareFrame {
+    fn set(&mut self, name: &str, value: ScalarValue) {
+        match (self.kind, name) {
+            (WellKnown::Timestamp | WellKnown::Duration, "seconds") => self.seconds = as_i64(&value),
+            (WellKnown::Timestamp | WellKnown::Duration, "nanos") => self.nanos = as_i64(&value) as i32,
+            (WellKnown::FieldMask, "paths") => {
+                if let ScalarValue::String(path) = value {
+                    self.paths.push(path);
+                }
+            }
+            (WellKnown::Wrapper(_), "value") => self.value = Some(value),
+            _ => {}
+        }
+    }
+}
+
 enum Frame {
     Message(MessageFrame),
     Entry(EntryFrame),
+    Bare(BareFrame),
     /// A field the message does not have, and everything inside it.
     Skipped,
 }
@@ -98,6 +127,11 @@ impl JsonModelSerializer {
         type_name: &str,
     ) -> WriteResult<()> {
         let desc = resolve_message(&self.proto_file, type_name).map_err(invalid)?;
+        if let Some(kind) = well_known::classify(&desc.full_name) {
+            // Written as one value, when it ends.
+            self.stack.push(Frame::Bare(BareFrame { kind, seconds: 0, nanos: 0, paths: Vec::new(), value: None }));
+            return Ok(());
+        }
         writer.write_start_object(ring)?;
         self.stack.push(Frame::Message(MessageFrame { desc, open: None, closed: HashSet::new() }));
         Ok(())
@@ -120,6 +154,13 @@ impl JsonModelSerializer {
                 }
                 Ok(())
             }
+            Some(Frame::Bare(frame)) => {
+                write_bare(writer, ring, &self.proto_file, frame)?;
+                if let Some(Frame::Entry(entry)) = self.stack.last_mut() {
+                    entry.value_written = true;
+                }
+                Ok(())
+            }
             Some(Frame::Entry(entry)) => finish_entry(writer, ring, &self.proto_file, entry),
             Some(Frame::Skipped) | None => Ok(()),
         }
@@ -137,6 +178,10 @@ impl JsonModelSerializer {
         let proto = &self.proto_file;
         match self.stack.last_mut() {
             None | Some(Frame::Skipped) => Ok(()),
+            Some(Frame::Bare(frame)) => {
+                frame.set(name, value);
+                Ok(())
+            }
             Some(Frame::Entry(entry)) => entry_field(writer, ring, proto, entry, name, &value),
             Some(Frame::Message(frame)) => {
                 let Some(fd) = frame.desc.fields.iter().find(|fd| fd.name == name).cloned() else {
@@ -171,6 +216,9 @@ impl JsonModelSerializer {
             Some(Frame::Skipped) => {
                 self.stack.push(Frame::Skipped);
                 return Ok(());
+            }
+            Some(Frame::Bare(_)) => {
+                return Err(invalid(format!("{name}: a well-known type written as a bare value has no message fields")));
             }
             Some(Frame::Entry(entry)) => {
                 if name != "value" || entry.value.field_type != FieldType::Message {
@@ -381,6 +429,25 @@ fn finish_entry(writer: &mut Writer, ring: &mut LoopBuf, proto: &ProtoFile, mut 
         }
     } else {
         Ok(())
+    }
+}
+
+/// The bare JSON value of a finished well-known message.
+fn write_bare(writer: &mut Writer, ring: &mut LoopBuf, proto: &ProtoFile, frame: BareFrame) -> WriteResult<()> {
+    match frame.kind {
+        WellKnown::Timestamp => {
+            writer.write_string(ring, &well_known::format_timestamp(frame.seconds, frame.nanos).map_err(invalid)?)
+        }
+        WellKnown::Duration => {
+            writer.write_string(ring, &well_known::format_duration(frame.seconds, frame.nanos).map_err(invalid)?)
+        }
+        WellKnown::FieldMask => writer.write_string(ring, &well_known::field_mask_to_json(&frame.paths).map_err(invalid)?),
+        WellKnown::Wrapper(field_type) => {
+            // Nothing set is the default of the wrapped type.
+            let fd = FieldDescriptor::builder().number(1).name("value").field_type(field_type).build();
+            let value = frame.value.unwrap_or(ScalarValue::I32(0));
+            write_scalar(writer, ring, &fd, proto, &value)
+        }
     }
 }
 
@@ -959,7 +1026,11 @@ mod tests {
 
     impl Replay {
         fn new() -> Self {
-            Self { out: Out::new(), just_started_field: false, depth: 0, error: None }
+            Self::over(Out::new())
+        }
+
+        fn over(out: Out) -> Self {
+            Self { out, just_started_field: false, depth: 0, error: None }
         }
 
         fn note(&mut self, r: Result<(), String>) -> Result<(), crate::proto::ProtoParseError> {
@@ -1090,7 +1161,11 @@ mod tests {
 
     /// The JSON the serializer writes for `script`.
     fn json_of(script: &[Ev]) -> String {
-        let mut o = Out::new();
+        json_of_in(REPEATED, "demo.R", script)
+    }
+
+    fn json_of_in(src: &str, root: &str, script: &[Ev]) -> String {
+        let mut o = Out::of(src, root);
         for ev in script {
             match ev {
                 Ev::F(name, v) => o.field(name, v.clone()).unwrap(),
@@ -1103,13 +1178,17 @@ mod tests {
 
     /// The JSON for `script` written as protobuf, read back and written as JSON.
     fn json_via_protobuf(script: &[Ev]) -> String {
+        json_via_protobuf_in(REPEATED, "demo.R", script)
+    }
+
+    fn json_via_protobuf_in(src: &str, root: &str, script: &[Ev]) -> String {
         use crate::proto::{ProtoModelAdapter, ProtoModelSerializer};
         use rprotobuf::Parser;
-        let proto = ProtoFileParser::parse(REPEATED).unwrap();
+        let proto = ProtoFileParser::parse(src).unwrap();
         let mut ser = ProtoModelSerializer::new(proto.clone());
         let mut w = rprotobuf::Writer::new();
         let mut ring = LoopBuf::with_capacity(4096);
-        ser.start_message("demo.R").unwrap();
+        ser.start_message(root).unwrap();
         for ev in script {
             match ev {
                 Ev::F(name, v) => ser.field(&mut w, &mut ring, name, v.clone()).unwrap(),
@@ -1121,8 +1200,8 @@ mod tests {
         let mut wire = Vec::new();
         w.drain_to(&mut ring, &mut wire).unwrap();
 
-        let mut adapter = ProtoModelAdapter::new(proto, Replay::new());
-        adapter.start_root_message("demo.R").unwrap();
+        let mut adapter = ProtoModelAdapter::new(proto, Replay::over(Out::of(src, root)));
+        adapter.start_root_message(root).unwrap();
         {
             let mut pb = Parser::new(&mut adapter);
             pb.parse(wire.as_slice()).unwrap();
@@ -1218,5 +1297,236 @@ mod tests {
             E,
         ];
         assert_eq!(json_via_protobuf(&script), json_of(&script));
+    }
+
+    // -- well-known types with a bare JSON form (issue #514) ----------------------------
+
+    const WKT: &str = r#"
+        syntax = "proto3";
+        package demo;
+        message W {
+            google.protobuf.Timestamp at = 1; google.protobuf.Duration d = 2;
+            google.protobuf.FieldMask mask = 3; google.protobuf.Int64Value i64v = 4;
+            google.protobuf.StringValue sv = 5; google.protobuf.BoolValue bv = 6;
+            google.protobuf.BytesValue bytes_v = 7; google.protobuf.DoubleValue dv = 8;
+            google.protobuf.UInt32Value u32v = 9; repeated google.protobuf.Timestamp times = 10;
+            map<string, google.protobuf.Duration> deadlines = 11; google.protobuf.Empty nothing = 12;
+            repeated google.protobuf.StringValue svs = 13; google.protobuf.FloatValue fv = 14;
+            google.protobuf.Int32Value i32v = 15; google.protobuf.UInt64Value u64v = 16;
+        }
+    "#;
+
+    impl Out {
+        /// A serializer over `src`, with a `root` message started.
+        fn of(src: &str, root: &str) -> Self {
+            let mut out = Self {
+                ser: JsonModelSerializer::new(ProtoFileParser::parse(src).unwrap()),
+                w: Writer::new(),
+                ring: LoopBuf::with_capacity(4096),
+            };
+            out.ser.start_message(&mut out.w, &mut out.ring, root).unwrap();
+            out
+        }
+
+        /// `type_name` as field `name`, with `fields` in it.
+        fn message(&mut self, name: &str, type_name: &str, fields: &[(&str, ScalarValue)]) -> Result<(), String> {
+            self.start(name, type_name)?;
+            for (n, v) in fields {
+                self.field(n, v.clone())?;
+            }
+            self.ser.end_field(&mut self.w, &mut self.ring).map_err(|e| e.to_string())
+        }
+    }
+
+    const TS: &str = "google.protobuf.Timestamp";
+    const DUR: &str = "google.protobuf.Duration";
+
+    fn secs_nanos(s: i64, n: i32) -> Vec<(&'static str, ScalarValue)> {
+        vec![("seconds", ScalarValue::I64(s)), ("nanos", ScalarValue::I32(n))]
+    }
+
+    fn wkt_json(build: impl FnOnce(&mut Out) -> Result<(), String>) -> Result<String, String> {
+        let mut o = Out::of(WKT, "demo.W");
+        build(&mut o)?;
+        Ok(o.finish())
+    }
+
+    #[test]
+    fn a_timestamp_is_an_rfc_3339_string() {
+        let json = wkt_json(|o| o.message("at", TS, &secs_nanos(63_108_020, 21_000_000))).unwrap();
+        assert_eq!(json, r#"{"at":"1972-01-01T10:00:20.021Z"}"#);
+    }
+
+    #[test]
+    fn a_timestamp_with_no_fields_is_the_epoch() {
+        assert_eq!(wkt_json(|o| o.message("at", TS, &[])).unwrap(), r#"{"at":"1970-01-01T00:00:00Z"}"#);
+        assert_eq!(wkt_json(|o| o.message("at", TS, &[("seconds", ScalarValue::I64(60))])).unwrap(), r#"{"at":"1970-01-01T00:01:00Z"}"#);
+    }
+
+    #[test]
+    fn a_duration_is_seconds_with_an_s() {
+        assert_eq!(wkt_json(|o| o.message("d", DUR, &secs_nanos(1, 500_000_000))).unwrap(), r#"{"d":"1.500s"}"#);
+        assert_eq!(wkt_json(|o| o.message("d", DUR, &secs_nanos(-3, -1000))).unwrap(), r#"{"d":"-3.000001s"}"#);
+        assert_eq!(wkt_json(|o| o.message("d", DUR, &[])).unwrap(), r#"{"d":"0s"}"#);
+    }
+
+    #[test]
+    fn a_field_mask_is_its_paths_in_camel_case_joined_by_commas() {
+        let paths = [("paths", text("foo_bar.baz")), ("paths", text("qux"))];
+        assert_eq!(wkt_json(|o| o.message("mask", "google.protobuf.FieldMask", &paths)).unwrap(), r#"{"mask":"fooBar.baz,qux"}"#);
+        assert_eq!(wkt_json(|o| o.message("mask", "google.protobuf.FieldMask", &[])).unwrap(), r#"{"mask":""}"#);
+    }
+
+    #[test]
+    fn a_wrapper_is_the_value_it_wraps_in_that_values_json_form() {
+        let w = |name: &str, ty: &str, v: ScalarValue| wkt_json(|o| o.message(name, ty, &[("value", v)])).unwrap();
+        assert_eq!(w("i64v", "google.protobuf.Int64Value", ScalarValue::I64(5)), r#"{"i64v":"5"}"#, "64-bit integers are strings");
+        assert_eq!(w("u64v", "google.protobuf.UInt64Value", ScalarValue::U64(u64::MAX)), r#"{"u64v":"18446744073709551615"}"#);
+        assert_eq!(w("i32v", "google.protobuf.Int32Value", ScalarValue::I32(-7)), r#"{"i32v":-7}"#);
+        assert_eq!(w("u32v", "google.protobuf.UInt32Value", ScalarValue::U64(4_000_000_000)), r#"{"u32v":4000000000}"#);
+        assert_eq!(w("sv", "google.protobuf.StringValue", text("hi \"there\"")), r#"{"sv":"hi \"there\""}"#);
+        assert_eq!(w("bv", "google.protobuf.BoolValue", ScalarValue::Bool(true)), r#"{"bv":true}"#);
+        assert_eq!(w("bytes_v", "google.protobuf.BytesValue", ScalarValue::Bytes(b"foo".to_vec())), r#"{"bytesV":"Zm9v"}"#);
+        assert_eq!(w("dv", "google.protobuf.DoubleValue", ScalarValue::F64(1.5)), r#"{"dv":1.5}"#);
+        assert_eq!(w("dv", "google.protobuf.DoubleValue", ScalarValue::F64(f64::NAN)), r#"{"dv":"NaN"}"#);
+        assert_eq!(w("fv", "google.protobuf.FloatValue", ScalarValue::F32(0.1)), r#"{"fv":0.1}"#);
+    }
+
+    #[test]
+    fn a_wrapper_with_nothing_in_it_is_the_default_of_its_type() {
+        let empty = |name: &str, ty: &str| wkt_json(|o| o.message(name, ty, &[])).unwrap();
+        assert_eq!(empty("i64v", "google.protobuf.Int64Value"), r#"{"i64v":"0"}"#);
+        assert_eq!(empty("i32v", "google.protobuf.Int32Value"), r#"{"i32v":0}"#);
+        assert_eq!(empty("sv", "google.protobuf.StringValue"), r#"{"sv":""}"#);
+        assert_eq!(empty("bv", "google.protobuf.BoolValue"), r#"{"bv":false}"#);
+        assert_eq!(empty("bytes_v", "google.protobuf.BytesValue"), r#"{"bytesV":""}"#);
+        assert_eq!(empty("dv", "google.protobuf.DoubleValue"), r#"{"dv":0}"#);
+    }
+
+    #[test]
+    fn empty_is_an_empty_object() {
+        assert_eq!(wkt_json(|o| o.message("nothing", "google.protobuf.Empty", &[])).unwrap(), r#"{"nothing":{}}"#);
+    }
+
+    #[test]
+    fn elements_of_a_repeated_field_and_values_of_a_map_are_bare_too() {
+        let json = wkt_json(|o| {
+            o.message("times", TS, &secs_nanos(0, 0))?;
+            o.message("times", TS, &secs_nanos(63_108_020, 0))?;
+            o.message("svs", "google.protobuf.StringValue", &[("value", text("a"))])?;
+            o.message("svs", "google.protobuf.StringValue", &[("value", text("b"))])?;
+            o.start("deadlines", "deadlines.MapEntry")?;
+            o.field("key", text("short"))?;
+            o.message("value", DUR, &secs_nanos(1, 0))?;
+            o.ser.end_field(&mut o.w, &mut o.ring).map_err(|e| e.to_string())?;
+            o.start("deadlines", "deadlines.MapEntry")?;
+            o.field("key", text("long"))?;
+            o.message("value", DUR, &secs_nanos(3600, 0))?;
+            o.ser.end_field(&mut o.w, &mut o.ring).map_err(|e| e.to_string())
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"times":["1970-01-01T00:00:00Z","1972-01-01T10:00:20Z"],"svs":["a","b"],"deadlines":{"short":"1s","long":"3600s"}}"#
+        );
+    }
+
+    #[test]
+    fn a_message_that_is_itself_a_timestamp_is_the_whole_document() {
+        let mut o = Out::of(WKT, TS);
+        o.field("seconds", ScalarValue::I64(63_108_020)).unwrap();
+        assert_eq!(o.finish(), r#""1972-01-01T10:00:20Z""#);
+    }
+
+    #[test]
+    fn a_value_that_cannot_be_written_in_the_json_form_is_an_error() {
+        let ts = |s, n| wkt_json(|o| o.message("at", TS, &secs_nanos(s, n)));
+        assert!(ts(300_000_000_000, 0).is_err(), "past year 9999");
+        assert!(ts(0, -1).is_err(), "negative nanos");
+        assert!(wkt_json(|o| o.message("d", DUR, &secs_nanos(1, -1))).is_err(), "signs differ");
+        assert!(wkt_json(|o| o.message("mask", "google.protobuf.FieldMask", &[("paths", text("fooBar"))])).is_err());
+        let err = wkt_json(|o| o.message("at", TS, &secs_nanos(300_000_000_000, 0))).unwrap_err();
+        assert!(err.contains("9999"), "{err}");
+    }
+
+    #[test]
+    fn fields_a_bare_type_does_not_have_are_ignored_and_a_nested_message_in_one_is_refused() {
+        let json = wkt_json(|o| o.message("at", TS, &[("seconds", ScalarValue::I64(0)), ("bogus", ScalarValue::I32(1))])).unwrap();
+        assert_eq!(json, r#"{"at":"1970-01-01T00:00:00Z"}"#);
+        let mut o = Out::of(WKT, "demo.W");
+        o.start("at", TS).unwrap();
+        assert!(o.start("seconds", DUR).is_err(), "nothing nests inside a timestamp");
+    }
+
+    #[test]
+    fn well_known_json_read_by_the_adapter_is_written_back_normalised() {
+        use crate::proto::JsonModelAdapter;
+        use rjsonparser::Parser;
+        let round = |json: &str| {
+            let proto = ProtoFileParser::parse(WKT).unwrap();
+            let mut adapter = JsonModelAdapter::new(proto, Replay::over(Out::of(WKT, "demo.W")));
+            adapter.start_root_message("demo.W").unwrap();
+            {
+                let mut p = Parser::new(&mut adapter);
+                p.parse(json.as_bytes()).unwrap_or_else(|e| panic!("{json}: {e}"));
+            }
+            adapter.end_root_message().unwrap();
+            let replay = adapter.into_handler();
+            assert_eq!(replay.error, None);
+            replay.out.finish()
+        };
+        assert_eq!(
+            round(r#"{"at":"1972-01-01T10:00:20.021Z","d":"1.5s","mask":"fooBar,baz.qux","i64v":"5","sv":"hi","bv":true,"bytesV":"Zm9v","dv":1.5,"u32v":7}"#),
+            r#"{"at":"1972-01-01T10:00:20.021Z","d":"1.500s","mask":"fooBar,baz.qux","i64v":"5","sv":"hi","bv":true,"bytesV":"Zm9v","dv":1.5,"u32v":7}"#
+        );
+        assert_eq!(round(r#"{"at":"1972-01-01T02:00:20-08:00"}"#), r#"{"at":"1972-01-01T10:00:20Z"}"#, "an offset becomes Z");
+        assert_eq!(round(r#"{"i64v":5,"u64v":"18446744073709551615"}"#), r#"{"i64v":"5","u64v":"18446744073709551615"}"#);
+        assert_eq!(
+            round(r#"{"times":["1970-01-01T00:00:00Z","1972-01-01T10:00:20Z"],"svs":["a","b"],"deadlines":{"s":"1s","l":"1h"}}"#.replace("1h", "3600s").as_str()),
+            r#"{"times":["1970-01-01T00:00:00Z","1972-01-01T10:00:20Z"],"svs":["a","b"],"deadlines":{"s":"1s","l":"3600s"}}"#
+        );
+        assert_eq!(round(r#"{"at":null,"d":null,"sv":null}"#), "{}", "null is absent");
+        assert_eq!(round(r#"{"nothing":{}}"#), r#"{"nothing":{}}"#);
+    }
+
+    #[test]
+    fn well_known_messages_come_out_the_same_through_protobuf() {
+        use Ev::{E, F, S};
+        let script = [
+            S("at", TS),
+            F("seconds", ScalarValue::I64(63_108_020)),
+            F("nanos", ScalarValue::I32(21_000_000)),
+            E,
+            S("d", DUR),
+            F("seconds", ScalarValue::I64(-3)),
+            F("nanos", ScalarValue::I32(-1000)),
+            E,
+            S("mask", "google.protobuf.FieldMask"),
+            F("paths", text("foo_bar")),
+            F("paths", text("baz")),
+            E,
+            S("i64v", "google.protobuf.Int64Value"),
+            F("value", ScalarValue::I64(5)),
+            E,
+            S("sv", "google.protobuf.StringValue"),
+            F("value", text("hi")),
+            E,
+            S("times", TS),
+            F("seconds", ScalarValue::I64(0)),
+            E,
+            S("times", TS),
+            F("seconds", ScalarValue::I64(86_400)),
+            E,
+            S("deadlines", "deadlines.MapEntry"),
+            F("key", text("k")),
+            S("value", DUR),
+            F("seconds", ScalarValue::I64(2)),
+            E,
+            E,
+        ];
+        let expected = r#"{"at":"1972-01-01T10:00:20.021Z","d":"-3.000001s","mask":"fooBar,baz","i64v":"5","sv":"hi","times":["1970-01-01T00:00:00Z","1970-01-02T00:00:00Z"],"deadlines":{"k":"2s"}}"#;
+        let direct = json_of_in(WKT, "demo.W", &script);
+        assert_eq!(direct, expected);
+        assert_eq!(json_via_protobuf_in(WKT, "demo.W", &script), expected);
     }
 }
