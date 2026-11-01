@@ -371,6 +371,11 @@ impl FtpFileSystem for BasicFtpFileSystem {
     ) -> Result<Box<dyn Read + Send>, FtpFileOpResult> {
         let p = self.join_jail(path)?;
         let mut f = File::open(p).map_err(|_| FtpFileOpResult::NotFound)?;
+        // `open` succeeds on a directory on Unix; reading it would fail only
+        // after the 150, when it is too late to say 550.
+        if f.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+            return Err(FtpFileOpResult::NotFound);
+        }
         if restart > 0 {
             f.seek(SeekFrom::Start(restart))
                 .map_err(|_| FtpFileOpResult::Failed)?;

@@ -310,6 +310,31 @@ impl FtpControlHandler {
         endpoint.send(&reply_multiline_charset(code, lines, self.utf8));
     }
 
+    /// The login check and then, for a command that cannot do without a
+    /// pathname, the argument check: 501 rather than silence, which would
+    /// leave the client waiting for a reply.
+    fn need_arg(&self, endpoint: &mut dyn Endpoint, arg: &str) -> bool {
+        if !self.require_auth(endpoint) {
+            return false;
+        }
+        if arg.is_empty() {
+            self.send_reply(endpoint, 501, "Syntax error: pathname required");
+            return false;
+        }
+        true
+    }
+
+    /// Ask the application whether `op` may touch `path` (as the client
+    /// named it); 550 if not.
+    fn authorized(&self, endpoint: &mut dyn Endpoint, op: FtpOperation, path: &str) -> bool {
+        if self.app.is_authorized(op, path, &self.meta) {
+            true
+        } else {
+            self.send_reply(endpoint, 550, "Permission denied");
+            false
+        }
+    }
+
     fn require_auth(&self, endpoint: &mut dyn Endpoint) -> bool {
         if self.logged_in {
             true
@@ -410,7 +435,7 @@ impl FtpControlHandler {
                     self.send_reply(
                         endpoint,
                         257,
-                        &format!("\"{}\" is current directory", self.cwd),
+                        &format!("{} is current directory", quote_path(&self.cwd)),
                     );
                 }
             }
@@ -420,12 +445,24 @@ impl FtpControlHandler {
                 endpoint.close();
             }
             FtpCommand::Rein => {
+                // RFC 959: flush all I/O and account information; the next
+                // user starts as at connect and inherits nothing, least of
+                // all a rename the last one armed.
+                if let Some(b) = &self.bridge {
+                    b.abort();
+                }
+                self.bridge = None;
                 self.logged_in = false;
                 self.pending_user = None;
                 self.meta.user = None;
                 self.cwd = "/".into();
                 self.utf8 = false;
                 self.epsv_all = false;
+                self.transfer_type = TransferType::Image;
+                self.restart = 0;
+                self.rename_from = None;
+                self.prot_p = false;
+                self.pbsz = false;
                 self.clear_pasv();
                 self.send_reply(endpoint, 220, "Service ready for new user");
             }
@@ -621,6 +658,11 @@ impl FtpControlHandler {
             self.send_reply(endpoint, 501, "EPSV ALL in effect; use EPSV");
             return;
         }
+        if self.meta.local.is_ipv6() {
+            // A PASV reply can only carry an IPv4 address.
+            self.send_reply(endpoint, 501, "PASV is IPv4 only; use EPSV");
+            return;
+        }
         if !self.check_data_protection(endpoint) {
             return;
         }
@@ -710,7 +752,8 @@ impl FtpControlHandler {
         let expect_tls = self.data_tls().is_some();
         let expected_peer = self.meta.peer.ip();
         let bind_ip = self.meta.local.ip();
-        let mut cfg = TcpListenerConfig::new(SocketAddr::new(bind_ip, 0), move || {
+        let port = self.pick_pasv_port();
+        let mut cfg = TcpListenerConfig::new(SocketAddr::new(bind_ip, port), move || {
             Box::new(FtpDataHandler::new(Arc::clone(&bridge2), expect_tls, expected_peer))
                 as Box<dyn ProtocolHandler>
         });
@@ -831,10 +874,7 @@ impl FtpControlHandler {
     }
 
     fn cmd_retr(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
-        if !self.require_auth(endpoint) || arg.is_empty() {
-            if arg.is_empty() {
-                self.send_reply(endpoint, 501, "Syntax error");
-            }
+        if !self.need_arg(endpoint, arg) {
             return;
         }
         if !self
@@ -927,10 +967,7 @@ impl FtpControlHandler {
         append: bool,
         opening: Option<&str>,
     ) {
-        if !self.require_auth(endpoint) || arg.is_empty() {
-            if arg.is_empty() {
-                self.send_reply(endpoint, 501, "Syntax error");
-            }
+        if !self.need_arg(endpoint, arg) {
             return;
         }
         if !self
@@ -1096,6 +1133,13 @@ impl FtpControlHandler {
         if !self.require_auth(endpoint) {
             return;
         }
+        // `LIST -la` is what clients send out of habit: the ls-style
+        // options are not a pathname.
+        let arg = strip_list_options(arg);
+        let named = if arg.is_empty() { self.cwd.as_str() } else { arg };
+        if !self.authorized(endpoint, FtpOperation::Read, named) {
+            return;
+        }
         if !self.prepare_data(endpoint) {
             return;
         }
@@ -1195,6 +1239,10 @@ impl FtpControlHandler {
         if !self.require_auth(endpoint) {
             return;
         }
+        let named = if arg.is_empty() { self.cwd.as_str() } else { arg };
+        if !self.authorized(endpoint, FtpOperation::Read, named) {
+            return;
+        }
         if !self.prepare_data(endpoint) {
             return;
         }
@@ -1232,6 +1280,10 @@ impl FtpControlHandler {
         if !self.require_auth(endpoint) {
             return;
         }
+        let named = if arg.is_empty() { self.cwd.as_str() } else { arg };
+        if !self.authorized(endpoint, FtpOperation::Read, named) {
+            return;
+        }
         let path = if arg.is_empty() {
             self.cwd.clone()
         } else {
@@ -1248,7 +1300,7 @@ impl FtpControlHandler {
     }
 
     fn cmd_size(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
-        if !self.require_auth(endpoint) || arg.is_empty() {
+        if !self.need_arg(endpoint, arg) || !self.authorized(endpoint, FtpOperation::Read, arg) {
             return;
         }
         let path = self.app.file_system(&self.meta).resolve(arg, &self.cwd);
@@ -1261,7 +1313,7 @@ impl FtpControlHandler {
     }
 
     fn cmd_mdtm(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
-        if !self.require_auth(endpoint) || arg.is_empty() {
+        if !self.need_arg(endpoint, arg) || !self.authorized(endpoint, FtpOperation::Read, arg) {
             return;
         }
         let path = self.app.file_system(&self.meta).resolve(arg, &self.cwd);
@@ -1278,7 +1330,7 @@ impl FtpControlHandler {
     }
 
     fn cmd_dele(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
-        if !self.require_auth(endpoint) || arg.is_empty() {
+        if !self.need_arg(endpoint, arg) {
             return;
         }
         if !self
@@ -1306,7 +1358,7 @@ impl FtpControlHandler {
     }
 
     fn cmd_rmd(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
-        if !self.require_auth(endpoint) || arg.is_empty() {
+        if !self.need_arg(endpoint, arg) {
             return;
         }
         if !self
@@ -1324,7 +1376,7 @@ impl FtpControlHandler {
     }
 
     fn cmd_mkd(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
-        if !self.require_auth(endpoint) || arg.is_empty() {
+        if !self.need_arg(endpoint, arg) {
             return;
         }
         if !self
@@ -1337,14 +1389,14 @@ impl FtpControlHandler {
         let path = self.app.file_system(&self.meta).resolve(arg, &self.cwd);
         match self.app.file_system(&self.meta).mkdir(&path, &self.meta) {
             FtpFileOpResult::Ok => {
-                self.send_reply(endpoint, 257, &format!("\"{path}\" created"));
+                self.send_reply(endpoint, 257, &format!("{} created", quote_path(&path)));
             }
             _ => self.send_reply(endpoint, 550, "MKD failed"),
         }
     }
 
     fn cmd_rnfr(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
-        if !self.require_auth(endpoint) || arg.is_empty() {
+        if !self.need_arg(endpoint, arg) {
             return;
         }
         if !self
@@ -1369,7 +1421,7 @@ impl FtpControlHandler {
     }
 
     fn cmd_rnto(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
-        if !self.require_auth(endpoint) || arg.is_empty() {
+        if !self.need_arg(endpoint, arg) {
             return;
         }
         let Some(from) = self.rename_from.take() else {
@@ -1406,7 +1458,7 @@ impl FtpControlHandler {
     }
 
     fn cmd_feat(&mut self, endpoint: &mut dyn Endpoint) {
-        let lines = [
+        let mut lines = vec![
             "Extensions supported:",
             " UTF8",
             " SIZE",
@@ -1416,11 +1468,11 @@ impl FtpControlHandler {
             " REST STREAM",
             " EPSV",
             " EPRT",
-            " AUTH TLS",
-            " PBSZ",
-            " PROT",
-            "End",
         ];
+        if self.config.tls_acceptor.is_some() {
+            lines.extend([" AUTH TLS", " PBSZ", " PROT"]);
+        }
+        lines.push("End");
         self.send_multiline(endpoint, 211, &lines);
     }
 
@@ -1442,6 +1494,10 @@ impl FtpControlHandler {
         let a = arg.to_ascii_uppercase();
         if a != "TLS" && a != "SSL" && a != "TLS-C" {
             self.send_reply(endpoint, 504, "AUTH type not supported");
+            return;
+        }
+        if self.meta.tls {
+            self.send_reply(endpoint, 503, "Already secured");
             return;
         }
         if self.config.tls_acceptor.is_none() {
@@ -1545,6 +1601,21 @@ impl ProtocolHandler for FtpControlHandler {
     }
 }
 
+/// A pathname as a 257 reply quotes it: in double quotes, any double quote
+/// in the name doubled (RFC 959 section 5).
+fn quote_path(path: &str) -> String {
+    format!("\"{}\"", path.replace('"', "\"\""))
+}
+
+/// `arg` without any leading ls-style option words (`-l`, `-la`, `-a`).
+fn strip_list_options(arg: &str) -> &str {
+    let mut rest = arg.trim_start();
+    while rest.starts_with('-') {
+        rest = rest.split_once(char::is_whitespace).map_or("", |(_, tail)| tail.trim_start());
+    }
+    rest
+}
+
 /// RFC 3659 `Perm=` fact letters for the logged-in user's abilities.
 fn mls_perm(is_dir: bool, read_only: bool) -> &'static str {
     if is_dir {
@@ -1562,6 +1633,10 @@ fn mls_perm(is_dir: bool, read_only: bool) -> &'static str {
 
 #[allow(dead_code)]
 fn _binding_ty(_: BindingId) {}
+
+#[cfg(test)]
+#[path = "control_session_tests.rs"]
+mod session_tests;
 
 #[cfg(test)]
 mod open_offload_tests {
