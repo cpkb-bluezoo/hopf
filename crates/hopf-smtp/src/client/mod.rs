@@ -34,6 +34,8 @@ mod handlers;
 mod pipeline;
 mod reply;
 mod retry;
+#[cfg(test)]
+mod session_tests;
 mod state;
 mod verify;
 

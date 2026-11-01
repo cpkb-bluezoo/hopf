@@ -135,3 +135,149 @@ impl Inner {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn only_temporary_failures_are_worth_trying_again() {
+        assert!(!SmtpSendOutcome::Delivered.is_retryable());
+        assert!(SmtpSendOutcome::Rejected { code: 450, message: String::new() }.is_retryable());
+        assert!(SmtpSendOutcome::Rejected { code: 499, message: String::new() }.is_retryable());
+        assert!(!SmtpSendOutcome::Rejected { code: 550, message: String::new() }.is_retryable());
+        assert!(!SmtpSendOutcome::Rejected { code: 399, message: String::new() }.is_retryable());
+        assert!(SmtpSendOutcome::Failed("connection reset".into()).is_retryable());
+    }
+
+    #[test]
+    fn the_delivery_policy_starts_at_half_an_hour_and_gives_up_after_five_days() {
+        let mut state = smtp_retry_policy().start();
+        let first = state.should_retry(&SmtpSendOutcome::Failed(String::new())).unwrap();
+        // 30 minutes, give or take the 10% jitter.
+        assert!(first >= Duration::from_secs(27 * 60) && first <= Duration::from_secs(33 * 60), "{first:?}");
+        assert!(state.should_retry(&SmtpSendOutcome::Delivered).is_none());
+        assert!(state.should_retry(&SmtpSendOutcome::Rejected { code: 550, message: String::new() }).is_none());
+    }
+
+    /// A loopback SMTP server that answers each connection's MAIL FROM with
+    /// `mail_reply(attempt)`; everything else is accepted.
+    fn server(mail_reply: impl Fn(usize) -> &'static str + Send + Sync + 'static) -> (u16, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&attempts);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let attempt = counted.fetch_add(1, Ordering::SeqCst);
+                let reply = mail_reply(attempt);
+                std::thread::spawn(move || {
+                    let mut out = stream.try_clone().unwrap();
+                    let mut input = BufReader::new(stream);
+                    let _ = out.write_all(b"220 test ESMTP\r\n");
+                    let mut in_data = false;
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        if input.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let cmd = line.trim_end().to_ascii_uppercase();
+                        let answer = if in_data {
+                            if cmd == "." {
+                                in_data = false;
+                                "250 2.0.0 queued\r\n"
+                            } else {
+                                continue;
+                            }
+                        } else if cmd.starts_with("EHLO") {
+                            "250 test\r\n"
+                        } else if cmd.starts_with("MAIL") {
+                            reply
+                        } else if cmd.starts_with("RCPT") {
+                            "250 ok\r\n"
+                        } else if cmd == "DATA" {
+                            in_data = true;
+                            "354 go\r\n"
+                        } else if cmd == "QUIT" {
+                            let _ = out.write_all(b"221 bye\r\n");
+                            return;
+                        } else {
+                            "250 ok\r\n"
+                        };
+                        if out.write_all(answer.as_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, attempts)
+    }
+
+    fn quick_policy() -> RetryPolicy {
+        RetryPolicy::exponential_backoff()
+            .with_initial_delay(Duration::from_millis(20))
+            .with_max_delay(Duration::from_millis(50))
+            .with_jitter(0.0)
+            .with_max_attempts(4)
+    }
+
+    fn run(port: u16, policy: RetryPolicy) -> SmtpSendOutcome {
+        let rt = Arc::new(Runtime::start(hopf_core::RuntimeConfig::default()).unwrap());
+        let client = SmtpClient::from_addr(format!("127.0.0.1:{port}").parse().unwrap());
+        let (tx, rx) = mpsc::channel();
+        RetryingSend::new(client, Arc::clone(&rt), policy, || {
+            let mut once = Some(b"hi\r\n".to_vec());
+            SmtpSend::new("client.example").mail_from("a@b").rcpt_to("c@d").message_with(move || once.take())
+        })
+        .on_final(move |o| {
+            let _ = tx.send(o);
+        })
+        .send();
+        rx.recv_timeout(Duration::from_secs(10)).expect("a final outcome")
+    }
+
+    #[test]
+    fn a_delivery_that_works_first_time_is_reported_once() {
+        let (port, attempts) = server(|_| "250 ok\r\n");
+        assert!(matches!(run(port, quick_policy()), SmtpSendOutcome::Delivered));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_temporary_refusal_is_tried_again_until_it_works() {
+        let (port, attempts) = server(|n| if n < 2 { "451 4.3.0 try later\r\n" } else { "250 ok\r\n" });
+        assert!(matches!(run(port, quick_policy()), SmtpSendOutcome::Delivered));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn a_permanent_refusal_is_not_tried_again() {
+        let (port, attempts) = server(|_| "550 5.1.1 no\r\n");
+        assert!(matches!(run(port, quick_policy()), SmtpSendOutcome::Rejected { code: 550, .. }));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_temporary_refusal_that_never_clears_is_given_up_on() {
+        let (port, attempts) = server(|_| "451 4.3.0 try later\r\n");
+        assert!(matches!(run(port, quick_policy()), SmtpSendOutcome::Rejected { code: 451, .. }));
+        // The policy allows four retries after the first try.
+        assert_eq!(attempts.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn a_server_that_cannot_be_reached_is_a_failure_after_the_attempts_are_used() {
+        let port = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        assert!(matches!(run(port, quick_policy()), SmtpSendOutcome::Failed(_)));
+    }
+}

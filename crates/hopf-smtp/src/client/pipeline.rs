@@ -644,12 +644,12 @@ impl SmtpSendDriver {
 
 impl SmtpClientDriver for SmtpSendDriver {
     fn on_greeting(&mut self, hello: &mut dyn SmtpClientHello, ep: &mut dyn Endpoint, esmtp: bool) {
+        // RFC 5321 section 4.1.1.1: EHLO first, whatever the banner says (a
+        // server may not announce ESMTP in it, yet still offer STARTTLS and
+        // AUTH); a server that does not know EHLO is then spoken to with HELO.
+        let _ = esmtp;
         let hostname = ehlo_argument(&self.state.lock().unwrap().hostname, ep);
-        if esmtp {
-            hello.ehlo(&hostname);
-        } else {
-            hello.helo(&hostname);
-        }
+        hello.ehlo(&hostname);
     }
 
     fn on_service_unavailable(&mut self, ep: &mut dyn Endpoint, message: &str) {
@@ -1145,8 +1145,10 @@ impl SmtpClientDriver for SmtpSendDriver {
     }
 
     fn on_disconnected(&mut self, _ep: &mut dyn Endpoint) {
-        // Completion already called on QUIT path; this is a no-op fallback.
-        let _ = self.state.lock().unwrap().on_complete.take();
+        // Reaching here means the server went away before the dialogue ended
+        // (a finished one has already reported, and a result is only ever
+        // reported once), so whoever is waiting must hear that it failed.
+        self.fail("the server closed the connection before the message was accepted");
     }
 
     fn resume_pending_data(&mut self, data: &mut dyn SmtpClientMessageData, _ep: &mut dyn Endpoint) {

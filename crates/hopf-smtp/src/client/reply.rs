@@ -162,6 +162,9 @@ pub enum SmtpEvent {
     },
     /// RSET accepted (RFC 5321: RSET has no failure path).
     RsetOk,
+    /// The server answered QUIT (with 221, or whatever it said): the dialogue
+    /// is over and the client may close.
+    QuitAcknowledged,
     /// 250/251/252 — VRFY succeeded. `code` distinguishes a fully verified
     /// mailbox (250) from one that will be forwarded (251) or merely
     /// accepted without verification (252); `text` is the resolved-mailbox
@@ -689,7 +692,7 @@ impl SmtpReplyLexer {
                 }
             }
             SmtpReplyShape::Rset => SmtpEvent::RsetOk,
-            SmtpReplyShape::Quit => return None, // no driver callback exists for QUIT
+            SmtpReplyShape::Quit => SmtpEvent::QuitAcknowledged,
             SmtpReplyShape::Vrfy => {
                 if matches!(code, 250..=252) {
                     SmtpEvent::VrfyOk { code, text: message.unwrap_or_default() }
@@ -1181,11 +1184,11 @@ mod tests {
     }
 
     #[test]
-    fn quit_produces_no_event() {
+    fn quit_is_acknowledged_by_whatever_reply_comes() {
         let mut lex = SmtpReplyLexer::new();
         lex.expect(SmtpReplyShape::Quit);
         let mut data: &[u8] = b"221 Bye\r\n";
-        assert_eq!(lex.feed(&mut data).unwrap(), Vec::<SmtpEvent>::new());
+        assert_eq!(lex.feed(&mut data).unwrap(), vec![SmtpEvent::QuitAcknowledged]);
     }
 
     #[test]

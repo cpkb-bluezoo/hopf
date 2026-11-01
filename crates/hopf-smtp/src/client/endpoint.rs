@@ -24,7 +24,7 @@ use super::state::{
     MailFromParams, SmtpCapabilities, SmtpClientAuthExchange, SmtpClientEnvelope,
     SmtpClientHello, SmtpClientMessageData, SmtpClientPostTls, SmtpClientSession,
 };
-use crate::client::dot_stuff;
+use crate::client::DotStuffer;
 
 // ── Protocol state ────────────────────────────────────────────────────────────
 
@@ -125,6 +125,9 @@ pub struct SmtpClientEndpoint {
     /// Connect budget remaining (reserved for future use).
     #[allow(dead_code)]
     connect_budget_remaining: Option<Duration>,
+    /// Dot-stuffs `write_content` pieces as one stream: where a piece
+    /// stops is not where a line stops.
+    stuffer: DotStuffer,
 }
 
 impl SmtpClientEndpoint {
@@ -158,6 +161,7 @@ impl SmtpClientEndpoint {
             pending_bdat: false,
             bdat_mode: false,
             connect_budget_remaining: None,
+            stuffer: DotStuffer::new(),
         }
     }
 
@@ -547,6 +551,7 @@ impl SmtpClientEndpoint {
                 let _ = self.pending.pop_front(); // DataCommand
                 self.proto_state = ProtoState::DataMode;
                 self.bdat_mode = false;
+                self.stuffer = DotStuffer::new();
                 driver.on_ready_for_data(self, ep);
             }
             SmtpEvent::MessageRejected { code, message } => {
@@ -929,7 +934,8 @@ impl SmtpClientMessageData for SmtpClientEndpoint {
         if self.proto_state != ProtoState::DataMode || self.bdat_mode {
             return;
         }
-        let stuffed = dot_stuff(content);
+        let mut stuffed = Vec::with_capacity(content.len() + 16);
+        self.stuffer.feed(content, &mut stuffed);
         self.outbound.extend_from_slice(&stuffed);
     }
 
@@ -939,8 +945,10 @@ impl SmtpClientMessageData for SmtpClientEndpoint {
         }
         self.proto_state = ProtoState::DataEndSent;
         self.lexer.expect(SmtpReplyShape::DataEnd);
-        // Ensure the buffered data ends with CRLF before the dot.
-        // (dot_stuff already handles CRLF normalization for each chunk)
+        // The text must end with CRLF before the dot.
+        let mut tail = Vec::new();
+        self.stuffer.finish(&mut tail);
+        self.outbound.extend_from_slice(&tail);
         self.outbound.extend_from_slice(b".\r\n");
     }
 
