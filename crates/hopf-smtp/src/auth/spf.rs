@@ -93,6 +93,12 @@ pub fn check_host(
     receiver: &str,
     cb: SpfCallback,
 ) {
+    // RFC 7208 section 5: an IPv4-mapped IPv6 address (how a dual-stack
+    // listener reports an IPv4 peer) is the IPv4 address it wraps.
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    };
     let (local_part, sender_domain) = split_sender(sender);
     let frame = Box::new(Frame {
         dns,
@@ -104,6 +110,7 @@ pub fn check_host(
         receiver: receiver.to_string(),
         lookups: 0,
         void_lookups: 0,
+        void_exceeded: false,
     });
     evaluate_record(
         frame,
@@ -177,6 +184,9 @@ struct Frame {
     receiver: String,
     lookups: usize,
     void_lookups: usize,
+    /// Set once more than [`MAX_VOID_LOOKUPS`] lookups found nothing: the
+    /// evaluation is then a `permerror` at the next opportunity.
+    void_exceeded: bool,
 }
 
 impl Frame {
@@ -201,9 +211,13 @@ impl Frame {
         self.lookups <= MAX_LOOKUPS
     }
 
-    fn charge_void(&mut self) -> bool {
+    /// Count a lookup that found nothing (RFC 7208 section 4.6.4): the third
+    /// makes the evaluation a `permerror`.
+    fn charge_void(&mut self) {
         self.void_lookups += 1;
-        self.void_lookups <= MAX_VOID_LOOKUPS
+        if self.void_lookups > MAX_VOID_LOOKUPS {
+            self.void_exceeded = true;
+        }
     }
 }
 
@@ -223,16 +237,12 @@ fn evaluate_record(frame: Box<Frame>, domain: String, depth: usize, cb: RecordCb
         return;
     }
     let dns = Arc::clone(&frame.dns);
-    let mut frame = frame;
     let query_domain = domain.clone();
     dns.query_txt(
         &query_domain,
         Box::new(move |lookup| match lookup {
             Lookup::TempError => cb(frame, SpfResult::TempError, None),
-            Lookup::NxDomain | Lookup::NoData => {
-                frame.charge_void();
-                cb(frame, SpfResult::None, None);
-            }
+            Lookup::NxDomain | Lookup::NoData => cb(frame, SpfResult::None, None),
             Lookup::Answers(txts) => {
                 let matching: Vec<&String> = txts.iter().filter(|t| is_spf_record(t)).collect();
                 if matching.is_empty() {
@@ -260,6 +270,10 @@ fn evaluate_terms(
     depth: usize,
     cb: RecordCb,
 ) {
+    if frame.void_exceeded {
+        cb(frame, SpfResult::PermError, None);
+        return;
+    }
     if idx >= record.terms.len() {
         match record.redirect.clone() {
             None => cb(frame, SpfResult::Neutral, None),
@@ -387,8 +401,13 @@ fn evaluate_terms(
                         evaluate_terms(frame, domain, record, idx + 1, depth, cb);
                     }
                     Lookup::Answers(mut mx) => {
+                        // RFC 7208 section 4.6.4: more than 10 exchanges is
+                        // a permerror, not a reason to look at fewer.
+                        if mx.len() > MAX_MX_HOSTS {
+                            cb(frame, SpfResult::PermError, None);
+                            return;
+                        }
                         mx.sort_by_key(|(pref, _)| *pref);
-                        mx.truncate(MAX_MX_HOSTS);
                         let hosts: Vec<String> = mx.into_iter().map(|(_, h)| h).collect();
                         check_hosts_any(
                             frame,
@@ -506,6 +525,10 @@ fn finish_match(
     result: SpfResult,
     cb: RecordCb,
 ) {
+    if frame.void_exceeded {
+        cb(frame, SpfResult::PermError, None);
+        return;
+    }
     if result != SpfResult::Fail {
         cb(frame, result, None);
         return;
@@ -785,12 +808,12 @@ fn parse_record(text: &str) -> Result<ParsedRecord, ()> {
     let mut redirect = None;
     let mut exp = None;
     for token in tokens {
-        let (qualifier, rest) = match token.chars().next() {
-            Some('+') => (Qualifier::Pass, &token[1..]),
-            Some('-') => (Qualifier::Fail, &token[1..]),
-            Some('~') => (Qualifier::SoftFail, &token[1..]),
-            Some('?') => (Qualifier::Neutral, &token[1..]),
-            Some(_) => (Qualifier::Pass, token),
+        let (qualifier, rest, explicit) = match token.chars().next() {
+            Some('+') => (Qualifier::Pass, &token[1..], true),
+            Some('-') => (Qualifier::Fail, &token[1..], true),
+            Some('~') => (Qualifier::SoftFail, &token[1..], true),
+            Some('?') => (Qualifier::Neutral, &token[1..], true),
+            Some(_) => (Qualifier::Pass, token, false),
             None => continue,
         };
         if rest.eq_ignore_ascii_case("all") {
@@ -852,17 +875,22 @@ fn parse_record(text: &str) -> Result<ParsedRecord, ()> {
                 },
             ));
         } else if let Some(spec) = strip_ci_prefix(rest, "redirect=") {
-            if spec.is_empty() {
+            // RFC 7208 section 6: no qualifier, and at most once.
+            if spec.is_empty() || explicit || redirect.is_some() {
                 return Err(());
             }
             redirect = Some(spec.to_string());
         } else if let Some(spec) = strip_ci_prefix(rest, "exp=") {
-            if spec.is_empty() {
+            if spec.is_empty() || explicit || exp.is_some() {
                 return Err(());
             }
             exp = Some(spec.to_string());
         } else if is_unknown_modifier(rest) {
-            // Unrecognized `name=value` modifier — ignore per RFC 7208 §6.
+            // Unrecognized `name=value` modifier — ignored per RFC 7208 §6,
+            // but a modifier never takes a qualifier.
+            if explicit {
+                return Err(());
+            }
         } else {
             return Err(());
         }
@@ -964,26 +992,28 @@ fn parse_domain_and_cidr(s: &str) -> Result<DomainAndCidr, ()> {
 }
 
 fn parse_dual_cidr(s: &str) -> Result<(Option<u8>, Option<u8>), ()> {
+    // RFC 7208 section 12: `[ "/" ip4-cidr ] [ "//" ip6-cidr ]`.
     let s = s.strip_prefix('/').ok_or(())?;
+    let v4 = |t: &str| -> Result<u8, ()> {
+        let n: u8 = t.parse().map_err(|_| ())?;
+        if n > 32 {
+            return Err(());
+        }
+        Ok(n)
+    };
+    let v6 = |t: &str| -> Result<u8, ()> {
+        let n: u8 = t.parse().map_err(|_| ())?;
+        if n > 128 {
+            return Err(());
+        }
+        Ok(n)
+    };
     if let Some(rest) = s.strip_prefix('/') {
-        let v6: u8 = rest.parse().map_err(|_| ())?;
-        if v6 > 128 {
-            return Err(());
-        }
-        Ok((None, Some(v6)))
-    } else if let Some(pos) = s.find('/') {
-        let v4: u8 = s[..pos].parse().map_err(|_| ())?;
-        let v6: u8 = s[pos + 1..].parse().map_err(|_| ())?;
-        if v4 > 32 || v6 > 128 {
-            return Err(());
-        }
-        Ok((Some(v4), Some(v6)))
+        Ok((None, Some(v6(rest)?)))
+    } else if let Some((four, six)) = s.split_once("//") {
+        Ok((Some(v4(four)?), Some(v6(six)?)))
     } else {
-        let v4: u8 = s.parse().map_err(|_| ())?;
-        if v4 > 32 {
-            return Err(());
-        }
-        Ok((Some(v4), None))
+        Ok((Some(v4(s)?), None))
     }
 }
 

@@ -166,6 +166,10 @@ impl DkimSignStream<'_, '_> {
     }
 
     /// Finish: compute the body hash from everything fed so far, then sign.
+    ///
+    /// Returns the header's value; send it as `DKIM-Signature: <value>` (one
+    /// space after the colon, and no change to the value, which is what
+    /// `c=simple` header canonicalization signs).
     pub fn finish(self) -> Result<String, SignError> {
         let signer = self.signer;
         let t = signer.timestamp.unwrap_or_else(|| {
@@ -197,7 +201,9 @@ impl DkimSignStream<'_, '_> {
 
         let sig_header_bytes = {
             let mut b = Vec::new();
-            b.extend_from_slice(b"DKIM-Signature:");
+            // The form callers emit: with simple header canonicalization the
+            // header is signed exactly as it is sent.
+            b.extend_from_slice(b"DKIM-Signature: ");
             b.extend_from_slice(unsigned_value.as_bytes());
             b
         };
@@ -226,7 +232,7 @@ pub(crate) fn select_headers<'a>(all: &'a [RawHeader], h_list: &[String]) -> Vec
             .iter()
             .filter(|h| h.name().eq_ignore_ascii_case(name))
             .collect();
-        let count = used.entry(name.clone()).or_insert(0);
+        let count = used.entry(name.to_ascii_lowercase()).or_insert(0);
         if *count < matches.len() {
             let idx = matches.len() - 1 - *count;
             selected.push(matches[idx]);

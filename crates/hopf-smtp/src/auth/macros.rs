@@ -95,7 +95,11 @@ pub fn expand(spec: &str, ctx: &MacroContext) -> Result<String, ()> {
                 let n: Option<usize> = if digits.is_empty() {
                     None
                 } else {
-                    Some(digits.parse().map_err(|_| ())?)
+                    // RFC 7208 section 7.1: a keep count of zero is an error.
+                    match digits.parse().map_err(|_| ())? {
+                        0 => return Err(()),
+                        n => Some(n),
+                    }
                 };
                 let transformed = transform(&value, &delims, reverse, n);
                 if url_escape {

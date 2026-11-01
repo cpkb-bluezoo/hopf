@@ -11,6 +11,7 @@ use rmimeparser::dkim::RawHeader;
 use hopf_core::crypto::{ed25519_verify, rsa_verify_pkcs1_sha256, RsaPublicKeyComponents, SignatureBytes};
 
 use super::canon::{self, Canonicalization};
+use super::sign::select_headers;
 use super::rsa_der;
 use crate::auth::dns_lookup::{DnsLookup, Lookup};
 
@@ -255,7 +256,7 @@ fn verify_tags_and_hash(
     };
 
     let signed_data = build_signed_data(&headers, &tags, &sig_header);
-    fetch_key_and_verify(dns, algo, tags.d, tags.s, signed_data, signature, cb);
+    fetch_key_and_verify(dns, algo, tags.d, tags.s, tags.i, signed_data, signature, cb);
 }
 
 /// Final stage shared by DKIM signatures and RFC 8617 ARC signatures: fetch
@@ -266,6 +267,7 @@ fn fetch_key_and_verify(
     algo: Algorithm,
     d: String,
     s: String,
+    identity: Option<String>,
     signed_data: Vec<u8>,
     signature: SignatureBytes,
     cb: DkimCallback,
@@ -283,7 +285,15 @@ fn fetch_key_and_verify(
                     } else {
                         match parse_key_record(&txts[0]) {
                             Err(()) => DkimResult::PermError,
-                            Ok(key) => evaluate_key(&key, algo, &signature, &signed_data),
+                            Ok(key) => {
+                                let identity_domain = identity.as_deref().and_then(|i| i.rsplit_once('@')).map(|(_, dom)| dom);
+                                match identity_domain {
+                                    Some(dom) if key.strict && !dom.trim_end_matches('.').eq_ignore_ascii_case(d.trim_end_matches('.')) => {
+                                        DkimResult::Fail
+                                    }
+                                    _ => evaluate_key(&key, algo, &signature, &signed_data),
+                                }
+                            }
                         }
                     }
                 }
@@ -359,7 +369,14 @@ pub(crate) fn verify_arc_seal(
         .split_once(':')
         .map(|(_, v)| v.to_string())
         .unwrap_or_default();
-    let tags = parse_tag_list(&value);
+    let Ok(tags) = parse_tag_list(&value) else {
+        cb(DkimSignatureResult {
+            result: DkimResult::PermError,
+            signing_domain: None,
+            selector: None,
+        });
+        return;
+    };
     let (Some(a), Some(b), Some(d), Some(s)) =
         (tags.get("a"), tags.get("b"), tags.get("d"), tags.get("s"))
     else {
@@ -403,6 +420,7 @@ pub(crate) fn verify_arc_seal(
         algo,
         d.clone(),
         s.clone(),
+        None,
         signed_data,
         SignatureBytes::from_bytes(hopf_core::Bytes::from(sig)),
         cb,
@@ -496,27 +514,6 @@ fn build_signed_data(headers: &[RawHeader], tags: &SigTags, sig_header: &RawHead
     out
 }
 
-/// RFC 6376 §5.4: for each name in `h=`, take the next-from-the-bottom
-/// unused header field instance with that name; if fewer instances exist
-/// than references, the extra references are simply omitted.
-fn select_headers<'a>(all: &'a [RawHeader], h_list: &[String]) -> Vec<&'a RawHeader> {
-    let mut used: HashMap<String, usize> = HashMap::new();
-    let mut selected = Vec::with_capacity(h_list.len());
-    for name in h_list {
-        let matches: Vec<&RawHeader> = all
-            .iter()
-            .filter(|h| h.name().eq_ignore_ascii_case(name))
-            .collect();
-        let count = used.entry(name.clone()).or_insert(0);
-        if *count < matches.len() {
-            let idx = matches.len() - 1 - *count;
-            selected.push(matches[idx]);
-            *count += 1;
-        }
-    }
-    selected
-}
-
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let stripped: String = s.chars().filter(|c| !c.is_whitespace()).collect();
     rmimeparser::charset::base64::decode(&stripped).ok()
@@ -531,6 +528,8 @@ fn domain_eq_or_subdomain(sub: &str, base: &str) -> bool {
 // --- DKIM-Signature tag parsing (RFC 6376 §3.5) ---------------------------
 
 struct SigTags {
+    /// `i=`, the signing identity, when given.
+    i: Option<String>,
     a: String,
     b: String,
     bh: String,
@@ -542,7 +541,9 @@ struct SigTags {
     x: Option<u64>,
 }
 
-fn parse_tag_list(value: &str) -> HashMap<String, String> {
+/// RFC 6376 section 3.2: `tag=value` pairs separated by `;`. A tag name may
+/// occur only once; a list with a repeated one is not valid.
+fn parse_tag_list(value: &str) -> Result<HashMap<String, String>, ()> {
     let mut tags = HashMap::new();
     for part in value.split(';') {
         let part = part.trim();
@@ -550,10 +551,12 @@ fn parse_tag_list(value: &str) -> HashMap<String, String> {
             continue;
         }
         if let Some((name, val)) = part.split_once('=') {
-            tags.insert(name.trim().to_string(), val.trim().to_string());
+            if tags.insert(name.trim().to_string(), val.trim().to_string()).is_some() {
+                return Err(());
+            }
         }
     }
-    tags
+    Ok(tags)
 }
 
 /// Which signature header a tag list belongs to: `DKIM-Signature`
@@ -572,7 +575,7 @@ fn parse_signature_tags(header_line: &str) -> Result<SigTags, ()> {
 
 fn parse_signature_tags_for(header_line: &str, kind: SigKind) -> Result<SigTags, ()> {
     let value = header_line.split_once(':').map(|(_, v)| v).unwrap_or("");
-    let tags = parse_tag_list(value);
+    let tags = parse_tag_list(value)?;
 
     if kind == SigKind::Dkim && tags.get("v").map(|v| v.as_str()) != Some("1") {
         return Err(());
@@ -621,6 +624,7 @@ fn parse_signature_tags_for(header_line: &str, kind: SigKind) -> Result<SigTags,
     };
 
     Ok(SigTags {
+        i: tags.get("i").cloned(),
         a,
         b,
         bh,
@@ -636,6 +640,8 @@ fn parse_signature_tags_for(header_line: &str, kind: SigKind) -> Result<SigTags,
 // --- DKIM key record parsing (RFC 6376 §3.6.1) ----------------------------
 
 struct KeyTags {
+    /// `t=s`: `i=` must be in the signing domain itself, not a subdomain.
+    strict: bool,
     k: String,
     p: Option<Vec<u8>>,
     h: Option<Vec<String>>,
@@ -643,7 +649,7 @@ struct KeyTags {
 }
 
 fn parse_key_record(txt: &str) -> Result<KeyTags, ()> {
-    let tags = parse_tag_list(txt);
+    let tags = parse_tag_list(txt)?;
     if let Some(v) = tags.get("v") {
         if !v.eq_ignore_ascii_case("DKIM1") {
             return Err(());
@@ -661,7 +667,10 @@ fn parse_key_record(txt: &str) -> Result<KeyTags, ()> {
     let s = tags
         .get("s")
         .map(|v| v.split(':').map(|s| s.trim().to_string()).collect());
-    Ok(KeyTags { k, p, h, s })
+    let strict = tags
+        .get("t")
+        .is_some_and(|t| t.split(':').any(|f| f.trim().eq_ignore_ascii_case("s")));
+    Ok(KeyTags { strict, k, p, h, s })
 }
 
 #[cfg(test)]
