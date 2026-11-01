@@ -251,8 +251,6 @@ fn make_server(
         mech,
         store,
         SaslServerOptions {
-            hostname: "localhost".into(),
-            realm: "hopf-mqtt".into(),
             peer_certificate: None,
             channel_binding: None,
         },

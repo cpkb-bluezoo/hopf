@@ -203,8 +203,8 @@ impl CredentialStore for SlowStore {
         std::thread::sleep(self.delay);
         self.inner.password_match(username, password)
     }
-    fn digest_ha1(&self, username: &str, realm: &str) -> Option<String> {
-        self.inner.digest_ha1(username, realm)
+    fn digest_ha1(&self, username: &str, realm: &str, algorithm: hopf_auth::DigestAlgorithm) -> Option<String> {
+        self.inner.digest_ha1(username, realm, algorithm)
     }
     fn scram_credentials(&self, username: &str) -> Option<ScramCredentials> {
         // SCRAM verifies against these, not `password_match`: the same delay.
@@ -233,12 +233,6 @@ fn client_fetch_round_trip() {
 
     let fetch = Pop3Fetch::new()
         .credentials("alice", "secret")
-        // `PasswordStore` never retains a recoverable plaintext password
-        // (see its doc comment), so it can't verify APOP; `prefer_apop`
-        // defaults to true and the server always advertises a timestamp
-        // (issue #218), so without this the auto-pilot tries APOP first
-        // and fails before ever attempting USER/PASS.
-        .prefer_apop(false)
         .on_message(Box::new(CollectMessages(received2, Vec::new())))
         .on_complete(Box::new(move |ok| {
             *done2.lock().unwrap() = Some(ok);
@@ -274,7 +268,6 @@ fn client_fetch_delete_after_fetch() {
     let fetch = Pop3Fetch::new()
         .credentials("alice", "secret")
         // See the comment on the same call in `client_fetch_round_trip`.
-        .prefer_apop(false)
         .delete_after_fetch(true)
         .on_complete(Box::new(move |ok| {
             *done2.lock().unwrap() = Some(ok);
@@ -342,7 +335,6 @@ fn client_empty_maildrop() {
     let fetch = Pop3Fetch::new()
         .credentials("bob", "pw")
         // See the comment on the same call in `client_fetch_round_trip`.
-        .prefer_apop(false)
         .on_complete(Box::new(move |ok| {
             *done2.lock().unwrap() = Some(ok);
         }));
@@ -369,7 +361,6 @@ fn client_localhost_hostname_dial() {
 
     let fetch = Pop3Fetch::new()
         .credentials("alice", "secret")
-        .prefer_apop(false)
         .on_message(Box::new(CollectMessages(received2, Vec::new())))
         .on_complete(Box::new(move |ok| {
             *done2.lock().unwrap() = Some(ok);
@@ -432,7 +423,6 @@ fn client_stls_fetch() {
 
     let fetch = Pop3Fetch::new()
         .credentials("alice", "secret")
-        .prefer_apop(false)
         .require_stls(true)
         .on_message(Box::new(CollectMessages(received2, Vec::new())))
         .on_complete(Box::new(move |ok| {
@@ -527,7 +517,7 @@ fn server_auth_pipelined_with_stat_is_not_run_before_auth_completes() {
     let mut buf = vec![0u8; 4096];
     read_until(&mut stream, &mut buf, |s| s.starts_with("+OK"));
 
-    let mut client = hopf_auth::create_client(SaslMechanism::ScramSha256, "alice", "secret", "localhost", "pop", None);
+    let mut client = hopf_auth::create_client(SaslMechanism::ScramSha256, "alice", "secret", None);
     let step = |client: &mut Box<dyn hopf_auth::SaslClient>, challenge: Option<&str>| {
         let challenge = challenge.map(|c| rmimeparser::charset::base64::decode(c).unwrap());
         match client.evaluate(challenge.as_deref()) {

@@ -153,8 +153,7 @@ pub(crate) fn ehlo_argument(hostname: &str, ep: &dyn Endpoint) -> String {
 
 /// The strongest mechanism an auto-pilot can drive with what it holds —
 /// a bare username/password, or (`bearer`) an OAuth 2.0 token — that the
-/// server actually advertises. Password auth excludes DIGEST-MD5
-/// (deprecated, needs a hostname the pipelines don't track) and EXTERNAL
+/// server actually advertises. Password auth excludes EXTERNAL
 /// (needs a client certificate); a custom driver can still use any of
 /// those directly via [`SmtpClientSession::auth`].
 pub(crate) fn choose_sasl_mechanism(auth_methods: &[String], bearer: bool) -> Option<SaslMechanism> {
@@ -481,8 +480,7 @@ impl SmtpSendDriver {
 
     /// The strongest mechanism this auto-pilot can drive with a bare
     /// username/password that the server actually advertises. Excludes
-    /// DIGEST-MD5 (deprecated, needs a hostname this pipeline doesn't
-    /// track), OAUTHBEARER (needs a bearer token, not a password), and
+    /// OAUTHBEARER (needs a bearer token, not a password) and
     /// EXTERNAL (needs a client certificate) — a custom driver can still
     /// use any of those directly via [`SmtpClientSession::auth`].
     fn choose_mechanism(auth_methods: &[String], bearer: bool) -> Option<SaslMechanism> {
@@ -692,7 +690,7 @@ impl SmtpClientDriver for SmtpSendDriver {
         if let Some((user, pass)) = st.auth.clone() {
             let bearer = st.auth_bearer;
             if let Some(mech) = Self::choose_mechanism(&caps.auth_methods, bearer) {
-                let mut client = create_client(mech, &user, &pass, "", "smtp", None);
+                let mut client = create_client(mech, &user, &pass, None);
                 if client.has_initial_response() {
                     if let SaslClientStep::Response(initial) | SaslClientStep::Complete(initial) = client.evaluate(None) {
                         st.sasl_client = Some(client);

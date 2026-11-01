@@ -10,11 +10,11 @@
 //! The argument is read according to its verb as its bytes arrive: message
 //! numbers (`RETR`, `DELE`, `TOP`, `LIST`, `UIDL`) are accumulated as numbers
 //! with nothing kept, the argument of a verb that takes none is skipped, and
-//! only a string (`USER`, `PASS`, `APOP`, `AUTH`) is kept, bounded.
+//! only a string (`USER`, `PASS`, `AUTH`) is kept, bounded.
 //!
 //! Beyond tokenizing the line, the lexer also builds the semantic
 //! [`Pop3Command`] directly: `RETR`/`DELE`/`TOP`'s message numbers are
-//! already-parsed `u32`s, `APOP`'s name/digest are already split, and
+//! already-parsed `u32`s, `TOP`'s message number and line count are already split, and
 //! `AUTH`'s initial response is already base64-decoded — the caller never
 //! re-parses a raw argument string. A command whose arguments don't match
 //! its verb's expected shape becomes [`Pop3Command::Malformed`] rather than
@@ -47,13 +47,6 @@ pub enum Pop3Command {
     User(String),
     /// `PASS string`
     Pass(String),
-    /// `APOP name digest`
-    Apop {
-        /// Mailbox name.
-        name: String,
-        /// MD5 digest (hex text, as sent).
-        digest: String,
-    },
     /// Bare `AUTH` — list supported SASL mechanisms (RFC 1734 style).
     AuthList,
     /// `AUTH mechanism [initial-response]` (RFC 5034).
@@ -132,7 +125,7 @@ enum State {
 /// lexer does with each byte of it as it arrives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArgKind {
-    /// A string (`USER`, `PASS`, `APOP`, `AUTH`): kept, bounded, since the
+    /// A string (`USER`, `PASS`, `AUTH`): kept, bounded, since the
     /// string is the thing.
     Text,
     /// Message numbers (`RETR`, `DELE`, `TOP`, `LIST`, `UIDL`): read as
@@ -376,7 +369,7 @@ impl Pop3ServerLexer {
         self.arg.clear();
         let verb = String::from_utf8_lossy(&self.verb).to_ascii_uppercase();
         self.kind = match verb.as_str() {
-            "USER" | "PASS" | "APOP" | "AUTH" => ArgKind::Text,
+            "USER" | "PASS" | "AUTH" => ArgKind::Text,
             "RETR" | "DELE" | "LIST" | "UIDL" => ArgKind::Numbers(1),
             "TOP" => ArgKind::Numbers(2),
             _ => ArgKind::Ignored,
@@ -457,12 +450,6 @@ fn build_command(verb: &str, arg: &[u8], numbers: Numbers) -> Pop3Command {
     match verb {
         "USER" => Pop3Command::User(trimmed.to_string()),
         "PASS" => Pop3Command::Pass(trimmed.to_string()),
-        "APOP" => match split_two(trimmed) {
-            Some((name, digest)) => {
-                Pop3Command::Apop { name: name.to_string(), digest: digest.to_string() }
-            }
-            None => Pop3Command::Malformed { verb: verb.to_string() },
-        },
         "AUTH" => {
             if trimmed.is_empty() {
                 return Pop3Command::AuthList;
@@ -524,7 +511,8 @@ fn parse_optional_msg(s: &str) -> Option<u32> {
 }
 
 /// Split on the first run of whitespace into exactly two non-empty tokens
-/// (`APOP name digest`, `TOP msg lines`).
+/// (`TOP msg lines`).
+#[cfg(test)]
 fn split_two(s: &str) -> Option<(&str, &str)> {
     let mut parts = s.splitn(2, char::is_whitespace);
     let first = parts.next().filter(|s| !s.is_empty())?;
@@ -564,22 +552,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_apop() {
+    fn apop_is_not_a_command() {
         let mut lex = Pop3ServerLexer::new(MAX_COMMAND_LINE);
         let mut data: &[u8] = b"APOP user deadbeefcafe\r\n";
         let cmds = lex.feed(&mut data);
-        assert_eq!(
-            cmds,
-            vec![Pop3Command::Apop { name: "user".into(), digest: "deadbeefcafe".into() }]
-        );
-    }
-
-    #[test]
-    fn apop_missing_digest_is_malformed() {
-        let mut lex = Pop3ServerLexer::new(MAX_COMMAND_LINE);
-        let mut data: &[u8] = b"APOP user\r\n";
-        let cmds = lex.feed(&mut data);
-        assert_eq!(cmds, vec![Pop3Command::Malformed { verb: "APOP".into() }]);
+        assert!(matches!(cmds.as_slice(), [Pop3Command::Unknown { .. }]), "{cmds:?}");
     }
 
     #[test]

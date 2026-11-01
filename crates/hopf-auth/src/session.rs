@@ -68,10 +68,6 @@ pub trait SaslClient: Send {
 /// Options for creating a server mechanism.
 #[derive(Debug, Clone)]
 pub struct SaslServerOptions {
-    /// Hostname for CRAM challenges / DIGEST digest-uri service.
-    pub hostname: String,
-    /// Realm string for DIGEST-MD5.
-    pub realm: String,
     /// Optional peer certificate fingerprint/DN for EXTERNAL.
     pub peer_certificate: Option<String>,
     /// This connection's `tls-server-end-point` channel-binding data
@@ -84,8 +80,6 @@ pub struct SaslServerOptions {
 impl Default for SaslServerOptions {
     fn default() -> Self {
         Self {
-            hostname: "localhost".into(),
-            realm: "hopf".into(),
             peer_certificate: None,
             channel_binding: None,
         }
@@ -101,9 +95,6 @@ pub fn create_server(
     match mechanism {
         SaslMechanism::Plain => Box::new(crate::plain::PlainServer::new(store)),
         SaslMechanism::Login => Box::new(crate::login::LoginServer::new(store)),
-        SaslMechanism::DigestMd5 => {
-            Box::new(crate::digest_md5::DigestMd5Server::new(store, opts.realm))
-        }
         SaslMechanism::ScramSha256 => Box::new(crate::scram::ScramSha256Server::new(store)),
         SaslMechanism::ScramSha256Plus => {
             let mut s = crate::scram::ScramSha256Server::new(store);
@@ -124,10 +115,7 @@ pub fn create_server(
     }
 }
 
-/// Create a client session. `host` and `service` (RFC 2831 §2.1.2
-/// `serv-type`, e.g. `"imap"`, `"pop"`, `"smtp"`, `"amqp"`) together form
-/// [`SaslMechanism::DigestMd5`]'s `digest-uri`; ignored by every other
-/// mechanism. `cert_authzid` is used for EXTERNAL (optional authzid).
+/// Create a client session.
 /// `channel_binding` is required for [`SaslMechanism::ScramSha256Plus`] —
 /// this connection's `tls-server-end-point` data (RFC 5929 §4); ignored by
 /// every other mechanism.
@@ -135,16 +123,11 @@ pub fn create_client(
     mechanism: SaslMechanism,
     username: &str,
     password: &str,
-    host: &str,
-    service: &str,
     channel_binding: Option<&[u8]>,
 ) -> Box<dyn SaslClient> {
     match mechanism {
         SaslMechanism::Plain => Box::new(crate::plain::PlainClient::new(username, password)),
         SaslMechanism::Login => Box::new(crate::login::LoginClient::new(username, password)),
-        SaslMechanism::DigestMd5 => Box::new(crate::digest_md5::DigestMd5Client::new(
-            username, password, host, service,
-        )),
         SaslMechanism::ScramSha256 => {
             Box::new(crate::scram::ScramSha256Client::new(username, password))
         }

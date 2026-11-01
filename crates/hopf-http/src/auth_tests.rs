@@ -286,7 +286,7 @@ fn digest_challenges_carry_fresh_nonces() {
 fn digest_accepts_a_correct_response_once_and_names_the_user() {
     let (f, seen) = digest_factory(None);
     let nonce = issue_nonce(&f);
-    let creds = build_digest_authorization("alice", "s3cret", "files", &nonce, "GET", "/doc");
+    let creds = build_digest_authorization(DigestAlgorithm::Sha256, "alice", "s3cret", "files", &nonce, "GET", "/doc");
     assert_eq!(digest_status(&f, "GET", "/doc", &creds), None);
     assert_eq!(seen.lock().unwrap().headers[0].get(AUTHENTICATED_USER), Some("alice"));
     assert_eq!(digest_status(&f, "GET", "/doc", &creds), Some(401), "a replay");
@@ -297,7 +297,7 @@ fn digest_rejects_a_wrong_password_an_unknown_user_and_a_wrong_method() {
     let (f, seen) = digest_factory(None);
     for (user, pass, method) in [("alice", "wrong", "GET"), ("mallory", "s3cret", "GET"), ("alice", "s3cret", "POST")] {
         let nonce = issue_nonce(&f);
-        let creds = build_digest_authorization(user, pass, "files", &nonce, "GET", "/");
+        let creds = build_digest_authorization(DigestAlgorithm::Sha256, user, pass, "files", &nonce, "GET", "/");
         assert_eq!(digest_status(&f, method, "/", &creds), Some(401), "{user}/{pass}/{method}");
     }
     assert!(seen.lock().unwrap().headers.is_empty());
@@ -307,9 +307,9 @@ fn digest_rejects_a_wrong_password_an_unknown_user_and_a_wrong_method() {
 fn a_failed_attempt_uses_up_the_nonce() {
     let (f, _) = digest_factory(None);
     let nonce = issue_nonce(&f);
-    let bad = build_digest_authorization("alice", "wrong", "files", &nonce, "GET", "/");
+    let bad = build_digest_authorization(DigestAlgorithm::Sha256, "alice", "wrong", "files", &nonce, "GET", "/");
     assert_eq!(digest_status(&f, "GET", "/", &bad), Some(401));
-    let good = build_digest_authorization("alice", "s3cret", "files", &nonce, "GET", "/");
+    let good = build_digest_authorization(DigestAlgorithm::Sha256, "alice", "s3cret", "files", &nonce, "GET", "/");
     assert_eq!(digest_status(&f, "GET", "/", &good), Some(401), "the client must ask again");
 }
 
@@ -318,7 +318,7 @@ fn digest_rejects_credentials_for_another_uri_than_the_request() {
     // RFC 7616 section 3.4: the uri in the credentials must be the request target.
     let (f, seen) = digest_factory(None);
     let nonce = issue_nonce(&f);
-    let creds = build_digest_authorization("alice", "s3cret", "files", &nonce, "GET", "/public");
+    let creds = build_digest_authorization(DigestAlgorithm::Sha256, "alice", "s3cret", "files", &nonce, "GET", "/public");
     assert_eq!(digest_status(&f, "GET", "/private", &creds), Some(401));
     assert!(seen.lock().unwrap().headers.is_empty());
 }
@@ -327,7 +327,7 @@ fn digest_rejects_credentials_for_another_uri_than_the_request() {
 fn digest_scheme_name_is_not_case_sensitive() {
     let (f, _) = digest_factory(None);
     let nonce = issue_nonce(&f);
-    let creds = build_digest_authorization("alice", "s3cret", "files", &nonce, "GET", "/");
+    let creds = build_digest_authorization(DigestAlgorithm::Sha256, "alice", "s3cret", "files", &nonce, "GET", "/");
     let mut h = f.create_handler();
     let mut out = Out::default();
     h.headers(&mut out, &request("GET", "/", Some(&format!("DIGEST {creds}"))));
@@ -356,7 +356,7 @@ fn digest_with_missing_pieces_is_challenged() {
 fn digest_nonces_expire() {
     let (f, _) = digest_factory(Some(Duration::from_millis(20)));
     let nonce = issue_nonce(&f);
-    let creds = build_digest_authorization("alice", "s3cret", "files", &nonce, "GET", "/");
+    let creds = build_digest_authorization(DigestAlgorithm::Sha256, "alice", "s3cret", "files", &nonce, "GET", "/");
     std::thread::sleep(Duration::from_millis(60));
     assert_eq!(digest_status(&f, "GET", "/", &creds), Some(401));
 }
@@ -379,10 +379,10 @@ fn the_oldest_nonce_is_the_one_dropped_when_the_table_is_full() {
     for _ in 0..MAX_OUTSTANDING_NONCES {
         issue_nonce(&f);
     }
-    let creds = build_digest_authorization("alice", "s3cret", "files", &first, "GET", "/");
+    let creds = build_digest_authorization(DigestAlgorithm::Sha256, "alice", "s3cret", "files", &first, "GET", "/");
     assert_eq!(digest_status(&f, "GET", "/", &creds), Some(401), "evicted");
     let recent = issue_nonce(&f);
-    let creds = build_digest_authorization("alice", "s3cret", "files", &recent, "GET", "/");
+    let creds = build_digest_authorization(DigestAlgorithm::Sha256, "alice", "s3cret", "files", &recent, "GET", "/");
     assert_eq!(digest_status(&f, "GET", "/", &creds), None, "a recent nonce still works");
 }
 
@@ -390,7 +390,7 @@ fn the_oldest_nonce_is_the_one_dropped_when_the_table_is_full() {
 fn a_client_supplied_user_header_never_survives_digest_auth() {
     let (f, seen) = digest_factory(None);
     let nonce = issue_nonce(&f);
-    let creds = build_digest_authorization("alice", "s3cret", "files", &nonce, "GET", "/");
+    let creds = build_digest_authorization(DigestAlgorithm::Sha256, "alice", "s3cret", "files", &nonce, "GET", "/");
     let mut req = request("GET", "/", Some(&format!("Digest {creds}")));
     req.add(AUTHENTICATED_USER, "root");
     let mut h = f.create_handler();
@@ -478,4 +478,114 @@ fn bearer_forwards_the_body_only_when_authorized() {
     h.request_complete(&mut out);
     assert!(seen.lock().unwrap().body.is_empty());
     assert_eq!(out.sent.len(), 1, "challenged once");
+}
+
+// -- Digest algorithms --------------------------------------------------------
+
+fn md5_factory(allow_md5: bool) -> DigestAuthFactory {
+    let seen = SharedSeen::default();
+    let store: Arc<dyn CredentialStore> =
+        Arc::new(PasswordStore::new().with_digest_realm("files").with_md5_digest().with_user("alice", "s3cret"));
+    DigestAuthFactory::new(
+        Arc::new(InnerFactory(seen)),
+        store,
+        DigestAuthConfig::new("files").with_md5(allow_md5),
+    )
+}
+
+/// Every Digest challenge a fresh request is given: `(algorithm, nonce)`.
+fn challenges(f: &DigestAuthFactory) -> Vec<(String, String)> {
+    let mut h = f.create_handler();
+    let mut out = Out::default();
+    h.headers(&mut out, &request("GET", "/", None));
+    assert_eq!(out.status(), Some(401));
+    out.sent[0]
+        .iter()
+        .filter(|field| field.name.eq_ignore_ascii_case("www-authenticate"))
+        .map(|field| {
+            let c = hopf_auth::http_digest::parse_challenge(&field.value).expect("a digest challenge");
+            (c.algorithm.name().to_string(), c.nonce)
+        })
+        .collect()
+}
+
+#[test]
+fn digest_challenges_for_sha256_alone_by_default() {
+    let f = md5_factory(false);
+    let c = challenges(&f);
+    assert_eq!(c.len(), 1, "{c:?}");
+    assert_eq!(c[0].0, "SHA-256");
+}
+
+#[test]
+fn digest_with_md5_allowed_offers_sha256_first_then_md5() {
+    let f = md5_factory(true);
+    let c = challenges(&f);
+    assert_eq!(c.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>(), ["SHA-256", "MD5"]);
+    assert_ne!(c[0].1, c[1].1, "each challenge has its own nonce");
+}
+
+#[test]
+fn digest_md5_credentials_are_refused_unless_md5_is_allowed() {
+    // The store holds an MD5 HA1 and the credentials are correct: still no.
+    let f = md5_factory(false);
+    let nonce = issue_nonce(&f);
+    let creds = build_digest_authorization(DigestAlgorithm::Md5, "alice", "s3cret", "files", &nonce, "GET", "/");
+    assert_eq!(digest_status(&f, "GET", "/", &creds), Some(401));
+}
+
+#[test]
+fn digest_md5_credentials_work_when_md5_is_allowed() {
+    let f = md5_factory(true);
+    let c = challenges(&f);
+    let md5_nonce = &c.iter().find(|(a, _)| a == "MD5").unwrap().1;
+    let creds = build_digest_authorization(DigestAlgorithm::Md5, "alice", "s3cret", "files", md5_nonce, "GET", "/");
+    assert_eq!(digest_status(&f, "GET", "/", &creds), None);
+    let sha_nonce = &c.iter().find(|(a, _)| a == "SHA-256").unwrap().1;
+    let creds = build_digest_authorization(DigestAlgorithm::Sha256, "alice", "s3cret", "files", sha_nonce, "GET", "/");
+    assert_eq!(digest_status(&f, "GET", "/", &creds), None, "and SHA-256 still does");
+}
+
+#[test]
+fn a_sha256_nonce_cannot_be_traded_down_to_md5() {
+    let f = md5_factory(true);
+    let c = challenges(&f);
+    let sha_nonce = &c.iter().find(|(a, _)| a == "SHA-256").unwrap().1;
+    let creds = build_digest_authorization(DigestAlgorithm::Md5, "alice", "s3cret", "files", sha_nonce, "GET", "/");
+    assert_eq!(digest_status(&f, "GET", "/", &creds), Some(401));
+}
+
+#[test]
+fn credentials_without_an_algorithm_count_as_md5() {
+    // RFC 7616 section 3.3: an absent algorithm is MD5, so by default refused.
+    let f = md5_factory(false);
+    let nonce = issue_nonce(&f);
+    let creds = build_digest_authorization(DigestAlgorithm::Sha256, "alice", "s3cret", "files", &nonce, "GET", "/")
+        .replace("algorithm=SHA-256, ", "");
+    assert!(!creds.contains("algorithm"));
+    assert_eq!(digest_status(&f, "GET", "/", &creds), Some(401));
+}
+
+#[test]
+fn unknown_and_session_algorithms_are_refused() {
+    let f = md5_factory(true);
+    for alg in ["SHA-512-256", "SHA-256-sess", "MD5-sess", "bogus"] {
+        let nonce = issue_nonce(&f);
+        let creds = build_digest_authorization(DigestAlgorithm::Sha256, "alice", "s3cret", "files", &nonce, "GET", "/")
+            .replace("algorithm=SHA-256", &format!("algorithm={alg}"));
+        assert_eq!(digest_status(&f, "GET", "/", &creds), Some(401), "{alg}");
+    }
+}
+
+#[test]
+fn a_store_without_the_algorithms_ha1_fails_the_login() {
+    // SHA-256 only in the store; MD5 allowed by the server: MD5 logins fail.
+    let seen = SharedSeen::default();
+    let store: Arc<dyn CredentialStore> =
+        Arc::new(PasswordStore::new().with_digest_realm("files").with_user("alice", "s3cret"));
+    let f = DigestAuthFactory::new(Arc::new(InnerFactory(seen)), store, DigestAuthConfig::new("files").with_md5(true));
+    let c = challenges(&f);
+    let md5_nonce = &c.iter().find(|(a, _)| a == "MD5").unwrap().1;
+    let creds = build_digest_authorization(DigestAlgorithm::Md5, "alice", "s3cret", "files", md5_nonce, "GET", "/");
+    assert_eq!(digest_status(&f, "GET", "/", &creds), Some(401));
 }

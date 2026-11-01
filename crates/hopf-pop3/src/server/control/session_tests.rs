@@ -177,7 +177,7 @@ fn scram_sha_256_authenticates_end_to_end() {
     let decode = |line: &str| rmimeparser::charset::base64::decode(line.trim().trim_start_matches("+ ")).unwrap();
     for initial_response in [true, false] {
         for (password, ok) in [("p", true), ("wrong", false)] {
-            let mut client = create_client(SaslMechanism::ScramSha256, "u", password, "localhost", "pop", None);
+            let mut client = create_client(SaslMechanism::ScramSha256, "u", password, None);
             let SaslClientStep::Response(first) = client.evaluate(None) else { panic!("client-first") };
             let mut s = Session::with_messages(&[]);
             let out = if initial_response {
@@ -218,13 +218,10 @@ fn a_login_too_soon_after_a_failure_is_refused_with_the_login_delay_code() {
 
 #[test]
 fn the_greeting_and_the_commands_that_work_before_login() {
-    let mut s = Session::with(&[], |mut c| {
-        c.enable_apop = true;
-        c
-    });
-    assert!(s.greeting.starts_with("+OK ready <") && s.greeting.ends_with("@localhost>\r\n"), "{:?}", s.greeting);
+    let mut s = Session::with(&[], |c| c);
+    assert_eq!(s.greeting, "+OK ready\r\n");
     let out = s.run("CAPA\r\n");
-    for capability in ["USER", "UIDL", "TOP", "RESP-CODES", "AUTH-RESP-CODE", "IMPLEMENTATION hopf", "UTF8 USER", "APOP", "SASL "] {
+    for capability in ["USER", "UIDL", "TOP", "RESP-CODES", "AUTH-RESP-CODE", "IMPLEMENTATION hopf", "UTF8 USER", "SASL "] {
         assert!(out.contains(&format!("\r\n{capability}")), "{capability} in {out}");
     }
     assert!(out.starts_with("+OK Capability list follows\r\n") && out.ends_with("\r\n.\r\n"), "{out}");
@@ -384,7 +381,7 @@ fn dele_hides_a_message_rset_brings_it_back_and_only_quit_removes_it() {
 fn commands_that_are_for_the_authorization_state_are_refused_once_logged_in() {
     let mut s = Session::with_messages(&[]);
     s.login();
-    for command in ["USER u", "PASS p", "APOP u 00000000000000000000000000000000", "AUTH", "AUTH PLAIN x"] {
+    for command in ["USER u", "PASS p", "AUTH", "AUTH PLAIN x"] {
         assert_eq!(s.run(&format!("{command}\r\n")), "-ERR Already authenticated\r\n", "{command}");
     }
     assert_eq!(s.run("STLS\r\n"), "-ERR STLS only valid in AUTHORIZATION state\r\n");
@@ -413,64 +410,13 @@ fn a_message_with_non_ascii_headers_needs_utf8_mode() {
     assert!(s.run("LIST 2\r\n").starts_with("+OK 2 "));
 }
 
-/// APOP needs a store that can recover the password; `PasswordStore` keeps none.
-struct RecoverableStore(hopf_auth::PasswordStore);
-
-impl hopf_auth::CredentialStore for RecoverableStore {
-    fn password_match(&self, username: &str, password: &str) -> bool {
-        self.0.password_match(username, password)
-    }
-    fn plaintext_password(&self, username: &str) -> Option<String> {
-        (username == "u").then(|| "p".to_string())
-    }
-    fn digest_ha1(&self, username: &str, realm: &str) -> Option<String> {
-        self.0.digest_ha1(username, realm)
-    }
-    fn scram_credentials(&self, username: &str) -> Option<hopf_auth::store::ScramCredentials> {
-        self.0.scram_credentials(username)
-    }
-}
-
-fn apop_session() -> Session {
-    Session::with(&[], |mut c| {
-        c.enable_apop = true;
-        c.store = Arc::new(RecoverableStore(hopf_auth::PasswordStore::new().with_user("u", "p")));
-        c
-    })
-}
-
 #[test]
-fn apop_authenticates_with_the_greeting_s_timestamp() {
-    let mut s = apop_session();
-    let timestamp = s.greeting.trim().rsplit(' ').next().unwrap().to_string();
-    assert!(timestamp.starts_with('<') && timestamp.ends_with('>'), "{timestamp}");
-    let digest = hopf_auth::crypto::md5_hex(format!("{timestamp}p").as_bytes());
-    assert_eq!(s.run(&format!("APOP u {digest}\r\n")), "+OK Mailbox opened\r\n");
-    assert!(s.run("STAT\r\n").starts_with("+OK 0 0"));
-
-    let mut s = apop_session();
-    let timestamp = s.greeting.trim().rsplit(' ').next().unwrap().to_string();
-    let wrong = hopf_auth::crypto::md5_hex(format!("{timestamp}nope").as_bytes());
-    assert_eq!(s.run(&format!("APOP u {wrong}\r\n")), "-ERR [AUTH] Authentication failed\r\n");
-    // A digest for another timestamp (a replay) is no good.
-    let replay = hopf_auth::crypto::md5_hex(b"<other@localhost>p");
-    assert_eq!(s.run(&format!("APOP u {replay}\r\n")), "-ERR [AUTH] Authentication failed\r\n");
-    // A store that cannot recover the password cannot do APOP, and says it failed.
-    let mut s = Session::with(&[], |mut c| {
-        c.enable_apop = true;
-        c
-    });
-    let timestamp = s.greeting.trim().rsplit(' ').next().unwrap().to_string();
-    let digest = hopf_auth::crypto::md5_hex(format!("{timestamp}p").as_bytes());
-    assert_eq!(s.run(&format!("APOP u {digest}\r\n")), "-ERR [AUTH] Authentication failed\r\n");
-    // Without APOP enabled the greeting has no timestamp and the command is refused.
-    let mut off = Session::with(&[], |mut c| {
-        c.enable_apop = false;
-        c
-    });
-    assert!(!off.greeting.contains('<'), "{:?}", off.greeting);
-    assert_eq!(off.run("APOP u 00000000000000000000000000000000\r\n"), "-ERR APOP not available\r\n");
-    assert!(!off.run("CAPA\r\n").contains("\r\nAPOP\r\n"));
+fn apop_is_gone() {
+    // No timestamp in the greeting, no APOP in CAPA, and the command is unknown.
+    let mut s = Session::with(&[], |c| c);
+    assert!(!s.greeting.contains('<'), "{:?}", s.greeting);
+    assert!(!s.run("CAPA\r\n").contains("\r\nAPOP\r\n"));
+    assert!(s.run("APOP u 00000000000000000000000000000000\r\n").starts_with("-ERR"));
 }
 
 #[test]

@@ -481,18 +481,6 @@ fn start_smtp_server_with_credential_store(store: Arc<dyn CredentialStore>) -> (
     (rt, bound)
 }
 
-/// A store enrolling "alice"/"secret" that can drive DIGEST-MD5, not just
-/// SCRAM-SHA-256 — [`start_smtp_server_with_store`]'s bare `PasswordStore`
-/// has no digest realm set, so it can't.
-fn digest_capable_store() -> Arc<dyn CredentialStore> {
-    Arc::new(SlowStore {
-        inner: PasswordStore::new()
-            .with_digest_realm("test.example.com")
-            .with_user("alice", "secret"),
-        delay: Duration::ZERO,
-    })
-}
-
 /// Wraps a [`PasswordStore`] and sleeps inside `password_match`/
 /// `scram_credentials` — deterministically widens the window a credential
 /// check spends offloaded to the storage pool (issue #181), so a
@@ -513,8 +501,8 @@ impl CredentialStore for SlowStore {
         std::thread::sleep(self.delay);
         self.inner.password_match(username, password)
     }
-    fn digest_ha1(&self, username: &str, realm: &str) -> Option<String> {
-        self.inner.digest_ha1(username, realm)
+    fn digest_ha1(&self, username: &str, realm: &str, algorithm: hopf_auth::DigestAlgorithm) -> Option<String> {
+        self.inner.digest_ha1(username, realm, algorithm)
     }
     fn scram_credentials(&self, username: &str) -> Option<ScramCredentials> {
         // SCRAM verifies against these, not `password_match`: the same delay.
@@ -561,7 +549,7 @@ fn read_until(stream: &mut TcpStream, buf: &mut [u8], pred: impl Fn(&str) -> boo
 /// SCRAM-SHA-256, with the server's final message as its own 334.
 #[test]
 fn smtp_auth_scram_raw() {
-    let (rt, addr) = start_smtp_server_with_credential_store(digest_capable_store());
+    let (rt, addr) = start_smtp_server_with_credential_store(Arc::new(PasswordStore::new().with_user("alice", "secret")));
 
     let mut stream = TcpStream::connect(addr).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -600,7 +588,7 @@ fn smtp_auth_scram_raw() {
 
 /// A SCRAM-SHA-256 client for alice/secret.
 fn scram_client() -> Box<dyn hopf_auth::SaslClient> {
-    hopf_auth::create_client(SaslMechanism::ScramSha256, "alice", "secret", "localhost", "smtp", None)
+    hopf_auth::create_client(SaslMechanism::ScramSha256, "alice", "secret", None)
 }
 
 /// One client step, as the base64 a protocol sends.
@@ -665,7 +653,7 @@ fn smtp_auth_unsupported_mechanism_is_rejected() {
 /// filtered by TLS requirement — not just a hardcoded `AUTH PLAIN`.
 #[test]
 fn smtp_ehlo_lists_mechanisms_filtered_by_tls() {
-    let (rt, addr) = start_smtp_server_with_credential_store(digest_capable_store());
+    let (rt, addr) = start_smtp_server_with_credential_store(Arc::new(PasswordStore::new().with_user("alice", "secret")));
 
     let mut stream = TcpStream::connect(addr).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -674,7 +662,7 @@ fn smtp_ehlo_lists_mechanisms_filtered_by_tls() {
     write_cmd(&mut stream, b"EHLO client.example\r\n");
     let ehlo = read_until(&mut stream, &mut buf, |s| s.contains("250 "));
 
-    for present in ["DIGEST-MD5", "SCRAM-SHA-256"] {
+    for present in ["SCRAM-SHA-256"] {
         assert!(ehlo.contains(present), "expected {present} in {ehlo}");
     }
     for absent in ["PLAIN", "LOGIN", "OAUTHBEARER", "EXTERNAL"] {

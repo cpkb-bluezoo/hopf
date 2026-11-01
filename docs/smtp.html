@@ -289,7 +289,7 @@
 </tr>
 </tbody>
 </table>
-<p>AUTH is only advertised once TLS is up for mechanisms that require it (PLAIN, LOGIN, OAUTHBEARER, EXTERNAL); TLS-independent mechanisms (DIGEST-MD5, SCRAM-SHA-256) are advertised as soon as a store is configured, even pre-TLS.</p>
+<p>AUTH is only advertised once TLS is up for mechanisms that require it (PLAIN, LOGIN, OAUTHBEARER, EXTERNAL); TLS-independent mechanisms (SCRAM-SHA-256) are advertised as soon as a store is configured, even pre-TLS.</p>
 <h2 id="authentication">Authentication</h2>
 <div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_auth::</span>PasswordStore<span class="op">;</span></span>
 <span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_smtp::</span><span class="op">{</span>SmtpConfig<span class="op">,</span> SmtpService<span class="op">};</span></span>
@@ -301,7 +301,7 @@
 <span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>auth_required(<span class="cn">true</span>)<span class="op">;</span></span></code></pre></div>
 <ul>
 <li><code>auth_required</code> — reject MAIL until AUTH succeeds.</li>
-<li>Mechanisms: whatever the store advertises via <code>supported_mechanisms()</code> — <code>PasswordStore</code> offers PLAIN, LOGIN, SCRAM-SHA-256, OAUTHBEARER, EXTERNAL, plus DIGEST-MD5 when enrolled with <code>with_digest_realm</code>. Same pattern as <a href="pop3.html">POP3</a>/<a href="imap.html">IMAP</a>.</li>
+<li>Mechanisms: whatever the store advertises via <code>supported_mechanisms()</code> — <code>PasswordStore</code> offers PLAIN, LOGIN, SCRAM-SHA-256, OAUTHBEARER, EXTERNAL. Same pattern as <a href="pop3.html">POP3</a>/<a href="imap.html">IMAP</a>.</li>
 </ul>
 <h2 id="handler-spi">Handler SPI</h2>
 <div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> SmtpHandlerFactory<span class="op">:</span> <span class="bu">Send</span> <span class="op">+</span> <span class="bu">Sync</span> <span class="op">{</span></span>

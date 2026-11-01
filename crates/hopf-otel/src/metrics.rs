@@ -375,7 +375,7 @@ impl Pop3ServerMetrics {
         });
     }
 
-    /// USER/PASS / APOP / AUTH attempt finished.
+    /// USER/PASS / AUTH attempt finished.
     pub fn auth(&self, ok: bool) {
         self.export.try_send_metric(MetricPoint::Counter {
             name: "pop3.server.auth",

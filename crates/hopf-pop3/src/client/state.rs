@@ -18,8 +18,6 @@ pub struct Pop3Capabilities {
     pub uidl: bool,
     /// Partial message retrieval (TOP, RFC 1939).
     pub top: bool,
-    /// APOP challenge present in the greeting.
-    pub apop: bool,
     /// SASL AUTH mechanisms advertised (uppercased, RFC 5034).
     pub sasl_mechs: Vec<String>,
     /// UTF8 extension (RFC 6856).
@@ -38,10 +36,6 @@ pub trait Pop3ClientAuthorization {
     fn capa(&mut self);
     /// Send `USER username`.
     fn user(&mut self, username: &str);
-    /// Send `APOP username md5digest`.
-    ///
-    /// `digest` is the lowercase-hex MD5 of `timestamp || password`.
-    fn apop(&mut self, username: &str, digest: &str);
     /// Send `AUTH mechanism [initial_response_b64]`.
     fn auth(&mut self, mechanism: &str, initial: Option<&[u8]>);
     /// Negotiate STLS (RFC 2595).
@@ -68,8 +62,6 @@ pub trait Pop3ClientPostStls {
     fn capa(&mut self);
     /// Send `USER username`.
     fn user(&mut self, username: &str);
-    /// Send `APOP username md5digest`.
-    fn apop(&mut self, username: &str, digest: &str);
     /// Send `AUTH mechanism [initial_response_b64]`.
     fn auth(&mut self, mechanism: &str, initial: Option<&[u8]>);
     /// Send `QUIT`.

@@ -420,11 +420,7 @@ impl CredentialStore for LdapCredentialStore {
         }
     }
 
-    fn plaintext_password(&self, _username: &str) -> Option<String> {
-        None
-    }
-
-    fn digest_ha1(&self, _username: &str, _realm: &str) -> Option<String> {
+    fn digest_ha1(&self, _username: &str, _realm: &str, _algorithm: hopf_auth::DigestAlgorithm) -> Option<String> {
         None
     }
 
@@ -521,9 +517,8 @@ mod tests {
         ));
         let mechs = store.supported_mechanisms();
         assert_eq!(mechs, vec![SaslMechanism::Plain, SaslMechanism::Login]);
-        assert!(store.digest_ha1("u", "r").is_none());
+        assert!(store.digest_ha1("u", "r", hopf_auth::DigestAlgorithm::Sha256).is_none());
         assert!(store.scram_credentials("u").is_none());
-        assert!(store.plaintext_password("u").is_none());
         let (tx, rx) = std::sync::mpsc::channel();
         store.validate_bearer("t", Box::new(move |r| { let _ = tx.send(r); }));
         assert!(rx.recv().unwrap().is_none());

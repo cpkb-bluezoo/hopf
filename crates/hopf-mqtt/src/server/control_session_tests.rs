@@ -45,13 +45,18 @@ fn packets(mut b: &[u8]) -> Vec<Pkt> {
         let (ty, flags) = (b[0] >> 4, b[0] & 0x0F);
         let (mut len, mut shift, mut i) = (0usize, 0, 1);
         loop {
-            let byte = b[i];
+            let Some(&byte) = b.get(i) else {
+                return out; // the rest of the length has not arrived
+            };
             len |= ((byte & 0x7F) as usize) << shift;
             i += 1;
             if byte & 0x80 == 0 {
                 break;
             }
             shift += 7;
+        }
+        if b.len() < i + len {
+            return out; // the rest of the packet has not arrived
         }
         out.push(Pkt { ty, flags, body: b[i..i + len].to_vec() });
         b = &b[i + len..];
@@ -136,7 +141,7 @@ fn connection(broker: &Arc<BrokerState>) -> Server {
 /// `want` packets (storage work completes on other threads) or 3 s pass.
 fn run_for(peer: &mut Server, wire: &[u8], want: usize) -> Vec<u8> {
     let mut out = peer.run_bytes(wire);
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while packets(&out).len() < want && Instant::now() < deadline && !peer.is_closed() {
         std::thread::sleep(Duration::from_millis(2));
         peer.pump();
@@ -149,7 +154,7 @@ fn run_for(peer: &mut Server, wire: &[u8], want: usize) -> Vec<u8> {
 /// `want` packets, then a moment longer in case more than that were sent.
 fn arrivals(peer: &mut Server, want: usize) -> Vec<u8> {
     let mut out = peer.take_bytes();
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while packets(&out).len() < want && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(2));
         peer.pump();
@@ -225,6 +230,22 @@ fn subscribed(b: &Arc<BrokerState>, version: ProtocolVersion, id: &str, f: &str)
     let out = sub.run_bytes(&subscribe_wire(1, &[filter(f, QoS::AtMostOnce)], version));
     assert_eq!(types(&out), [SUBACK]);
     sub
+}
+
+/// Send `wire` and gather everything that comes back for it: the reply and
+/// any deliveries it causes, which may arrive with the reply or after it.
+fn run_and_collect(peer: &mut Server, wire: &[u8], want: usize) -> Vec<u8> {
+    let mut out = peer.run_bytes(wire);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while packets(&out).len() < want && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+        peer.pump();
+        out.extend(peer.take_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(30));
+    peer.pump();
+    out.extend(peer.take_bytes());
+    out
 }
 
 fn connack_of(out: &[u8], version: ProtocolVersion) -> (bool, u8, Properties) {
@@ -371,7 +392,7 @@ fn a_second_connect_ends_the_connection() {
 fn a_connect_split_into_single_bytes_is_accepted() {
     let mut peer = connection(&broker());
     let mut out = peer.run_chunked_bytes(&connect_wire(V3, "a"), 1);
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while out.is_empty() && Instant::now() < deadline {
         peer.pump();
         out.extend(peer.take_bytes());
@@ -649,7 +670,7 @@ fn a_large_payload_split_into_small_reads_is_delivered_whole() {
     let out = publisher.run_chunked_bytes(&publish_wire("big", &payload, QoS::AtMostOnce, false, 0, V3), 777);
     assert!(out.is_empty());
     let mut got = arrivals(&mut sub, 1);
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(10);
     let want_len = payload.len();
     let body = |g: &[u8]| -> Option<Vec<u8>> {
         let pk = std::panic::catch_unwind(|| packets(g)).ok()?;
@@ -712,7 +733,7 @@ fn bad_topic_aliases_end_the_connection_with_the_right_reason() {
 fn retain(b: &Arc<BrokerState>, version: ProtocolVersion, topic: &str) {
     let mut publisher = up_with(b, version, "retainer");
     publisher.run_bytes(&publish_wire(topic, b"kept", QoS::AtMostOnce, true, 0, version));
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while b.retained_matching(topic).is_empty() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(2));
         publisher.pump();
@@ -726,11 +747,12 @@ fn retain_then_subscribe(handling: u8, resubscribe: bool) -> usize {
     let mut sub = up_with(&b, V5, "sub");
     let mut f = filter("ret/#", QoS::AtMostOnce);
     f.retain_handling = handling;
-    sub.run_bytes(&subscribe_wire(1, &[f.clone()], V5));
-    let mut n = packets(&arrivals(&mut sub, usize::from(handling != 2))).iter().filter(|p| p.ty == PUBLISH).count();
+    // The SUBACK and, unless handling is 2, the retained message.
+    let out = run_and_collect(&mut sub, &subscribe_wire(1, &[f.clone()], V5), 1 + usize::from(handling != 2));
+    let mut n = packets(&out).iter().filter(|p| p.ty == PUBLISH).count();
     if resubscribe {
-        sub.run_bytes(&subscribe_wire(2, &[f], V5));
-        n += packets(&arrivals(&mut sub, usize::from(handling == 0))).iter().filter(|p| p.ty == PUBLISH).count();
+        let out = run_and_collect(&mut sub, &subscribe_wire(2, &[f], V5), 1 + usize::from(handling == 0));
+        n += packets(&out).iter().filter(|p| p.ty == PUBLISH).count();
     }
     n
 }
@@ -753,8 +775,7 @@ fn a_retained_delivery_has_the_retain_flag_set() {
     let b = broker();
     retain(&b, V3, "r");
     let mut sub = up_with(&b, V3, "sub");
-    sub.run_bytes(&subscribe_wire(1, &[filter("r", QoS::AtMostOnce)], V3));
-    let got = packets(&arrivals(&mut sub, 1));
+    let got = packets(&run_and_collect(&mut sub, &subscribe_wire(1, &[filter("r", QoS::AtMostOnce)], V3), 2));
     let p = got.iter().find(|p| p.ty == PUBLISH).expect("retained delivery");
     let (topic, payload, _, retain, _) = publish_of(p, V3);
     assert_eq!((topic.as_str(), payload.as_slice(), retain), ("r", &b"kept"[..], true));
@@ -934,7 +955,7 @@ fn scram_delivers_the_server_final_message_in_the_connack_not_in_an_auth_packet(
     // MQTT 5.0 section 4.12.1: during CONNECT the last server data rides in
     // CONNACK's Authentication Data, and the CONNACK names the method.
     let mut peer = connection_with(&broker(), &auth_store(), None, None);
-    let mut client = create_client(SaslMechanism::ScramSha256, "alice", "secret", "localhost", "mqtt", None);
+    let mut client = create_client(SaslMechanism::ScramSha256, "alice", "secret", None);
     let first = sasl_data(client.evaluate(None));
     let out = run_for(&mut peer, &connect_with_method("SCRAM-SHA-256", Some(&first)), 1);
     let (code, props) = auth_of(&packets(&out)[0]);

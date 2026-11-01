@@ -16,7 +16,7 @@ use hopf_otel::{
 };
 use rmimeparser::charset::base64;
 
-use crate::server::auth::{advertised_mechanisms, apop_timestamp, capa_sasl_line, verify_apop};
+use crate::server::auth::{advertised_mechanisms, capa_sasl_line};
 use crate::server::codec::{Pop3Command, Pop3ServerLexer, MAX_COMMAND_LINE};
 use crate::server::handler::{
     AuthenticateState, AuthorizationHandler, ClientConnected, ConnectedState, ListState,
@@ -97,7 +97,6 @@ pub struct Pop3ControlHandler {
     stls_used: bool,
     utf8: bool,
     pending_user: Option<String>,
-    apop_timestamp: String,
     sasl: Option<Box<dyn SaslServer>>,
     /// The mechanism has succeeded for this user and its final data has been
     /// sent as a `+`: the client's empty line is all that is awaited before
@@ -130,7 +129,7 @@ pub struct Pop3ControlHandler {
     /// (issue #181).
     pending_auth_check: Arc<Mutex<Option<AuthCheckOutcome>>>,
     /// Commands lexed while `busy` was set (e.g. a pipelined command right
-    /// behind PASS/APOP/AUTH/RETR/TOP/QUIT), dispatched once it clears —
+    /// behind PASS/AUTH/RETR/TOP/QUIT), dispatched once it clears —
     /// without this, a command already parsed out of the same read as a
     /// busy-triggering one would otherwise be silently dropped rather than
     /// processed against stale state or queued correctly.
@@ -148,13 +147,13 @@ struct PendingOpen {
 }
 
 /// Result of a credential check offloaded to the storage pool (issue #181)
-/// — `CredentialStore::password_match`/`verify_apop`/`SaslServer::step` can
+/// — `CredentialStore::password_match`/`SaslServer::step` can
 /// block for LDAP/PAM-backed stores, so all three run off the reactor
 /// thread; the outcome lands here for `sync_pending_auth_check` to apply
 /// once back on the reactor (the storage callback only has
 /// `&mut dyn Endpoint`, never `&mut Self`).
 enum AuthCheckOutcome {
-    /// PASS or APOP.
+    /// PASS.
     Password {
         user: String,
         result: Result<bool, String>,
@@ -177,11 +176,6 @@ impl Pop3ControlHandler {
         runtime: Arc<Runtime>,
     ) -> Self {
         let expect_implicit_tls = config.implicit_tls && config.tls_acceptor.is_some();
-        let apop_timestamp = if config.enable_apop {
-            apop_timestamp(&config.hostname)
-        } else {
-            String::new()
-        };
         Self {
             client_connected: Some(client),
             authorization: None,
@@ -198,7 +192,6 @@ impl Pop3ControlHandler {
             stls_used: false,
             utf8: false,
             pending_user: None,
-            apop_timestamp,
             sasl: None,
             sasl_ack: None,
             control_handle: None,
@@ -357,8 +350,6 @@ impl Pop3ControlHandler {
         let mut view = ConnectedView {
             endpoint,
             authorization: &mut self.authorization,
-            apop_timestamp: &self.apop_timestamp,
-            enable_apop: self.config.enable_apop,
         };
         if let Some(mut c) = self.client_connected.take() {
             c.connected(&mut view, &self.meta);
@@ -434,8 +425,7 @@ impl Pop3ControlHandler {
                 self.send(endpoint, reply::ok("User accepted"));
             }
             Pop3Command::Pass(password) => self.cmd_pass(endpoint, &password),
-            Pop3Command::Apop { name, digest } => self.cmd_apop(endpoint, &name, &digest),
-            Pop3Command::AuthList => self.cmd_auth_list(endpoint),
+                        Pop3Command::AuthList => self.cmd_auth_list(endpoint),
             Pop3Command::Auth {
                 mechanism,
                 initial_response,
@@ -466,7 +456,6 @@ impl Pop3ControlHandler {
             Pop3Command::Uidl(n) => self.cmd_uidl(endpoint, n),
             Pop3Command::User(_)
             | Pop3Command::Pass(_)
-            | Pop3Command::Apop { .. }
             | Pop3Command::AuthList
             | Pop3Command::Auth { .. } => self.send(endpoint, reply::err("Already authenticated")),
             Pop3Command::Malformed { verb } => {
@@ -493,9 +482,6 @@ impl Pop3ControlHandler {
         }
         if self.config.enable_pipelining {
             lines.push("PIPELINING".to_string());
-        }
-        if self.config.enable_apop {
-            lines.push("APOP".to_string());
         }
         if !self.tls && self.config.tls_acceptor.is_some() && !self.config.implicit_tls {
             lines.push("STLS".to_string());
@@ -619,43 +605,6 @@ impl Pop3ControlHandler {
         );
     }
 
-    fn cmd_apop(&mut self, endpoint: &mut dyn Endpoint, user: &str, digest: &str) {
-        if !self.config.enable_apop {
-            self.send(endpoint, reply::err("APOP not available"));
-            return;
-        }
-        if self.login_delay_active() {
-            self.send(endpoint, reply::err("[LOGIN-DELAY] Login delay active"));
-            return;
-        }
-        let Some(handle) = self.control_handle.clone() else {
-            self.send(endpoint, reply::err("[SYS/TEMP] No connection handle"));
-            return;
-        };
-        let store = Arc::clone(&self.config.store);
-        let user = user.to_owned();
-        let user_for_check = user.clone();
-        let timestamp = self.apop_timestamp.clone();
-        let digest = digest.to_owned();
-        let pending = Arc::clone(&self.pending_auth_check);
-        let busy = Arc::clone(&self.busy);
-        self.set_busy(true);
-        endpoint.pause_read();
-        self.runtime.storage().submit_on(
-            handle.clone(),
-            move || Ok(verify_apop(store.as_ref(), &user_for_check, &timestamp, &digest)),
-            move |result: Result<bool, StorageError>| {
-                let result = result.map_err(|e| e.to_string());
-                *pending.lock().unwrap() = Some(AuthCheckOutcome::Password { user, result });
-                handle.with_endpoint(move |ep| {
-                    busy.store(false, Ordering::Relaxed);
-                    ep.resume_read();
-                    ep.poke_handler();
-                });
-            },
-        );
-    }
-
     fn cmd_auth_list(&mut self, endpoint: &mut dyn Endpoint) {
         if self.login_delay_active() {
             self.send(endpoint, reply::err("[LOGIN-DELAY] Login delay active"));
@@ -691,8 +640,6 @@ impl Pop3ControlHandler {
             return;
         }
         let opts = SaslServerOptions {
-            hostname: self.config.hostname.clone(),
-            realm: self.config.hostname.clone(),
             peer_certificate: self.peer_certificate.clone(),
             channel_binding: None,
         };
@@ -786,7 +733,7 @@ impl Pop3ControlHandler {
         self.sasl_step(endpoint, server, Some(&response), false);
     }
 
-    /// Apply the outcome of an offloaded credential check (PASS/APOP or a
+    /// Apply the outcome of an offloaded credential check (PASS or a
     /// SASL step), once `submit_on`'s callback has stashed one — see
     /// `AuthCheckOutcome`.
     fn sync_pending_auth_check(&mut self, endpoint: &mut dyn Endpoint) {
@@ -1365,7 +1312,7 @@ impl ProtocolHandler for Pop3ControlHandler {
             for cmd in cmds {
                 // While busy, queue instead of dropping — a command already
                 // lexed out of this same buffer (e.g. pipelined right behind
-                // PASS/APOP/AUTH) must not be lost just because a prior command
+                // PASS/AUTH) must not be lost just because a prior command
                 // in this same batch started a storage offload.
                 self.enqueue_or_dispatch(endpoint, cmd);
             }
@@ -1416,19 +1363,12 @@ impl ProtocolHandler for Pop3ControlHandler {
 struct ConnectedView<'a> {
     endpoint: &'a mut dyn Endpoint,
     authorization: &'a mut Option<Box<dyn AuthorizationHandler>>,
-    apop_timestamp: &'a str,
-    enable_apop: bool,
 }
 
 impl ConnectedState for ConnectedView<'_> {
     fn accept_connection(&mut self, greeting: &str, handler: Box<dyn AuthorizationHandler>) {
         *self.authorization = Some(handler);
-        let msg = if self.enable_apop && !self.apop_timestamp.is_empty() {
-            format!("{greeting} {}", self.apop_timestamp)
-        } else {
-            greeting.to_string()
-        };
-        self.endpoint.send(&reply::ok(&msg));
+        self.endpoint.send(&reply::ok(greeting));
     }
 
     fn reject_connection(&mut self, message: &str) {
@@ -1505,7 +1445,7 @@ impl AuthenticateState for AuthView<'_> {
                     }
                     busy.store(false, Ordering::Relaxed);
                     ep.resume_read();
-                    // A command pipelined right behind PASS/APOP/AUTH (e.g.
+                    // A command pipelined right behind PASS/AUTH (e.g.
                     // STAT) can be sitting in `cmd_queue` at this point —
                     // the client already sent it and is waiting on a reply,
                     // so nothing else will trigger another `receive()` to

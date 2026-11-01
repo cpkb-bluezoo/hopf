@@ -51,8 +51,6 @@ pub enum Pop3ReplyShape {
     User,
     /// `PASS`.
     Pass,
-    /// `APOP`.
-    Apop,
     /// `AUTH` (initial send, and every subsequent challenge response).
     Auth,
     /// `STLS`.
@@ -98,7 +96,7 @@ pub enum Pop3Event {
     Capa(Pop3Capabilities),
     /// `USER` accepted; not yet authenticated.
     UserOk,
-    /// Authenticated (via PASS, APOP, or AUTH).
+    /// Authenticated (via PASS or AUTH).
     Authenticated,
     /// AUTH SASL challenge (`+` continuation), already base64-decoded.
     AuthChallenge {
@@ -447,7 +445,6 @@ impl Pop3ReplyLexer {
             | Pop3ReplyShape::Capa
             | Pop3ReplyShape::User
             | Pop3ReplyShape::Pass
-            | Pop3ReplyShape::Apop
             | Pop3ReplyShape::Auth
             | Pop3ReplyShape::Stls
             | Pop3ReplyShape::Dele
@@ -595,7 +592,7 @@ impl Pop3ReplyLexer {
                         self.state = State::Prefix(Prefix::Start);
                         Some(Pop3Event::UserOk)
                     }
-                    Pop3ReplyShape::Pass | Pop3ReplyShape::Apop | Pop3ReplyShape::Auth => {
+                    Pop3ReplyShape::Pass | Pop3ReplyShape::Auth => {
                         self.state = State::Prefix(Prefix::Start);
                         Some(Pop3Event::Authenticated)
                     }
@@ -858,8 +855,8 @@ mod tests {
     }
 
     #[test]
-    fn pass_apop_auth_all_produce_authenticated() {
-        for shape in [Pop3ReplyShape::Pass, Pop3ReplyShape::Apop, Pop3ReplyShape::Auth] {
+    fn pass_and_auth_both_produce_authenticated() {
+        for shape in [Pop3ReplyShape::Pass, Pop3ReplyShape::Auth] {
             let mut lex = Pop3ReplyLexer::new();
             lex.expect(shape);
             let mut data: &[u8] = b"+OK Mailbox open, 2 messages\r\n";

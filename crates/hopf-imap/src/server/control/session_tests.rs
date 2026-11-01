@@ -1016,7 +1016,7 @@ fn scram_sha_256_authenticates_end_to_end() {
     let decode = |line: &str| rmimeparser::charset::base64::decode(line.trim().trim_start_matches("+ ")).unwrap();
     for initial_response in [true, false] {
         for (password, ok) in [("p", true), ("wrong", false)] {
-            let mut client = create_client(SaslMechanism::ScramSha256, "u", password, "localhost", "imap", None);
+            let mut client = create_client(SaslMechanism::ScramSha256, "u", password, None);
             let SaslClientStep::Response(first) = client.evaluate(None) else { panic!("client-first") };
             let mut s = Session::new();
             let out = if initial_response {
@@ -1044,7 +1044,7 @@ fn scram_sha_256_authenticates_end_to_end() {
         }
     }
     // The client may refuse the server's proof by cancelling.
-    let mut client = create_client(SaslMechanism::ScramSha256, "u", "p", "localhost", "imap", None);
+    let mut client = create_client(SaslMechanism::ScramSha256, "u", "p", None);
     let SaslClientStep::Response(first) = client.evaluate(None) else { panic!() };
     let mut s = Session::new();
     let out = s.run(&format!("a AUTHENTICATE SCRAM-SHA-256 {}\r\n", b64(&first)));

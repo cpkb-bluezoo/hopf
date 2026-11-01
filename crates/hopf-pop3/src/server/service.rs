@@ -25,7 +25,7 @@ pub struct Pop3Config {
     pub listen: SocketAddr,
     /// Hostname for greetings and APOP timestamps.
     pub hostname: String,
-    /// Credential store (USER/PASS, APOP, SASL).
+    /// Credential store (USER/PASS, SASL).
     pub store: Arc<dyn CredentialStore>,
     /// Mailbox factory (opens INBOX after auth).
     pub mailbox_factory: Arc<dyn MailboxFactory>,
@@ -35,8 +35,6 @@ pub struct Pop3Config {
     pub implicit_tls: bool,
     /// Greeting text (without `+OK` prefix). Empty → built-in.
     pub greeting: String,
-    /// Advertise and accept APOP.
-    pub enable_apop: bool,
     /// Advertise and accept UTF8.
     pub enable_utf8: bool,
     /// Advertise PIPELINING in CAPA (pipelining always works).
@@ -65,7 +63,6 @@ impl Pop3Config {
             tls_acceptor: None,
             implicit_tls: false,
             greeting: String::new(),
-            enable_apop: true,
             enable_utf8: true,
             enable_pipelining: false,
             login_delay: Duration::ZERO,

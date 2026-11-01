@@ -93,11 +93,11 @@
 <tbody>
 <tr>
 <td>Commands</td>
-<td>USER/PASS, APOP, AUTH (SASL), STAT, LIST, RETR, DELE, RSET, TOP, UIDL, CAPA, NOOP, QUIT, STLS, UTF8</td>
+<td>USER/PASS, AUTH (SASL), STAT, LIST, RETR, DELE, RSET, TOP, UIDL, CAPA, NOOP, QUIT, STLS, UTF8</td>
 </tr>
 <tr>
 <td>Auth</td>
-<td><code>CredentialStore</code> — USER/PASS, APOP, PLAIN, LOGIN, DIGEST-MD5, SCRAM-SHA-256, OAUTHBEARER, EXTERNAL</td>
+<td><code>CredentialStore</code> — USER/PASS, PLAIN, LOGIN, SCRAM-SHA-256, OAUTHBEARER, EXTERNAL</td>
 </tr>
 <tr>
 <td>TLS</td>
@@ -140,7 +140,7 @@ svc.start()?;</code></pre>
 <h2 id="composition">Composition</h2>
 <p>Register a <code>"pop3"</code> handler factory on <code>CompositionRegistry</code> that builds a <code>Pop3ControlHandler</code> (or use <code>Pop3Service::start</code> programmatically).</p>
 <h2 id="client">Client</h2>
-<p>The <code>hopf-pop3</code> crate ships a full async client. The high-level <code>Pop3Fetch</code> auto-pilot handles CAPA negotiation, optional STLS upgrade, USER/PASS or APOP authentication, STAT + RETR for every message, optional DELE, and QUIT.</p>
+<p>The <code>hopf-pop3</code> crate ships a full async client. The high-level <code>Pop3Fetch</code> auto-pilot handles CAPA negotiation, optional STLS upgrade, USER/PASS or SASL authentication, STAT + RETR for every message, optional DELE, and QUIT.</p>
 <h3 id="pop3fetch-quick-start">Pop3Fetch quick start</h3>
 <pre class="rust,ignore"><code>use std::sync::Arc;
 use hopf_core::{Runtime, RuntimeConfig};
@@ -197,12 +197,7 @@ Pop3Client::new(&quot;mail.example.com&quot;, 110)
 <tr>
 <td><code>Pop3Fetch::credentials(user, pass)</code></td>
 <td>—</td>
-<td>USER/PASS or APOP</td>
-</tr>
-<tr>
-<td><code>.prefer_apop(true)</code></td>
-<td>false</td>
-<td>Use APOP when server offers timestamp</td>
+<td>USER/PASS or SASL</td>
 </tr>
 <tr>
 <td><code>.delete_after_fetch(true)</code></td>

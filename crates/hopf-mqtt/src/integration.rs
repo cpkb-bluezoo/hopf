@@ -470,8 +470,8 @@ impl hopf_auth::CredentialStore for SlowStore {
         std::thread::sleep(self.delay);
         self.inner.password_match(username, password)
     }
-    fn digest_ha1(&self, username: &str, realm: &str) -> Option<String> {
-        self.inner.digest_ha1(username, realm)
+    fn digest_ha1(&self, username: &str, realm: &str, algorithm: hopf_auth::DigestAlgorithm) -> Option<String> {
+        self.inner.digest_ha1(username, realm, algorithm)
     }
     fn scram_credentials(&self, username: &str) -> Option<hopf_auth::ScramCredentials> {
         self.inner.scram_credentials(username)

@@ -39,7 +39,7 @@ mod varint;
 mod version;
 
 pub use auth::{
-    build_digest_authorization, parse_basic_authorization, BasicAuthConfig, BasicAuthFactory,
+    build_digest_authorization, parse_basic_authorization, DigestAlgorithm, BasicAuthConfig, BasicAuthFactory,
     BearerAuthFactory, DigestAuthConfig, DigestAuthFactory,
 };
 pub use client::{

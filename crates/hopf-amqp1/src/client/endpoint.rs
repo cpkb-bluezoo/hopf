@@ -180,7 +180,7 @@ impl Amqp1ClientEndpoint {
         let initial_response = if mechanism.eq_ignore_ascii_case("PLAIN") {
             let user = self.params.username.clone().unwrap_or_default();
             let pass = self.params.password.clone().unwrap_or_default();
-            let mut client = create_client(SaslMechanism::Plain, &user, &pass, "", "amqp", None);
+            let mut client = create_client(SaslMechanism::Plain, &user, &pass, None);
             let resp = match client.evaluate(None) {
                 SaslClientStep::Response(r) | SaslClientStep::Complete(r) => r,
                 SaslClientStep::Failure => Vec::new(),

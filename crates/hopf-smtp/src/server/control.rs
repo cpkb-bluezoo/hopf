@@ -1173,8 +1173,6 @@ impl SmtpControlHandler {
             return;
         }
         let opts = SaslServerOptions {
-            hostname: self.config.hostname.clone(),
-            realm: self.config.hostname.clone(),
             peer_certificate: self.meta.security_info.peer_certificate_fingerprint().map(str::to_string),
             channel_binding: None,
         };

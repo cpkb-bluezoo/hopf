@@ -240,11 +240,7 @@ impl CredentialStore for PamCredentialStore {
         pam_password_match(&self.config.service, username, password)
     }
 
-    fn plaintext_password(&self, _username: &str) -> Option<String> {
-        None
-    }
-
-    fn digest_ha1(&self, _username: &str, _realm: &str) -> Option<String> {
+    fn digest_ha1(&self, _username: &str, _realm: &str, _algorithm: crate::http_digest::DigestAlgorithm) -> Option<String> {
         None
     }
 
@@ -272,9 +268,8 @@ mod tests {
             store.supported_mechanisms(),
             vec![SaslMechanism::Plain, SaslMechanism::Login]
         );
-        assert!(store.digest_ha1("u", "r").is_none());
+        assert!(store.digest_ha1("u", "r", crate::http_digest::DigestAlgorithm::Sha256).is_none());
         assert!(store.scram_credentials("u").is_none());
-        assert!(store.plaintext_password("u").is_none());
         let (tx, rx) = std::sync::mpsc::channel();
         store.validate_bearer("t", Box::new(move |r| { let _ = tx.send(r); }));
         assert!(rx.recv().unwrap().is_none());

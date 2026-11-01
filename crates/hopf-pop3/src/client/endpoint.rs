@@ -34,8 +34,6 @@ enum ProtoState {
     UserSent,
     /// PASS sent; waiting for +OK/-ERR (authentication).
     PassSent,
-    /// APOP sent; waiting for +OK/-ERR.
-    ApopSent,
     /// AUTH sent or responding to a challenge; waiting for +OK/-ERR/+.
     AuthSent,
     /// STLS sent; waiting for +OK/-ERR.
@@ -262,7 +260,6 @@ impl Pop3ClientEndpoint {
             ProtoState::CapaPostTlsSent => self.handle_capa_post_tls(event, ep),
             ProtoState::UserSent => self.handle_user(event, ep),
             ProtoState::PassSent => self.handle_pass(event, ep),
-            ProtoState::ApopSent => self.handle_apop(event, ep),
             ProtoState::AuthSent => self.handle_auth(event, ep),
             ProtoState::StlsSent => self.handle_stls(event, ep),
             ProtoState::StatSent => self.handle_stat(event, ep),
@@ -296,9 +293,9 @@ impl Pop3ClientEndpoint {
             None => return,
         };
         match event {
-            Pop3Event::ServerGreeting { apop_challenge } => {
+            Pop3Event::ServerGreeting { .. } => {
                 self.proto_state = ProtoState::Transaction;
-                driver.on_greeting(self, ep, apop_challenge.as_ref());
+                driver.on_greeting(self, ep);
             }
             Pop3Event::Err { message } => {
                 self.proto_state = ProtoState::Error;
@@ -398,26 +395,6 @@ impl Pop3ClientEndpoint {
                 driver.on_error(ep, &err);
                 ep.close();
             }
-        }
-        self.driver = Some(driver);
-    }
-
-    fn handle_apop(&mut self, event: Pop3Event, ep: &mut dyn Endpoint) {
-        let mut driver = match self.driver.take() {
-            Some(d) => d,
-            None => return,
-        };
-        match event {
-            Pop3Event::Authenticated => {
-                self.proto_state = ProtoState::Transaction;
-                self.authenticated = true;
-                driver.on_authenticated(self, ep);
-            }
-            Pop3Event::Err { message } => {
-                self.proto_state = ProtoState::Transaction;
-                driver.on_auth_failed(self, ep, &message);
-            }
-            _ => {}
         }
         self.driver = Some(driver);
     }
@@ -882,12 +859,6 @@ impl Pop3ClientAuthorization for Pop3ClientEndpoint {
         self.write_line(&format!("USER {username}"));
     }
 
-    fn apop(&mut self, username: &str, digest: &str) {
-        self.proto_state = ProtoState::ApopSent;
-        self.lexer.expect(Pop3ReplyShape::Apop);
-        self.write_line(&format!("APOP {username} {digest}"));
-    }
-
     fn auth(&mut self, mechanism: &str, initial: Option<&[u8]>) {
         self.proto_state = ProtoState::AuthSent;
         self.lexer.expect(Pop3ReplyShape::Auth);
@@ -943,12 +914,6 @@ impl Pop3ClientPostStls for Pop3ClientEndpoint {
         self.proto_state = ProtoState::UserSent;
         self.lexer.expect(Pop3ReplyShape::User);
         self.write_line(&format!("USER {username}"));
-    }
-
-    fn apop(&mut self, username: &str, digest: &str) {
-        self.proto_state = ProtoState::ApopSent;
-        self.lexer.expect(Pop3ReplyShape::Apop);
-        self.write_line(&format!("APOP {username} {digest}"));
     }
 
     fn auth(&mut self, mechanism: &str, initial: Option<&[u8]>) {
@@ -1078,7 +1043,6 @@ fn is_no_such_message(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::reply::ContentId;
     use crate::client::state::Pop3ClientWakeState;
     use hopf_core::ConnHandle;
     use std::collections::VecDeque;
@@ -1167,7 +1131,7 @@ mod tests {
     }
 
     impl Pop3ClientDriver for QueueDriver {
-        fn on_greeting(&mut self, auth: &mut dyn Pop3ClientAuthorization, _e: &mut dyn Endpoint, _c: Option<&ContentId>) {
+        fn on_greeting(&mut self, auth: &mut dyn Pop3ClientAuthorization, _e: &mut dyn Endpoint) {
             self.log("greeting");
             auth.user("alice");
         }

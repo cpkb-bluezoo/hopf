@@ -7,8 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hopf_auth::crypto::decode_base64;
-use hopf_auth::digest_md5::parse_params;
-use hopf_auth::http_digest::{challenge_header, new_nonce, verify_authorization};
+use hopf_auth::http_digest::{
+    challenge_header, credentials_algorithm, new_nonce, parse_params, verify_authorization,
+};
+pub use hopf_auth::http_digest::DigestAlgorithm;
 use hopf_auth::{
     CredentialStore, IdentityMaterial, PeerContext, TrustDecision, TrustPolicy,
 };
@@ -195,6 +197,10 @@ pub struct DigestAuthConfig {
     /// How long an issued nonce remains acceptable if never used —
     /// see [`DEFAULT_NONCE_TTL`].
     pub nonce_ttl: Duration,
+    /// Also offer, and accept, the MD5 algorithm. Off by default: only
+    /// SHA-256 (RFC 7616) is challenged for and accepted. The credential
+    /// store must hold an MD5 HA1 for it to succeed.
+    pub allow_md5: bool,
 }
 
 impl DigestAuthConfig {
@@ -203,7 +209,14 @@ impl DigestAuthConfig {
         Self {
             realm: realm.into(),
             nonce_ttl: DEFAULT_NONCE_TTL,
+            allow_md5: false,
         }
+    }
+
+    /// Also offer and accept MD5 (see [`Self::allow_md5`]).
+    pub fn with_md5(mut self, allow: bool) -> Self {
+        self.allow_md5 = allow;
+        self
     }
 
     /// Override the nonce TTL.
@@ -218,7 +231,7 @@ pub struct DigestAuthFactory {
     inner: Arc<dyn ServerHandlerFactory>,
     store: Arc<dyn CredentialStore>,
     config: DigestAuthConfig,
-    nonces: Arc<Mutex<HashMap<String, Instant>>>,
+    nonces: Arc<Mutex<HashMap<String, (Instant, DigestAlgorithm)>>>,
 }
 
 impl DigestAuthFactory {
@@ -244,6 +257,7 @@ impl ServerHandlerFactory for DigestAuthFactory {
             store: Arc::clone(&self.store),
             realm: self.config.realm.clone(),
             nonce_ttl: self.config.nonce_ttl,
+            allow_md5: self.config.allow_md5,
             nonces: Arc::clone(&self.nonces),
             authorized: false,
             challenged: false,
@@ -256,15 +270,16 @@ struct DigestAuthHandler {
     store: Arc<dyn CredentialStore>,
     realm: String,
     nonce_ttl: Duration,
-    nonces: Arc<Mutex<HashMap<String, Instant>>>,
+    allow_md5: bool,
+    nonces: Arc<Mutex<HashMap<String, (Instant, DigestAlgorithm)>>>,
     authorized: bool,
     challenged: bool,
 }
 
 impl DigestAuthHandler {
-    fn prune_expired_nonces(&self, nonces: &mut HashMap<String, Instant>) {
+    fn prune_expired_nonces(&self, nonces: &mut HashMap<String, (Instant, DigestAlgorithm)>) {
         let ttl = self.nonce_ttl;
-        nonces.retain(|_, issued_at| issued_at.elapsed() <= ttl);
+        nonces.retain(|_, (issued_at, _)| issued_at.elapsed() <= ttl);
     }
 
     /// Consume a tracked nonce: `true` only if `nonce` was actually issued
@@ -274,10 +289,25 @@ impl DigestAuthHandler {
     /// `Authorization: Digest` header (even with a byte-identical,
     /// cryptographically valid `response` value) presents a nonce that's
     /// already gone from the map on the second attempt.
-    fn consume_nonce(&self, nonce: &str) -> bool {
+    ///
+    /// A nonce was issued in a challenge for one algorithm and only answers
+    /// that algorithm: a client may not trade a SHA-256 challenge down to MD5.
+    fn consume_nonce(&self, nonce: &str, algorithm: DigestAlgorithm) -> bool {
         let mut nonces = self.nonces.lock().unwrap();
         self.prune_expired_nonces(&mut nonces);
-        nonces.remove(nonce).is_some()
+        match nonces.remove(nonce) {
+            Some((_, issued_for)) => issued_for == algorithm,
+            None => false,
+        }
+    }
+
+    /// The algorithms this handler challenges for and accepts, strongest first.
+    fn algorithms(&self) -> Vec<DigestAlgorithm> {
+        let mut algs = vec![DigestAlgorithm::Sha256];
+        if self.allow_md5 {
+            algs.push(DigestAlgorithm::Md5);
+        }
+        algs
     }
 
     fn check_auth(&mut self, headers: &Headers) -> Option<String> {
@@ -285,14 +315,20 @@ impl DigestAuthHandler {
         let params = parse_params(creds);
         let username = params.get("username")?;
         let nonce = params.get("nonce")?;
+        // Only the plain variants of the algorithms on offer (a `-sess`
+        // variant is never challenged for).
+        let (algorithm, sess) = credentials_algorithm(creds)?;
+        if sess || !self.algorithms().contains(&algorithm) {
+            return None;
+        }
         // Consult (and consume) the tracked nonce *before* verifying the
         // credential hash — an untracked/expired/already-used nonce is
         // rejected outright, regardless of whether `response` is
         // otherwise cryptographically correct.
-        if !self.consume_nonce(nonce) {
+        if !self.consume_nonce(nonce, algorithm) {
             return None;
         }
-        let ha1 = self.store.digest_ha1(username, &self.realm)?;
+        let ha1 = self.store.digest_ha1(username, &self.realm, algorithm)?;
         let method = headers.method().unwrap_or("GET");
         // The credentials must be for this request (RFC 7616 section 3.4).
         if let (Some(signed), Some(target)) = (params.get("uri"), headers.path()) {
@@ -305,7 +341,7 @@ impl DigestAuthHandler {
             .map(|s| s.as_str())
             .or_else(|| headers.path())
             .unwrap_or("/");
-        if verify_authorization(creds, &ha1, method, uri, Some(nonce)) {
+        if verify_authorization(creds, &ha1, algorithm, method, uri, Some(nonce)) {
             Some(username.clone())
         } else {
             None
@@ -313,24 +349,30 @@ impl DigestAuthHandler {
     }
 
     fn send_challenge(&mut self, response: &mut dyn ServerWriter) {
-        let nonce = new_nonce();
-        {
-            let mut nonces = self.nonces.lock().unwrap();
-            self.prune_expired_nonces(&mut nonces);
-            while nonces.len() >= MAX_OUTSTANDING_NONCES {
-                let Some(oldest) = nonces.iter().min_by_key(|(_, at)| **at).map(|(n, _)| n.clone()) else {
-                    break;
-                };
-                nonces.remove(&oldest);
-            }
-            nonces.insert(nonce.clone(), Instant::now());
-        }
         let mut h = Headers::new();
         h.status(401);
-        h.set(
-            "www-authenticate",
-            format!("Digest {}", challenge_header(&self.realm, &nonce)),
-        );
+        // One challenge per algorithm, strongest first (RFC 7616 section 3.7),
+        // each with a nonce of its own.
+        for algorithm in self.algorithms() {
+            let nonce = new_nonce();
+            {
+                let mut nonces = self.nonces.lock().unwrap();
+                self.prune_expired_nonces(&mut nonces);
+                while nonces.len() >= MAX_OUTSTANDING_NONCES {
+                    let Some(oldest) =
+                        nonces.iter().min_by_key(|(_, (at, _))| *at).map(|(n, _)| n.clone())
+                    else {
+                        break;
+                    };
+                    nonces.remove(&oldest);
+                }
+                nonces.insert(nonce.clone(), (Instant::now(), algorithm));
+            }
+            h.add(
+                "www-authenticate",
+                format!("Digest {}", challenge_header(&self.realm, &nonce, algorithm)),
+            );
+        }
         h.set("content-length", "0");
         response.headers(h);
         response.complete();
@@ -642,7 +684,7 @@ mod tests {
             .nth(1)
             .and_then(|s| s.split('"').next())
             .expect("nonce");
-        let creds = build_digest_authorization("alice", "s3cret", "test", nonce, "GET", "/");
+        let creds = build_digest_authorization(DigestAlgorithm::Sha256, "alice", "s3cret", "test", nonce, "GET", "/");
         let req = format!(
             "GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Digest {creds}\r\nConnection: close\r\n\r\n"
         );
@@ -705,7 +747,7 @@ mod tests {
             "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         );
         let nonce = challenge_nonce(&resp);
-        let creds = build_digest_authorization("alice", "s3cret", "test", &nonce, "GET", "/");
+        let creds = build_digest_authorization(DigestAlgorithm::Sha256, "alice", "s3cret", "test", &nonce, "GET", "/");
 
         let first = send_request(addr, &digest_req(&creds));
         assert!(first.contains("200"), "first use should succeed: {first}");
@@ -739,7 +781,7 @@ mod tests {
 
         let forged_nonce = "0000deadbeef0000deadbeef00000000";
         let creds =
-            build_digest_authorization("alice", "s3cret", "test", forged_nonce, "GET", "/");
+            build_digest_authorization(DigestAlgorithm::Sha256, "alice", "s3cret", "test", forged_nonce, "GET", "/");
         let resp = send_request(addr, &digest_req(&creds));
         assert!(resp.contains("401"), "{resp}");
 
@@ -767,7 +809,7 @@ mod tests {
             "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         );
         let nonce = challenge_nonce(&resp);
-        let creds = build_digest_authorization("alice", "s3cret", "test", &nonce, "GET", "/");
+        let creds = build_digest_authorization(DigestAlgorithm::Sha256, "alice", "s3cret", "test", &nonce, "GET", "/");
 
         std::thread::sleep(Duration::from_millis(150));
         let resp = send_request(addr, &digest_req(&creds));

@@ -267,7 +267,7 @@ impl NntpClientEndpoint {
             .copied()
             .find(|m| offered.iter().any(|o| o.eq_ignore_ascii_case(m.name())));
         if let Some(mech) = mech {
-            let mut client = create_client(mech, &user, &pass, "", "nntp", None);
+            let mut client = create_client(mech, &user, &pass, None);
             let mut line = format!("AUTHINFO SASL {}", mech.name());
             if client.has_initial_response() {
                 if let SaslClientStep::Response(initial) | SaslClientStep::Complete(initial) = client.evaluate(None) {

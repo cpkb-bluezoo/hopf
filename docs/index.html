@@ -268,9 +268,9 @@
 <h3 id="pop3-hopf-pop3">POP3 (<code>hopf-pop3</code>)</h3>
 <ul>
 <li>POP3 / POP3S server (RFC 1939 + CAPA / STLS / UTF8 / SASL AUTH)</li>
-<li>USER/PASS, APOP, TOP, UIDL; staged handler SPI with default mailbox-backed handler</li>
+<li>USER/PASS, TOP, UIDL; staged handler SPI with default mailbox-backed handler</li>
 <li>Opens <code>INBOX</code> via <code>MailboxFactory</code>; session DELE until QUIT expunge</li>
-<li>Async client: <code>Pop3Client</code> + <code>Pop3Fetch</code> auto-pilot; USER/PASS, APOP, AUTH PLAIN, STLS/POP3S</li>
+<li>Async client: <code>Pop3Client</code> + <code>Pop3Fetch</code> auto-pilot; USER/PASS, SASL AUTH, STLS/POP3S</li>
 </ul>
 <h3 id="nntp-hopf-nntp">NNTP (<code>hopf-nntp</code>)</h3>
 <ul>
@@ -322,9 +322,9 @@
 <h3 id="auth-hopf-auth">Auth (<code>hopf-auth</code>)</h3>
 <ul>
 <li>TrustPolicy / IdentityMaterial for listen and dial</li>
-<li>SASL: PLAIN, LOGIN, DIGEST-MD5, SCRAM-SHA-256, OAUTHBEARER, EXTERNAL</li>
+<li>SASL: PLAIN, LOGIN, SCRAM-SHA-256, OAUTHBEARER, EXTERNAL</li>
 <li><strong>Planned:</strong> GSSAPI/Kerberos SASL (RFC 4752, Gumdrop parity) as optional feature</li>
-<li>HTTP Digest helpers; password / token / certificate stores for demos and wiring</li>
+<li>HTTP Digest helpers (SHA-256 by default); password / token / certificate stores for demos and wiring</li>
 </ul>
 <h3 id="telemetry-hopf-otel">Telemetry (<code>hopf-otel</code>)</h3>
 <ul>

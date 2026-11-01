@@ -285,7 +285,7 @@ impl AmqpClientEndpoint {
         } else {
             // AMQPLAIN aside, only PLAIN and EXTERNAL are wired through
             // hopf_auth today — anything else (a forced but unimplemented
-            // mechanism, e.g. GSSAPI or DIGEST-MD5) fails clearly here
+            // mechanism, e.g. GSSAPI) fails clearly here
             // rather than being silently attempted.
             let mech = match chosen.to_ascii_uppercase().as_str() {
                 "PLAIN" => SaslMechanism::Plain,
@@ -295,7 +295,7 @@ impl AmqpClientEndpoint {
             if mech == SaslMechanism::External && !endpoint.is_secure() {
                 return Err(AmqpError::Malformed("EXTERNAL requires a TLS connection"));
             }
-            let mut client = create_client(mech, &self.username, &self.password, "", "amqp", None);
+            let mut client = create_client(mech, &self.username, &self.password, None);
             let response = if client.has_initial_response() {
                 match client.evaluate(None) {
                     SaslClientStep::Response(r) | SaslClientStep::Complete(r) => r,

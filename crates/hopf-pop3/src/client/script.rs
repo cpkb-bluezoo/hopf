@@ -10,9 +10,8 @@
 //! one" (RETR). [`Pop3Fetch`] covers the fetch-everything case; this
 //! covers everything else a client does, without a hand-written driver
 //! per operation. Same TLS and authentication policy as `Pop3Fetch`:
-//! CAPA first, STLS when required or offered, then APOP (if preferred and
-//! offered), the strongest SASL mechanism the server advertises, or
-//! USER/PASS.
+//! CAPA first, STLS when required or offered, then the strongest SASL
+//! mechanism the server advertises, or USER/PASS.
 //!
 //! [`Pop3Fetch`]: super::Pop3Fetch
 
@@ -23,7 +22,6 @@ use hopf_auth::{create_client, SaslClient, SaslClientStep, SaslMechanism};
 use hopf_core::Endpoint;
 
 use super::handlers::{Pop3ClientDriver, Pop3ClientHandlerFactory};
-use super::reply::ContentId;
 use super::state::{
     Pop3Capabilities, Pop3ClientAuthExchange, Pop3ClientAuthorization, Pop3ClientPassword,
     Pop3ClientPostStls, Pop3ClientTransaction,
@@ -83,7 +81,7 @@ pub enum Pop3OpResult {
 pub enum Pop3ScriptOutcome {
     /// Every op ran; results in op order.
     Done(Vec<Pop3OpResult>),
-    /// The server refused the credentials (`-ERR` to PASS / APOP / AUTH),
+    /// The server refused the credentials (`-ERR` to PASS / AUTH),
     /// with its text. The connection was closed cleanly.
     AuthFailed(String),
     /// Anything else, with whatever ops had completed by then.
@@ -97,10 +95,8 @@ pub enum Pop3ScriptOutcome {
 
 struct ScriptState {
     credentials: Option<(String, String)>,
-    prefer_apop: bool,
     require_stls: bool,
     opportunistic_stls: bool,
-    apop_timestamp: Option<String>,
     sasl_client: Option<Box<dyn SaslClient>>,
     ops: std::collections::VecDeque<Pop3Op>,
     results: Vec<Pop3OpResult>,
@@ -144,10 +140,8 @@ impl Pop3Script {
     pub fn new() -> Self {
         Self(Arc::new(Mutex::new(ScriptState {
             credentials: None,
-            prefer_apop: false,
             require_stls: false,
             opportunistic_stls: false,
-            apop_timestamp: None,
             sasl_client: None,
             ops: Default::default(),
             results: Vec::new(),
@@ -162,13 +156,6 @@ impl Pop3Script {
     /// Username and password.
     pub fn credentials(self, user: impl Into<String>, pass: impl Into<String>) -> Self {
         self.0.lock().unwrap().credentials = Some((user.into(), pass.into()));
-        self
-    }
-
-    /// Use APOP when the greeting offers it (the password never crosses
-    /// the wire, but the server must hold it in the clear).
-    pub fn prefer_apop(self, prefer: bool) -> Self {
-        self.0.lock().unwrap().prefer_apop = prefer;
         self
     }
 
@@ -224,13 +211,6 @@ fn choose_mechanism(sasl_mechs: &[String]) -> Option<SaslMechanism> {
     PREFERENCE.iter().copied().find(|m| sasl_mechs.iter().any(|s| s.eq_ignore_ascii_case(m.name())))
 }
 
-fn apop_digest(timestamp: &str, password: &str) -> String {
-    let mut data = Vec::with_capacity(timestamp.len() + password.len());
-    data.extend_from_slice(timestamp.as_bytes());
-    data.extend_from_slice(password.as_bytes());
-    hopf_auth::crypto::md5_hex(&data)
-}
-
 impl ScriptDriver {
     fn finish(&self, outcome: Pop3ScriptOutcome) {
         let cb = self.state.lock().unwrap().on_result.take();
@@ -283,16 +263,8 @@ impl ScriptDriver {
         let Some((user, pass)) = st.credentials.clone() else {
             return false;
         };
-        if st.prefer_apop {
-            if let Some(ts) = st.apop_timestamp.clone() {
-                let digest = apop_digest(&ts, &pass);
-                drop(st);
-                auth.apop(&user, &digest);
-                return true;
-            }
-        }
         if let Some(mech) = choose_mechanism(&caps.sasl_mechs) {
-            let mut client = create_client(mech, &user, &pass, "", "pop", None);
+            let mut client = create_client(mech, &user, &pass, None);
             if client.has_initial_response() {
                 if let SaslClientStep::Response(initial) | SaslClientStep::Complete(initial) = client.evaluate(None) {
                     st.sasl_client = Some(client);
@@ -312,14 +284,14 @@ impl ScriptDriver {
         true
     }
 
-    /// Authenticate after STLS (APOP is not possible there).
+    /// Authenticate after STLS .
     fn authenticate_post_stls(&self, post_stls: &mut dyn Pop3ClientPostStls, caps: &Pop3Capabilities) -> bool {
         let mut st = self.state.lock().unwrap();
         let Some((user, pass)) = st.credentials.clone() else {
             return false;
         };
         if let Some(mech) = choose_mechanism(&caps.sasl_mechs) {
-            let mut client = create_client(mech, &user, &pass, "", "pop", None);
+            let mut client = create_client(mech, &user, &pass, None);
             if client.has_initial_response() {
                 if let SaslClientStep::Response(initial) | SaslClientStep::Complete(initial) = client.evaluate(None) {
                     st.sasl_client = Some(client);
@@ -352,10 +324,7 @@ impl ScriptDriver {
 }
 
 impl Pop3ClientDriver for ScriptDriver {
-    fn on_greeting(&mut self, auth: &mut dyn Pop3ClientAuthorization, _ep: &mut dyn Endpoint, apop_challenge: Option<&ContentId>) {
-        if let Some(challenge) = apop_challenge {
-            self.state.lock().unwrap().apop_timestamp = Some(challenge.to_string());
-        }
+    fn on_greeting(&mut self, auth: &mut dyn Pop3ClientAuthorization, _ep: &mut dyn Endpoint) {
         auth.capa();
     }
 

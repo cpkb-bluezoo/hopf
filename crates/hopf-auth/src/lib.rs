@@ -4,12 +4,11 @@
 //! ([#2](https://github.com/cpkb-bluezoo/hopf/issues/2)).
 //!
 //! SASL mechanisms (Gumdrop parity except GSSAPI, planned as optional feature):
-//! PLAIN, LOGIN, DIGEST-MD5, SCRAM-SHA-256, OAUTHBEARER, EXTERNAL.
+//! PLAIN, LOGIN, SCRAM-SHA-256, OAUTHBEARER, EXTERNAL.
 
 #![warn(missing_docs)]
 
 pub mod crypto;
-pub mod digest_md5;
 pub mod external;
 pub mod http_digest;
 pub mod login;
@@ -26,6 +25,7 @@ pub mod xoauth2;
 #[cfg(all(feature = "pam", unix))]
 pub mod pam;
 
+pub use http_digest::DigestAlgorithm;
 pub use mechanism::SaslMechanism;
 pub use oauth_introspection::{
     IntrospectionCredentialStore, IntrospectionRequest, IntrospectionResponse,
@@ -132,7 +132,7 @@ impl PasswordTrustPolicy {
     pub fn into_store(self) -> PasswordStore {
         let mut s = PasswordStore::new();
         for (u, scram) in self.users {
-            s.insert_scram(u, scram, None);
+            s.insert_scram(u, scram, Vec::new());
         }
         s
     }
@@ -192,8 +192,6 @@ mod tests {
 
     fn roundtrip(mech: SaslMechanism, store: Arc<dyn CredentialStore>) {
         let opts = SaslServerOptions {
-            hostname: "mail.example".into(),
-            realm: "example".into(),
             peer_certificate: if mech == SaslMechanism::External {
                 Some("fp-alice".into())
             } else {
@@ -207,7 +205,7 @@ mod tests {
             SaslMechanism::External => ("", ""),
             _ => ("alice", "s3cret"),
         };
-        let mut client = create_client(mech, user, pass, "mail.example", "smtp", None);
+        let mut client = create_client(mech, user, pass, None);
 
         let mut client_msg: Option<Vec<u8>> = if client.has_initial_response() {
             match client.evaluate(None) {
@@ -284,8 +282,6 @@ mod tests {
             SaslMechanism::ScramSha256Plus,
             "alice",
             "s3cret",
-            "mail.example",
-            "smtp",
             Some(&channel_binding),
         );
         assert_eq!(server.mechanism(), SaslMechanism::ScramSha256Plus);

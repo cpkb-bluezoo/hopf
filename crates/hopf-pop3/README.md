@@ -5,7 +5,7 @@ POP3 / POP3S **server and async client** for [Hopf](https://cpkb-bluezoo.github.
 
 ## Server features
 
-- **Commands:** USER/PASS, APOP, AUTH (SASL), STAT, LIST, RETR, DELE, RSET,
+- **Commands:** USER/PASS, AUTH (SASL), STAT, LIST, RETR, DELE, RSET,
   TOP, UIDL, CAPA, NOOP, QUIT, STLS, UTF8
 - **Auth:** `CredentialStore` + staged handler SPI; default handler opens
   `INBOX` via `MailboxFactory`
@@ -16,7 +16,7 @@ POP3 / POP3S **server and async client** for [Hopf](https://cpkb-bluezoo.github.
 
 - **Async:** non-blocking, built on the hopf-core `Runtime` / `ProtocolHandler`
 - **DNS:** async hostname resolution via hopf-dns (`DnsResolver`)
-- **Auth:** USER/PASS, APOP (MD5 digest), AUTH PLAIN; `prefer_apop` flag
+- **Auth:** USER/PASS and AUTH (SCRAM-SHA-256, PLAIN, LOGIN)
 - **TLS:** STLS (explicit) and POP3S (implicit)
 - **Pipeline:** `Pop3Fetch` auto-pilot — CAPA → auth → STAT → LIST → RETR → QUIT
 - **Custom drivers:** `Pop3ClientDriver` + `Pop3ClientHandlerFactory` traits

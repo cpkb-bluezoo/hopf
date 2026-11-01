@@ -187,7 +187,7 @@ session.sync(
 <tbody>
 <tr><td><code>supported_mechanisms</code></td><td>PLAIN, LOGIN</td></tr>
 <tr><td><code>password_match</code></td><td>search-then-bind</td></tr>
-<tr><td>digest / SCRAM / CRAM / plaintext / bearer</td><td>unsupported</td></tr>
+<tr><td>digest / SCRAM / bearer</td><td>unsupported</td></tr>
 </tbody>
 </table>
 <p><strong>Reactor rule:</strong> <code>password_match</code> blocks on a Condvar + timeout completed from LDAP callbacks. Call it only from a storage/worker pool — never on a reactor thread.</p>

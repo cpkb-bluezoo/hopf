@@ -3,7 +3,7 @@
 //! POP3 / POP3S server **and** async client for Hopf (Gumdrop `pop3` port).
 //!
 //! Provides a staged handler SPI, default mailbox-backed handler, STLS /
-//! implicit TLS, USER/PASS, APOP, and SASL AUTH on the server side.
+//! implicit TLS, USER/PASS and SASL AUTH on the server side.
 //! The async client ([`Pop3Client`] / [`Pop3Fetch`]) mirrors the SMTP client
 //! design: DNS-aware facade, driver callback trait, and a ready-made fetch
 //! pipeline.

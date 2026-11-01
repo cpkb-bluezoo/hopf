@@ -10,7 +10,6 @@ use std::io;
 
 use hopf_core::Endpoint;
 
-use super::reply::ContentId;
 use super::state::{
     Pop3Capabilities, Pop3ClientAuthExchange, Pop3ClientAuthorization, Pop3ClientPassword,
     Pop3ClientPostStls, Pop3ClientTransaction, Pop3ClientWakeState,
@@ -50,21 +49,11 @@ pub trait Pop3ClientDriver: Send {
     // ── Greeting ─────────────────────────────────────────────────────────
 
     /// Server greeting received (the `+OK` line after TCP connect). The
-    /// banner's decorative text is not exposed — greeting text has no
-    /// protocol meaning beyond the optional APOP challenge, which is
-    /// already parsed.
-    ///
-    /// `apop_challenge` is the `<local@domain>` token from the greeting if
-    /// the server supports APOP (RFC 1939 §7).
+    /// banner's text is not exposed - it has no protocol meaning.
     ///
     /// Typical next action: call `auth.capa()` to discover capabilities, or
-    /// go straight to `auth.user(…)` / `auth.apop(…)`.
-    fn on_greeting(
-        &mut self,
-        auth: &mut dyn Pop3ClientAuthorization,
-        ep: &mut dyn Endpoint,
-        apop_challenge: Option<&ContentId>,
-    );
+    /// go straight to `auth.user(…)`.
+    fn on_greeting(&mut self, auth: &mut dyn Pop3ClientAuthorization, ep: &mut dyn Endpoint);
 
     // ── CAPA ─────────────────────────────────────────────────────────────
 
@@ -105,7 +94,7 @@ pub trait Pop3ClientDriver: Send {
         message: &str,
     );
 
-    // ── USER / PASS / APOP ────────────────────────────────────────────────
+    // ── USER / PASS ────────────────────────────────────────────────
 
     /// `USER` accepted (+OK); send the password next.
     fn on_user_ok(&mut self, password: &mut dyn Pop3ClientPassword, ep: &mut dyn Endpoint);

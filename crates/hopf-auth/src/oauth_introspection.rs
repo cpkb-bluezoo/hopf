@@ -153,11 +153,8 @@ impl CredentialStore for IntrospectionCredentialStore {
     fn password_match(&self, username: &str, password: &str) -> bool {
         self.inner.password_match(username, password)
     }
-    fn plaintext_password(&self, username: &str) -> Option<String> {
-        self.inner.plaintext_password(username)
-    }
-    fn digest_ha1(&self, username: &str, realm: &str) -> Option<String> {
-        self.inner.digest_ha1(username, realm)
+    fn digest_ha1(&self, username: &str, realm: &str, algorithm: crate::http_digest::DigestAlgorithm) -> Option<String> {
+        self.inner.digest_ha1(username, realm, algorithm)
     }
     fn scram_credentials(&self, username: &str) -> Option<ScramCredentials> {
         self.inner.scram_credentials(username)

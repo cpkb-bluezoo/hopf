@@ -2,7 +2,7 @@
 
 //! `Pop3Fetch` — auto-pilot message-fetch pipeline.
 //!
-//! Drives: greeting → CAPA → (STLS) → CAPA → USER/PASS or APOP → STAT →
+//! Drives: greeting → CAPA → (STLS) → CAPA → USER/PASS or AUTH → STAT →
 //! LIST → RETR each message → (DELE each) → QUIT.
 //!
 //! # Example
@@ -46,7 +46,6 @@ use hopf_auth::{create_client, SaslClient, SaslClientStep, SaslMechanism};
 use hopf_core::Endpoint;
 
 use super::handlers::{Pop3ClientDriver, Pop3ClientHandlerFactory};
-use super::reply::ContentId;
 use super::state::{
     Pop3Capabilities, Pop3ClientAuthExchange, Pop3ClientAuthorization, Pop3ClientPassword,
     Pop3ClientPostStls, Pop3ClientTransaction,
@@ -77,11 +76,8 @@ pub trait MessageReceiveCallback: Send {
 
 struct Pop3FetchState {
     credentials: Option<(String, String)>,
-    prefer_apop: bool,
     delete_after_fetch: bool,
     require_stls: bool,
-    /// APOP challenge from the greeting, e.g. `<timestamp@host>`.
-    apop_timestamp: Option<String>,
     /// In-progress SASL exchange (mechanism beyond PLAIN's single-shot
     /// initial response), awaiting the next server challenge.
     sasl_client: Option<Box<dyn SaslClient>>,
@@ -112,10 +108,8 @@ impl Pop3Fetch {
     pub fn new() -> Self {
         Pop3Fetch(Arc::new(Mutex::new(Pop3FetchState {
             credentials: None,
-            prefer_apop: true,
             delete_after_fetch: false,
             require_stls: false,
-            apop_timestamp: None,
             sasl_client: None,
             pending: VecDeque::new(),
             current_id: 0,
@@ -126,20 +120,13 @@ impl Pop3Fetch {
         })))
     }
 
-    /// Set USER/PASS (or APOP) credentials.
+    /// Set USER/PASS (or SASL) credentials.
     pub fn credentials(
         self,
         user: impl Into<String>,
         pass: impl Into<String>,
     ) -> Self {
         self.0.lock().unwrap().credentials = Some((user.into(), pass.into()));
-        self
-    }
-
-    /// Prefer APOP when the server provides a timestamp in the greeting.
-    /// Default: `true`.
-    pub fn prefer_apop(self, prefer: bool) -> Self {
-        self.0.lock().unwrap().prefer_apop = prefer;
         self
     }
 
@@ -206,18 +193,9 @@ impl Pop3FetchDriver {
         }
     }
 
-    /// Compute APOP digest: MD5(timestamp || password) as lowercase hex.
-    fn apop_digest(timestamp: &str, password: &str) -> String {
-        let mut data = Vec::with_capacity(timestamp.len() + password.len());
-        data.extend_from_slice(timestamp.as_bytes());
-        data.extend_from_slice(password.as_bytes());
-        hopf_auth::crypto::md5_hex(&data)
-    }
-
     /// The strongest mechanism this auto-pilot can drive with a bare
     /// username/password that the server actually advertises. Excludes
-    /// DIGEST-MD5 (deprecated, needs a hostname this pipeline doesn't
-    /// track), OAUTHBEARER (needs a bearer token, not a password), and
+    /// OAUTHBEARER (needs a bearer token, not a password) and
     /// EXTERNAL (needs a client certificate) — a custom driver can still
     /// use any of those directly via [`Pop3ClientAuthorization::auth`].
     fn choose_mechanism(sasl_mechs: &[String]) -> Option<SaslMechanism> {
@@ -242,17 +220,8 @@ impl Pop3FetchDriver {
         let Some((user, pass)) = st.credentials.clone() else {
             return false;
         };
-        // Prefer APOP if available and desired.
-        if st.prefer_apop {
-            if let Some(ts) = st.apop_timestamp.clone() {
-                let digest = Self::apop_digest(&ts, &pass);
-                drop(st);
-                auth.apop(&user, &digest);
-                return true;
-            }
-        }
         if let Some(mech) = Self::choose_mechanism(&caps.sasl_mechs) {
-            let mut client = create_client(mech, &user, &pass, "", "pop", None);
+            let mut client = create_client(mech, &user, &pass, None);
             if client.has_initial_response() {
                 if let SaslClientStep::Response(initial) | SaslClientStep::Complete(initial) = client.evaluate(None) {
                     st.sasl_client = Some(client);
@@ -273,7 +242,7 @@ impl Pop3FetchDriver {
         true
     }
 
-    /// Authenticate after STLS (no APOP possible here).
+    /// Authenticate after STLS.
     fn authenticate_post_stls(
         &self,
         post_stls: &mut dyn Pop3ClientPostStls,
@@ -284,7 +253,7 @@ impl Pop3FetchDriver {
             return false;
         };
         if let Some(mech) = Self::choose_mechanism(&caps.sasl_mechs) {
-            let mut client = create_client(mech, &user, &pass, "", "pop", None);
+            let mut client = create_client(mech, &user, &pass, None);
             if client.has_initial_response() {
                 if let SaslClientStep::Response(initial) | SaslClientStep::Complete(initial) = client.evaluate(None) {
                     st.sasl_client = Some(client);
@@ -333,18 +302,8 @@ impl Pop3FetchDriver {
 }
 
 impl Pop3ClientDriver for Pop3FetchDriver {
-    fn on_greeting(
-        &mut self,
-        auth: &mut dyn Pop3ClientAuthorization,
-        _ep: &mut dyn Endpoint,
-        apop_challenge: Option<&ContentId>,
-    ) {
-        if let Some(challenge) = apop_challenge {
-            // APOP's digest is computed over the literal `<local@domain>`
-            // banner text, which `ContentId`'s Display reproduces exactly.
-            self.state.lock().unwrap().apop_timestamp = Some(challenge.to_string());
-        }
-        // CAPA first either way, to discover STLS/SASL support.
+    fn on_greeting(&mut self, auth: &mut dyn Pop3ClientAuthorization, _ep: &mut dyn Endpoint) {
+        // CAPA first, to discover STLS/SASL support.
         auth.capa();
     }
 
@@ -459,7 +418,7 @@ impl Pop3ClientDriver for Pop3FetchDriver {
     ) {
         let mut st = self.state.lock().unwrap();
         let Some(mut client) = st.sasl_client.take() else {
-            // PLAIN/USER-PASS/APOP never reach here; an unexpected
+            // PLAIN/USER-PASS never reach here; an unexpected
             // challenge with no in-progress exchange can't be answered.
             drop(st);
             exchange.abort();

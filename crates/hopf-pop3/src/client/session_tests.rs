@@ -202,7 +202,7 @@ fn script_acknowledges_the_servers_final_scram_data_with_an_empty_line() {
     let mut server = create_server(
         SaslMechanism::ScramSha256,
         store,
-        SaslServerOptions { hostname: "pop".into(), realm: "pop".into(), peer_certificate: None, channel_binding: None },
+        SaslServerOptions { peer_certificate: None, channel_binding: None },
     );
     let b64 = |b: &[u8]| rmimeparser::charset::base64::encode(b);
     let unb64 = |s: &str| rmimeparser::charset::base64::decode(s.trim()).unwrap();
@@ -253,14 +253,11 @@ fn script_gives_up_on_a_challenge_that_is_not_base64() {
 }
 
 #[test]
-fn script_uses_apop_when_preferred() {
+fn script_ignores_an_apop_timestamp_in_the_greeting() {
     let (s, result) = script(Some(("alice", "secret")), vec![Pop3Op::Stat]);
-    let s = s.prefer_apop(true);
     let mut peer = connect(&s);
     assert_eq!(peer.run("+OK ready <1896.697170952@dbc.mtview.ca.us>\r\n"), "CAPA\r\n");
-    let digest = hopf_auth::crypto::md5_hex(b"<1896.697170952@dbc.mtview.ca.us>secret");
-    assert_eq!(peer.run(CAPA_USER), format!("APOP alice {digest}\r\n"));
-    assert_eq!(peer.run("+OK\r\n"), "STAT\r\n");
+    assert_eq!(peer.run(CAPA_USER), "USER alice\r\n");
     assert!(result.lock().unwrap().is_none());
 }
 
@@ -391,7 +388,6 @@ fn fetch(delete: bool, stop_after: Option<usize>) -> (Pop3Fetch, Arc<Mutex<Colle
     let sink = Arc::clone(&done);
     let f = Pop3Fetch::new()
         .credentials("a", "b")
-        .prefer_apop(false)
         .delete_after_fetch(delete)
         .on_message(Box::new(Collector(Arc::clone(&collected))))
         .on_complete(Box::new(move |ok| sink.lock().unwrap().push(ok)));
@@ -514,14 +510,13 @@ fn fetch_reports_failure_when_the_connection_drops() {
 }
 
 #[test]
-fn fetch_prefers_apop_by_default() {
+fn fetch_ignores_an_apop_timestamp_in_the_greeting() {
     let done: Arc<Mutex<Vec<bool>>> = Arc::default();
     let sink = Arc::clone(&done);
     let f = Pop3Fetch::new().credentials("alice", "secret").on_complete(Box::new(move |ok| sink.lock().unwrap().push(ok)));
     let mut peer = connect(&f);
     peer.run("+OK ready <t@h>\r\n");
-    let digest = hopf_auth::crypto::md5_hex(b"<t@h>secret");
-    assert_eq!(peer.run(CAPA_USER), format!("APOP alice {digest}\r\n"));
+    assert_eq!(peer.run(CAPA_USER), "USER alice\r\n");
 }
 
 #[test]

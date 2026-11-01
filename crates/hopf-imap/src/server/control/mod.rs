@@ -1007,8 +1007,6 @@ impl ImapControlHandler {
             return;
         }
         let opts = SaslServerOptions {
-            hostname: self.config.hostname.clone(),
-            realm: self.config.hostname.clone(),
             peer_certificate: self.peer_certificate.clone(),
             channel_binding: None,
         };
