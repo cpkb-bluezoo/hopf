@@ -23,6 +23,8 @@ pub struct ImapCapabilities {
     pub idle: bool,
     /// `LOGIN` disabled (`LOGINDISABLED`).
     pub login_disabled: bool,
+    /// `SASL-IR` (RFC 4959): an initial response may follow `AUTHENTICATE`.
+    pub sasl_ir: bool,
     /// `MOVE`.
     pub move_: bool,
     /// `UIDPLUS`.
@@ -75,6 +77,7 @@ impl ImapCapabilities {
             "LITERAL-" => self.literal_minus = true,
             "IDLE" => self.idle = true,
             "LOGINDISABLED" => self.login_disabled = true,
+            "SASL-IR" => self.sasl_ir = true,
             "MOVE" => self.move_ = true,
             "UIDPLUS" => self.uidplus = true,
             "NAMESPACE" => self.namespace = true,

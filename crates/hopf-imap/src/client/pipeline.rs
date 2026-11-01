@@ -45,6 +45,38 @@ pub trait MessageReceiveCallback: Send {
     }
 }
 
+fn auth_plain_initial(user: &str, pass: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(user.len() + pass.len() + 2);
+    buf.push(0u8);
+    buf.extend_from_slice(user.as_bytes());
+    buf.push(0u8);
+    buf.extend_from_slice(pass.as_bytes());
+    buf
+}
+
+/// Log in with what the server allows: AUTHENTICATE PLAIN when preferred and
+/// offered (with the initial response only if the server has SASL-IR, RFC
+/// 4959, else after its `+`), otherwise LOGIN - which a server that says
+/// LOGINDISABLED must not be sent (RFC 3501 section 7.2.1), PLAIN being the
+/// fallback then. Returns `false` when neither can be used.
+fn authenticate(auth: &mut dyn ImapClientNotAuthenticated, user: &str, pass: &str, prefer_plain: bool) -> bool {
+    let caps = auth.capabilities().clone();
+    let plain = |auth: &mut dyn ImapClientNotAuthenticated| {
+        let initial = auth_plain_initial(user, pass);
+        auth.authenticate("PLAIN", caps.sasl_ir.then_some(initial.as_slice()));
+    };
+    if prefer_plain && caps.auth_plain {
+        plain(auth);
+    } else if !caps.login_disabled {
+        auth.login(user, pass);
+    } else if caps.auth_plain {
+        plain(auth);
+    } else {
+        return false;
+    }
+    true
+}
+
 struct ImapFetchState {
     username: String,
     password: String,
@@ -155,8 +187,10 @@ impl Default for ImapFetch {
 
 impl ImapClientHandlerFactory for ImapFetch {
     fn create(&self) -> Box<dyn ImapClientDriver> {
+        let events = self.0.lock().unwrap().events.take();
         Box::new(ImapFetchDriver {
             state: Arc::clone(&self.0),
+            events,
         })
     }
 
@@ -172,6 +206,7 @@ impl ImapClientHandlerFactory for ImapFetch {
 
 struct ImapFetchDriver {
     state: Arc<Mutex<ImapFetchState>>,
+    events: Option<Box<dyn MailboxEventListener>>,
 }
 
 impl ImapFetchDriver {
@@ -183,34 +218,21 @@ impl ImapFetchDriver {
         }
     }
 
-    fn auth_plain_initial(user: &str, pass: &str) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.push(0u8);
-        buf.extend_from_slice(user.as_bytes());
-        buf.push(0u8);
-        buf.extend_from_slice(pass.as_bytes());
-        buf
-    }
-
-    fn do_authenticate(&self, auth: &mut dyn ImapClientNotAuthenticated) {
+    /// Authenticate the way the server allows; `false` if it allows none.
+    fn do_authenticate(&self, auth: &mut dyn ImapClientNotAuthenticated) -> bool {
         let st = self.state.lock().unwrap();
-        let user = st.username.clone();
-        let pass = st.password.clone();
-        let prefer = st.prefer_auth_plain;
-        let caps = auth.capabilities().clone();
+        let (user, pass, prefer) = (st.username.clone(), st.password.clone(), st.prefer_auth_plain);
         drop(st);
-        if prefer && caps.auth_plain {
-            let initial = Self::auth_plain_initial(&user, &pass);
-            auth.authenticate("PLAIN", Some(&initial));
-        } else {
-            auth.login(&user, &pass);
-        }
+        authenticate(auth, &user, &pass, prefer)
     }
 }
 
 impl ImapClientDriver for ImapFetchDriver {
     fn mailbox_events(&mut self) -> Option<&mut dyn MailboxEventListener> {
-        None
+        match self.events {
+            Some(ref mut e) => Some(e.as_mut()),
+            None => None,
+        }
     }
 
     fn on_greeting(
@@ -240,11 +262,10 @@ impl ImapClientDriver for ImapFetchDriver {
             ep.close();
             return;
         }
-        if !ep.is_secure() && caps.starttls && require {
-            auth.starttls();
-            return;
+        if !self.do_authenticate(auth) {
+            self.complete(false);
+            ep.close();
         }
-        self.do_authenticate(auth);
     }
 
     fn on_tls_established(
@@ -292,7 +313,7 @@ impl ImapClientDriver for ImapFetchDriver {
         _text: &str,
     ) {
         let st = self.state.lock().unwrap();
-        let initial = Self::auth_plain_initial(&st.username, &st.password);
+        let initial = auth_plain_initial(&st.username, &st.password);
         drop(st);
         exchange.respond(&initial);
     }
@@ -532,28 +553,12 @@ impl ImapIdleDriver {
         }
     }
 
-    fn auth_plain_initial(user: &str, pass: &str) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.push(0u8);
-        buf.extend_from_slice(user.as_bytes());
-        buf.push(0u8);
-        buf.extend_from_slice(pass.as_bytes());
-        buf
-    }
-
-    fn do_authenticate(&self, auth: &mut dyn ImapClientNotAuthenticated) {
+    /// Authenticate the way the server allows; `false` if it allows none.
+    fn do_authenticate(&self, auth: &mut dyn ImapClientNotAuthenticated) -> bool {
         let st = self.state.lock().unwrap();
-        let user = st.username.clone();
-        let pass = st.password.clone();
-        let prefer = st.prefer_auth_plain;
-        let caps = auth.capabilities().clone();
+        let (user, pass, prefer) = (st.username.clone(), st.password.clone(), st.prefer_auth_plain);
         drop(st);
-        if prefer && caps.auth_plain {
-            let initial = Self::auth_plain_initial(&user, &pass);
-            auth.authenticate("PLAIN", Some(&initial));
-        } else {
-            auth.login(&user, &pass);
-        }
+        authenticate(auth, &user, &pass, prefer)
     }
 }
 
@@ -615,7 +620,10 @@ impl ImapClientDriver for ImapIdleDriver {
             ep.close();
             return;
         }
-        self.do_authenticate(auth);
+        if !self.do_authenticate(auth) {
+            self.complete(false);
+            ep.close();
+        }
     }
 
     fn on_tls_established(
@@ -663,7 +671,7 @@ impl ImapClientDriver for ImapIdleDriver {
         _text: &str,
     ) {
         let st = self.state.lock().unwrap();
-        let initial = Self::auth_plain_initial(&st.username, &st.password);
+        let initial = auth_plain_initial(&st.username, &st.password);
         drop(st);
         exchange.respond(&initial);
     }
@@ -809,3 +817,7 @@ mod idle_pipeline_tests {
         assert!(st.done_on_event);
     }
 }
+
+#[cfg(test)]
+#[path = "pipeline_tests.rs"]
+mod pipeline_tests;
