@@ -1266,6 +1266,9 @@ impl ProtocolHandler for AmqpClientEndpoint {
                 };
                 parser.feed(data, &mut handler);
             }
+            // The placeholder left in `self.parser` while it was out is what
+            // `connection.tune` updated, so carry the negotiated limit over.
+            parser.set_max_frame(self.negotiated_frame_max);
             self.parser = parser;
             // Compact: consume all fed bytes (parser owns its buffer).
             *data = &[];

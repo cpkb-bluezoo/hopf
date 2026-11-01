@@ -49,6 +49,8 @@ mod error;
 mod facade;
 mod handlers;
 mod recovery;
+#[cfg(test)]
+mod session_tests;
 mod timeout;
 
 pub use endpoint::{AmqpClientEndpoint, AmqpClientParams};

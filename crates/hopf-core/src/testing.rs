@@ -150,6 +150,30 @@ impl<H: ProtocolHandler> Peer<H> {
         String::from_utf8_lossy(&std::mem::take(&mut *self.wire.out.lock().unwrap())).into_owned()
     }
 
+    /// Everything the handler has written since the last call, as bytes: for
+    /// binary protocols, where `take` would mangle what is not UTF-8.
+    pub fn take_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut *self.wire.out.lock().unwrap())
+    }
+
+    /// As [`Self::run`], for binary input and output.
+    pub fn run_bytes(&mut self, wire: &[u8]) -> Vec<u8> {
+        self.input.extend_from_slice(wire);
+        self.stalled = false;
+        self.pump();
+        self.take_bytes()
+    }
+
+    /// As [`Self::run_chunked`], for binary input and output.
+    pub fn run_chunked_bytes(&mut self, wire: &[u8], chunk: usize) -> Vec<u8> {
+        for piece in wire.chunks(chunk) {
+            self.input.extend_from_slice(piece);
+            self.stalled = false;
+            self.pump();
+        }
+        self.take_bytes()
+    }
+
     /// Writes `wire` and returns what the handler answered by the time it is idle.
     pub fn run(&mut self, wire: &str) -> String {
         self.input.extend_from_slice(wire.as_bytes());

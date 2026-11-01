@@ -24,3 +24,6 @@ integration = []
 hopf-core = { workspace = true }
 hopf-auth = { workspace = true }
 hopf-dns = { workspace = true }
+
+[dev-dependencies]
+hopf-core = { workspace = true, features = ["testing"] }
