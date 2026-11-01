@@ -112,6 +112,9 @@ pub struct Pop3ControlHandler {
     pending_top_offload: Option<u32>,
     last_auth_fail: Option<Instant>,
     last_activity: Instant,
+    /// Set by the idle timer (see [`Self::arm_idle_timer`]) to have the
+    /// handler look at how long the session has been quiet.
+    idle_check_due: Arc<AtomicBool>,
     peer: SocketAddr,
     local: SocketAddr,
     /// Handler-visible connection metadata (includes `traceparent`).
@@ -205,6 +208,7 @@ impl Pop3ControlHandler {
             pending_top_offload: None,
             last_auth_fail: None,
             last_activity: Instant::now(),
+            idle_check_due: Arc::new(AtomicBool::new(false)),
             peer: SocketAddr::from(([0, 0, 0, 0], 0)),
             local: SocketAddr::from(([0, 0, 0, 0], 0)),
             meta: Pop3ConnectionMetadata {
@@ -438,6 +442,42 @@ impl Pop3ControlHandler {
                 reply::err("Command not valid in AUTHORIZATION state"),
             ),
         }
+    }
+
+    /// Wake the handler in `after` to see whether the session has been idle
+    /// too long. The timer only sets a flag and pokes: the check itself runs
+    /// in `receive`, with the handler's state to hand.
+    fn arm_idle_timer(&self, endpoint: &mut dyn Endpoint, after: std::time::Duration) {
+        let due = Arc::clone(&self.idle_check_due);
+        let handle = endpoint.handle();
+        endpoint.schedule_timer(
+            after,
+            Box::new(move || {
+                handle.with_endpoint(move |ep| {
+                    due.store(true, Ordering::Relaxed);
+                    ep.poke_handler();
+                });
+            }),
+        );
+    }
+
+    /// The idle timer has gone off. A session in TRANSACTION state that has
+    /// had nothing from its client for [`Pop3Config::transaction_timeout`],
+    /// and is not in the middle of a storage operation or a download, is
+    /// ended without entering UPDATE (RFC 1939 section 5: no messages are
+    /// deleted). Any other session is looked at again when it could be due.
+    fn check_idle(&mut self, endpoint: &mut dyn Endpoint) {
+        let timeout = self.config.transaction_timeout;
+        if self.session == Pop3SessionState::Transaction && !self.busy.load(Ordering::Relaxed) {
+            let idle = self.last_activity.elapsed();
+            if idle >= timeout {
+                self.send(endpoint, reply::err("[SYS/TEMP] Transaction timeout"));
+                endpoint.close();
+                return;
+            }
+            return self.arm_idle_timer(endpoint, timeout - idle);
+        }
+        self.arm_idle_timer(endpoint, timeout);
     }
 
     fn dispatch_txn(&mut self, endpoint: &mut dyn Endpoint, cmd: Pop3Command) {
@@ -1287,12 +1327,18 @@ impl ProtocolHandler for Pop3ControlHandler {
         self.sync_meta_addrs();
         self.begin_connection_telemetry();
         self.control_handle = Some(endpoint.handle());
+        if !self.config.transaction_timeout.is_zero() {
+            self.arm_idle_timer(endpoint, self.config.transaction_timeout);
+        }
         if !self.expect_implicit_tls || self.tls {
             self.greet(endpoint);
         }
     }
 
     fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        if self.idle_check_due.swap(false, Ordering::Relaxed) {
+            self.check_idle(endpoint);
+        }
         hopf_core::with_slice(buf, |data| {
             self.sync_pending_open();
             self.sync_pending_auth_check(endpoint);

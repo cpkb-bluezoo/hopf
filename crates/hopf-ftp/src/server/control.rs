@@ -621,8 +621,16 @@ impl FtpControlHandler {
             FtpAuthResult::NeedPassword => {
                 self.send_reply(endpoint, 331, "User name okay, need password");
             }
+            FtpAuthResult::Unavailable => self.service_unavailable(endpoint),
             _ => self.login_failed(endpoint),
         }
+    }
+
+    /// The application cannot serve this connection at all (RFC 959: 421,
+    /// and the control connection closes).
+    fn service_unavailable(&mut self, endpoint: &mut dyn Endpoint) {
+        self.send_reply(endpoint, 421, "Service not available, closing control connection");
+        endpoint.close();
     }
 
     /// A USER or PASS was refused. Count it against the connection and the
@@ -677,6 +685,7 @@ impl FtpControlHandler {
             FtpAuthResult::NeedAccount => {
                 self.send_reply(endpoint, 332, "Need account for login");
             }
+            FtpAuthResult::Unavailable => self.service_unavailable(endpoint),
             _ => self.login_failed(endpoint),
         }
     }
@@ -735,19 +744,7 @@ impl FtpControlHandler {
         }
         self.clear_pasv();
         let bridge = self.ensure_bridge();
-        let bridge2 = Arc::clone(&bridge);
-        let expect_tls = self.data_tls().is_some();
-        let expected_peer = self.meta.peer.ip();
-        let bind_ip = self.meta.local.ip();
-        let port = self.pick_pasv_port();
-        let mut cfg = TcpListenerConfig::new(SocketAddr::new(bind_ip, port), move || {
-            Box::new(FtpDataHandler::new(Arc::clone(&bridge2), expect_tls, expected_peer))
-                as Box<dyn ProtocolHandler>
-        });
-        if let Some(tls) = self.data_tls() {
-            cfg = cfg.with_tls(tls);
-        }
-        match self.runtime.add_tcp_listener(cfg) {
+        match self.open_passive_listener(&bridge) {
             Ok((local, id)) => {
                 self.record_pasv_bind();
                 let adv = self.advertised_addr(local);
@@ -761,19 +758,45 @@ impl FtpControlHandler {
         }
     }
 
-    fn pick_pasv_port(&self) -> u16 {
-        match (self.config.pasv_port_min, self.config.pasv_port_max) {
-            (Some(a), Some(b)) if a <= b => {
-                let span = (b - a) as u32;
-                let n = (std::time::SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.subsec_nanos())
-                    .unwrap_or(0))
-                    % (span + 1);
-                a + n as u16
+    /// Open the listener for a passive data connection. With a port range
+    /// configured, the ports are tried in turn from a random one, wrapping
+    /// round, until one can be bound: a range in which most ports are busy
+    /// (many sessions at once) still finds a free one. With none, any port.
+    fn open_passive_listener(&self, bridge: &Arc<DataBridge>) -> std::io::Result<(SocketAddr, BindingId)> {
+        let expect_tls = self.data_tls().is_some();
+        let expected_peer = self.meta.peer.ip();
+        let bind_ip = self.meta.local.ip();
+        let tls = self.data_tls();
+        let listener_on = |port: u16| {
+            let bridge = Arc::clone(bridge);
+            let mut cfg = TcpListenerConfig::new(SocketAddr::new(bind_ip, port), move || {
+                Box::new(FtpDataHandler::new(Arc::clone(&bridge), expect_tls, expected_peer))
+                    as Box<dyn ProtocolHandler>
+            });
+            if let Some(tls) = &tls {
+                cfg = cfg.with_tls(Arc::clone(tls));
             }
-            _ => 0,
+            cfg
+        };
+        let (min, max) = match (self.config.pasv_port_min, self.config.pasv_port_max) {
+            (Some(min), Some(max)) if min <= max => (min, max),
+            _ => return self.runtime.add_tcp_listener(listener_on(0)),
+        };
+        let span = u32::from(max - min) + 1;
+        let start = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+            % span;
+        let mut last = None;
+        for i in 0..span {
+            let port = min + ((start + i) % span) as u16;
+            match self.runtime.add_tcp_listener(listener_on(port)) {
+                Ok(bound) => return Ok(bound),
+                Err(e) => last = Some(e),
+            }
         }
+        Err(last.expect("a range has at least one port"))
     }
 
     fn cmd_epsv(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
@@ -815,19 +838,7 @@ impl FtpControlHandler {
         }
         self.clear_pasv();
         let bridge = self.ensure_bridge();
-        let bridge2 = Arc::clone(&bridge);
-        let expect_tls = self.data_tls().is_some();
-        let expected_peer = self.meta.peer.ip();
-        let bind_ip = self.meta.local.ip();
-        let port = self.pick_pasv_port();
-        let mut cfg = TcpListenerConfig::new(SocketAddr::new(bind_ip, port), move || {
-            Box::new(FtpDataHandler::new(Arc::clone(&bridge2), expect_tls, expected_peer))
-                as Box<dyn ProtocolHandler>
-        });
-        if let Some(tls) = self.data_tls() {
-            cfg = cfg.with_tls(tls);
-        }
-        match self.runtime.add_tcp_listener(cfg) {
+        match self.open_passive_listener(&bridge) {
             Ok((local, id)) => {
                 self.record_pasv_bind();
                 self.data_mode = DataMode::Passive {

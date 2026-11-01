@@ -3,12 +3,12 @@
 //! POP3 service configuration and listener factory.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hopf_auth::CredentialStore;
 use hopf_core::tls::SharedTlsAcceptor;
-use hopf_core::{ProtocolHandler, Runtime, TcpListenerConfig};
+use hopf_core::{BindingId, ProtocolHandler, Runtime, TcpListenerConfig};
 use hopf_mailbox::MailboxFactory;
 
 use crate::server::control::Pop3ControlHandler;
@@ -99,6 +99,8 @@ pub struct Pop3Service {
     otel_metrics: Option<Arc<hopf_otel::Pop3ServerMetrics>>,
     export: Option<hopf_otel::ExportHandle>,
     traces_enabled: bool,
+    /// The listener [`Self::start`] registered, for [`Self::stop`].
+    binding: Mutex<Option<BindingId>>,
 }
 
 impl Pop3Service {
@@ -118,6 +120,7 @@ impl Pop3Service {
             otel_metrics: None,
             export: None,
             traces_enabled: false,
+            binding: Mutex::new(None),
         }
     }
 
@@ -135,6 +138,7 @@ impl Pop3Service {
             otel_metrics: None,
             export: None,
             traces_enabled: false,
+            binding: Mutex::new(None),
         }
     }
 
@@ -188,14 +192,357 @@ impl Pop3Service {
             } else {
                 cfg = cfg.with_starttls_acceptor(Arc::clone(tls));
             }
+        } else if self.config.implicit_tls {
+            // POP3S was asked for and there is nothing to do TLS with. A
+            // listener marked secure with no acceptor refuses every
+            // connection, where leaving it plain would serve a cleartext
+            // POP3 session on what its operator believes is a TLS port.
+            cfg.secure = true;
         }
         cfg
     }
 
-    /// Register the listener; returns bound address.
+    /// Register the listener; returns bound address. Fails with
+    /// `InvalidInput` if implicit TLS is configured without an acceptor.
     pub fn start(&self) -> std::io::Result<SocketAddr> {
+        if self.config.implicit_tls && self.config.tls_acceptor.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "implicit TLS (POP3S) needs a TLS acceptor: use Pop3Config::with_tls",
+            ));
+        }
         let cfg = self.control_listener();
-        let (addr, _) = self.runtime.add_tcp_listener(cfg)?;
+        let (addr, id) = self.runtime.add_tcp_listener(cfg)?;
+        *self.binding.lock().unwrap() = Some(id);
         Ok(addr)
+    }
+
+    /// Stop accepting connections. Sessions already open carry on until they
+    /// end; until they have, and this service is dropped, nothing else lets
+    /// go of the [`Runtime`]. A service that was not started, or was already
+    /// stopped, is left as it is.
+    pub fn stop(&self) {
+        if let Some(id) = self.binding.lock().unwrap().take() {
+            self.runtime.remove_binding(id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    use hopf_core::RuntimeConfig;
+
+    use crate::server::handler::{ClientConnected, ConnectedState, Pop3ConnectionMetadata};
+
+    fn runtime() -> Arc<Runtime> {
+        Arc::new(Runtime::start(RuntimeConfig::default()).unwrap())
+    }
+
+    /// A config on an ephemeral port over a Maildir under `root`, with one
+    /// user, `u` with password `p`.
+    fn config(root: &std::path::Path) -> Pop3Config {
+        let store = Arc::new(hopf_auth::PasswordStore::new().with_user("u", "p"));
+        let factory = Arc::new(hopf_mailbox::MaildirFactory::new(root));
+        Pop3Config::new("127.0.0.1:0".parse().unwrap(), "mail.example", store, factory)
+    }
+
+    fn acceptor(dir: &std::path::Path) -> SharedTlsAcceptor {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let (cert_path, key_path) = (dir.join("cert.pem"), dir.join("key.pem"));
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+        hopf_core::acceptor_from_pem(&cert_path, &key_path, &[]).unwrap()
+    }
+
+    /// A blocking client over a real connection.
+    struct Client {
+        reader: BufReader<TcpStream>,
+    }
+
+    impl Client {
+        fn connect(addr: SocketAddr) -> Self {
+            let stream = TcpStream::connect(addr).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            Self { reader: BufReader::new(stream) }
+        }
+
+        fn line(&mut self) -> String {
+            let mut line = String::new();
+            self.reader.read_line(&mut line).unwrap_or(0);
+            line
+        }
+
+        /// Send `cmd` and read the reply: the status line, and for a
+        /// multi-line one (`multi`) up to the lone dot.
+        fn run(&mut self, cmd: &str, multi: bool) -> String {
+            self.reader.get_mut().write_all(format!("{cmd}\r\n").as_bytes()).unwrap();
+            let mut out = self.line();
+            if multi && out.starts_with("+OK") {
+                loop {
+                    let line = self.line();
+                    if line.is_empty() {
+                        break;
+                    }
+                    let end = line == ".\r\n";
+                    out.push_str(&line);
+                    if end {
+                        break;
+                    }
+                }
+            }
+            out
+        }
+
+        fn login(&mut self, user: &str, pass: &str) -> String {
+            let u = self.run(&format!("USER {user}"), false);
+            assert!(u.starts_with("+OK"), "{u}");
+            self.run(&format!("PASS {pass}"), false)
+        }
+
+        fn at_eof(&mut self) -> bool {
+            self.line().is_empty()
+        }
+    }
+
+    fn wait(pred: impl Fn() -> bool) -> bool {
+        for _ in 0..500 {
+            if pred() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        pred()
+    }
+
+    // -- the configuration -----------------------------------------------------
+
+    #[test]
+    fn a_new_config_has_the_documented_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = config(dir.path());
+        assert_eq!(c.hostname, "mail.example");
+        assert!(c.tls_acceptor.is_none() && !c.implicit_tls && c.greeting.is_empty());
+        assert!(c.enable_utf8 && !c.enable_pipelining);
+        assert_eq!((c.login_delay, c.expire_days, c.transaction_timeout), (Duration::ZERO, None, DEFAULT_TRANSACTION_TIMEOUT));
+        assert_eq!(DEFAULT_TRANSACTION_TIMEOUT, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn the_builders_set_what_they_say() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = config(dir.path()).with_tls(acceptor(dir.path())).implicit_tls().with_greeting("hello");
+        assert!(c.tls_acceptor.is_some() && c.implicit_tls);
+        assert_eq!(c.greeting, "hello");
+    }
+
+    // -- the listener ----------------------------------------------------------------
+
+    #[test]
+    fn the_listener_is_plain_stls_or_implicit_as_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = |c: Pop3Config| Pop3Service::new(c, runtime()).control_listener();
+        let plain = svc(config(dir.path()));
+        assert!(!plain.secure && plain.tls.is_none());
+        let stls = svc(config(dir.path()).with_tls(acceptor(dir.path())));
+        assert!(!stls.secure && stls.tls.is_some(), "STLS is offered, the handshake waits for it");
+        let implicit = svc(config(dir.path()).with_tls(acceptor(dir.path())).implicit_tls());
+        assert!(implicit.secure && implicit.tls.is_some(), "the handshake starts on accept");
+    }
+
+    #[test]
+    fn implicit_tls_with_no_acceptor_is_refused_not_served_in_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = Pop3Service::new(config(dir.path()).implicit_tls(), runtime());
+        let err = svc.start().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+        assert!(svc.control_listener().secure, "composed by hand, every connection is refused");
+    }
+
+    #[test]
+    fn a_client_is_greeted_with_the_hostname_or_the_configured_greeting() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = Pop3Service::new(config(dir.path()), runtime()).start().unwrap();
+        let greeting = Client::connect(addr).line();
+        assert!(greeting.starts_with("+OK") && greeting.contains("mail.example POP3 server ready"), "{greeting}");
+        let addr = Pop3Service::new(config(dir.path()).with_greeting("welcome to the test"), runtime()).start().unwrap();
+        let greeting = Client::connect(addr).line();
+        assert!(greeting.contains("welcome to the test") && !greeting.contains("server ready"), "{greeting}");
+    }
+
+    #[test]
+    fn the_capability_switches_and_the_acceptor_reach_the_capa_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let capa = |c: Pop3Config| {
+            let addr = Pop3Service::new(c, runtime()).start().unwrap();
+            let mut client = Client::connect(addr);
+            client.line();
+            client.run("CAPA", true)
+        };
+        let plain = capa(config(dir.path()));
+        assert!(plain.contains("UTF8") && !plain.contains("PIPELINING") && !plain.contains("EXPIRE") && !plain.contains("STLS"), "{plain}");
+        let mut c = config(dir.path()).with_tls(acceptor(dir.path()));
+        c.enable_utf8 = false;
+        c.enable_pipelining = true;
+        c.expire_days = Some(30);
+        let tuned = capa(c);
+        assert!(tuned.contains("PIPELINING") && tuned.contains("EXPIRE 30") && tuned.contains("STLS") && !tuned.contains("UTF8"), "{tuned}");
+    }
+
+    #[test]
+    fn a_failed_login_holds_off_the_next_attempt_for_the_configured_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = config(dir.path());
+        c.login_delay = Duration::from_millis(400);
+        let addr = Pop3Service::new(c, runtime()).start().unwrap();
+        let mut client = Client::connect(addr);
+        client.line();
+        assert!(client.login("u", "wrong").starts_with("-ERR"));
+        let too_soon = client.login("u", "p");
+        assert!(too_soon.contains("[LOGIN-DELAY]"), "an attempt inside the delay was not refused: {too_soon}");
+        std::thread::sleep(Duration::from_millis(450));
+        let later = client.login("u", "p");
+        assert!(later.starts_with("+OK"), "{later}");
+    }
+
+    #[test]
+    fn an_idle_session_is_ended_by_the_server_after_the_transaction_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = config(dir.path());
+        c.transaction_timeout = Duration::from_millis(300);
+        let addr = Pop3Service::new(c, runtime()).start().unwrap();
+        let mut client = Client::connect(addr);
+        client.line();
+        assert!(client.login("u", "p").starts_with("+OK"));
+        // The client says nothing: it is the server that must end the session.
+        let started = Instant::now();
+        let last = client.line();
+        assert!(last.starts_with("-ERR") && last.contains("timeout"), "no timeout notice: {last:?}");
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        assert!(client.at_eof(), "the session was not closed");
+    }
+
+    #[test]
+    fn a_session_that_keeps_working_is_not_timed_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = config(dir.path());
+        c.transaction_timeout = Duration::from_millis(400);
+        let addr = Pop3Service::new(c, runtime()).start().unwrap();
+        let mut client = Client::connect(addr);
+        client.line();
+        assert!(client.login("u", "p").starts_with("+OK"));
+        // Twice the timeout in all, but never idle for the whole of it.
+        for _ in 0..6 {
+            std::thread::sleep(Duration::from_millis(150));
+            assert!(client.run("STAT", false).starts_with("+OK"), "a working session was cut off");
+        }
+    }
+
+    #[test]
+    fn a_connection_that_has_not_logged_in_is_not_subject_to_the_transaction_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = config(dir.path());
+        c.transaction_timeout = Duration::from_millis(200);
+        let addr = Pop3Service::new(c, runtime()).start().unwrap();
+        let mut client = Client::connect(addr);
+        client.line();
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(client.login("u", "p").starts_with("+OK"), "the timeout is for the transaction state");
+    }
+
+    // -- a handler per connection ---------------------------------------------------
+
+    struct Counting {
+        inner: DefaultPop3HandlerFactory,
+        created: Arc<AtomicUsize>,
+        ended: Arc<AtomicUsize>,
+    }
+
+    struct CountedEnd {
+        inner: Box<dyn ClientConnected>,
+        ended: Arc<AtomicUsize>,
+    }
+
+    impl ClientConnected for CountedEnd {
+        fn connected(&mut self, state: &mut dyn ConnectedState, meta: &Pop3ConnectionMetadata) {
+            self.inner.connected(state, meta);
+        }
+        fn disconnected(&mut self) {
+            self.ended.fetch_add(1, Ordering::SeqCst);
+            self.inner.disconnected();
+        }
+    }
+
+    impl Pop3HandlerFactory for Counting {
+        fn create(&self) -> Box<dyn ClientConnected> {
+            self.created.fetch_add(1, Ordering::SeqCst);
+            Box::new(CountedEnd { inner: self.inner.create(), ended: Arc::clone(&self.ended) })
+        }
+    }
+
+    #[test]
+    fn each_connection_gets_its_own_handler_and_its_end_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let (created, ended) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let factory = Arc::new(Counting {
+            inner: DefaultPop3HandlerFactory::new("hi"),
+            created: Arc::clone(&created),
+            ended: Arc::clone(&ended),
+        });
+        let svc = Pop3Service::with_handler_factory(config(dir.path()), runtime(), factory);
+        let before = svc.metrics().connections.load(Ordering::Relaxed);
+        let addr = svc.start().unwrap();
+        let mut a = Client::connect(addr);
+        let mut b = Client::connect(addr);
+        assert!(a.line().starts_with("+OK") && b.line().starts_with("+OK"));
+        assert_eq!(created.load(Ordering::SeqCst), 2);
+        assert!(svc.metrics().connections.load(Ordering::Relaxed) >= before + 2);
+        assert!(a.run("QUIT", false).starts_with("+OK"));
+        assert!(wait(|| ended.load(Ordering::SeqCst) == 1), "the first connection's end was not reported");
+        drop(b);
+        assert!(wait(|| ended.load(Ordering::SeqCst) == 2), "a client that just goes away is also an end");
+    }
+
+    // -- storage and shutdown ----------------------------------------------------------
+
+    #[test]
+    fn a_mailbox_that_cannot_be_opened_refuses_the_login_and_leaves_the_connection_usable() {
+        // The Maildir root is a file, so a user's mailbox cannot be made there.
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_directory = dir.path().join("file");
+        std::fs::write(&not_a_directory, b"x").unwrap();
+        let addr = Pop3Service::new(config(&not_a_directory), runtime()).start().unwrap();
+        let mut c = Client::connect(addr);
+        c.line();
+        let answer = c.login("u", "p");
+        assert!(answer.starts_with("-ERR"), "{answer}");
+        assert!(c.run("NOOP", false).starts_with("-ERR") || c.run("QUIT", false).starts_with("+OK"), "the server hung after the storage failure");
+    }
+
+    #[test]
+    fn a_stopped_service_refuses_new_connections_but_lets_open_sessions_finish_and_the_runtime_shut_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime();
+        let svc = Pop3Service::new(config(dir.path()), Arc::clone(&rt));
+        let addr = svc.start().unwrap();
+        let mut open = Client::connect(addr);
+        assert!(open.line().starts_with("+OK"));
+
+        svc.stop();
+        svc.stop(); // a second stop is nothing
+        assert!(wait(|| TcpStream::connect(addr).is_err()), "a stopped service still accepts connections");
+        assert!(open.login("u", "p").starts_with("+OK"), "stopping cut an open session off");
+
+        assert!(open.run("QUIT", false).starts_with("+OK"));
+        assert!(open.at_eof());
+        drop(open);
+        drop(svc);
+        assert!(wait(|| Arc::strong_count(&rt) == 1), "something still holds the runtime: {} references", Arc::strong_count(&rt));
+        Arc::try_unwrap(rt).ok().expect("nothing else holds the runtime").shutdown();
     }
 }

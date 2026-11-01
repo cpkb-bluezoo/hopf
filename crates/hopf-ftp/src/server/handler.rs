@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use hopf_auth::{IdentityMaterial, PeerContext, TrustDecision, TrustPolicy};
 
-use crate::server::fs::{BasicFtpFileSystem, FtpFileSystem};
+use crate::server::fs::{BasicFtpFileSystem, DirectoryChange, FtpFileInfo, FtpFileOpResult, FtpFileSystem, UniqueName};
 
 /// Per-connection metadata visible to handlers.
 #[derive(Debug, Clone)]
@@ -334,16 +334,103 @@ impl FilesystemFtpHandlerFactory {
 }
 
 impl FtpConnectionHandlerFactory for FilesystemFtpHandlerFactory {
+    /// A handler over the root. If the root cannot be opened (it was removed
+    /// or became unreadable since the service started) the handler refuses
+    /// every login as `Unavailable`: this runs on the accept thread, and a
+    /// panic there stops every listener of the runtime from accepting.
     fn create(&self) -> Box<dyn FtpConnectionHandler> {
         let h = if self.read_only {
             FilesystemFtpHandler::read_only(&self.root, Arc::clone(&self.policy))
         } else {
             FilesystemFtpHandler::new(&self.root, Arc::clone(&self.policy))
         };
-        let mut h = h.expect("ftp root must exist at factory create");
-        if let Some(q) = &self.quota {
-            h = h.with_quota(Arc::clone(q));
+        match h {
+            Ok(mut h) => {
+                if let Some(q) = &self.quota {
+                    h = h.with_quota(Arc::clone(q));
+                }
+                Box::new(h)
+            }
+            Err(e) => {
+                hopf_core::log_warn(
+                    "ftp.root.unavailable",
+                    format!("cannot open the FTP root {}: {e}", self.root.display()),
+                );
+                Box::new(UnavailableFtpHandler { fs: NoFileSystem })
+            }
         }
-        Box::new(h)
+    }
+}
+
+/// The handler for a connection when there is nothing to serve: every login
+/// is answered as the service being unavailable.
+struct UnavailableFtpHandler {
+    fs: NoFileSystem,
+}
+
+impl FtpConnectionHandler for UnavailableFtpHandler {
+    fn authenticate(
+        &mut self,
+        _username: &str,
+        _password: Option<&str>,
+        _account: Option<&str>,
+        _meta: &FtpConnectionMetadata,
+    ) -> FtpAuthResult {
+        FtpAuthResult::Unavailable
+    }
+
+    /// Never reached, since no login succeeds; refuses everything anyway.
+    fn file_system(&mut self, _meta: &FtpConnectionMetadata) -> &mut dyn FtpFileSystem {
+        &mut self.fs
+    }
+}
+
+/// A file system with nothing in it that refuses every change.
+struct NoFileSystem;
+
+impl FtpFileSystem for NoFileSystem {
+    fn list_directory(&self, _path: &str, _meta: &FtpConnectionMetadata) -> Option<Vec<FtpFileInfo>> {
+        None
+    }
+    fn change_directory(&self, _path: &str, cwd: &str, _meta: &FtpConnectionMetadata) -> DirectoryChange {
+        DirectoryChange { result: FtpFileOpResult::Failed, new_cwd: cwd.to_string() }
+    }
+    fn file_info(&self, _path: &str, _meta: &FtpConnectionMetadata) -> Option<FtpFileInfo> {
+        None
+    }
+    fn mkdir(&self, _path: &str, _meta: &FtpConnectionMetadata) -> FtpFileOpResult {
+        FtpFileOpResult::Failed
+    }
+    fn rmdir(&self, _path: &str, _meta: &FtpConnectionMetadata) -> FtpFileOpResult {
+        FtpFileOpResult::Failed
+    }
+    fn delete(&self, _path: &str, _meta: &FtpConnectionMetadata) -> FtpFileOpResult {
+        FtpFileOpResult::Failed
+    }
+    fn rename(&self, _from: &str, _to: &str, _meta: &FtpConnectionMetadata) -> FtpFileOpResult {
+        FtpFileOpResult::Failed
+    }
+    fn resolve(&self, path: &str, _cwd: &str) -> String {
+        path.to_string()
+    }
+    fn open_read(
+        &self,
+        _path: &str,
+        _restart: u64,
+        _meta: &FtpConnectionMetadata,
+    ) -> Result<Box<dyn std::io::Read + Send>, FtpFileOpResult> {
+        Err(FtpFileOpResult::Failed)
+    }
+    fn open_write(
+        &self,
+        _path: &str,
+        _append: bool,
+        _restart: u64,
+        _meta: &FtpConnectionMetadata,
+    ) -> Result<Box<dyn std::io::Write + Send>, FtpFileOpResult> {
+        Err(FtpFileOpResult::Failed)
+    }
+    fn generate_unique_name(&self, _base: &str, _suggested: Option<&str>, _meta: &FtpConnectionMetadata) -> UniqueName {
+        UniqueName { result: FtpFileOpResult::Failed, path: String::new() }
     }
 }
