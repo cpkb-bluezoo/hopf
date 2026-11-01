@@ -58,6 +58,10 @@ fn encode_txt(pairs: &[(String, String)]) -> Vec<u8> {
         out.push(bytes.len() as u8);
         out.extend_from_slice(bytes);
     }
+    if out.is_empty() {
+        // Every entry was too long to carry: still not an empty record.
+        out.push(0);
+    }
     out
 }
 
@@ -270,4 +274,83 @@ fn poll_browse(
 
 fn service_ptr_lookup(shared: &Arc<Mutex<Shared>>, instance: &str, qtype: DnsType) -> Vec<DnsResourceRecord> {
     shared.lock().unwrap().cache_lookup(instance, qtype)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn txt_is_length_prefixed_key_value_strings() {
+        assert_eq!(encode_txt(&pairs(&[("a", "b"), ("path", "/")])), b"\x03a=b\x06path=/");
+    }
+
+    #[test]
+    fn no_txt_pairs_is_a_single_empty_string() {
+        // RFC 6763 section 6.1: a TXT record is never empty.
+        assert_eq!(encode_txt(&[]), [0]);
+    }
+
+    #[test]
+    fn an_entry_over_255_bytes_is_left_out() {
+        let long = "x".repeat(256);
+        let enc = encode_txt(&pairs(&[("ok", "1"), ("big", &long)]));
+        assert_eq!(enc, b"\x04ok=1");
+    }
+
+    #[test]
+    fn a_txt_whose_every_entry_is_too_long_is_still_not_empty() {
+        let long = "x".repeat(300);
+        assert_eq!(encode_txt(&pairs(&[("big", &long)])), [0]);
+    }
+
+    #[test]
+    fn txt_round_trips_and_keeps_a_value_with_an_equals_sign() {
+        let items = pairs(&[("a", "b"), ("url", "http://x/?q=1"), ("flag", "")]);
+        let decoded = decode_txt(&encode_txt(&items));
+        assert_eq!(decoded[0], ("a".to_string(), "b".to_string()));
+        assert_eq!(decoded[1], ("url".to_string(), "http://x/?q=1".to_string()));
+        assert_eq!(decoded[2], ("flag".to_string(), String::new()));
+    }
+
+    #[test]
+    fn a_key_with_no_equals_sign_decodes_as_a_flag() {
+        assert_eq!(decode_txt(b"\x04flag"), [("flag".to_string(), String::new())]);
+    }
+
+    #[test]
+    fn empty_strings_in_a_txt_are_skipped() {
+        assert!(decode_txt(&[0]).is_empty());
+        assert_eq!(decode_txt(b"\x00\x03a=b"), [("a".to_string(), "b".to_string())]);
+    }
+
+    #[test]
+    fn a_truncated_txt_keeps_what_came_before_the_cut() {
+        assert_eq!(decode_txt(b"\x03a=b\x09short"), [("a".to_string(), "b".to_string())]);
+    }
+
+    #[test]
+    fn a_registration_makes_ptr_srv_txt_and_the_enumeration_pointer() {
+        let reg = ServiceRegistration {
+            service_type: "_ipp._tcp".into(),
+            instance_name: "Office".into(),
+            port: 631,
+            txt: pairs(&[("rp", "printers/main")]),
+        };
+        let (records, fqdn) = build_records(&reg, "host.local", 4500);
+        assert_eq!(fqdn, "Office._ipp._tcp.local");
+        assert_eq!(records.len(), 4);
+        assert!(records.iter().all(|r| r.ttl == 4500));
+        assert_eq!(records[0].name, "_ipp._tcp.local");
+        assert_eq!(records[0].as_domain_name().as_deref(), Some("Office._ipp._tcp.local"));
+        let (_, _, port, target) = records[1].as_srv().unwrap();
+        assert_eq!((port, target.as_str()), (631, "host.local"));
+        assert_eq!(records[2].rtype, Some(DnsType::Txt));
+        assert_eq!(records[3].name, "_services._dns-sd._udp.local");
+        assert_eq!(records[3].as_domain_name().as_deref(), Some("_ipp._tcp.local"));
+    }
 }

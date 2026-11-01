@@ -105,9 +105,39 @@ pub(crate) struct Shared {
     peer: SocketAddr,
     token: Token,
     cache: MdnsCache,
+    /// Everything sent, parsed back from the wire, so tests can see it
+    /// without a socket.
+    #[cfg(test)]
+    pub(crate) outbox: Mutex<Vec<(SocketAddr, DnsMessage)>>,
 }
 
 impl Shared {
+    fn new(
+        reactor: ReactorHandle,
+        hostname_label: &str,
+        addresses: Vec<Ipv4Addr>,
+        timing: Timing,
+    ) -> Self {
+        Self {
+            state: State::Idle,
+            timing,
+            hostname_label: hostname_label.to_string(),
+            name_conflict_suffix: 1,
+            current_name: format!("{hostname_label}.local"),
+            own_addresses: addresses,
+            dynamic_records: Vec::new(),
+            probes_sent: 0,
+            announces_sent: 0,
+            timer: None,
+            reactor,
+            peer: SocketAddr::new(MDNS_GROUP.into(), MDNS_PORT),
+            token: Token(usize::MAX),
+            cache: MdnsCache::new(),
+            #[cfg(test)]
+            outbox: Mutex::new(Vec::new()),
+        }
+    }
+
     pub(crate) fn reactor_handle(&self) -> ReactorHandle {
         self.reactor.clone()
     }
@@ -145,6 +175,10 @@ impl Shared {
 
     fn send(&self, msg: &DnsMessage, dest: SocketAddr) {
         if let Ok(bytes) = msg.serialize() {
+            #[cfg(test)]
+            if let Ok(parsed) = DnsMessage::parse(&bytes) {
+                self.outbox.lock().unwrap().push((dest, parsed));
+            }
             self.reactor.udp_send(self.token, dest, bytes);
         }
     }
@@ -569,23 +603,7 @@ impl MdnsService {
         multicast_if: Option<Ipv4Addr>,
     ) -> std::io::Result<Self> {
         let reactor = rt.pick_worker().clone();
-        let placeholder_token = Token(usize::MAX);
-        let shared = Arc::new(Mutex::new(Shared {
-            state: State::Idle,
-            timing,
-            hostname_label: hostname_label.to_string(),
-            name_conflict_suffix: 1,
-            current_name: format!("{hostname_label}.local"),
-            own_addresses: addresses,
-            dynamic_records: Vec::new(),
-            probes_sent: 0,
-            announces_sent: 0,
-            timer: None,
-            reactor: reactor.clone(),
-            peer: SocketAddr::new(MDNS_GROUP.into(), MDNS_PORT),
-            token: placeholder_token,
-            cache: MdnsCache::new(),
-        }));
+        let shared = Arc::new(Mutex::new(Shared::new(reactor.clone(), hostname_label, addresses, timing)));
 
         let handler = Box::new(MdnsHandler { shared: Arc::clone(&shared) });
         let (_, token) = listen_mdns_udp(&reactor, handler, multicast_if)?;
@@ -643,3 +661,7 @@ impl Drop for MdnsService {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "responder_tests.rs"]
+mod tests;
