@@ -25,6 +25,29 @@ pub enum FieldType {
 }
 
 impl FieldType {
+    /// The scalar type a `.proto` type name spells (`"int32"`, `"string"`, ...);
+    /// `None` for a message or enum name.
+    pub fn from_scalar_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "double" => Self::Double,
+            "float" => Self::Float,
+            "int32" => Self::Int32,
+            "int64" => Self::Int64,
+            "uint32" => Self::Uint32,
+            "uint64" => Self::Uint64,
+            "sint32" => Self::Sint32,
+            "sint64" => Self::Sint64,
+            "fixed32" => Self::Fixed32,
+            "fixed64" => Self::Fixed64,
+            "sfixed32" => Self::Sfixed32,
+            "sfixed64" => Self::Sfixed64,
+            "bool" => Self::Bool,
+            "string" => Self::String,
+            "bytes" => Self::Bytes,
+            _ => return None,
+        })
+    }
+
     pub fn is_scalar(self) -> bool {
         !matches!(self, Self::Message | Self::Enum | Self::Map)
     }

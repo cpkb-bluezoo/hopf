@@ -298,24 +298,7 @@ fn read_varint(data: &[u8], pos: &mut usize) -> Result<u64, ProtoParseError> {
 }
 
 fn scalar_type(name: &str) -> Option<FieldType> {
-    Some(match name {
-        "double" => FieldType::Double,
-        "float" => FieldType::Float,
-        "int32" => FieldType::Int32,
-        "int64" => FieldType::Int64,
-        "uint32" => FieldType::Uint32,
-        "uint64" => FieldType::Uint64,
-        "sint32" => FieldType::Sint32,
-        "sint64" => FieldType::Sint64,
-        "fixed32" => FieldType::Fixed32,
-        "fixed64" => FieldType::Fixed64,
-        "sfixed32" => FieldType::Sfixed32,
-        "sfixed64" => FieldType::Sfixed64,
-        "bool" => FieldType::Bool,
-        "string" => FieldType::String,
-        "bytes" => FieldType::Bytes,
-        _ => return None,
-    })
+    FieldType::from_scalar_name(name)
 }
 
 /// A length-delimited string or bytes value as the scalar of type `ft`.
