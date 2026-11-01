@@ -191,9 +191,9 @@ impl ProtoFileParser {
         for s in &mut services {
             resolver.resolve_service(s);
         }
-        for m in resolver.well_known_used() {
-            messages.push(m);
-        }
+        let (well_known_messages, well_known_enums) = resolver.well_known_used();
+        messages.extend(well_known_messages);
+        enums.extend(well_known_enums);
 
         let mut file_builder = ProtoFile::builder()
             .package_name(pkg)
@@ -1148,14 +1148,73 @@ const WELL_KNOWN: &[&str] = &[
     "BoolValue",
     "StringValue",
     "BytesValue",
+    "Struct",
+    "Value",
+    "ListValue",
 ];
+
+/// The well-known enums.
+const WELL_KNOWN_ENUMS: &[&str] = &["NullValue"];
+
+/// The types that go together: `Struct` holds `Value`s, a `Value` can be a
+/// `Struct` or a `ListValue`, and a `ListValue` holds `Value`s.
+const JSON_TREE: &[&str] = &["Struct", "Value", "ListValue", "NullValue"];
 
 /// Structure of a `google.protobuf` well-known type. Their proto3 JSON
 /// mapping (an RFC 3339 string for a Timestamp and so on) is applied by the
-/// JSON adapter and serializer for Timestamp, Duration, FieldMask and the
-/// wrapper types; `Any` is an ordinary message there.
+/// JSON adapter and serializer for Timestamp, Duration, FieldMask, the
+/// wrapper types, Struct, Value and ListValue; `Any` is an ordinary message
+/// there.
 fn well_known_type(simple: &str) -> Option<MessageDescriptor> {
     use FieldType::*;
+    const VALUE: &str = "google.protobuf.Value";
+    let named = |b: MessageDescriptorBuilderOwned| b.name(simple).full_name(format!("google.protobuf.{simple}"));
+    match simple {
+        "Struct" => {
+            return Some(
+                named(MessageDescriptor::builder())
+                    .add_field(
+                        FieldDescriptor::builder()
+                            .number(1)
+                            .name("fields")
+                            .field_type(Map)
+                            .key_type_name("string")
+                            .value_type_name(VALUE)
+                            .build(),
+                    )
+                    .build(),
+            )
+        }
+        "ListValue" => {
+            return Some(
+                named(MessageDescriptor::builder())
+                    .add_field(
+                        FieldDescriptor::builder()
+                            .number(1)
+                            .name("values")
+                            .field_type(Message)
+                            .message_type_name(VALUE)
+                            .repeated(true)
+                            .build(),
+                    )
+                    .build(),
+            )
+        }
+        "Value" => {
+            let field = |number, name: &str, field_type| FieldDescriptor::builder().number(number).name(name).field_type(field_type);
+            return Some(
+                named(MessageDescriptor::builder())
+                    .add_field(field(1, "null_value", Enum).enum_type_name("google.protobuf.NullValue").build())
+                    .add_field(field(2, "number_value", Double).build())
+                    .add_field(field(3, "string_value", String).build())
+                    .add_field(field(4, "bool_value", Bool).build())
+                    .add_field(field(5, "struct_value", Message).message_type_name("google.protobuf.Struct").build())
+                    .add_field(field(6, "list_value", Message).message_type_name("google.protobuf.ListValue").build())
+                    .build(),
+            )
+        }
+        _ => {}
+    }
     let fields: &[(&str, FieldType, i32, bool)] = match simple {
         "Empty" => &[],
         "Timestamp" | "Duration" => &[("seconds", Int64, 1, false), ("nanos", Int32, 2, false)],
@@ -1186,6 +1245,19 @@ fn well_known_type(simple: &str) -> Option<MessageDescriptor> {
         );
     }
     Some(b.build())
+}
+
+fn well_known_enum(simple: &str) -> Option<EnumDescriptor> {
+    match simple {
+        "NullValue" => Some(
+            EnumDescriptor::builder()
+                .name("NullValue")
+                .full_name("google.protobuf.NullValue")
+                .add_value(0, "NULL_VALUE")
+                .build(),
+        ),
+        _ => None,
+    }
 }
 
 /// Turns type names as written into full names, once every type in the file
@@ -1223,10 +1295,20 @@ impl Resolver {
             && !self.messages.contains(full_name)
     }
 
+    fn is_well_known_enum(&self, full_name: &str) -> bool {
+        full_name
+            .strip_prefix("google.protobuf.")
+            .is_some_and(|s| WELL_KNOWN_ENUMS.contains(&s))
+            && !self.enums.contains(full_name)
+    }
+
     fn classify(&mut self, full_name: &str) -> Option<Resolved> {
         if self.messages.contains(full_name) {
             Some(Resolved::Message(full_name.to_string()))
         } else if self.enums.contains(full_name) {
+            Some(Resolved::Enum(full_name.to_string()))
+        } else if self.is_well_known_enum(full_name) {
+            self.well_known_used.insert(full_name.to_string());
             Some(Resolved::Enum(full_name.to_string()))
         } else if self.is_well_known(full_name) {
             self.well_known_used.insert(full_name.to_string());
@@ -1299,13 +1381,18 @@ impl Resolver {
     }
 
     /// The well-known types the file refers to, to be added to it.
-    fn well_known_used(self) -> Vec<MessageDescriptor> {
-        let mut names: Vec<String> = self.well_known_used.into_iter().collect();
+    fn well_known_used(self) -> (Vec<MessageDescriptor>, Vec<EnumDescriptor>) {
+        let mut names = self.well_known_used;
+        // Struct, Value and ListValue refer to each other, and Value to NullValue.
+        if ["Struct", "Value", "ListValue"].iter().any(|n| names.contains(&format!("google.protobuf.{n}"))) {
+            names.extend(JSON_TREE.iter().map(|n| format!("google.protobuf.{n}")));
+        }
+        let mut names: Vec<String> = names.into_iter().collect();
         names.sort();
-        names
-            .iter()
-            .filter_map(|n| n.strip_prefix("google.protobuf.").and_then(well_known_type))
-            .collect()
+        let simple = |n: &String| n.strip_prefix("google.protobuf.").map(str::to_string);
+        let messages = names.iter().filter_map(simple).filter_map(|n| well_known_type(&n)).collect();
+        let enums = names.iter().filter_map(simple).filter_map(|n| well_known_enum(&n)).collect();
+        (messages, enums)
     }
 }
 
@@ -1514,6 +1601,59 @@ mod tests {
         assert!(pf.message("google.protobuf.Duration").is_some());
         assert!(pf.message("google.protobuf.Empty").is_none());
         assert!(pf.message("demo.M").is_some());
+    }
+
+    #[test]
+    fn struct_value_and_list_value_come_as_a_set_with_their_null_enum() {
+        let pf = parse("syntax = \"proto3\"; package demo; message M { google.protobuf.Struct s = 1; }");
+        let st = pf.message("google.protobuf.Struct").unwrap();
+        let fields = st.field_by_name("fields").unwrap();
+        assert_eq!(fields.field_type, FieldType::Map);
+        assert_eq!(fields.key_type_name.as_deref(), Some("string"));
+        assert_eq!(fields.value_type_name.as_deref(), Some("google.protobuf.Value"));
+        let v = pf.message("google.protobuf.Value").unwrap();
+        let kinds: Vec<(&str, FieldType, i32)> =
+            v.fields.iter().map(|f| (f.name.as_str(), f.field_type, f.number)).collect();
+        assert_eq!(
+            kinds,
+            [
+                ("null_value", FieldType::Enum, 1),
+                ("number_value", FieldType::Double, 2),
+                ("string_value", FieldType::String, 3),
+                ("bool_value", FieldType::Bool, 4),
+                ("struct_value", FieldType::Message, 5),
+                ("list_value", FieldType::Message, 6),
+            ]
+        );
+        assert_eq!(v.field_by_name("struct_value").unwrap().message_type_name.as_deref(), Some("google.protobuf.Struct"));
+        assert_eq!(v.field_by_name("null_value").unwrap().enum_type_name.as_deref(), Some("google.protobuf.NullValue"));
+        let list = pf.message("google.protobuf.ListValue").unwrap().field_by_name("values").unwrap();
+        assert!(list.repeated && list.message_type_name.as_deref() == Some("google.protobuf.Value"));
+        assert_eq!(pf.enum_type("google.protobuf.NullValue").unwrap().value_name(0), Some("NULL_VALUE"));
+        assert_eq!(field(&pf, "demo.M", "s").message_type_name.as_deref(), Some("google.protobuf.Struct"));
+    }
+
+    #[test]
+    fn any_one_of_the_three_brings_the_others_it_refers_to() {
+        for used in ["Value", "ListValue", "Struct"] {
+            let pf = parse(&format!("syntax = \"proto3\"; package demo; message M {{ google.protobuf.{used} x = 1; }}"));
+            for name in ["Struct", "Value", "ListValue"] {
+                assert!(pf.message(&format!("google.protobuf.{name}")).is_some(), "{used} should bring {name}");
+            }
+            assert!(pf.enum_type("google.protobuf.NullValue").is_some());
+        }
+        let none = parse("syntax = \"proto3\"; package demo; message M { int32 x = 1; }");
+        assert!(none.message("google.protobuf.Struct").is_none() && none.enum_type("google.protobuf.NullValue").is_none());
+    }
+
+    #[test]
+    fn null_value_can_be_used_on_its_own() {
+        let pf = parse("syntax = \"proto3\"; package demo; message M { google.protobuf.NullValue n = 1; }");
+        let f = field(&pf, "demo.M", "n");
+        assert_eq!(f.field_type, FieldType::Enum);
+        assert_eq!(f.enum_type_name.as_deref(), Some("google.protobuf.NullValue"));
+        assert!(pf.enum_type("google.protobuf.NullValue").is_some());
+        assert!(pf.message("google.protobuf.Value").is_none(), "only the enum was asked for");
     }
 
     #[test]

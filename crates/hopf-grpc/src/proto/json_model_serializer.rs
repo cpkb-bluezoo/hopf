@@ -8,7 +8,7 @@ use loopbuf::LoopBuf;
 use rjsonparser::{WriteError, WriteResult, Writer};
 
 use super::base64;
-use super::well_known::{self, WellKnown};
+use super::well_known::{self, TreeKind, WellKnown};
 use super::{FieldDescriptor, FieldType, MessageDescriptor, ProtoFile, ScalarValue};
 
 /// A JSON array or object the current message has open for one of its fields.
@@ -76,10 +76,25 @@ impl BareFrame {
     }
 }
 
+/// A `Struct`, `Value` or `ListValue`, written as the JSON value it holds.
+struct TreeFrame {
+    kind: TreeKind,
+    /// A `Value` has been given its one kind.
+    set: bool,
+}
+
+/// One member of a `Struct`: its key, then its value.
+struct MemberFrame {
+    key_written: bool,
+    value_written: bool,
+}
+
 enum Frame {
     Message(MessageFrame),
     Entry(EntryFrame),
     Bare(BareFrame),
+    Tree(TreeFrame),
+    Member(MemberFrame),
     /// A field the message does not have, and everything inside it.
     Skipped,
 }
@@ -132,6 +147,15 @@ impl JsonModelSerializer {
             self.stack.push(Frame::Bare(BareFrame { kind, seconds: 0, nanos: 0, paths: Vec::new(), value: None }));
             return Ok(());
         }
+        if let Some(kind) = well_known::classify_tree(&desc.full_name) {
+            match kind {
+                TreeKind::Struct => writer.write_start_object(ring)?,
+                TreeKind::List => writer.write_start_array(ring)?,
+                TreeKind::Value => {}
+            }
+            self.stack.push(Frame::Tree(TreeFrame { kind, set: false }));
+            return Ok(());
+        }
         writer.write_start_object(ring)?;
         self.stack.push(Frame::Message(MessageFrame { desc, open: None, closed: HashSet::new() }));
         Ok(())
@@ -148,16 +172,31 @@ impl JsonModelSerializer {
             Some(Frame::Message(mut frame)) => {
                 close_open(writer, ring, &mut frame)?;
                 writer.write_end_object(ring)?;
-                // A message that was a map entry's value completes the entry.
-                if let Some(Frame::Entry(entry)) = self.stack.last_mut() {
-                    entry.value_written = true;
-                }
+                value_done(&mut self.stack);
                 Ok(())
             }
             Some(Frame::Bare(frame)) => {
                 write_bare(writer, ring, &self.proto_file, frame)?;
-                if let Some(Frame::Entry(entry)) = self.stack.last_mut() {
-                    entry.value_written = true;
+                value_done(&mut self.stack);
+                Ok(())
+            }
+            Some(Frame::Tree(frame)) => {
+                match frame.kind {
+                    TreeKind::Struct => writer.write_end_object(ring)?,
+                    TreeKind::List => writer.write_end_array(ring)?,
+                    // A Value with no kind set is null.
+                    TreeKind::Value if !frame.set => writer.write_null(ring)?,
+                    TreeKind::Value => {}
+                }
+                value_done(&mut self.stack);
+                Ok(())
+            }
+            Some(Frame::Member(member)) => {
+                if !member.key_written {
+                    writer.write_key(ring, "")?;
+                }
+                if !member.value_written {
+                    writer.write_null(ring)?;
                 }
                 Ok(())
             }
@@ -182,6 +221,23 @@ impl JsonModelSerializer {
                 frame.set(name, value);
                 Ok(())
             }
+            Some(Frame::Tree(frame)) => tree_field(writer, ring, frame, name, &value),
+            Some(Frame::Member(member)) => match name {
+                "key" => {
+                    if member.key_written {
+                        return Err(invalid("a Struct member has two keys"));
+                    }
+                    let key = match &value {
+                        ScalarValue::String(s) => s.as_str(),
+                        _ => "",
+                    };
+                    writer.write_key(ring, key)?;
+                    member.key_written = true;
+                    Ok(())
+                }
+                "value" => Err(invalid("a Struct member's value is a Value: write it with start_field")),
+                _ => Ok(()),
+            },
             Some(Frame::Entry(entry)) => entry_field(writer, ring, proto, entry, name, &value),
             Some(Frame::Message(frame)) => {
                 let Some(fd) = frame.desc.fields.iter().find(|fd| fd.name == name).cloned() else {
@@ -219,6 +275,36 @@ impl JsonModelSerializer {
             }
             Some(Frame::Bare(_)) => {
                 return Err(invalid(format!("{name}: a well-known type written as a bare value has no message fields")));
+            }
+            Some(Frame::Tree(frame)) => {
+                let child = match (frame.kind, name) {
+                    (TreeKind::Value, "struct_value") => well_known::STRUCT,
+                    (TreeKind::Value, "list_value") => well_known::LIST_VALUE,
+                    (TreeKind::Struct, "fields") => {
+                        self.stack.push(Frame::Member(MemberFrame { key_written: false, value_written: false }));
+                        return Ok(());
+                    }
+                    (TreeKind::List, "values") => well_known::VALUE,
+                    _ => return Err(invalid(format!("{name} is not a field of this well-known type"))),
+                };
+                if frame.kind == TreeKind::Value {
+                    if frame.set {
+                        return Err(invalid("a Value has two kinds"));
+                    }
+                    frame.set = true;
+                }
+                child.to_string()
+            }
+            Some(Frame::Member(member)) => {
+                if name != "value" {
+                    return Err(invalid(format!("{name} cannot hold a message in a Struct member")));
+                }
+                if !member.key_written {
+                    writer.write_key(ring, "")?;
+                    member.key_written = true;
+                }
+                member.value_written = true;
+                well_known::VALUE.to_string()
             }
             Some(Frame::Entry(entry)) => {
                 if name != "value" || entry.value.field_type != FieldType::Message {
@@ -265,6 +351,49 @@ impl JsonModelSerializer {
     ) -> WriteResult<()> {
         self.end_message(writer, ring)
     }
+}
+
+/// A message that was the value of a map entry or Struct member has ended:
+/// the entry or member has its value.
+fn value_done(stack: &mut [Frame]) {
+    match stack.last_mut() {
+        Some(Frame::Entry(entry)) => entry.value_written = true,
+        Some(Frame::Member(member)) => member.value_written = true,
+        _ => {}
+    }
+}
+
+/// A scalar field of a `Value`: the one kind it holds.
+fn tree_field(writer: &mut Writer, ring: &mut LoopBuf, frame: &mut TreeFrame, name: &str, value: &ScalarValue) -> WriteResult<()> {
+    if frame.kind != TreeKind::Value {
+        return Err(invalid(format!("{name}: a Struct or ListValue has no scalar fields")));
+    }
+    if !matches!(name, "null_value" | "number_value" | "string_value" | "bool_value") {
+        return Err(invalid(format!("{name} is not a scalar kind of Value")));
+    }
+    if frame.set {
+        return Err(invalid("a Value has two kinds"));
+    }
+    match name {
+        "null_value" => writer.write_null(ring)?,
+        "number_value" => {
+            let n = as_f64(value);
+            if !n.is_finite() {
+                return Err(invalid("a Value cannot hold NaN or an infinity: JSON has no number for it"));
+            }
+            writer.write_f64(ring, n)?;
+        }
+        "string_value" => match value {
+            ScalarValue::String(s) => writer.write_string(ring, s)?,
+            _ => writer.write_string(ring, "")?,
+        },
+        _ => writer.write_boolean(
+            ring,
+            matches!(value, ScalarValue::Bool(true)) || matches!(value, ScalarValue::U64(v) if *v != 0),
+        )?,
+    }
+    frame.set = true;
+    Ok(())
 }
 
 /// Before writing `fd` in `frame`: close the array or map of another field
@@ -1528,5 +1657,217 @@ mod tests {
         let direct = json_of_in(WKT, "demo.W", &script);
         assert_eq!(direct, expected);
         assert_eq!(json_via_protobuf_in(WKT, "demo.W", &script), expected);
+    }
+
+    // -- Struct, Value and ListValue (issue #514) ---------------------------------------
+
+    const TREE: &str = r#"
+        syntax = "proto3";
+        package demo;
+        message T {
+            google.protobuf.Struct meta = 1; google.protobuf.Value v = 2;
+            google.protobuf.ListValue items = 3; repeated google.protobuf.Value vs = 4;
+            map<string, google.protobuf.Value> by = 5; string s = 6;
+        }
+    "#;
+
+    const VALUE: &str = "google.protobuf.Value";
+    const STRUCT: &str = "google.protobuf.Struct";
+    const LIST: &str = "google.protobuf.ListValue";
+
+    /// One event of a Value: its kind, and the number, string or boolean in it.
+    fn num(v: f64) -> Ev {
+        Ev::F("number_value", ScalarValue::F64(v))
+    }
+
+    fn tree_json(root: &str, script: Vec<Ev>) -> String {
+        json_of_in(TREE, root, &script)
+    }
+
+    /// The events of a Struct member: `key`, then its value from `value`.
+    fn member(key: &'static str, value: Vec<Ev>) -> Vec<Ev> {
+        let mut ev = vec![Ev::S("fields", "fields.MapEntry"), Ev::F("key", text(key)), Ev::S("value", VALUE)];
+        ev.extend(value);
+        ev.push(Ev::E);
+        ev.push(Ev::E);
+        ev
+    }
+
+    fn element(value: Vec<Ev>) -> Vec<Ev> {
+        let mut ev = vec![Ev::S("values", VALUE)];
+        ev.extend(value);
+        ev.push(Ev::E);
+        ev
+    }
+
+    fn st(members: Vec<Vec<Ev>>) -> Vec<Ev> {
+        let mut ev = vec![Ev::S("struct_value", STRUCT)];
+        ev.extend(members.into_iter().flatten());
+        ev.push(Ev::E);
+        ev
+    }
+
+    fn list(elements: Vec<Vec<Ev>>) -> Vec<Ev> {
+        let mut ev = vec![Ev::S("list_value", LIST)];
+        ev.extend(elements.into_iter().flatten());
+        ev.push(Ev::E);
+        ev
+    }
+
+    #[test]
+    fn a_struct_is_a_json_object_of_its_values() {
+        let mut script = vec![Ev::S("meta", STRUCT)];
+        script.extend(member("a", vec![num(1.0)]));
+        script.extend(member("b", vec![Ev::F("string_value", text("x"))]));
+        script.extend(member("c", vec![Ev::F("bool_value", ScalarValue::Bool(true))]));
+        script.extend(member("d", vec![Ev::F("null_value", ScalarValue::U64(0))]));
+        script.push(Ev::E);
+        assert_eq!(tree_json("demo.T", script), r#"{"meta":{"a":1,"b":"x","c":true,"d":null}}"#);
+    }
+
+    #[test]
+    fn structs_and_lists_nest() {
+        let mut script = vec![Ev::S("meta", STRUCT)];
+        script.extend(member("o", st(vec![member("n", vec![num(1.5)])])));
+        script.extend(member(
+            "l",
+            list(vec![
+                element(vec![num(1.0)]),
+                element(vec![Ev::F("string_value", text("a"))]),
+                element(list(vec![element(vec![Ev::F("bool_value", ScalarValue::Bool(true))])])),
+                element(st(vec![])),
+            ]),
+        ));
+        script.push(Ev::E);
+        assert_eq!(tree_json("demo.T", script), r#"{"meta":{"o":{"n":1.5},"l":[1,"a",[true],{}]}}"#);
+    }
+
+    #[test]
+    fn a_value_field_is_whatever_json_value_it_holds() {
+        let one = |kind: Vec<Ev>| {
+            let mut script = vec![Ev::S("v", VALUE)];
+            script.extend(kind);
+            script.push(Ev::E);
+            tree_json("demo.T", script)
+        };
+        assert_eq!(one(vec![num(-2.5)]), r#"{"v":-2.5}"#);
+        assert_eq!(one(vec![Ev::F("string_value", text("s \"q\""))]), r#"{"v":"s \"q\""}"#);
+        assert_eq!(one(vec![Ev::F("bool_value", ScalarValue::Bool(false))]), r#"{"v":false}"#);
+        assert_eq!(one(vec![Ev::F("null_value", ScalarValue::U64(0))]), r#"{"v":null}"#);
+        assert_eq!(one(st(vec![member("k", vec![num(1.0)])])), r#"{"v":{"k":1}}"#);
+        assert_eq!(one(list(vec![element(vec![num(1.0)]), element(vec![num(2.0)])])), r#"{"v":[1,2]}"#);
+        assert_eq!(one(vec![]), r#"{"v":null}"#, "a Value with nothing set is null");
+    }
+
+    #[test]
+    fn empty_structs_and_lists_and_incomplete_members() {
+        let mut script = vec![Ev::S("meta", STRUCT), Ev::E, Ev::S("items", LIST), Ev::E];
+        assert_eq!(tree_json("demo.T", script), r#"{"meta":{},"items":[]}"#);
+        // a member with no value is null, one with no key has the empty key
+        script = vec![Ev::S("meta", STRUCT), Ev::S("fields", "fields.MapEntry"), Ev::F("key", text("k")), Ev::E, Ev::S("fields", "fields.MapEntry"), Ev::S("value", VALUE), num(1.0), Ev::E, Ev::E, Ev::E];
+        assert_eq!(tree_json("demo.T", script), r#"{"meta":{"k":null,"":1}}"#);
+    }
+
+    #[test]
+    fn a_list_value_field_repeated_values_and_a_map_of_values() {
+        let mut script = vec![Ev::S("items", LIST)];
+        script.extend(element(vec![num(1.0)]));
+        script.extend(element(vec![Ev::F("string_value", text("a"))]));
+        script.push(Ev::E);
+        for v in [vec![num(1.0)], st(vec![member("x", vec![num(2.0)])])] {
+            script.push(Ev::S("vs", VALUE));
+            script.extend(v);
+            script.push(Ev::E);
+        }
+        script.push(Ev::S("by", "by.MapEntry"));
+        script.push(Ev::F("key", text("k")));
+        script.push(Ev::S("value", VALUE));
+        script.extend(list(vec![element(vec![num(1.0)])]));
+        script.push(Ev::E);
+        script.push(Ev::E);
+        script.push(Ev::F("s", text("after")));
+        assert_eq!(
+            tree_json("demo.T", script),
+            r#"{"items":[1,"a"],"vs":[1,{"x":2}],"by":{"k":[1]},"s":"after"}"#
+        );
+    }
+
+    #[test]
+    fn a_struct_value_or_list_can_be_the_whole_document() {
+        let mut s = member("a", vec![num(1.0)]);
+        s.extend(member("b", vec![Ev::F("bool_value", ScalarValue::Bool(true))]));
+        assert_eq!(tree_json(STRUCT, s), r#"{"a":1,"b":true}"#);
+        assert_eq!(tree_json(VALUE, vec![Ev::F("string_value", text("x"))]), r#""x""#);
+        assert_eq!(tree_json(VALUE, vec![num(7.0)]), "7");
+        assert_eq!(tree_json(LIST, [element(vec![num(1.0)]), element(vec![num(2.0)])].into_iter().flatten().collect()), "[1,2]");
+    }
+
+    #[test]
+    fn what_json_cannot_hold_in_a_value_is_an_error() {
+        let try_one = |ev: Vec<Ev>| {
+            let mut o = Out::of(TREE, "demo.T");
+            o.start("v", VALUE)?;
+            for e in ev {
+                match e {
+                    Ev::F(n, v) => o.field(n, v)?,
+                    Ev::S(n, t) => o.start(n, t)?,
+                    Ev::E => o.end(),
+                }
+            }
+            Ok::<(), String>(())
+        };
+        assert!(try_one(vec![num(f64::NAN)]).is_err(), "NaN is not JSON");
+        assert!(try_one(vec![num(f64::INFINITY)]).is_err());
+        assert!(try_one(vec![num(1.0), Ev::F("string_value", text("x"))]).is_err(), "two kinds in one Value");
+        assert!(try_one(vec![Ev::S("nope", STRUCT)]).is_err(), "not a kind of Value");
+    }
+
+    #[test]
+    fn json_with_any_shape_read_by_the_adapter_is_written_back_as_it_was() {
+        use crate::proto::JsonModelAdapter;
+        use rjsonparser::Parser;
+        for json in [
+            r#"{"meta":{"a":1,"b":"x","c":true,"d":null,"e":[1,2,{"f":[]}],"g":{}}}"#,
+            r#"{"v":1.5}"#,
+            r#"{"v":"s"}"#,
+            r#"{"v":null}"#,
+            r#"{"v":[[],[[1]],{"a":{"b":{"c":[null]}}}]}"#,
+            r#"{"items":[1,"two",[3],{"four":4},null,false]}"#,
+            r#"{"vs":[1,"a",null,{"x":[true]},[1,[2]]],"by":{"k":{"n":[1]},"j":null,"i":3},"s":"x"}"#,
+            r#"{"meta":{},"items":[]}"#,
+        ] {
+            let proto = ProtoFileParser::parse(TREE).unwrap();
+            let mut adapter = JsonModelAdapter::new(proto, Replay::over(Out::of(TREE, "demo.T")));
+            adapter.start_root_message("demo.T").unwrap();
+            {
+                let mut p = Parser::new(&mut adapter);
+                p.parse(json.as_bytes()).unwrap_or_else(|e| panic!("{json}: {e}"));
+            }
+            adapter.end_root_message().unwrap();
+            let replay = adapter.into_handler();
+            assert_eq!(replay.error, None, "{json}");
+            assert_eq!(replay.out.finish(), json);
+        }
+    }
+
+    #[test]
+    fn the_same_tree_comes_out_through_protobuf() {
+        let mut script = vec![Ev::S("meta", STRUCT)];
+        script.extend(member("n", vec![num(1.0)]));
+        script.extend(member("s", vec![Ev::F("string_value", text("x"))]));
+        script.extend(member("nested", st(vec![member("l", list(vec![element(vec![num(1.0)]), element(vec![Ev::F("null_value", ScalarValue::U64(0))])]))])));
+        script.push(Ev::E);
+        script.push(Ev::S("v", VALUE));
+        script.extend(list(vec![element(vec![Ev::F("bool_value", ScalarValue::Bool(true))])]));
+        script.push(Ev::E);
+        script.push(Ev::S("by", "by.MapEntry"));
+        script.push(Ev::F("key", text("k")));
+        script.push(Ev::S("value", VALUE));
+        script.push(num(2.5));
+        script.push(Ev::E);
+        script.push(Ev::E);
+        let expected = r#"{"meta":{"n":1,"s":"x","nested":{"l":[1,null]}},"v":[true],"by":{"k":2.5}}"#;
+        assert_eq!(json_of_in(TREE, "demo.T", &script), expected);
+        assert_eq!(json_via_protobuf_in(TREE, "demo.T", &script), expected);
     }
 }

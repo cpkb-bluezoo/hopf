@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use rjsonparser::{ContentHandler, Number, ParseError, ParseResult};
 
 use super::base64;
-use super::well_known::{self, WellKnown};
+use super::well_known::{self, TreeKind, WellKnown};
 use super::{
     FieldDescriptor, FieldType, MessageDescriptor, ProtoFile, ProtoMessageHandler, ProtoParseError,
     ScalarValue,
@@ -61,6 +61,52 @@ fn seconds_and_nanos(seconds: i64, nanos: i32) -> Vec<(&'static str, ScalarValue
     fields
 }
 
+/// How deeply an arbitrary JSON value (a `Struct`, `Value` or `ListValue`)
+/// may nest: the limit protobuf's own JSON parsers use.
+const MAX_TREE_DEPTH: usize = 100;
+
+/// Where an arbitrary JSON value is going, and what to do when it is done.
+struct TreeTarget {
+    kind: TreeKind,
+    /// The field it is the value of; `None` when it is the root message.
+    holder: Option<String>,
+    after: TreeAfter,
+}
+
+enum TreeAfter {
+    /// A field, or an element of a repeated field (whose array stays open).
+    Field { in_array: bool },
+    /// The value of a map entry, which the tree starts and ends.
+    MapValue { field: FieldDescriptor, key: ScalarValue },
+    Root,
+}
+
+/// An open JSON object or array inside a tree, and how many (message,
+/// field) pairs of events to close with it.
+enum TreeCtx {
+    Object { pairs: u8, awaiting: bool },
+    Array { pairs: u8 },
+}
+
+/// An arbitrary JSON value being translated into events: the contexts still
+/// open inside it.
+struct Tree {
+    stack: Vec<TreeCtx>,
+    target: TreeTarget,
+}
+
+enum TreeTok<'a> {
+    StartObject,
+    EndObject,
+    StartArray,
+    EndArray,
+    Key(&'a str),
+    Null,
+    Bool(bool),
+    Num(f64),
+    Str(&'a str),
+}
+
 /// Adapter: JSON parse events → [`ProtoMessageHandler`] semantic events.
 pub struct JsonModelAdapter<H: ProtoMessageHandler> {
     proto_file: ProtoFile,
@@ -78,6 +124,9 @@ pub struct JsonModelAdapter<H: ProtoMessageHandler> {
     /// The string value being read, gathered from the chunks the parser
     /// delivers: converting it to a field needs the whole of it.
     string: String,
+    /// An arbitrary JSON value being read as a `Struct`, `Value` or
+    /// `ListValue`: while there is one, every event goes to it.
+    tree: Option<Tree>,
 }
 
 impl<H: ProtoMessageHandler> JsonModelAdapter<H> {
@@ -94,6 +143,7 @@ impl<H: ProtoMessageHandler> JsonModelAdapter<H> {
             root_object_open: false,
             last_error: None,
             string: String::new(),
+            tree: None,
         }
     }
 
@@ -405,6 +455,198 @@ impl<H: ProtoMessageHandler> JsonModelAdapter<H> {
         self.handler.end_field().map_err(|e| self.map_err(e))
     }
 
+    /// Where the value about to be read is going, if it is a `Struct`, a
+    /// `Value` or a `ListValue`.
+    fn tree_target(&self) -> Option<TreeTarget> {
+        let classify = |type_name: Option<&str>| type_name.and_then(well_known::classify_tree);
+        match &self.pending {
+            Some(Pending::Field(fd)) if fd.field_type == FieldType::Message && !fd.repeated => {
+                classify(fd.message_type_name.as_deref())
+                    .map(|kind| TreeTarget { kind, holder: Some(fd.name.clone()), after: TreeAfter::Field { in_array: false } })
+            }
+            Some(Pending::Array(fd)) if fd.field_type == FieldType::Message => classify(fd.message_type_name.as_deref())
+                .map(|kind| TreeTarget { kind, holder: Some(fd.name.clone()), after: TreeAfter::Field { in_array: true } }),
+            Some(Pending::MapValue { field, key }) => classify(field.value_type_name.as_deref()).map(|kind| TreeTarget {
+                kind,
+                holder: Some("value".into()),
+                after: TreeAfter::MapValue { field: field.clone(), key: key.clone() },
+            }),
+            None if self.root_started && !self.root_object_open && self.message_stack.len() == 1 => {
+                let root = &self.message_stack.front()?.message;
+                classify(Some(&root.full_name)).map(|kind| TreeTarget { kind, holder: None, after: TreeAfter::Root })
+            }
+            _ => None,
+        }
+    }
+
+    /// Start reading the value `tok` begins as a `Struct`, `Value` or
+    /// `ListValue`, if that is what is wanted. `Ok(false)` if it is not.
+    fn begin_tree(&mut self, tok: &TreeTok) -> ParseResult<bool> {
+        // A null for a Struct or ListValue field is no value at all.
+        let Some(target) = self.tree_target() else {
+            return Ok(false);
+        };
+        if matches!(tok, TreeTok::Null) && target.kind != TreeKind::Value {
+            self.pending = match target.after {
+                TreeAfter::Field { in_array: true } => self.pending.take(),
+                // The entry is left out; the map goes on.
+                TreeAfter::MapValue { field, .. } => Some(Pending::Map(field)),
+                _ => None,
+            };
+            return Ok(true);
+        }
+        if let TreeAfter::MapValue { field, key } = &target.after {
+            let entry_type = map_entry_type_name(field);
+            self.handler.start_field(&field.name, &entry_type).map_err(|e| self.map_err(e))?;
+            self.handler.start_message(&entry_type).map_err(|e| self.map_err(e))?;
+            self.emit_field("key", key.clone())?;
+        }
+        self.tree = Some(Tree { stack: Vec::new(), target });
+        self.tree_token(tok)?;
+        Ok(true)
+    }
+
+    fn open_message(&mut self, field: &str, type_name: &str) -> ParseResult<()> {
+        self.handler.start_field(field, type_name).map_err(|e| self.map_err(e))?;
+        self.handler.start_message(type_name).map_err(|e| self.map_err(e))
+    }
+
+    /// End `pairs` messages that were each started as a field.
+    fn close_messages(&mut self, pairs: u8) -> ParseResult<()> {
+        for _ in 0..pairs {
+            self.handler.end_message().map_err(|e| self.map_err(e))?;
+            self.handler.end_field().map_err(|e| self.map_err(e))?;
+        }
+        Ok(())
+    }
+
+    /// One JSON token of a tree being read.
+    fn tree_token(&mut self, tok: &TreeTok) -> ParseResult<()> {
+        match tok {
+            TreeTok::Key(key) => {
+                match self.tree.as_mut().and_then(|t| t.stack.last_mut()) {
+                    Some(TreeCtx::Object { awaiting, .. }) if !*awaiting => *awaiting = true,
+                    _ => return Err(ParseError::new("unexpected object key")),
+                }
+                self.open_message("fields", "fields.MapEntry")?;
+                self.emit_field("key", ScalarValue::String((*key).to_string()))
+            }
+            TreeTok::EndObject | TreeTok::EndArray => {
+                let tree = self.tree.as_mut().ok_or_else(|| ParseError::new("unexpected end"))?;
+                let pairs = match (tree.stack.pop(), tok) {
+                    (Some(TreeCtx::Object { pairs, awaiting: false }), TreeTok::EndObject) => pairs,
+                    (Some(TreeCtx::Array { pairs }), TreeTok::EndArray) => pairs,
+                    _ => return Err(ParseError::new("unbalanced JSON value")),
+                };
+                self.close_messages(pairs)?;
+                self.tree_value_done()
+            }
+            _ => self.tree_value(tok),
+        }
+    }
+
+    /// A value starts: a top-level one, a member of an object, or an element
+    /// of an array. Its events depend on which.
+    fn tree_value(&mut self, tok: &TreeTok) -> ParseResult<()> {
+        let tree = self.tree.as_ref().ok_or_else(|| ParseError::new("unexpected value"))?;
+        // What is being read here: the kind, and the field it is held in.
+        let (kind, holder): (TreeKind, Option<String>) = match tree.stack.last() {
+            None => (tree.target.kind, tree.target.holder.clone()),
+            Some(TreeCtx::Object { awaiting: true, .. }) => (TreeKind::Value, Some("value".into())),
+            Some(TreeCtx::Object { .. }) => return Err(ParseError::new("an object member needs a key")),
+            Some(TreeCtx::Array { .. }) => (TreeKind::Value, Some("values".into())),
+        };
+        let is_container = matches!(tok, TreeTok::StartObject | TreeTok::StartArray);
+        if is_container && tree.stack.len() >= MAX_TREE_DEPTH {
+            return Err(ParseError::new(format!("JSON value nested more than {MAX_TREE_DEPTH} deep")));
+        }
+        let wrapped = holder.is_some() as u8;
+        match kind {
+            TreeKind::Struct => {
+                if !matches!(tok, TreeTok::StartObject) {
+                    return Err(ParseError::new("a Struct is written as a JSON object"));
+                }
+                if let Some(h) = &holder {
+                    self.open_message(h, well_known::STRUCT)?;
+                }
+                self.tree.as_mut().unwrap().stack.push(TreeCtx::Object { pairs: wrapped, awaiting: false });
+                Ok(())
+            }
+            TreeKind::List => {
+                if !matches!(tok, TreeTok::StartArray) {
+                    return Err(ParseError::new("a ListValue is written as a JSON array"));
+                }
+                if let Some(h) = &holder {
+                    self.open_message(h, well_known::LIST_VALUE)?;
+                }
+                self.tree.as_mut().unwrap().stack.push(TreeCtx::Array { pairs: wrapped });
+                Ok(())
+            }
+            TreeKind::Value => {
+                if let Some(h) = &holder {
+                    self.open_message(h, well_known::VALUE)?;
+                }
+                match tok {
+                    TreeTok::StartObject => {
+                        self.open_message("struct_value", well_known::STRUCT)?;
+                        self.tree.as_mut().unwrap().stack.push(TreeCtx::Object { pairs: 1 + wrapped, awaiting: false });
+                        Ok(())
+                    }
+                    TreeTok::StartArray => {
+                        self.open_message("list_value", well_known::LIST_VALUE)?;
+                        self.tree.as_mut().unwrap().stack.push(TreeCtx::Array { pairs: 1 + wrapped });
+                        Ok(())
+                    }
+                    scalar => {
+                        let (name, value) = match scalar {
+                            TreeTok::Null => ("null_value", ScalarValue::U64(0)),
+                            TreeTok::Bool(b) => ("bool_value", ScalarValue::Bool(*b)),
+                            TreeTok::Num(n) => ("number_value", ScalarValue::F64(*n)),
+                            TreeTok::Str(s) => ("string_value", ScalarValue::String((*s).to_string())),
+                            _ => return Err(ParseError::new("unexpected JSON token")),
+                        };
+                        self.emit_field(name, value)?;
+                        self.close_messages(wrapped)?;
+                        self.tree_value_done()
+                    }
+                }
+            }
+        }
+    }
+
+    /// A value of the tree is complete: close the object member it was the
+    /// value of, or, if it was the whole tree, the tree.
+    fn tree_value_done(&mut self) -> ParseResult<()> {
+        let tree = self.tree.as_mut().ok_or_else(|| ParseError::new("unexpected end"))?;
+        match tree.stack.last_mut() {
+            Some(TreeCtx::Object { awaiting, .. }) => {
+                if *awaiting {
+                    *awaiting = false;
+                    self.close_messages(1)?;
+                }
+                Ok(())
+            }
+            Some(TreeCtx::Array { .. }) => Ok(()),
+            None => {
+                let tree = self.tree.take().unwrap();
+                match tree.target.after {
+                    TreeAfter::Field { in_array } => {
+                        if !in_array {
+                            self.pending = None;
+                        }
+                    }
+                    TreeAfter::MapValue { field, .. } => {
+                        self.handler.end_message().map_err(|e| self.map_err(e))?;
+                        self.handler.end_field().map_err(|e| self.map_err(e))?;
+                        self.pending = Some(Pending::Map(field));
+                    }
+                    TreeAfter::Root => {}
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn skip_scalar(&mut self) {
         if self.skip_value && self.skip_depth == 0 {
             self.skip_value = false;
@@ -591,8 +833,14 @@ fn is_message_value_type(name: &str) -> bool {
 
 impl<H: ProtoMessageHandler> ContentHandler for JsonModelAdapter<H> {
     fn start_object(&mut self) -> ParseResult<()> {
+        if self.tree.is_some() {
+            return self.tree_token(&TreeTok::StartObject);
+        }
         if self.skip_value {
             self.skip_depth += 1;
+            return Ok(());
+        }
+        if self.begin_tree(&TreeTok::StartObject)? {
             return Ok(());
         }
         if matches!(self.pending, Some(Pending::Field(ref fd)) if fd.field_type == FieldType::Map)
@@ -671,6 +919,9 @@ impl<H: ProtoMessageHandler> ContentHandler for JsonModelAdapter<H> {
     }
 
     fn end_object(&mut self) -> ParseResult<()> {
+        if self.tree.is_some() {
+            return self.tree_token(&TreeTok::EndObject);
+        }
         if self.skip_value {
             self.skip_depth = self.skip_depth.saturating_sub(1);
             if self.skip_depth == 0 {
@@ -693,8 +944,16 @@ impl<H: ProtoMessageHandler> ContentHandler for JsonModelAdapter<H> {
     }
 
     fn start_array(&mut self) -> ParseResult<()> {
+        if self.tree.is_some() {
+            return self.tree_token(&TreeTok::StartArray);
+        }
         if self.skip_value {
             self.skip_depth += 1;
+            return Ok(());
+        }
+        // A repeated field's array is its own; any other array bound for a
+        // ListValue or Value is the value.
+        if !matches!(&self.pending, Some(Pending::Field(fd)) if fd.repeated) && self.begin_tree(&TreeTok::StartArray)? {
             return Ok(());
         }
         match self.pending.take() {
@@ -711,6 +970,9 @@ impl<H: ProtoMessageHandler> ContentHandler for JsonModelAdapter<H> {
     }
 
     fn end_array(&mut self) -> ParseResult<()> {
+        if self.tree.is_some() {
+            return self.tree_token(&TreeTok::EndArray);
+        }
         if self.skip_value {
             self.skip_depth = self.skip_depth.saturating_sub(1);
             if self.skip_depth == 0 {
@@ -728,6 +990,9 @@ impl<H: ProtoMessageHandler> ContentHandler for JsonModelAdapter<H> {
     }
 
     fn key(&mut self, key: &str) -> ParseResult<()> {
+        if self.tree.is_some() {
+            return self.tree_token(&TreeTok::Key(key));
+        }
         if self.skip_value {
             return Ok(());
         }
@@ -755,6 +1020,19 @@ impl<H: ProtoMessageHandler> ContentHandler for JsonModelAdapter<H> {
         if self.skip_value {
             self.skip_scalar();
             return Ok(());
+        }
+        let as_f64 = match value {
+            Number::BigInt(s) => s.parse::<f64>().ok(),
+            other => other.as_f64(),
+        };
+        if self.tree.is_some() || self.tree_target().is_some() {
+            let n = as_f64.filter(|n| n.is_finite()).ok_or_else(|| ParseError::new("invalid floating point number"))?;
+            if self.tree.is_some() {
+                return self.tree_token(&TreeTok::Num(n));
+            }
+            if self.begin_tree(&TreeTok::Num(n))? {
+                return Ok(());
+            }
         }
         if self.read_bare(BareInput::Num(value))? {
             return Ok(());
@@ -804,6 +1082,12 @@ impl<H: ProtoMessageHandler> ContentHandler for JsonModelAdapter<H> {
             self.skip_scalar();
             return Ok(());
         }
+        if self.tree.is_some() {
+            return self.tree_token(&TreeTok::Str(&value));
+        }
+        if self.begin_tree(&TreeTok::Str(&value))? {
+            return Ok(());
+        }
         if self.read_bare(BareInput::Str(&value))? {
             return Ok(());
         }
@@ -826,6 +1110,12 @@ impl<H: ProtoMessageHandler> ContentHandler for JsonModelAdapter<H> {
     fn boolean_value(&mut self, value: bool) -> ParseResult<()> {
         if self.skip_value {
             self.skip_scalar();
+            return Ok(());
+        }
+        if self.tree.is_some() {
+            return self.tree_token(&TreeTok::Bool(value));
+        }
+        if self.begin_tree(&TreeTok::Bool(value))? {
             return Ok(());
         }
         if self.read_bare(BareInput::Bool(value))? {
@@ -851,8 +1141,14 @@ impl<H: ProtoMessageHandler> ContentHandler for JsonModelAdapter<H> {
     }
 
     fn null_value(&mut self) -> ParseResult<()> {
+        if self.tree.is_some() {
+            return self.tree_token(&TreeTok::Null);
+        }
         if self.skip_value {
             self.skip_scalar();
+            return Ok(());
+        }
+        if self.begin_tree(&TreeTok::Null)? {
             return Ok(());
         }
         self.pending = None;
@@ -1385,5 +1681,201 @@ mod tests {
             ["start:google.protobuf.StringValue", "field:value=String(\"hi\")", "end"]
         );
         assert!(adapt_in("google.protobuf.Timestamp", r#"{"seconds":1}"#).is_err());
+    }
+
+    // -- Struct, Value and ListValue (issue #514) ---------------------------------------
+
+    const TREE: &str = r#"
+        syntax = "proto3";
+        package demo;
+        message T {
+            google.protobuf.Struct meta = 1; google.protobuf.Value v = 2;
+            google.protobuf.ListValue items = 3; repeated google.protobuf.Value vs = 4;
+            map<string, google.protobuf.Value> by = 5; string s = 6;
+            repeated google.protobuf.ListValue grid = 7;
+            map<string, google.protobuf.Struct> structs = 8;
+        }
+    "#;
+
+    fn tree_in(root: &str, json: &str) -> Result<Vec<String>, String> {
+        let proto = ProtoFileParser::parse(TREE).unwrap();
+        let mut adapter = JsonModelAdapter::new(proto, Collect { events: vec![] });
+        adapter.start_root_message(root).unwrap();
+        let result = {
+            let mut p = Parser::new(&mut adapter);
+            p.parse(json.as_bytes())
+        };
+        match result {
+            Ok(_) => {
+                adapter.end_root_message().unwrap();
+                Ok(adapter.into_handler().events)
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn tree(json: &str) -> Result<Vec<String>, String> {
+        tree_in("demo.T", json).map(|ev| ev[1..ev.len() - 1].to_vec())
+    }
+
+    fn strs(events: &[&str]) -> Vec<String> {
+        events.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The events of a Value holding `kind` events, started as field `holder`.
+    fn value(holder: &str, kind: &[&str]) -> Vec<String> {
+        let mut ev = vec![format!("start_field:{holder}:google.protobuf.Value"), "start:google.protobuf.Value".to_string()];
+        ev.extend(kind.iter().map(|s| s.to_string()));
+        ev.push("end".into());
+        ev.push("end_field".into());
+        ev
+    }
+
+    #[test]
+    fn a_json_object_for_a_struct_is_a_struct_of_values() {
+        let mut expected = strs(&["start_field:meta:google.protobuf.Struct", "start:google.protobuf.Struct"]);
+        for (key, kind) in [("a", "field:number_value=F64(1.0)"), ("b", "field:string_value=String(\"x\")")] {
+            expected.extend(strs(&["start_field:fields:fields.MapEntry", "start:fields.MapEntry"]));
+            expected.push(format!("field:key=String(\"{key}\")"));
+            expected.extend(value("value", &[kind]));
+            expected.extend(strs(&["end", "end_field"]));
+        }
+        expected.extend(strs(&["end", "end_field"]));
+        assert_eq!(tree(r#"{"meta":{"a":1,"b":"x"}}"#).unwrap(), expected);
+    }
+
+    #[test]
+    fn a_value_field_takes_every_kind_of_json_value() {
+        let events = |json: &str| tree(json).unwrap();
+        assert_eq!(events(r#"{"v":1.5}"#), value("v", &["field:number_value=F64(1.5)"]));
+        assert_eq!(events(r#"{"v":-3}"#), value("v", &["field:number_value=F64(-3.0)"]));
+        assert_eq!(events(r#"{"v":"s"}"#), value("v", &["field:string_value=String(\"s\")"]));
+        assert_eq!(events(r#"{"v":true}"#), value("v", &["field:bool_value=Bool(true)"]));
+        assert_eq!(events(r#"{"v":null}"#), value("v", &["field:null_value=U64(0)"]), "null is the null value, not an unset field");
+    }
+
+    #[test]
+    fn objects_and_arrays_inside_a_value_nest_as_struct_and_list_values() {
+        assert_eq!(
+            tree(r#"{"v":{"x":[1,null]}}"#).unwrap(),
+            strs(&[
+                "start_field:v:google.protobuf.Value", "start:google.protobuf.Value",
+                "start_field:struct_value:google.protobuf.Struct", "start:google.protobuf.Struct",
+                "start_field:fields:fields.MapEntry", "start:fields.MapEntry", "field:key=String(\"x\")",
+                "start_field:value:google.protobuf.Value", "start:google.protobuf.Value",
+                "start_field:list_value:google.protobuf.ListValue", "start:google.protobuf.ListValue",
+                "start_field:values:google.protobuf.Value", "start:google.protobuf.Value", "field:number_value=F64(1.0)", "end", "end_field",
+                "start_field:values:google.protobuf.Value", "start:google.protobuf.Value", "field:null_value=U64(0)", "end", "end_field",
+                "end", "end_field",
+                "end", "end_field",
+                "end", "end_field",
+                "end", "end_field",
+                "end", "end_field",
+            ])
+        );
+    }
+
+    #[test]
+    fn a_list_value_field_is_an_array_of_values() {
+        let mut expected = strs(&["start_field:items:google.protobuf.ListValue", "start:google.protobuf.ListValue"]);
+        expected.extend(value("values", &["field:number_value=F64(1.0)"]));
+        expected.extend(value("values", &["field:string_value=String(\"a\")"]));
+        expected.extend(strs(&["end", "end_field"]));
+        assert_eq!(tree(r#"{"items":[1,"a"]}"#).unwrap(), expected);
+    }
+
+    #[test]
+    fn repeated_values_and_map_values_and_repeated_lists() {
+        let ev = tree(r#"{"vs":[1,{"a":2}],"by":{"k":null,"j":[1]},"grid":[[1],[]]}"#).unwrap();
+        let starts = |name: &str| ev.iter().filter(|e| e.starts_with(&format!("start_field:{name}:"))).count();
+        assert_eq!(starts("vs"), 2, "one Value per element");
+        assert_eq!(starts("by"), 2, "one entry per key");
+        assert_eq!(starts("grid"), 2, "one ListValue per element");
+        assert!(ev.contains(&"start_field:value:google.protobuf.Value".to_string()));
+        // balanced
+        let opens = ev.iter().filter(|e| e.starts_with("start_field:")).count();
+        assert_eq!(opens, ev.iter().filter(|e| *e == "end_field").count());
+        assert_eq!(ev.iter().filter(|e| e.starts_with("start:")).count(), ev.iter().filter(|e| *e == "end").count());
+    }
+
+    #[test]
+    fn fields_after_a_tree_are_still_read_and_empty_trees_are_empty() {
+        let ev = tree(r#"{"meta":{"a":{}},"s":"after","items":[]}"#).unwrap();
+        assert!(ev.contains(&"field:s=String(\"after\")".to_string()), "{ev:?}");
+        assert_eq!(
+            tree(r#"{"meta":{}}"#).unwrap(),
+            strs(&["start_field:meta:google.protobuf.Struct", "start:google.protobuf.Struct", "end", "end_field"])
+        );
+        assert_eq!(
+            tree(r#"{"items":[]}"#).unwrap(),
+            strs(&["start_field:items:google.protobuf.ListValue", "start:google.protobuf.ListValue", "end", "end_field"])
+        );
+    }
+
+    #[test]
+    fn null_for_a_struct_or_list_field_leaves_it_unset() {
+        assert!(tree(r#"{"meta":null,"items":null}"#).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_null_map_value_leaves_the_entry_out_and_the_map_goes_on() {
+        let ev = tree(r#"{"structs":{"a":null,"b":{"x":1}},"s":"after"}"#).unwrap();
+        let keys: Vec<&String> = ev.iter().filter(|e| e.starts_with("field:key=")).collect();
+        assert_eq!(keys, ["field:key=String(\"b\")", "field:key=String(\"x\")"], "b, and x inside it; no a: {ev:?}");
+        assert!(ev.contains(&"field:s=String(\"after\")".to_string()), "the map ended properly: {ev:?}");
+    }
+
+    #[test]
+    fn the_wrong_shape_of_json_for_a_struct_or_list_is_an_error() {
+        for json in [
+            r#"{"meta":[1]}"#,
+            r#"{"meta":"x"}"#,
+            r#"{"meta":1}"#,
+            r#"{"meta":true}"#,
+            r#"{"items":{"a":1}}"#,
+            r#"{"items":"x"}"#,
+            r#"{"items":1}"#,
+            r#"{"grid":[{"a":1}]}"#,
+            r#"{"grid":[1]}"#,
+        ] {
+            assert!(tree(json).is_err(), "{json}");
+        }
+    }
+
+    #[test]
+    fn a_message_that_is_itself_a_struct_value_or_list_is_read_from_the_document() {
+        assert_eq!(
+            tree_in("google.protobuf.Struct", r#"{"a":true}"#).unwrap(),
+            {
+                let mut ev = strs(&["start:google.protobuf.Struct", "start_field:fields:fields.MapEntry", "start:fields.MapEntry", "field:key=String(\"a\")"]);
+                ev.extend(value("value", &["field:bool_value=Bool(true)"]));
+                ev.extend(strs(&["end", "end_field", "end"]));
+                ev
+            }
+        );
+        assert_eq!(
+            tree_in("google.protobuf.Value", "5").unwrap(),
+            strs(&["start:google.protobuf.Value", "field:number_value=F64(5.0)", "end"])
+        );
+        assert_eq!(
+            tree_in("google.protobuf.Value", r#"[1]"#).unwrap()[..3],
+            strs(&["start:google.protobuf.Value", "start_field:list_value:google.protobuf.ListValue", "start:google.protobuf.ListValue"])[..]
+        );
+        let list = tree_in("google.protobuf.ListValue", "[1]").unwrap();
+        assert_eq!(list.first().unwrap(), "start:google.protobuf.ListValue");
+        assert!(list.contains(&"start_field:values:google.protobuf.Value".to_string()));
+        assert!(tree_in("google.protobuf.Struct", "[1]").is_err());
+        assert!(tree_in("google.protobuf.ListValue", "{}").is_err());
+    }
+
+    #[test]
+    fn a_tree_may_be_nested_a_hundred_deep_but_no_deeper() {
+        let nested = |n: usize| format!("{}{}", r#"{"a":"#.repeat(n), "1").to_string() + &"}".repeat(n);
+        assert!(tree(&format!(r#"{{"meta":{}}}"#, nested(99))).is_ok(), "the Struct is one level");
+        let err = tree(&format!(r#"{{"meta":{}}}"#, nested(150))).unwrap_err();
+        assert!(err.contains("deep"), "{err}");
+        let lists = |n: usize| format!("{}1{}", "[".repeat(n), "]".repeat(n));
+        assert!(tree(&format!(r#"{{"v":{}}}"#, lists(100))).is_ok());
+        assert!(tree(&format!(r#"{{"v":{}}}"#, lists(101))).is_err());
     }
 }

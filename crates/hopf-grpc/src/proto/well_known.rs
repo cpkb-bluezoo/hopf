@@ -40,6 +40,29 @@ pub(crate) fn classify(full_name: &str) -> Option<WellKnown> {
     })
 }
 
+/// `Struct`, `Value` and `ListValue`: well-known types whose JSON form is an
+/// arbitrary JSON value, written and read as it goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TreeKind {
+    Struct,
+    Value,
+    List,
+}
+
+pub(crate) const STRUCT: &str = "google.protobuf.Struct";
+pub(crate) const VALUE: &str = "google.protobuf.Value";
+pub(crate) const LIST_VALUE: &str = "google.protobuf.ListValue";
+
+/// The kind of arbitrary-JSON well-known type this is, if it is one.
+pub(crate) fn classify_tree(full_name: &str) -> Option<TreeKind> {
+    match full_name.trim_start_matches('.') {
+        STRUCT => Some(TreeKind::Struct),
+        VALUE => Some(TreeKind::Value),
+        LIST_VALUE => Some(TreeKind::List),
+        _ => None,
+    }
+}
+
 const SECONDS_PER_DAY: i64 = 86_400;
 /// 0001-01-01T00:00:00Z and 9999-12-31T23:59:59Z, the range of a Timestamp.
 const MIN_TIMESTAMP: i64 = -62_135_596_800;
@@ -297,6 +320,11 @@ mod tests {
         assert_eq!(classify("google.protobuf.Int64Value"), Some(WellKnown::Wrapper(FieldType::Int64)));
         assert_eq!(classify("google.protobuf.BytesValue"), Some(WellKnown::Wrapper(FieldType::Bytes)));
         assert_eq!(classify("google.protobuf.Empty"), None, "an object like any other");
+        assert_eq!(classify("google.protobuf.Struct"), None, "an arbitrary value, not a bare one");
+        assert_eq!(classify_tree("google.protobuf.Struct"), Some(TreeKind::Struct));
+        assert_eq!(classify_tree(".google.protobuf.Value"), Some(TreeKind::Value));
+        assert_eq!(classify_tree("google.protobuf.ListValue"), Some(TreeKind::List));
+        assert_eq!(classify_tree("google.protobuf.Timestamp"), None);
         assert_eq!(classify("google.protobuf.Any"), None);
         assert_eq!(classify("demo.Timestamp"), None, "only the well-known one");
     }

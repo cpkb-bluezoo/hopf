@@ -2274,6 +2274,7 @@ mod tests {
             repeated string names = 1; Inner one = 2; map<string, int32> counts = 3;
             repeated Inner inners = 4; map<string, Inner> by_name = 5; string note = 6;
             google.protobuf.Timestamp at = 7; google.protobuf.Duration took = 8;
+            google.protobuf.Struct extra = 9;
         }
         service Svc { rpc Call (Req) returns (Rep); }
     "#;
@@ -2536,6 +2537,45 @@ mod tests {
         let ts = [vec![0x08], varint(63_108_020), vec![0x10], varint(21_000_000)].concat();
         let dur = [vec![0x08, 1, 0x10], varint(500_000_000)].concat();
         let expected = [vec![7 << 3 | 2, ts.len() as u8], ts, vec![8 << 3 | 2, dur.len() as u8], dur].concat();
+        assert_eq!(pb, expected);
+    }
+
+    #[test]
+    fn a_struct_is_plain_json_in_json_and_a_map_of_values_in_protobuf() {
+        let script = |m: &mut GrpcResponseMessage| {
+            const V: &str = "google.protobuf.Value";
+            m.start_field("extra", "google.protobuf.Struct")?;
+            m.start_field("fields", "fields.MapEntry")?;
+            m.field("key", text("n"))?;
+            m.start_field("value", V)?;
+            m.field("number_value", ScalarValue::F64(1.5))?;
+            m.end_field()?;
+            m.end_field()?;
+            m.start_field("fields", "fields.MapEntry")?;
+            m.field("key", text("tags"))?;
+            m.start_field("value", V)?;
+            m.start_field("list_value", "google.protobuf.ListValue")?;
+            m.start_field("values", V)?;
+            m.field("string_value", text("a"))?;
+            m.end_field()?;
+            m.end_field()?;
+            m.end_field()?;
+            m.end_field()?;
+            m.end_field()
+        };
+        let (json, failed) = respond("application/grpc+json", script);
+        assert_eq!(failed, None);
+        assert_eq!(String::from_utf8(json).unwrap(), r#"{"extra":{"n":1.5,"tags":["a"]}}"#);
+
+        let (pb, failed) = respond("application/grpc", script);
+        assert_eq!(failed, None);
+        // Struct (field 9): two `fields` entries (field 1), each a key and a Value.
+        let len = |field: u8, body: &[u8]| [vec![field << 3 | 2, body.len() as u8], body.to_vec()].concat();
+        let n_value = [vec![2 << 3 | 1], 1.5f64.to_le_bytes().to_vec()].concat(); // number_value = 2, fixed64
+        let a_value = len(3, b"a"); // string_value = 3
+        let tags_value = len(6, &len(1, &a_value)); // list_value = 6, values = 1
+        let entry = |key: &[u8], value: &[u8]| len(1, &[len(1, key), len(2, value)].concat());
+        let expected = len(9, &[entry(b"n", &n_value), entry(b"tags", &tags_value)].concat());
         assert_eq!(pb, expected);
     }
 }
