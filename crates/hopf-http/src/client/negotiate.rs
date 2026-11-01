@@ -17,7 +17,7 @@ use hopf_core::{ConnHandle, SecurityInfo};
 use hopf_dns::DnsResolver;
 use hopf_quic::QuicClientConfig;
 
-use crate::client::alt_svc::{parse_alt_svc_h3, AltSvcCache};
+use crate::client::alt_svc::AltSvcCache;
 use crate::client::api::{
     HttpClientError, HttpClientSessionHandle, HttpConnectionHandler, HttpResponseHandler,
     SessionRequestOps,
@@ -130,6 +130,26 @@ pub(crate) struct AutoNegotiatingOps {
     state: Arc<Mutex<NegotiationState>>,
 }
 
+impl AutoNegotiatingOps {
+    /// Count a request as in flight, then send it. The count goes up
+    /// *before* the send: the response can complete (on the reactor thread)
+    /// before the send call returns, and its completion must find the
+    /// request already counted or the count would never get back to zero.
+    /// A send that is refused is taken back out.
+    fn sent_one(
+        &mut self,
+        send: impl FnOnce(&mut (dyn SessionRequestOps + Send)) -> Result<(), HttpClientError>,
+    ) -> Result<(), HttpClientError> {
+        self.state.lock().unwrap().in_flight += 1;
+        let result = send(&mut *self.inner.lock().unwrap());
+        if result.is_err() {
+            let mut st = self.state.lock().unwrap();
+            st.in_flight = st.in_flight.saturating_sub(1);
+        }
+        result
+    }
+}
+
 impl SessionRequestOps for AutoNegotiatingOps {
     fn is_open(&self) -> bool {
         self.inner.lock().unwrap().is_open()
@@ -146,11 +166,7 @@ impl SessionRequestOps for AutoNegotiatingOps {
             inner: handler,
             state: Arc::clone(&self.state),
         });
-        let result = self.inner.lock().unwrap().send_no_body(method, path, headers, wrapped);
-        if result.is_ok() {
-            self.state.lock().unwrap().in_flight += 1;
-        }
-        result
+        self.sent_one(|inner| inner.send_no_body(method, path, headers, wrapped))
     }
 
     fn start_body(
@@ -164,11 +180,7 @@ impl SessionRequestOps for AutoNegotiatingOps {
             inner: handler,
             state: Arc::clone(&self.state),
         });
-        let result = self.inner.lock().unwrap().start_body(method, path, headers, wrapped);
-        if result.is_ok() {
-            self.state.lock().unwrap().in_flight += 1;
-        }
-        result
+        self.sent_one(|inner| inner.start_body(method, path, headers, wrapped))
     }
 
     fn body_content(&mut self, data: &[u8]) -> Result<usize, HttpClientError> {
@@ -209,10 +221,9 @@ impl HttpResponseHandler for AltSvcObservingResponseHandler {
 
     fn header(&mut self, name: &str, value: &str) {
         if name.eq_ignore_ascii_case("alt-svc") {
-            if let Some(entry) = parse_alt_svc_h3(value) {
-                let mut g = self.state.lock().unwrap();
-                let (host, port) = (g.host.clone(), g.port);
-                g.alt_svc_cache.put(&host, port, &entry);
+            let mut g = self.state.lock().unwrap();
+            let (host, port) = (g.host.clone(), g.port);
+            if g.alt_svc_cache.observe(&host, port, value).is_some() {
                 g.h3_seen = true;
             }
         }
@@ -264,6 +275,9 @@ type FallbackFn = Box<dyn FnOnce(io::Error) + Send>;
 pub(crate) struct SpeculativeHandler {
     inner: Arc<Mutex<Box<dyn HttpConnectionHandler>>>,
     on_fallback: Mutex<Option<FallbackFn>>,
+    /// The session was handed to the real handler: from then on a failure
+    /// is the caller's to hear about, not a reason to try another tier.
+    connected: bool,
 }
 
 impl SpeculativeHandler {
@@ -274,6 +288,7 @@ impl SpeculativeHandler {
         Self {
             inner,
             on_fallback: Mutex::new(Some(on_fallback)),
+            connected: false,
         }
     }
 }
@@ -284,6 +299,7 @@ impl HttpConnectionHandler for SpeculativeHandler {
     }
 
     fn on_connected(&mut self, session: &mut HttpClientSessionHandle) {
+        self.connected = true;
         self.inner.lock().unwrap().on_connected(session);
     }
 
@@ -292,6 +308,10 @@ impl HttpConnectionHandler for SpeculativeHandler {
     }
 
     fn on_error(&mut self, err: &io::Error) {
+        if self.connected {
+            self.inner.lock().unwrap().on_error(err);
+            return;
+        }
         if let Some(cb) = self.on_fallback.lock().unwrap().take() {
             cb(io::Error::new(err.kind(), err.to_string()));
         }
@@ -352,4 +372,331 @@ pub(crate) fn dial_h3_by_name(
             );
         }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::version::HttpVersion;
+
+    /// What the fake connection does when a request is sent on it.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mode {
+        /// Answer straight away, inside `send_no_body` (as a connection that
+        /// already has the response buffered would).
+        Inline,
+        /// Keep the handler; the test finishes it later.
+        Hold,
+    }
+
+    struct FakeOps {
+        mode: Mode,
+        alt_svc: Option<&'static str>,
+        held: Arc<Mutex<Vec<Box<dyn HttpResponseHandler>>>>,
+        sent: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl SessionRequestOps for FakeOps {
+        fn is_open(&self) -> bool {
+            true
+        }
+        fn send_no_body(
+            &mut self,
+            method: &str,
+            path: &str,
+            _headers: Headers,
+            mut handler: Box<dyn HttpResponseHandler>,
+        ) -> Result<(), HttpClientError> {
+            self.sent.lock().unwrap().push(format!("{method} {path}"));
+            match self.mode {
+                Mode::Inline => {
+                    handler.ok(200);
+                    if let Some(v) = self.alt_svc {
+                        handler.header("Alt-Svc", v);
+                    }
+                    handler.close();
+                }
+                Mode::Hold => {
+                    if let Some(v) = self.alt_svc {
+                        handler.ok(200);
+                        handler.header("alt-svc", v);
+                    }
+                    self.held.lock().unwrap().push(handler);
+                }
+            }
+            Ok(())
+        }
+        fn start_body(
+            &mut self,
+            _m: &str,
+            _p: &str,
+            _h: Headers,
+            _handler: Box<dyn HttpResponseHandler>,
+        ) -> Result<(), HttpClientError> {
+            Err(HttpClientError::new("not used"))
+        }
+        fn body_content(&mut self, _d: &[u8]) -> Result<usize, HttpClientError> {
+            Ok(0)
+        }
+        fn end_body(&mut self) -> Result<(), HttpClientError> {
+            Ok(())
+        }
+        fn cancel_request(&mut self) -> Result<(), HttpClientError> {
+            Ok(())
+        }
+        fn on_body_writable(&mut self, _cb: Box<dyn FnOnce() + Send>) {}
+    }
+
+    struct Quiet;
+    impl HttpResponseHandler for Quiet {
+        fn ok(&mut self, _s: u16) {}
+        fn error(&mut self, _s: u16) {}
+        fn header(&mut self, _n: &str, _v: &str) {}
+        fn response_body_content(&mut self, _d: &[u8]) {}
+        fn close(&mut self) {}
+        fn failed(&mut self, _e: io::Error) {}
+    }
+
+    struct Rig {
+        ops: Arc<Mutex<dyn SessionRequestOps + Send>>,
+        state: Arc<Mutex<NegotiationState>>,
+        cache: Arc<AltSvcCache>,
+        upgrades: Arc<AtomicUsize>,
+        held: Arc<Mutex<Vec<Box<dyn HttpResponseHandler>>>>,
+    }
+
+    fn rig(mode: Mode, alt_svc: Option<&'static str>) -> Rig {
+        let cache = Arc::new(AltSvcCache::new());
+        let upgrades = Arc::new(AtomicUsize::new(0));
+        let u2 = Arc::clone(&upgrades);
+        let state = Arc::new(Mutex::new(NegotiationState {
+            in_flight: 0,
+            host: "example.test".into(),
+            port: 443,
+            alt_svc_cache: Arc::clone(&cache),
+            h3_seen: false,
+            on_idle_upgrade: Some(Box::new(move || {
+                u2.fetch_add(1, Ordering::SeqCst);
+            })),
+        }));
+        let held = Arc::new(Mutex::new(Vec::new()));
+        let inner: Arc<Mutex<dyn SessionRequestOps + Send>> = Arc::new(Mutex::new(FakeOps {
+            mode,
+            alt_svc,
+            held: Arc::clone(&held),
+            sent: Arc::default(),
+        }));
+        let ops: Arc<Mutex<dyn SessionRequestOps + Send>> =
+            Arc::new(Mutex::new(AutoNegotiatingOps { inner, state: Arc::clone(&state) }));
+        Rig { ops, state, cache, upgrades, held }
+    }
+
+    fn send(rig: &Rig) {
+        rig.ops.lock().unwrap().send_no_body("GET", "/", Headers::new(), Box::new(Quiet)).unwrap();
+    }
+
+    fn finish_one(rig: &Rig) {
+        let mut h = rig.held.lock().unwrap().remove(0);
+        h.close();
+    }
+
+    #[test]
+    fn an_h3_alt_svc_is_cached_and_the_upgrade_runs_when_the_connection_goes_idle() {
+        let rig = rig(Mode::Hold, Some("h3=\":8443\"; ma=60"));
+        send(&rig);
+        assert_eq!(rig.upgrades.load(Ordering::SeqCst), 0, "not while a request is in flight");
+        assert!(rig.cache.get("example.test", 443).is_some());
+        finish_one(&rig);
+        assert_eq!(rig.upgrades.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn the_upgrade_waits_for_every_request_in_flight() {
+        let rig = rig(Mode::Hold, Some("h3=\":8443\""));
+        send(&rig);
+        send(&rig);
+        finish_one(&rig);
+        assert_eq!(rig.upgrades.load(Ordering::SeqCst), 0, "one request is still running");
+        finish_one(&rig);
+        assert_eq!(rig.upgrades.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn the_upgrade_runs_once() {
+        let rig = rig(Mode::Hold, Some("h3=\":8443\""));
+        send(&rig);
+        finish_one(&rig);
+        send(&rig);
+        finish_one(&rig);
+        assert_eq!(rig.upgrades.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn no_alt_svc_means_no_upgrade() {
+        let rig = rig(Mode::Hold, None);
+        send(&rig);
+        finish_one(&rig);
+        assert_eq!(rig.upgrades.load(Ordering::SeqCst), 0);
+        assert_eq!(rig.state.lock().unwrap().in_flight, 0);
+    }
+
+    #[test]
+    fn an_alt_svc_for_something_other_than_h3_means_no_upgrade() {
+        let rig = rig(Mode::Hold, Some("h2=\":443\""));
+        send(&rig);
+        finish_one(&rig);
+        assert_eq!(rig.upgrades.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_response_that_completes_inside_the_send_still_counts_as_done() {
+        // The request is counted before it is sent: a response can finish
+        // (on the reactor thread, say) before `send_no_body` returns.
+        let rig = rig(Mode::Inline, Some("h3=\":8443\""));
+        send(&rig);
+        assert_eq!(rig.state.lock().unwrap().in_flight, 0, "nothing is left in flight");
+        assert_eq!(rig.upgrades.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_failed_request_counts_as_done_too() {
+        let rig = rig(Mode::Hold, Some("h3=\":8443\""));
+        send(&rig);
+        let mut h = rig.held.lock().unwrap().remove(0);
+        h.failed(io::Error::other("reset"));
+        assert_eq!(rig.upgrades.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_send_that_is_refused_is_not_counted() {
+        let rig = rig(Mode::Hold, None);
+        let r = rig.ops.lock().unwrap().start_body("POST", "/", Headers::new(), Box::new(Quiet));
+        assert!(r.is_err());
+        assert_eq!(rig.state.lock().unwrap().in_flight, 0);
+    }
+
+    #[test]
+    fn an_alt_svc_clear_withdraws_what_was_cached_and_does_not_upgrade() {
+        let rig = rig(Mode::Hold, Some("clear"));
+        rig.cache.observe("example.test", 443, "h3=\":8443\"");
+        send(&rig);
+        finish_one(&rig);
+        assert_eq!(rig.cache.get("example.test", 443), None);
+        assert_eq!(rig.upgrades.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn an_alt_svc_with_a_zero_max_age_does_not_upgrade() {
+        let rig = rig(Mode::Hold, Some("h3=\":8443\"; ma=0"));
+        send(&rig);
+        finish_one(&rig);
+        assert_eq!(rig.upgrades.load(Ordering::SeqCst), 0);
+    }
+
+    // -- the handler wrappers ------------------------------------------------
+
+    #[derive(Default)]
+    struct Events(Mutex<Vec<String>>);
+
+    struct Recorder(Arc<Events>);
+    impl HttpConnectionHandler for Recorder {
+        fn on_connected(&mut self, session: &mut HttpClientSessionHandle) {
+            self.0 .0.lock().unwrap().push(format!("connected {:?}", session.version()));
+        }
+        fn on_disconnected(&mut self) {
+            self.0 .0.lock().unwrap().push("disconnected".into());
+        }
+        fn on_error(&mut self, err: &io::Error) {
+            self.0 .0.lock().unwrap().push(format!("error {err}"));
+        }
+    }
+
+    fn shared(events: &Arc<Events>) -> Arc<Mutex<Box<dyn HttpConnectionHandler>>> {
+        Arc::new(Mutex::new(Box::new(Recorder(Arc::clone(events)))))
+    }
+
+    fn session() -> HttpClientSessionHandle {
+        let ops: Arc<Mutex<dyn SessionRequestOps + Send>> = Arc::new(Mutex::new(FakeOps {
+            mode: Mode::Hold,
+            alt_svc: None,
+            held: Arc::default(),
+            sent: Arc::default(),
+        }));
+        HttpClientSessionHandle::new(ops, HttpVersion::Http11, None)
+    }
+
+    #[test]
+    fn the_plain_forwarding_handler_passes_every_event_on() {
+        let events = Arc::new(Events::default());
+        let mut h = ForwardingHandler::plain(shared(&events));
+        h.on_connected(&mut session());
+        h.on_disconnected();
+        h.on_error(&io::Error::other("boom"));
+        assert_eq!(*events.0.lock().unwrap(), ["connected Http11", "disconnected", "error boom"]);
+    }
+
+    #[test]
+    fn the_same_real_handler_can_be_connected_more_than_once() {
+        let events = Arc::new(Events::default());
+        let real = shared(&events);
+        ForwardingHandler::plain(Arc::clone(&real)).on_connected(&mut session());
+        ForwardingHandler::plain(real).on_connected(&mut session());
+        assert_eq!(events.0.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn the_observing_handler_watches_the_requests_it_forwards() {
+        let events = Arc::new(Events::default());
+        let rig = rig(Mode::Hold, None);
+        let wrap = NegotiationWrap { state: Arc::clone(&rig.state), conn_handle: Arc::default() };
+        let mut h = ForwardingHandler::observing(shared(&events), wrap);
+        h.on_connected(&mut session());
+        assert_eq!(*events.0.lock().unwrap(), ["connected Http11"]);
+    }
+
+    #[test]
+    fn a_speculative_failure_falls_back_once_and_does_not_reach_the_real_handler() {
+        let events = Arc::new(Events::default());
+        let fallbacks = Arc::new(Mutex::new(Vec::new()));
+        let f2 = Arc::clone(&fallbacks);
+        let mut h = SpeculativeHandler::new(
+            shared(&events),
+            Box::new(move |e| f2.lock().unwrap().push(e.to_string())),
+        );
+        h.on_error(&io::Error::new(io::ErrorKind::ConnectionRefused, "no h3 here"));
+        h.on_error(&io::Error::other("second"));
+        assert_eq!(*fallbacks.lock().unwrap(), ["no h3 here"], "once, with the first error");
+        assert!(events.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_speculative_handler_forwards_a_successful_connection() {
+        let events = Arc::new(Events::default());
+        let mut h = SpeculativeHandler::new(shared(&events), Box::new(|_| panic!("no fallback expected")));
+        h.on_connected(&mut session());
+        h.on_disconnected();
+        assert_eq!(*events.0.lock().unwrap(), ["connected Http11", "disconnected"]);
+    }
+
+    #[test]
+    fn an_error_after_a_speculative_connection_was_made_is_the_real_handlers() {
+        // Falling back means "that tier could not be dialed"; once the
+        // session was handed to the caller, a later failure is theirs to
+        // hear about, not a reason to dial another tier behind their back.
+        let events = Arc::new(Events::default());
+        let fallbacks = Arc::new(AtomicUsize::new(0));
+        let f2 = Arc::clone(&fallbacks);
+        let mut h = SpeculativeHandler::new(
+            shared(&events),
+            Box::new(move |_| {
+                f2.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        h.on_connected(&mut session());
+        h.on_error(&io::Error::other("connection lost"));
+        assert_eq!(fallbacks.load(Ordering::SeqCst), 0);
+        assert_eq!(*events.0.lock().unwrap(), ["connected Http11", "error connection lost"]);
+    }
 }

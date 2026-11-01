@@ -724,18 +724,23 @@ pub fn connect_auto_unix(
 }
 
 /// Scans `records` (answers from a batched A/AAAA/HTTPS query) for a
-/// non-alias-form HTTPS record (RFC 9460) advertising `h3` ALPN support,
-/// returning the address to dial QUIC on directly if found. Prefers the
+/// non-alias-form HTTPS record (RFC 9460) advertising `h3` ALPN support -
+/// the one with the lowest SvcPriority - returning the address to dial QUIC on directly if found. Prefers the
 /// record's own `ipv4hint`/`ipv6hint` SvcParams (IPv6 first); falls back to
 /// the plain A/AAAA answers from the same batch when the HTTPS record
 /// carries no hints of its own.
 #[cfg(feature = "h3")]
 pub(crate) fn pick_h3_target(records: &[DnsResourceRecord], origin_port: u16) -> Option<SocketAddr> {
-    let https = records.iter().find(|rr| {
-        rr.rtype == Some(DnsType::Https)
-            && !rr.is_svcb_alias_form()
-            && rr.svcb_alpn_protocols().iter().any(|p| p == "h3")
-    })?;
+    // The lowest SvcPriority first (RFC 9460 section 2.4.1), whatever order
+    // the answer came in.
+    let https = records
+        .iter()
+        .filter(|rr| {
+            rr.rtype == Some(DnsType::Https)
+                && !rr.is_svcb_alias_form()
+                && rr.svcb_alpn_protocols().iter().any(|p| p == "h3")
+        })
+        .min_by_key(|rr| rr.svcb_priority().unwrap_or(u16::MAX))?;
     let port = https.svcb_port().unwrap_or(origin_port);
 
     if let Some(ip) = https.svcb_ipv6hint().into_iter().next() {
@@ -764,3 +769,132 @@ pub(crate) fn resolve_literal(host: &str, port: u16) -> Option<SocketAddr> {
     parse_literal_ip(host).map(|ip| SocketAddr::new(ip, port))
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn literal_addresses_are_recognised_with_the_port_given() {
+        assert_eq!(resolve_literal("127.0.0.1", 8080), Some("127.0.0.1:8080".parse().unwrap()));
+        assert_eq!(resolve_literal("::1", 443), Some("[::1]:443".parse().unwrap()));
+        assert_eq!(resolve_literal("2001:db8::7", 80), Some("[2001:db8::7]:80".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_socket_address_brings_its_own_port() {
+        assert_eq!(resolve_literal("10.0.0.1:81", 80), Some("10.0.0.1:81".parse().unwrap()));
+        assert_eq!(resolve_literal("[::1]:8443", 443), Some("[::1]:8443".parse().unwrap()));
+    }
+
+    #[test]
+    fn names_are_not_literals() {
+        for host in ["localhost", "example.com", "", "256.1.1.1", "1.2.3", "host:80"] {
+            assert_eq!(resolve_literal(host, 80), None, "{host:?}");
+        }
+    }
+
+    #[test]
+    fn default_timeouts_are_bounded() {
+        let t = HttpClientTimeouts::default();
+        assert!(t.dns < t.connect && t.connect < t.stage + t.stage);
+        assert!(!t.dns.is_zero() && !t.connect.is_zero() && !t.stage.is_zero());
+    }
+
+    #[cfg(feature = "h3")]
+    mod h3_target {
+        use super::*;
+        use hopf_dns::wire::{
+            SVCB_PARAM_ALPN, SVCB_PARAM_IPV4HINT, SVCB_PARAM_IPV6HINT, SVCB_PARAM_PORT,
+        };
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
+        fn alpn(names: &[&str]) -> (u16, Vec<u8>) {
+            let mut v = Vec::new();
+            for n in names {
+                v.push(n.len() as u8);
+                v.extend_from_slice(n.as_bytes());
+            }
+            (SVCB_PARAM_ALPN, v)
+        }
+
+        fn https(priority: u16, params: &[(u16, Vec<u8>)]) -> DnsResourceRecord {
+            DnsResourceRecord::https("example.test", 60, priority, ".", params).unwrap()
+        }
+
+        fn a(ip: [u8; 4]) -> DnsResourceRecord {
+            DnsResourceRecord::a("example.test", 60, Ipv4Addr::from(ip))
+        }
+
+        fn aaaa(last: u16) -> DnsResourceRecord {
+            DnsResourceRecord::aaaa("example.test", 60, Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, last))
+        }
+
+        fn sock(s: &str) -> Option<SocketAddr> {
+            Some(s.parse().unwrap())
+        }
+
+        #[test]
+        fn no_https_record_means_no_h3_target() {
+            assert_eq!(pick_h3_target(&[a([192, 0, 2, 1]), aaaa(1)], 443), None);
+            assert_eq!(pick_h3_target(&[], 443), None);
+        }
+
+        #[test]
+        fn an_https_record_without_h3_is_not_enough() {
+            let r = https(1, &[alpn(&["h2", "http/1.1"])]);
+            assert_eq!(pick_h3_target(&[r, a([192, 0, 2, 1])], 443), None);
+        }
+
+        #[test]
+        fn an_alias_form_record_is_not_a_service() {
+            let r = DnsResourceRecord::https("example.test", 60, 0, "svc.example.test", &[]).unwrap();
+            assert_eq!(pick_h3_target(&[r, a([192, 0, 2, 1])], 443), None);
+        }
+
+        #[test]
+        fn the_addresses_come_from_the_batch_when_the_record_has_no_hints() {
+            let r = https(1, &[alpn(&["h3"])]);
+            assert_eq!(pick_h3_target(&[r.clone(), a([192, 0, 2, 1])], 443), sock("192.0.2.1:443"));
+            assert_eq!(
+                pick_h3_target(&[r, a([192, 0, 2, 1]), aaaa(7)], 443),
+                sock("[2001:db8::7]:443"),
+                "IPv6 first"
+            );
+        }
+
+        #[test]
+        fn the_records_own_hints_and_port_win() {
+            let r = https(
+                1,
+                &[
+                    alpn(&["h3"]),
+                    (SVCB_PARAM_PORT, 8443u16.to_be_bytes().to_vec()),
+                    (SVCB_PARAM_IPV4HINT, vec![198, 51, 100, 9]),
+                ],
+            );
+            assert_eq!(pick_h3_target(&[r.clone(), a([192, 0, 2, 1])], 443), sock("198.51.100.9:8443"));
+            let mut v6 = vec![0x20, 0x01, 0x0d, 0xb8];
+            v6.extend_from_slice(&[0; 11]);
+            v6.push(5);
+            let r6 = https(1, &[alpn(&["h3"]), (SVCB_PARAM_IPV6HINT, v6), (SVCB_PARAM_IPV4HINT, vec![198, 51, 100, 9])]);
+            assert_eq!(pick_h3_target(&[r6], 443), sock("[2001:db8::5]:443"), "an IPv6 hint beats an IPv4 one");
+        }
+
+        #[test]
+        fn the_best_service_priority_is_chosen_whatever_order_the_answer_is_in() {
+            // RFC 9460 section 2.4.1: the lowest SvcPriority is tried first.
+            let low = https(1, &[alpn(&["h3"]), (SVCB_PARAM_IPV4HINT, vec![192, 0, 2, 1])]);
+            let high = https(5, &[alpn(&["h3"]), (SVCB_PARAM_IPV4HINT, vec![192, 0, 2, 5])]);
+            assert_eq!(pick_h3_target(&[high.clone(), low.clone()], 443), sock("192.0.2.1:443"));
+            assert_eq!(pick_h3_target(&[low, high], 443), sock("192.0.2.1:443"));
+        }
+
+        #[test]
+        fn a_lower_priority_record_without_h3_does_not_hide_one_with_it() {
+            let h2 = https(1, &[alpn(&["h2"]), (SVCB_PARAM_IPV4HINT, vec![192, 0, 2, 1])]);
+            let h3 = https(2, &[alpn(&["h3"]), (SVCB_PARAM_IPV4HINT, vec![192, 0, 2, 2])]);
+            assert_eq!(pick_h3_target(&[h2, h3], 443), sock("192.0.2.2:443"));
+        }
+    }
+}

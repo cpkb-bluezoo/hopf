@@ -192,6 +192,30 @@ impl AltSvcCache {
         );
     }
 
+    /// Forget what `host:port` advertised.
+    pub fn remove(&self, host: &str, port: u16) {
+        self.inner.lock().unwrap().remove(&(host.to_ascii_lowercase(), port));
+    }
+
+    /// Apply an `Alt-Svc` response header value seen from `host:port`
+    /// (RFC 7838 section 3): `clear` forgets everything cached for the
+    /// origin; an `h3` entry is cached unless its `ma` is zero, which
+    /// withdraws it. Returns the entry only when there is an h3 alternative
+    /// to act on; anything else leaves the cache as it was.
+    pub fn observe(&self, host: &str, port: u16, value: &str) -> Option<AltSvcH3Entry> {
+        if value.trim().eq_ignore_ascii_case("clear") {
+            self.remove(host, port);
+            return None;
+        }
+        let entry = parse_alt_svc_h3(value)?;
+        if entry.max_age.is_zero() {
+            self.remove(host, port);
+            return None;
+        }
+        self.put(host, port, &entry);
+        Some(entry)
+    }
+
     /// Returns the cached h3 entry for `host:port`, or `None` if absent or
     /// expired.
     pub fn get(&self, host: &str, port: u16) -> Option<AltSvcEntry> {
@@ -274,9 +298,7 @@ impl ClientHandler for AltSvcObservingHandler {
 
     fn response_headers(&mut self, request: &mut dyn ClientWriter, headers: &Headers) {
         if let Some(value) = headers.get("alt-svc") {
-            if let Some(entry) = parse_alt_svc_h3(value) {
-                self.cache.put(&self.host, self.port, &entry);
-            }
+            self.cache.observe(&self.host, self.port, value);
         }
         self.inner.response_headers(request, headers);
     }
@@ -370,5 +392,51 @@ mod tests {
         );
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(cache.get("expired.test", 443), None);
+    }
+
+    #[test]
+    fn clear_removes_what_was_cached() {
+        let cache = AltSvcCache::new();
+        assert!(cache.observe("example.test", 443, "h3=\":8443\"; ma=60").is_some());
+        assert!(cache.get("example.test", 443).is_some());
+        assert!(cache.observe("example.test", 443, "clear").is_none());
+        assert_eq!(cache.get("example.test", 443), None, "RFC 7838 section 3: clear invalidates");
+        // case and spacing do not matter
+        cache.observe("example.test", 443, "h3=\":8443\"");
+        assert!(cache.observe("example.test", 443, "  CLEAR ").is_none());
+        assert_eq!(cache.get("example.test", 443), None);
+    }
+
+    #[test]
+    fn a_zero_max_age_withdraws_the_alternative_and_is_not_usable() {
+        let cache = AltSvcCache::new();
+        cache.observe("example.test", 443, "h3=\":8443\"; ma=60");
+        assert!(cache.observe("example.test", 443, "h3=\":8443\"; ma=0").is_none());
+        assert_eq!(cache.get("example.test", 443), None);
+    }
+
+    #[test]
+    fn observing_an_h3_entry_returns_it_and_caches_it() {
+        let cache = AltSvcCache::new();
+        let e = cache.observe("Example.Test", 443, "h2=\":443\", h3=\"alt.test:8443\"; ma=120").unwrap();
+        assert_eq!((e.host.as_deref(), e.port), (Some("alt.test"), 8443));
+        let got = cache.get("example.test", 443).unwrap();
+        assert_eq!((got.h3_host.as_deref(), got.h3_port), (Some("alt.test"), 8443));
+    }
+
+    #[test]
+    fn observing_something_that_is_not_h3_changes_nothing() {
+        let cache = AltSvcCache::new();
+        cache.observe("example.test", 443, "h3=\":8443\"");
+        assert!(cache.observe("example.test", 443, "h2=\":443\"").is_none());
+        assert!(cache.get("example.test", 443).is_some(), "an h2-only header does not clear h3");
+        assert!(cache.observe("example.test", 443, "").is_none());
+        assert!(cache.observe("example.test", 443, "h3=\"broken").is_none());
+    }
+
+    #[test]
+    fn draft_h3_versions_are_not_h3() {
+        assert_eq!(parse_alt_svc_h3("h3-29=\":443\""), None);
+        assert_eq!(parse_alt_svc_h3("h3-Q050=\":443\", h3-27=\":443\""), None);
     }
 }
