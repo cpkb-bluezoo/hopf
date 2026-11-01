@@ -14,7 +14,11 @@ use hopf_core::{
 };
 use hopf_dns::{parse_literal_ip, DnsResolver};
 
-use crate::{ClientHandlerFactory, H1Endpoint, H2Endpoint, H2cUpgradeClientEndpoint, HttpLimits};
+use super::race::{connect_any, Dial, MakeHandler};
+use crate::{
+    ClientHandlerFactory, DiscardingClientWriter, H1Endpoint, H2Endpoint, H2cUpgradeClientEndpoint, HttpLimits,
+    HttpVersion,
+};
 
 #[cfg(feature = "h3")]
 use crate::client::alt_svc::AltSvcCache;
@@ -40,6 +44,11 @@ pub struct HttpClientTimeouts {
     pub connect: Duration,
     /// Time budget waiting for each HTTP response stage (headers, etc.).
     pub stage: Duration,
+    /// When a name resolves to several addresses, how long an attempt may be
+    /// under way before the next address is tried alongside it (RFC 8305
+    /// section 5 recommends 250 ms). An attempt that fails starts the next
+    /// at once.
+    pub attempt_delay: Duration,
 }
 
 impl Default for HttpClientTimeouts {
@@ -48,6 +57,7 @@ impl Default for HttpClientTimeouts {
             dns: Duration::from_secs(5),
             connect: Duration::from_secs(30),
             stage: Duration::from_secs(60),
+            attempt_delay: super::race::DEFAULT_ATTEMPT_DELAY,
         }
     }
 }
@@ -92,6 +102,7 @@ pub fn connect_http(
     settings: DialSettings,
 ) -> io::Result<()> {
     let limits = settings.limits;
+    let on_failure = request_failed(rt, Arc::clone(&factory));
     let make_handler: Arc<dyn Fn() -> Box<dyn ProtocolHandler> + Send + Sync> =
         Arc::new(move || -> Box<dyn ProtocolHandler> {
             if http2 {
@@ -100,7 +111,7 @@ pub fn connect_http(
                 Box::new(H1Endpoint::client(Arc::clone(&factory), limits, false))
             }
         });
-    dial(rt, host_or_addr, port, &settings, make_handler)
+    dial(rt, host_or_addr, port, &settings, make_handler, on_failure)
 }
 
 /// Dial an HTTP/1.1 or HTTP/2 cleartext peer over a UNIX domain socket
@@ -136,11 +147,12 @@ pub fn connect_http2_upgrade(
     settings: DialSettings,
 ) -> io::Result<()> {
     let limits = settings.limits;
+    let on_failure = request_failed(rt, Arc::clone(&factory));
     let make_handler: Arc<dyn Fn() -> Box<dyn ProtocolHandler> + Send + Sync> =
         Arc::new(move || -> Box<dyn ProtocolHandler> {
             Box::new(H2cUpgradeClientEndpoint::new(Arc::clone(&factory), limits))
         });
-    dial(rt, host_or_addr, port, &settings, make_handler)
+    dial(rt, host_or_addr, port, &settings, make_handler, on_failure)
 }
 
 /// Dial an HTTP/2 peer via HTTP/1.1 h2c Upgrade over a UNIX domain socket
@@ -185,11 +197,12 @@ pub fn connect_https(
 ) -> io::Result<()> {
     let server_name = server_name.into();
     let limits = settings.limits;
+    let on_failure = request_failed(rt, Arc::clone(&factory));
     let make_handler: Arc<dyn Fn() -> Box<dyn ProtocolHandler> + Send + Sync> =
         Arc::new(move || -> Box<dyn ProtocolHandler> {
             Box::new(TlsAlpnClientEndpoint::new(Arc::clone(&factory), limits))
         });
-    dial_tls(rt, host_or_addr, port, &settings, tls_connector, server_name, make_handler)
+    dial_tls(rt, host_or_addr, port, &settings, tls_connector, server_name, make_handler, on_failure)
 }
 
 /// [`ProtocolHandler`] that waits for the TLS handshake to complete, then
@@ -261,6 +274,24 @@ impl ProtocolHandler for TlsAlpnClientEndpoint {
     }
 }
 
+/// What to do, once, when no connection could be made to a peer: the DNS
+/// lookup failed, there was no address, or every address failed.
+pub(crate) type OnFailure = Arc<dyn Fn(io::Error) + Send + Sync>;
+
+/// The application hears of a dial that failed before any connection
+/// existed, as a request that failed ([`ClientHandler::request_failed`]): a
+/// handler is made for the purpose, since none was, and is given a writer
+/// that discards what is written.
+fn request_failed(rt: &Arc<Runtime>, factory: Arc<dyn ClientHandlerFactory>) -> OnFailure {
+    let reactor = rt.pick_worker().clone();
+    Arc::new(move |err: io::Error| {
+        let reactor = reactor.clone();
+        let conn = hopf_core::ConnHandle::from_execute(Arc::new(move |task| reactor.execute(task)));
+        let mut handler = factory.create_handler();
+        handler.request_failed(&mut DiscardingClientWriter::new(conn, HttpVersion::Http11), &err);
+    })
+}
+
 /// Shared DNS-resolve-then-connect plumbing.
 pub(crate) fn dial(
     rt: &Arc<Runtime>,
@@ -268,48 +299,15 @@ pub(crate) fn dial(
     port: u16,
     settings: &DialSettings,
     make_handler: Arc<dyn Fn() -> Box<dyn ProtocolHandler> + Send + Sync>,
+    on_failure: OnFailure,
 ) -> io::Result<()> {
-    let connect_timeout = Some(settings.timeouts.connect);
-
-    if let Some(addr) = resolve_literal(host_or_addr, port) {
-        let mh = Arc::clone(&make_handler);
-        return rt.connect(
-            TcpConnectorConfig::new(addr, move || mh()).connect_timeout(connect_timeout),
-        );
-    }
-
-    let res = match &settings.resolver {
-        Some(r) => Arc::clone(r),
-        None => Arc::new(DnsResolver::for_runtime(rt)?),
-    };
-    let rt2 = Arc::clone(rt);
-    res.resolve(
-        host_or_addr,
-        port,
-        Box::new(move |result| {
-            let addrs = match result {
-                Ok(a) => a,
-                Err(e) => {
-                    subsystem_log(LogLevel::Warn, "hopf-http", "http.dns.error", format!("DNS error: {e}"));
-                    return;
-                }
-            };
-            if let Some(addr) = addrs.into_iter().next() {
-                let mh = Arc::clone(&make_handler);
-                let cfg = TcpConnectorConfig::new(addr, move || mh())
-                    .connect_timeout(connect_timeout);
-                if let Err(e) = rt2.connect(cfg) {
-                    subsystem_log(LogLevel::Warn, "hopf-http", "http.connect.error", format!("connect error: {e}"));
-                }
-            }
-        }),
-    );
-    Ok(())
+    dial_resolved(rt, host_or_addr, port, settings, None, make_handler, on_failure)
 }
 
 /// [`dial`], additionally configuring the connector for TLS (ALPN offered
 /// via whatever `tls_connector` itself is set up for — `h2`/`http/1.1` for
 /// [`connect_https`]'s use).
+#[allow(clippy::too_many_arguments)]
 fn dial_tls(
     rt: &Arc<Runtime>,
     host_or_addr: &str,
@@ -318,16 +316,43 @@ fn dial_tls(
     tls_connector: SharedTlsConnector,
     server_name: String,
     make_handler: Arc<dyn Fn() -> Box<dyn ProtocolHandler> + Send + Sync>,
+    on_failure: OnFailure,
+) -> io::Result<()> {
+    dial_resolved(rt, host_or_addr, port, settings, Some((tls_connector, server_name)), make_handler, on_failure)
+}
+
+/// The connector for one attempt to `addr`.
+fn tcp_connector(
+    addr: SocketAddr,
+    make: impl Fn() -> Box<dyn ProtocolHandler> + Send + Sync + 'static,
+    connect_timeout: Option<Duration>,
+    tls: &Option<(SharedTlsConnector, String)>,
+) -> TcpConnectorConfig {
+    let cfg = TcpConnectorConfig::new(addr, make).connect_timeout(connect_timeout);
+    match tls {
+        Some((connector, server_name)) => cfg.with_tls(Arc::clone(connector), server_name.clone()),
+        None => cfg,
+    }
+}
+
+/// Resolve `host_or_addr` and connect to the first of its addresses to
+/// answer (see [`super::race`]). A literal address is dialed directly. If no
+/// connection can be made, `on_failure` is told why.
+fn dial_resolved(
+    rt: &Arc<Runtime>,
+    host_or_addr: &str,
+    port: u16,
+    settings: &DialSettings,
+    tls: Option<(SharedTlsConnector, String)>,
+    make_handler: Arc<dyn Fn() -> Box<dyn ProtocolHandler> + Send + Sync>,
+    on_failure: OnFailure,
 ) -> io::Result<()> {
     let connect_timeout = Some(settings.timeouts.connect);
+    let attempt_delay = settings.timeouts.attempt_delay;
 
     if let Some(addr) = resolve_literal(host_or_addr, port) {
         let mh = Arc::clone(&make_handler);
-        return rt.connect(
-            TcpConnectorConfig::new(addr, move || mh())
-                .connect_timeout(connect_timeout)
-                .with_tls(tls_connector, server_name),
-        );
+        return rt.connect(tcp_connector(addr, move || mh(), connect_timeout, &tls));
     }
 
     let res = match &settings.resolver {
@@ -335,26 +360,44 @@ fn dial_tls(
         None => Arc::new(DnsResolver::for_runtime(rt)?),
     };
     let rt2 = Arc::clone(rt);
+    let host = host_or_addr.to_string();
     res.resolve(
         host_or_addr,
         port,
         Box::new(move |result| {
             let addrs = match result {
-                Ok(a) => a,
+                Ok(a) if !a.is_empty() => a,
+                Ok(_) => {
+                    let err = io::Error::new(io::ErrorKind::NotFound, format!("no address for {host}"));
+                    subsystem_log(LogLevel::Warn, "hopf-http", "http.dns.error", err.to_string());
+                    return on_failure(err);
+                }
                 Err(e) => {
                     subsystem_log(LogLevel::Warn, "hopf-http", "http.dns.error", format!("DNS error: {e}"));
-                    return;
+                    return on_failure(io::Error::new(e.kind(), format!("DNS error resolving {host}: {e}")));
                 }
             };
-            if let Some(addr) = addrs.into_iter().next() {
-                let mh = Arc::clone(&make_handler);
-                let cfg = TcpConnectorConfig::new(addr, move || mh())
-                    .connect_timeout(connect_timeout)
-                    .with_tls(tls_connector, server_name);
-                if let Err(e) = rt2.connect(cfg) {
+            let rt3 = Arc::clone(&rt2);
+            let dial: Dial = Arc::new(move |addr, attempt| {
+                // The connector's factory runs once, for this attempt.
+                let attempt = std::sync::Mutex::new(Some(attempt));
+                let make: MakeHandler = Arc::clone(&make_handler);
+                let gated = move || -> Box<dyn ProtocolHandler> {
+                    let attempt = attempt.lock().unwrap().take().expect("an attempt is dialed once");
+                    attempt.gate(Arc::clone(&make))
+                };
+                rt3.connect(tcp_connector(addr, gated, connect_timeout, &tls))
+            });
+            connect_any(
+                &rt2,
+                addrs,
+                attempt_delay,
+                dial,
+                Box::new(move |e| {
                     subsystem_log(LogLevel::Warn, "hopf-http", "http.connect.error", format!("connect error: {e}"));
-                }
-            }
+                    on_failure(e);
+                }),
+            );
         }),
     );
     Ok(())

@@ -257,34 +257,81 @@ impl HttpClient {
         addr: SocketAddr,
         handler: Box<dyn HttpConnectionHandler>,
     ) -> (TcpConnectorConfig, Arc<HttpClientSessionConfig>) {
-        let config = Arc::new(HttpClientSessionConfig {
+        let config = self.session_config(handler);
+        (self.connector_with(addr, &config, None), config)
+    }
+
+    /// The configuration of a connection: shared by every attempt to
+    /// connect, so that the application's `handler` is told of the one that
+    /// wins, or, once, that none could.
+    fn session_config(&self, handler: Box<dyn HttpConnectionHandler>) -> Arc<HttpClientSessionConfig> {
+        Arc::new(HttpClientSessionConfig {
             host: self.host.clone(),
             port: self.port,
             limits: self.limits,
             secure: self.secure,
             handler: Mutex::new(Some(handler)),
             stage: self.timeouts.stage,
-        });
+        })
+    }
+
+    /// The dial config for one attempt at `addr` with `config`. With an
+    /// `attempt` of an address race, the connection's events are held back
+    /// until it wins (see [`super::race`]).
+    fn connector_with(
+        &self,
+        addr: SocketAddr,
+        config: &Arc<HttpClientSessionConfig>,
+        attempt: Option<super::race::Attempt>,
+    ) -> TcpConnectorConfig {
         let limits = self.limits;
         let secure = self.secure;
         let h2_prior = self.h2_prior_knowledge;
         let connect_timeout = Some(self.timeouts.connect);
-        let config_for_factory = Arc::clone(&config);
+        let config_for_factory = Arc::clone(config);
+        let attempt = Mutex::new(attempt);
 
         let mut cfg = TcpConnectorConfig::new(addr, move || {
-            Box::new(HttpClientConnection::new(
-                Arc::clone(&config_for_factory),
-                limits,
-                secure,
-                h2_prior,
-            )) as Box<dyn ProtocolHandler>
+            let config = Arc::clone(&config_for_factory);
+            let make: super::race::MakeHandler = Arc::new(move || {
+                Box::new(HttpClientConnection::new(Arc::clone(&config), limits, secure, h2_prior))
+                    as Box<dyn ProtocolHandler>
+            });
+            match attempt.lock().unwrap().take() {
+                Some(attempt) => attempt.gate(make),
+                None => make(),
+            }
         })
         .connect_timeout(connect_timeout);
 
         if let (Some(tls), Some(name)) = (&self.tls_connector, &self.tls_server_name) {
             cfg = cfg.with_tls(Arc::clone(tls), name.clone());
         }
-        (cfg, config)
+        cfg
+    }
+
+    /// Connect to the first of `addrs` to answer (RFC 8305, see
+    /// [`super::race`]). `handler` hears of the connection that wins, or, if
+    /// none can be made, of the failure.
+    fn connect_any(&self, rt: &Arc<Runtime>, addrs: Vec<SocketAddr>, handler: Box<dyn HttpConnectionHandler>) {
+        let config = self.session_config(handler);
+        let client = self.clone_for_dial();
+        let rt2 = Arc::clone(rt);
+        let config_for_dial = Arc::clone(&config);
+        let dial: super::race::Dial = Arc::new(move |addr, attempt| {
+            rt2.connect(client.connector_with(addr, &config_for_dial, Some(attempt)))
+        });
+        super::race::connect_any(
+            rt,
+            addrs,
+            self.timeouts.attempt_delay,
+            dial,
+            Box::new(move |e| {
+                if let Some(mut h) = config.handler.lock().unwrap().take() {
+                    h.on_error(&e);
+                }
+            }),
+        );
     }
 
     /// UNIX-domain counterpart of [`Self::connector_for_addr`].
@@ -404,19 +451,14 @@ impl HttpClient {
                         return;
                     }
                 };
-                let Some(addr) = addrs.into_iter().next() else {
+                if addrs.is_empty() {
                     handler.on_error(&io::Error::new(
                         io::ErrorKind::NotFound,
                         format!("no address for {host_for_error}"),
                     ));
                     return;
-                };
-                let (cfg, config) = client.connector_for_addr(addr, handler);
-                if let Err(e) = rt2.connect(cfg) {
-                    if let Some(mut h) = config.handler.lock().unwrap().take() {
-                        h.on_error(&e);
-                    }
                 }
+                client.connect_any(&rt2, addrs, handler);
             }),
         );
         Ok(())
@@ -623,19 +665,14 @@ impl HttpClient {
                         return;
                     }
                 };
-                let Some(addr) = addrs.into_iter().next() else {
+                if addrs.is_empty() {
                     fh.on_error(&io::Error::new(
                         io::ErrorKind::NotFound,
                         format!("no address for {host_for_error}"),
                     ));
                     return;
-                };
-                let (cfg, config) = client2.connector_for_addr(addr, fh);
-                if let Err(e) = rt2.connect(cfg) {
-                    if let Some(mut h) = config.handler.lock().unwrap().take() {
-                        h.on_error(&e);
-                    }
                 }
+                client2.connect_any(&rt2, addrs, fh);
             }),
         );
     }

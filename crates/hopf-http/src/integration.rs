@@ -114,6 +114,8 @@ struct Outcome {
     status: u16,
     body: Vec<u8>,
     done: bool,
+    /// Set (with `done`) when the request failed instead: the kind and text.
+    failed: Option<(io::ErrorKind, String)>,
 }
 
 struct GetOnce {
@@ -145,6 +147,25 @@ impl ClientHandler for GetOnce {
 
     fn response_complete(&mut self, _request: &mut dyn ClientWriter) {
         self.out.lock().unwrap().done = true;
+    }
+
+    fn request_failed(&mut self, _request: &mut dyn ClientWriter, err: &io::Error) {
+        let mut out = self.out.lock().unwrap();
+        out.failed = Some((err.kind(), err.to_string()));
+        out.done = true;
+    }
+}
+
+/// [`GetFactory`] that counts the handlers it is asked for.
+struct CountingFactory {
+    inner: GetFactory,
+    created: std::sync::atomic::AtomicUsize,
+}
+
+impl ClientHandlerFactory for CountingFactory {
+    fn create_handler(&self) -> Box<dyn ClientHandler> {
+        self.created.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.create_handler()
     }
 }
 
@@ -274,6 +295,8 @@ struct GumdropOutcome {
     failed: Option<io::ErrorKind>,
     on_error_called: bool,
     on_connected_called: bool,
+    /// What `on_error` was given.
+    error: Option<String>,
 }
 
 fn wait_gumdrop_done(out: &Arc<Mutex<GumdropOutcome>>, max: Duration) -> bool {
@@ -659,8 +682,10 @@ impl HttpConnectionHandler for ErrorRecordingConn {
     fn on_connected(&mut self, _session: &mut HttpClientSessionHandle) {
         self.out.lock().unwrap().on_connected_called = true;
     }
-    fn on_error(&mut self, _err: &io::Error) {
-        self.out.lock().unwrap().on_error_called = true;
+    fn on_error(&mut self, err: &io::Error) {
+        let mut out = self.out.lock().unwrap();
+        out.on_error_called = true;
+        out.error = Some(err.to_string());
     }
 }
 
@@ -2344,4 +2369,147 @@ fn gumdrop_h1_second_bodyless_request_off_reactor_completes() {
         assert!(wait_gumdrop_done(&out, Duration::from_secs(5)), "request {i} never completed");
         assert_eq!(out.lock().unwrap().status, 200);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Several addresses for one name (RFC 8305, issue #516)
+// ---------------------------------------------------------------------------
+
+/// A resolver that answers every name with `addrs`: the IPv4 ones for an A
+/// query and the IPv6 ones for an AAAA query, in a loopback DNS stub.
+fn resolver_answering(rt: &Arc<Runtime>, addrs: Vec<std::net::IpAddr>) -> Arc<hopf_dns::DnsResolver> {
+    use hopf_dns::wire::{DnsMessage, DnsResourceRecord, DnsType, FLAG_QR, FLAG_RA};
+    let stub = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    stub.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let stub_addr = stub.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        while let Ok((n, peer)) = stub.recv_from(&mut buf) {
+            let Ok(q) = DnsMessage::parse(&buf[..n]) else { continue };
+            let mut resp = q.response_template(0);
+            resp.flags |= FLAG_QR | FLAG_RA;
+            if let Some(question) = q.questions.first() {
+                for addr in &addrs {
+                    match (question.qtype, addr) {
+                        (Some(DnsType::A), std::net::IpAddr::V4(v4)) => {
+                            resp.answers.push(DnsResourceRecord::a(&question.name, 60, *v4))
+                        }
+                        (Some(DnsType::Aaaa), std::net::IpAddr::V6(v6)) => {
+                            resp.answers.push(DnsResourceRecord::aaaa(&question.name, 60, *v6))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let _ = stub.send_to(&resp.serialize().unwrap(), peer);
+        }
+    });
+    let dns = Arc::new(hopf_dns::DnsResolver::new(rt.pick_worker().clone()));
+    dns.add_server(stub_addr);
+    dns.set_timeout(Duration::from_millis(500));
+    dns.open().unwrap();
+    dns
+}
+
+/// Resolves to `::1`, which nothing listens on (so refuses at once), and then
+/// to `127.0.0.1`, where the test server is.
+fn unreachable_then_good(rt: &Arc<Runtime>) -> Arc<hopf_dns::DnsResolver> {
+    resolver_answering(rt, vec!["::1".parse().unwrap(), "127.0.0.1".parse().unwrap()])
+}
+
+fn settings_with(resolver: Arc<hopf_dns::DnsResolver>) -> DialSettings {
+    DialSettings { limits: HttpLimits::default(), timeouts: HttpClientTimeouts::default(), resolver: Some(resolver) }
+}
+
+/// A port that nothing listens on, on either loopback family.
+fn closed_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+/// The first address a name resolves to refuses connections; the second is
+/// the server. The request goes through, and the application's handler
+/// factory is asked for one handler, not one per address tried.
+#[test]
+fn connect_http_tries_the_next_address_when_the_first_refuses() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let addr = start_server(&rt);
+    let out = Arc::new(Mutex::new(Outcome::default()));
+    let factory = Arc::new(CountingFactory { inner: GetFactory { out: Arc::clone(&out) }, created: Default::default() });
+
+    connect_http(&rt, "dual.hopf-http-test.invalid", addr.port(), factory.clone(), false, settings_with(unreachable_then_good(&rt))).unwrap();
+
+    assert!(wait_done(&out, Duration::from_secs(5)), "request timed out");
+    let g = out.lock().unwrap();
+    assert_eq!(g.failed, None, "the first address's refusal reached the application");
+    assert_eq!((g.status, g.body.as_slice()), (200, b"hello-http-client".as_slice()));
+    assert_eq!(factory.created.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// With nothing to connect to the request fails, and the application is told
+/// why, once, naming how many addresses were tried.
+#[test]
+fn connect_http_reports_a_failure_when_every_address_refuses() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let out = Arc::new(Mutex::new(Outcome::default()));
+    let factory: Arc<dyn ClientHandlerFactory> = Arc::new(GetFactory { out: Arc::clone(&out) });
+
+    connect_http(&rt, "dual.hopf-http-test.invalid", closed_port(), factory, false, settings_with(unreachable_then_good(&rt))).unwrap();
+
+    assert!(wait_done(&out, Duration::from_secs(5)), "the application was never told");
+    let g = out.lock().unwrap();
+    let (kind, why) = g.failed.clone().expect("the request should have failed");
+    assert_eq!(kind, io::ErrorKind::ConnectionRefused, "{why}");
+    assert!(why.contains("tried 2 addresses"), "{why}");
+    assert_eq!(g.status, 0);
+}
+
+/// A name with no addresses fails the request too, instead of only logging.
+#[test]
+fn connect_http_reports_a_name_with_no_address() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let out = Arc::new(Mutex::new(Outcome::default()));
+    let factory: Arc<dyn ClientHandlerFactory> = Arc::new(GetFactory { out: Arc::clone(&out) });
+    let nothing = resolver_answering(&rt, vec![]);
+
+    connect_http(&rt, "nowhere.hopf-http-test.invalid", 80, factory, false, settings_with(nothing)).unwrap();
+
+    assert!(wait_done(&out, Duration::from_secs(5)), "the application was never told");
+    let (kind, why) = out.lock().unwrap().failed.clone().expect("the request should have failed");
+    assert_eq!(kind, io::ErrorKind::NotFound);
+    assert!(why.contains("nowhere.hopf-http-test.invalid"), "{why}");
+}
+
+/// The same, through the session API.
+#[test]
+fn http_client_tries_the_next_address_when_the_first_refuses() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let addr = start_server(&rt);
+    let out = Arc::new(Mutex::new(GumdropOutcome::default()));
+
+    HttpClient::new("dual.hopf-http-test.invalid", addr.port())
+        .resolver(unreachable_then_good(&rt))
+        .connect(&rt, Box::new(NeverRespondConn { out: Arc::clone(&out) }))
+        .unwrap();
+
+    assert!(wait_gumdrop_done(&out, Duration::from_secs(5)), "request timed out");
+    let g = out.lock().unwrap();
+    assert!(!g.on_error_called, "the first address's refusal reached the application: {:?}", g.error);
+    assert!(g.on_connected_called);
+    assert_eq!((g.status, g.body.as_slice()), (200, b"hello-http-client".as_slice()));
+}
+
+#[test]
+fn http_client_reports_one_failure_when_every_address_refuses() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let out = Arc::new(Mutex::new(GumdropOutcome::default()));
+
+    HttpClient::new("dual.hopf-http-test.invalid", closed_port())
+        .resolver(unreachable_then_good(&rt))
+        .connect(&rt, Box::new(ErrorRecordingConn { out: Arc::clone(&out) }))
+        .unwrap();
+
+    assert!(wait_for(|| out.lock().unwrap().on_error_called, Duration::from_secs(5)), "on_error was never invoked");
+    let g = out.lock().unwrap();
+    assert!(!g.on_connected_called);
+    assert!(g.error.as_deref().is_some_and(|e| e.contains("tried 2 addresses")), "{:?}", g.error);
 }

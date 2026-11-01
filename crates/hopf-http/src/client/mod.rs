@@ -13,6 +13,7 @@ pub(crate) mod h2_session;
 pub(crate) mod h3_session;
 #[cfg(feature = "h3")]
 pub(crate) mod negotiate;
+pub(crate) mod race;
 pub(crate) mod redirect;
 pub(crate) mod session_config;
 

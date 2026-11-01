@@ -27,5 +27,6 @@ brotli = { version = "9", default-features = false, features = ["std"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
+hopf-core = { workspace = true, features = ["testing"] }
 rcgen = { workspace = true }
 tempfile = { workspace = true }

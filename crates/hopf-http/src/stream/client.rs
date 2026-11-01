@@ -220,6 +220,13 @@ pub struct DiscardingClientWriter {
     version: HttpVersion,
 }
 
+impl DiscardingClientWriter {
+    /// A writer on `conn` that discards what is written.
+    pub(crate) fn new(conn: ConnHandle, version: HttpVersion) -> Self {
+        Self { conn, version }
+    }
+}
+
 impl ClientWriter for DiscardingClientWriter {
     fn headers(&mut self, _headers: Headers) {}
     fn start_request_body(&mut self) {}
