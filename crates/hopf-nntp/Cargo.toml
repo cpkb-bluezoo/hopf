@@ -27,5 +27,6 @@ hopf-dns = { workspace = true }
 base64 = "0.22"
 
 [dev-dependencies]
+hopf-core = { workspace = true, features = ["testing"] }
 rcgen = { workspace = true }
 tempfile = { workspace = true }

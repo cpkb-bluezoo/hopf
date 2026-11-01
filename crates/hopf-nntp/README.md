@@ -11,10 +11,14 @@ NNTP / NNTPS **async client** for [Hopf](https://cpkb-bluezoo.github.io/hopf/)
 - **Auth:** AUTHINFO USER/PASS and AUTHINFO SASL (SCRAM-SHA-256, CRAM-MD5,
   PLAIN, LOGIN) chosen from CAPABILITIES
 - **Session:** a cloneable `NntpSession` queues commands from any thread;
-  replies, multi-line bodies (dot-unstuffed) and completions come back as
-  callbacks
-- **Helpers:** LIST ACTIVE, GROUP, OVER, ARTICLE, HEAD, POST, QUIT, and any
-  raw command
+  replies and completions come back as callbacks
+- **Parsing:** one pass over the connection's ring, nothing buffered whole.
+  `GROUP` and `STAT` replies, LIST ACTIVE and OVER lines are read into typed
+  values field by field as the bytes arrive (one callback per entry); article,
+  head and body text is passed on as it arrives, dot-unstuffed, in whatever
+  pieces the connection delivers it, with no limit on line length
+- **Helpers:** LIST ACTIVE, GROUP, STAT, OVER, ARTICLE, HEAD, BODY, POST,
+  QUIT, and any raw command
 
 ## Quick start
 

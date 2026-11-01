@@ -15,10 +15,10 @@ use hopf_core::{Endpoint, LoopBuf, ProtocolHandler, SecurityInfo, SharedTlsConne
 use super::error::NntpClientError;
 use super::handlers::{NntpClientHandler, NntpGreeting};
 use super::reply::{
-    has_capability, is_multiline_code, normalize_capabilities, sasl_mechanisms, NntpReplyLexer,
+    has_capability, is_multiline_code, normalize_capabilities, sasl_mechanisms, Block, NntpReplyLexer,
     NntpStatus, ReplyEvent,
 };
-use super::session::{Command, NntpSession, Queue};
+use super::session::{Command, Detail, NntpSession, Queue, Sink};
 
 /// Mechanisms tried for a password, in order of preference.
 const SASL_PREFERENCE: &[SaslMechanism] = &[
@@ -85,9 +85,9 @@ pub(crate) struct NntpClientEndpoint {
     timer: Option<TimerHandle>,
     connected_notified: bool,
     lexer: NntpReplyLexer,
-    /// A multi-line block is due next (set by whichever handler saw the
-    /// status that announces it, cleared at the block's end).
-    block_next: bool,
+    /// A multi-line block of this shape is due next (set by whichever
+    /// handler saw the status that announces it, cleared at the block's end).
+    block_next: Option<Block>,
 }
 
 impl NntpClientEndpoint {
@@ -117,7 +117,7 @@ impl NntpClientEndpoint {
             timer: None,
             connected_notified: false,
             lexer: NntpReplyLexer::default(),
-            block_next: false,
+            block_next: None,
         }
     }
 
@@ -208,7 +208,7 @@ impl NntpClientEndpoint {
     fn on_capabilities_status(&mut self, ep: &mut dyn Endpoint, after_tls: bool, status: NntpStatus) {
         if status.code == 101 {
             self.phase = Phase::Capabilities { after_tls, collecting: true };
-            self.block_next = true;
+            self.block_next = Some(Block::Lines);
         } else {
             // No CAPABILITIES support: carry on with none.
             self.capabilities = Vec::new();
@@ -271,7 +271,7 @@ impl NntpClientEndpoint {
             let mut client = create_client(mech, &user, &pass, "", "nntp", None);
             let mut line = format!("AUTHINFO SASL {}", mech.name());
             if client.has_initial_response() {
-                if let SaslClientStep::Response(initial) = client.evaluate(None) {
+                if let SaslClientStep::Response(initial) | SaslClientStep::Complete(initial) = client.evaluate(None) {
                     line.push(' ');
                     line.push_str(&if initial.is_empty() { "=".to_string() } else { B64.encode(&initial) });
                 }
@@ -383,8 +383,9 @@ impl NntpClientEndpoint {
         }
     }
 
-    /// A status line while a command is in flight.
-    fn on_command_status(&mut self, ep: &mut dyn Endpoint, status: NntpStatus) {
+    /// A status line while a command is in flight, with the fields of it a
+    /// `GROUP` or article reply carried.
+    fn on_command_status(&mut self, ep: &mut dyn Endpoint, status: NntpStatus, detail: Option<Detail>) {
         self.arm_timer(ep);
         let Some((mut cmd, waiting)) = self.in_flight.take() else {
             // Nothing asked for this; servers do not speak unprompted.
@@ -404,7 +405,10 @@ impl NntpClientEndpoint {
                 return;
             }
         }
-        if matches!(waiting, InFlight::Status) && cmd.multiline && is_multiline_code(status.code) {
+        if let (Some(detail), Some(on_detail)) = (detail, cmd.on_detail.as_mut()) {
+            on_detail(detail);
+        }
+        if matches!(waiting, InFlight::Status) && cmd.sink.is_some() && is_multiline_code(status.code) {
             // Remember the status; completion fires at the dot.
             let code = status.code;
             let text = status.text;
@@ -413,18 +417,40 @@ impl NntpClientEndpoint {
                 Ok(_) => on_complete(Ok(NntpStatus { code, text })),
                 Err(e) => on_complete(Err(e)),
             });
+            self.block_next = cmd.sink.as_ref().map(Sink::block);
             self.in_flight = Some((cmd, InFlight::Lines));
-            self.block_next = true;
         } else {
             self.complete(ep, cmd, Ok(status));
         }
     }
 
-    /// A line of the multi-line block of the command in flight.
-    fn on_command_block_line(&mut self, ep: &mut dyn Endpoint, line: &[u8]) {
+    /// Status in whatever phase the connection is in.
+    fn on_status(&mut self, ep: &mut dyn Endpoint, status: NntpStatus, detail: Option<Detail>) {
+        match self.phase {
+            Phase::Greeting => self.on_greeting(ep, status),
+            Phase::Capabilities { after_tls, .. } => self.on_capabilities_status(ep, after_tls, status),
+            Phase::StartTls => self.on_starttls_reply(ep, status),
+            Phase::PendingTls => {}
+            Phase::AuthUser => self.on_auth_user_reply(ep, status),
+            Phase::AuthPass => self.on_auth_pass_reply(ep, status),
+            Phase::AuthSasl => self.on_auth_sasl_reply(ep, status),
+            Phase::Ready => self.on_command_status(ep, status, detail),
+            Phase::Closed => {}
+        }
+    }
+
+    /// Some of the block of the command in flight.
+    fn on_command_block(&mut self, ep: &mut dyn Endpoint, event: ReplyEvent, content: &[u8]) {
         self.arm_timer(ep);
-        if let Some((cmd, InFlight::Lines)) = self.in_flight.as_mut() {
-            (cmd.on_line)(line);
+        let Some((cmd, InFlight::Lines)) = self.in_flight.as_mut() else {
+            return;
+        };
+        match (cmd.sink.as_mut(), event) {
+            (Some(Sink::Content(f)), ReplyEvent::Content) => f(content),
+            (Some(Sink::Newsgroups(f)), ReplyEvent::Newsgroup(e)) => f(e),
+            (Some(Sink::Overview(f)), ReplyEvent::Overview(e)) => f(e),
+            // (A line that is no entry is not one; the rest still count.)
+            _ => {}
         }
     }
 
@@ -486,24 +512,27 @@ impl ProtocolHandler for NntpClientEndpoint {
                     };
                     self.protocol_error(ep, what, &line);
                 }
-                ReplyEvent::Status(status) => match self.phase {
-                    Phase::Greeting => self.on_greeting(ep, status),
-                    Phase::Capabilities { after_tls, .. } => self.on_capabilities_status(ep, after_tls, status),
-                    Phase::StartTls => self.on_starttls_reply(ep, status),
-                    Phase::PendingTls => {}
-                    Phase::AuthUser => self.on_auth_user_reply(ep, status),
-                    Phase::AuthPass => self.on_auth_pass_reply(ep, status),
-                    Phase::AuthSasl => self.on_auth_sasl_reply(ep, status),
-                    Phase::Ready => self.on_command_status(ep, status),
-                    Phase::Closed => {}
-                },
-                ReplyEvent::Line => match self.phase {
-                    Phase::Capabilities { .. } => self.caps_lines.push(lexer.line().to_vec()),
-                    Phase::Ready => self.on_command_block_line(ep, lexer.line()),
-                    _ => {}
-                },
+                ReplyEvent::Status(status) => self.on_status(ep, status, None),
+                ReplyEvent::Group(status, group) => self.on_status(ep, status, Some(Detail::Group(group))),
+                ReplyEvent::Article(status, article) => self.on_status(ep, status, Some(Detail::Article(article))),
+                ReplyEvent::Line => {
+                    if let Phase::Capabilities { .. } = self.phase {
+                        self.caps_lines.push(lexer.line().to_vec());
+                    }
+                }
+                ReplyEvent::Content => {
+                    if self.phase == Phase::Ready {
+                        self.on_command_block(ep, ReplyEvent::Content, lexer.content());
+                    }
+                }
+                event @ (ReplyEvent::Newsgroup(_) | ReplyEvent::Overview(_)) => {
+                    if self.phase == Phase::Ready {
+                        self.on_command_block(ep, event, &[]);
+                    }
+                }
+                ReplyEvent::BadEntry => {}
                 ReplyEvent::BlockEnd => {
-                    self.block_next = false;
+                    self.block_next = None;
                     match self.phase {
                         Phase::Capabilities { after_tls, .. } => self.on_capabilities_end(ep, after_tls),
                         Phase::Ready => self.on_command_block_end(ep),

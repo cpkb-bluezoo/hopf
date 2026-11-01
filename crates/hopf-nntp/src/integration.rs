@@ -294,8 +294,8 @@ struct Outcome {
     group_result: Option<Result<(u64, u64, u64), String>>,
     missing_group: Option<String>,
     overview: Vec<OverviewEntry>,
-    article: Vec<String>,
-    head: Vec<String>,
+    article: Vec<u8>,
+    head: Vec<u8>,
     posted: Option<Result<(), String>>,
     session: Option<NntpSession>,
 }
@@ -325,9 +325,9 @@ impl NntpClientHandler for FullRun {
         let o = Arc::clone(&self.0);
         session.over(10, 12, move |e| o.lock().unwrap().overview.push(e), |_| {});
         let o = Arc::clone(&self.0);
-        session.article(12, move |l| o.lock().unwrap().article.push(String::from_utf8_lossy(l).into_owned()), |_| {});
+        session.article(12, move |l| o.lock().unwrap().article.extend_from_slice(l), |_| {});
         let o = Arc::clone(&self.0);
-        session.head(12, move |l| o.lock().unwrap().head.push(String::from_utf8_lossy(l).into_owned()), |_| {});
+        session.head(12, move |l| o.lock().unwrap().head.extend_from_slice(l), |_| {});
         let o = Arc::clone(&self.0);
         session.post(
             b"From: alice <alice@example.com>\r\nNewsgroups: comp.lang.rust\r\nSubject: hi\r\n\r\n.hidden dot\r\nbody line\r\n",
@@ -374,8 +374,11 @@ fn assert_full_run(out: &Shared, recorded: &Arc<Mutex<Recorded>>, secure: bool, 
     assert_eq!(o.overview.len(), 3);
     assert_eq!(o.overview[1].references, "<a1@example.com>");
     assert_eq!(o.overview[2].subject, ".Leading dot subject");
-    assert_eq!(o.article, vec!["From: cat <cat@example.com>", "Subject: .Leading dot subject", "Message-ID: <c1@example.com>", "", ".starts with a dot", "second line"]);
-    assert_eq!(o.head.len(), 3);
+    assert_eq!(
+        String::from_utf8_lossy(&o.article),
+        "From: cat <cat@example.com>\r\nSubject: .Leading dot subject\r\nMessage-ID: <c1@example.com>\r\n\r\n.starts with a dot\r\nsecond line\r\n"
+    );
+    assert_eq!(o.head.iter().filter(|&&b| b == b'\n').count(), 3);
     assert_eq!(o.posted, Some(Ok(())));
     let r = recorded.lock().unwrap();
     assert_eq!(r.posted.len(), 1);
@@ -416,10 +419,9 @@ fn sasl_plain_is_preferred_when_offered() {
         .unwrap();
     assert_full_run(&out, &recorded, false, true);
     let cmds = recorded.lock().unwrap().commands.clone();
-    // hopf-auth's PLAIN client answers the server's empty challenge rather
-    // than sending an initial response inline; both are RFC 4643 §2.4.
-    assert!(cmds.iter().any(|c| c.starts_with("AUTHINFO SASL PLAIN")), "{cmds:?}");
-    assert!(cmds.iter().any(|c| c.starts_with("<sasl response")), "{cmds:?}");
+    // PLAIN sends its initial response with the command (RFC 4643 §2.4).
+    assert!(cmds.iter().any(|c| c == "AUTHINFO SASL PLAIN AGFsaWNlAHNlY3JldA=="), "{cmds:?}");
+    assert!(!cmds.iter().any(|c| c.starts_with("<sasl response")), "{cmds:?}");
     assert!(!cmds.iter().any(|c| c.starts_with("AUTHINFO USER")), "{cmds:?}");
 }
 

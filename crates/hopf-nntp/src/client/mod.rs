@@ -8,6 +8,8 @@ mod facade;
 mod handlers;
 pub(crate) mod reply;
 mod session;
+#[cfg(test)]
+mod session_tests;
 mod timeout;
 
 pub use error::NntpClientError;
@@ -15,7 +17,7 @@ pub use facade::NntpClient;
 pub use handlers::{NntpClientHandler, NntpClientHandlerFactory, NntpGreeting};
 pub use reply::{
     dot_stuff, parse_group_response, parse_newsgroup_line, parse_overview_line, parse_status,
-    GroupResult, NewsgroupEntry, NntpStatus, OverviewEntry,
+    ArticleRef, GroupResult, NewsgroupEntry, NntpStatus, OverviewEntry,
 };
-pub use session::{CompletionCallback, LineCallback, NntpSession};
+pub use session::{CompletionCallback, ContentCallback, NntpSession};
 pub use timeout::NntpClientTimeouts;

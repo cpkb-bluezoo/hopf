@@ -8,23 +8,46 @@ use std::sync::{Arc, Mutex};
 use hopf_core::ConnHandle;
 
 use super::error::NntpClientError;
-use super::reply::{
-    dot_stuff, parse_group_response, parse_newsgroup_line, parse_overview_line, GroupResult,
-    NewsgroupEntry, NntpStatus, OverviewEntry,
-};
+use super::reply::{dot_stuff, ArticleRef, Block, GroupResult, NewsgroupEntry, NntpStatus, OverviewEntry};
 
-/// Receives each line of a multi-line block, dot-unstuffed, without CRLF.
-pub type LineCallback = Box<dyn FnMut(&[u8]) + Send>;
+/// Receives the text of a multi-line block as it arrives: dot-unstuffed, line
+/// ends kept, in as many pieces as the connection delivers it in. No line
+/// is held back to be handed over whole.
+pub type ContentCallback = Box<dyn FnMut(&[u8]) + Send>;
 /// Receives a command's final status, or the error that ended the session.
 pub type CompletionCallback = Box<dyn FnOnce(Result<NntpStatus, NntpClientError>) + Send>;
+
+/// Where the block that follows a command's reply goes, and so how it is read.
+pub(crate) enum Sink {
+    Content(ContentCallback),
+    Newsgroups(Box<dyn FnMut(NewsgroupEntry) + Send>),
+    Overview(Box<dyn FnMut(OverviewEntry) + Send>),
+}
+
+impl Sink {
+    pub fn block(&self) -> Block {
+        match self {
+            Sink::Content(_) => Block::Raw,
+            Sink::Newsgroups(_) => Block::Newsgroups,
+            Sink::Overview(_) => Block::Overview,
+        }
+    }
+}
+
+/// What a status line carried, read into its fields as it arrived.
+pub(crate) enum Detail {
+    Group(GroupResult),
+    Article(ArticleRef),
+}
 
 /// One queued command.
 pub(crate) struct Command {
     /// Without CRLF.
     pub line: String,
-    /// Whether a multi-line block follows a 2xx reply that announces one.
-    pub multiline: bool,
-    pub on_line: LineCallback,
+    /// Where a multi-line block goes, when a 2xx reply announces one.
+    pub sink: Option<Sink>,
+    /// Receives the fields of a `GROUP` or article status.
+    pub on_detail: Option<Box<dyn FnMut(Detail) + Send>>,
     pub on_complete: CompletionCallback,
     /// When the first reply carries this code, write the payload (already
     /// framed) and wait for a second status line.
@@ -83,85 +106,108 @@ impl NntpSession {
         self.conn.poke();
     }
 
-    /// Any command. `on_line` receives each line of a multi-line block
-    /// (dot-unstuffed, without CRLF) when `multiline` is set and the reply
-    /// code announces one; `on_complete` gets the final status, or the
+    fn queue(&self, line: String, sink: Option<Sink>, on_detail: Option<Box<dyn FnMut(Detail) + Send>>, on_complete: CompletionCallback) {
+        self.enqueue(Command { line, sink, on_detail, on_complete, continuation: None });
+    }
+
+    /// Any command. `on_content` receives the multi-line block (dot-unstuffed,
+    /// line ends kept, in pieces) when `multiline` is set and the reply code
+    /// announces one; `on_complete` gets the final status, or the
     /// transport error that ended the session.
     pub fn command(
         &self,
         line: impl Into<String>,
         multiline: bool,
-        on_line: impl FnMut(&[u8]) + Send + 'static,
+        on_content: impl FnMut(&[u8]) + Send + 'static,
         on_complete: impl FnOnce(Result<NntpStatus, NntpClientError>) + Send + 'static,
     ) {
-        self.enqueue(Command {
-            line: line.into(),
-            multiline,
-            on_line: Box::new(on_line),
-            on_complete: Box::new(on_complete),
-            continuation: None,
-        });
+        let sink = multiline.then(|| Sink::Content(Box::new(on_content)));
+        self.queue(line.into(), sink, None, Box::new(on_complete));
     }
 
-    /// `LIST ACTIVE [wildmat]`.
+    /// `LIST ACTIVE [wildmat]`: one call per newsgroup, as its line is read.
     pub fn list_active(
         &self,
         wildmat: &str,
-        mut on_entry: impl FnMut(NewsgroupEntry) + Send + 'static,
+        on_entry: impl FnMut(NewsgroupEntry) + Send + 'static,
         on_complete: impl FnOnce(Result<(), NntpClientError>) + Send + 'static,
     ) {
         let wm = wildmat.trim();
         let line = if wm.is_empty() { "LIST ACTIVE".to_string() } else { format!("LIST ACTIVE {wm}") };
-        self.command(
+        self.queue(
             line,
-            true,
-            move |l| {
-                if let Some(e) = parse_newsgroup_line(&String::from_utf8_lossy(l)) {
-                    on_entry(e);
-                }
-            },
-            move |r| on_complete(expect(r, "LIST ACTIVE", 215).map(|_| ())),
+            Some(Sink::Newsgroups(Box::new(on_entry))),
+            None,
+            Box::new(move |r| on_complete(expect(r, "LIST ACTIVE", 215).map(|_| ()))),
         );
     }
 
     /// `GROUP name`.
     pub fn group(&self, name: &str, on_complete: impl FnOnce(Result<GroupResult, NntpClientError>) + Send + 'static) {
-        self.command(format!("GROUP {name}"), false, |_| {}, move |r| {
-            on_complete(expect(r, "GROUP", 211).and_then(|s| {
-                parse_group_response(&s.text).ok_or_else(|| NntpClientError::new(211, format!("bad GROUP response: {}", s.text)))
-            }))
-        });
+        let slot: Arc<Mutex<Option<GroupResult>>> = Arc::default();
+        let fill = Arc::clone(&slot);
+        self.queue(
+            format!("GROUP {name}"),
+            None,
+            Some(Box::new(move |d| {
+                if let Detail::Group(g) = d {
+                    *fill.lock().unwrap() = Some(g);
+                }
+            })),
+            Box::new(move |r| {
+                on_complete(expect(r, "GROUP", 211).and_then(|s| {
+                    slot.lock().unwrap().take().ok_or_else(|| NntpClientError::new(211, format!("bad GROUP response: {}", s.text)))
+                }))
+            }),
+        );
     }
 
-    /// `OVER first-last` in the selected group.
+    /// `STAT number`: whether the article exists, and what it is called.
+    pub fn stat(&self, number: u64, on_complete: impl FnOnce(Result<ArticleRef, NntpClientError>) + Send + 'static) {
+        let slot: Arc<Mutex<Option<ArticleRef>>> = Arc::default();
+        let fill = Arc::clone(&slot);
+        self.queue(
+            format!("STAT {number}"),
+            None,
+            Some(Box::new(move |d| {
+                if let Detail::Article(a) = d {
+                    *fill.lock().unwrap() = Some(a);
+                }
+            })),
+            Box::new(move |r| {
+                on_complete(expect(r, "STAT", 223).and_then(|s| {
+                    slot.lock().unwrap().take().ok_or_else(|| NntpClientError::new(223, format!("bad STAT response: {}", s.text)))
+                }))
+            }),
+        );
+    }
+
+    /// `OVER first-last` in the selected group: one call per article, as its
+    /// line is read.
     pub fn over(
         &self,
         first: u64,
         last: u64,
-        mut on_entry: impl FnMut(OverviewEntry) + Send + 'static,
+        on_entry: impl FnMut(OverviewEntry) + Send + 'static,
         on_complete: impl FnOnce(Result<(), NntpClientError>) + Send + 'static,
     ) {
-        self.command(
+        self.queue(
             format!("OVER {first}-{last}"),
-            true,
-            move |l| {
-                if let Some(e) = parse_overview_line(&String::from_utf8_lossy(l)) {
-                    on_entry(e);
-                }
-            },
-            move |r| on_complete(expect(r, "OVER", 224).map(|_| ())),
+            Some(Sink::Overview(Box::new(on_entry))),
+            None,
+            Box::new(move |r| on_complete(expect(r, "OVER", 224).map(|_| ()))),
         );
     }
 
-    /// `ARTICLE number` in the selected group; `on_line` gets headers,
-    /// the empty separator line and the body, line by line.
+    /// `ARTICLE number` in the selected group; `on_content` gets the headers,
+    /// the empty separator line and the body, as they arrive.
     pub fn article(
         &self,
         number: u64,
-        on_line: impl FnMut(&[u8]) + Send + 'static,
+        on_content: impl FnMut(&[u8]) + Send + 'static,
         on_complete: impl FnOnce(Result<(), NntpClientError>) + Send + 'static,
     ) {
-        self.command(format!("ARTICLE {number}"), true, on_line, move |r| {
+        self.command(format!("ARTICLE {number}"), true, on_content, move |r| {
             on_complete(expect(r, "ARTICLE", 220).map(|_| ()))
         });
     }
@@ -170,11 +216,23 @@ impl NntpSession {
     pub fn head(
         &self,
         number: u64,
-        on_line: impl FnMut(&[u8]) + Send + 'static,
+        on_content: impl FnMut(&[u8]) + Send + 'static,
         on_complete: impl FnOnce(Result<(), NntpClientError>) + Send + 'static,
     ) {
-        self.command(format!("HEAD {number}"), true, on_line, move |r| {
+        self.command(format!("HEAD {number}"), true, on_content, move |r| {
             on_complete(expect(r, "HEAD", 221).map(|_| ()))
+        });
+    }
+
+    /// `BODY number` in the selected group.
+    pub fn body(
+        &self,
+        number: u64,
+        on_content: impl FnMut(&[u8]) + Send + 'static,
+        on_complete: impl FnOnce(Result<(), NntpClientError>) + Send + 'static,
+    ) {
+        self.command(format!("BODY {number}"), true, on_content, move |r| {
+            on_complete(expect(r, "BODY", 222).map(|_| ()))
         });
     }
 
@@ -183,8 +241,8 @@ impl NntpSession {
     pub fn post(&self, article: &[u8], on_complete: impl FnOnce(Result<(), NntpClientError>) + Send + 'static) {
         self.enqueue(Command {
             line: "POST".to_string(),
-            multiline: false,
-            on_line: Box::new(|_| {}),
+            sink: None,
+            on_detail: None,
             on_complete: Box::new(move |r| on_complete(expect(r, "POST", 240).map(|_| ()))),
             continuation: Some((340, dot_stuff(article))),
         });
@@ -195,8 +253,8 @@ impl NntpSession {
         let conn = self.conn.clone();
         self.enqueue(Command {
             line: "QUIT".to_string(),
-            multiline: false,
-            on_line: Box::new(|_| {}),
+            sink: None,
+            on_detail: None,
             on_complete: Box::new(move |_| conn.close()),
             continuation: None,
         });
