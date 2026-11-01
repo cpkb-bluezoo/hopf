@@ -682,7 +682,8 @@ fn abor_always_answers() {
     let mut s = Session::logged_in();
     assert!(s.run("ABOR").starts_with("226 "), "even with nothing to abort");
     let _d = s.passive();
-    assert!(s.run("ABOR").starts_with("226 "));
+    // Whether the data connection was already accepted decides if a 426 comes first.
+    assert!(s.run("ABOR").contains("226 "));
     assert!(s.run("LIST").starts_with("425 "), "ABOR dropped the data connection it had set up");
 }
 

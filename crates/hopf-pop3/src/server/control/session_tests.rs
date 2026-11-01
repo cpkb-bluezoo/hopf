@@ -81,7 +81,14 @@ impl Session {
 
     /// Drops the connection without a QUIT and connects again to the same mailbox.
     pub(super) fn reconnect(&mut self) {
+        let old = Arc::clone(&self.peer.handler.bundle);
         self.peer.disconnect();
+        // Leaving a mailbox without QUIT closes it on the storage pool; the
+        // next session must not start (and rename files) alongside that.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while old.lock().unwrap().mailbox.is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
         let store = Arc::new(hopf_auth::PasswordStore::new().with_user("u", "p"));
         let listen: SocketAddr = "127.0.0.1:1110".parse().unwrap();
         let (peer, greeting) = Self::connect(Pop3Config::new(listen, "localhost", store, self.factory.clone()));

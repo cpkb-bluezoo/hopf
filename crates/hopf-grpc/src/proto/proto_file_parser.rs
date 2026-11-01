@@ -331,18 +331,18 @@ impl ProtoFileParser {
         self.parse_field_options()?;
         self.expect(';')?;
 
-        // Gumdrop computes key/value FieldTypes then discards them.
+        // The key must be a scalar; the value a scalar or a message/enum
+        // name, which resolves against the package like any field's type.
         let _key_ft = self.scalar_type_from_name(&key_type)?;
-        let _value_ft = if value_type.starts_with('.')
-            || value_type
-                .chars()
-                .next()
-                .map(|c| c.is_uppercase())
-                .unwrap_or(false)
-        {
-            FieldType::Message
+        let value_type = if is_scalar_type(&value_type) {
+            self.scalar_type_from_name(&value_type)?;
+            value_type
+        } else if let Some(rest) = value_type.strip_prefix('.') {
+            rest.to_string()
+        } else if parent_full_name.is_empty() {
+            value_type
         } else {
-            self.scalar_type_from_name(&value_type)?
+            resolve_type(parent_full_name, &value_type)
         };
 
         Ok(Some(

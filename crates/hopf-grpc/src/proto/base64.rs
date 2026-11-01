@@ -38,69 +38,49 @@ fn decode_char(c: u8) -> Option<u8> {
         b'A'..=b'Z' => Some(c - b'A'),
         b'a'..=b'z' => Some(c - b'a' + 26),
         b'0'..=b'9' => Some(c - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
+        // The standard alphabet and the URL-safe one: proto3 JSON parsers
+        // accept either for `bytes`.
+        b'+' | b'-' => Some(62),
+        b'/' | b'_' => Some(63),
         _ => None,
     }
 }
 
-/// Decode standard Base64 (padding optional). Returns `None` on invalid input.
+/// Decode Base64, standard or URL-safe alphabet, padding optional. Returns
+/// `None` on invalid input: a character outside the alphabets, `=` anywhere
+/// but the end, padding that does not complete a group, or a length no
+/// whole number of bytes encodes.
 pub fn decode(s: &str) -> Option<Vec<u8>> {
-    let bytes: Vec<u8> = s
-        .bytes()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
-    if bytes.is_empty() {
-        return Some(Vec::new());
-    }
+    let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     let pad = bytes.iter().rev().take_while(|&&b| b == b'=').count();
     if pad > 2 {
         return None;
     }
-    let len = bytes.len();
-    if len % 4 != 0 {
-        // Allow unpadded input by synthetically padding.
-        let need = (4 - (len % 4)) % 4;
-        let mut padded = bytes;
-        padded.extend(std::iter::repeat_n(b'=', need));
-        return decode_padded(&padded);
+    let body = &bytes[..bytes.len() - pad];
+    if body.contains(&b'=') {
+        return None;
     }
-    decode_padded(&bytes)
-}
-
-fn decode_padded(bytes: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    let mut i = 0;
-    while i < bytes.len() {
-        let a = if bytes[i] == b'=' {
-            0
-        } else {
-            decode_char(bytes[i])?
-        };
-        let b = if bytes[i + 1] == b'=' {
-            0
-        } else {
-            decode_char(bytes[i + 1])?
-        };
-        let c = if bytes[i + 2] == b'=' {
-            0
-        } else {
-            decode_char(bytes[i + 2])?
-        };
-        let d = if bytes[i + 3] == b'=' {
-            0
-        } else {
-            decode_char(bytes[i + 3])?
-        };
-        let n = ((a as u32) << 18) | ((b as u32) << 12) | ((c as u32) << 6) | (d as u32);
-        out.push(((n >> 16) & 0xff) as u8);
-        if bytes[i + 2] != b'=' {
-            out.push(((n >> 8) & 0xff) as u8);
+    // With padding the group must be completed; without it any length but
+    // 1 mod 4 (a single sextet carries no whole byte) is fine.
+    if pad > 0 && bytes.len() % 4 != 0 {
+        return None;
+    }
+    if body.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(body.len() / 4 * 3 + 2);
+    for chunk in body.chunks(4) {
+        let mut n = 0u32;
+        for (i, &c) in chunk.iter().enumerate() {
+            n |= u32::from(decode_char(c)?) << (18 - 6 * i);
         }
-        if bytes[i + 3] != b'=' {
-            out.push((n & 0xff) as u8);
+        out.push((n >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((n >> 8) as u8);
         }
-        i += 4;
+        if chunk.len() > 3 {
+            out.push(n as u8);
+        }
     }
     Some(out)
 }

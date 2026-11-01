@@ -151,12 +151,29 @@ fn write_scalar(
             }
             writer.write_i32(ring, num)
         }
-        FieldType::Float => writer.write_f64(ring, as_f64(value)),
-        FieldType::Double => writer.write_f64(ring, as_f64(value)),
+        // NaN and the infinities are strings in proto3 JSON; a number is the
+        // value the field has, not the double it widens to (0.1f32 is 0.1).
+        FieldType::Float => {
+            let f = match value {
+                ScalarValue::F32(v) => *v,
+                other => as_f64(other) as f32,
+            };
+            match non_finite(f64::from(f)) {
+                Some(text) => writer.write_string(ring, text),
+                None => writer.write_f64(ring, format!("{f}").parse().unwrap_or(f64::from(f))),
+            }
+        }
+        FieldType::Double => {
+            let d = as_f64(value);
+            match non_finite(d) {
+                Some(text) => writer.write_string(ring, text),
+                None => writer.write_f64(ring, d),
+            }
+        }
         FieldType::Int32 | FieldType::Sint32 | FieldType::Sfixed32 => {
             writer.write_i32(ring, as_i64(value) as i32)
         }
-        FieldType::Uint32 | FieldType::Fixed32 => writer.write_i64(ring, as_u64(value) as i64),
+        FieldType::Uint32 | FieldType::Fixed32 => writer.write_i64(ring, i64::from(as_u64(value) as u32)),
         // 64-bit integers are JSON strings in proto3 JSON mapping.
         FieldType::Int64 | FieldType::Sint64 | FieldType::Sfixed64 => {
             writer.write_string(ring, &as_i64(value).to_string())
@@ -165,6 +182,19 @@ fn write_scalar(
             writer.write_string(ring, &as_u64(value).to_string())
         }
         FieldType::Message | FieldType::Map => Ok(()),
+    }
+}
+
+/// The proto3 JSON spelling of a non-finite floating point value.
+fn non_finite(v: f64) -> Option<&'static str> {
+    if v.is_nan() {
+        Some("NaN")
+    } else if v == f64::INFINITY {
+        Some("Infinity")
+    } else if v == f64::NEG_INFINITY {
+        Some("-Infinity")
+    } else {
+        None
     }
 }
 
@@ -237,5 +267,113 @@ mod tests {
         let (a, b) = ring.readable_spans();
         let s = String::from_utf8([a, b].concat()).unwrap();
         assert_eq!(s, r#"{"text":"hi","fooBar":7}"#);
+    }
+
+    const SRC: &str = r#"
+        syntax = "proto3";
+        package demo;
+        enum Color { RED = 0; GREEN = 1; }
+        message Inner { int32 v = 1; }
+        message M {
+            int32 i32 = 1; int64 i64 = 2; uint32 u32 = 3; uint64 u64 = 4;
+            sint32 s32 = 5; sint64 s64 = 6; fixed32 f32 = 7; fixed64 f64 = 8;
+            sfixed32 sf32 = 9; sfixed64 sf64 = 10; float fl = 11; double db = 12;
+            bool b = 13; string s = 14; bytes by = 15; Color color = 16;
+            Inner one = 17;
+        }
+    "#;
+
+    /// The JSON for one `field` call on `demo.M`.
+    fn json(name: &str, value: ScalarValue) -> Result<String, String> {
+        let mut ser = JsonModelSerializer::new(ProtoFileParser::parse(SRC).unwrap());
+        let mut w = Writer::new();
+        let mut ring = LoopBuf::with_capacity(512);
+        ser.start_message(&mut w, &mut ring, "demo.M").unwrap();
+        ser.field(&mut w, &mut ring, name, value).map_err(|e| e.to_string())?;
+        ser.end_message(&mut w, &mut ring).unwrap();
+        let (a, b) = ring.readable_spans();
+        Ok(String::from_utf8([a, b].concat()).unwrap())
+    }
+
+    #[test]
+    fn integers_follow_the_proto3_json_mapping() {
+        assert_eq!(json("i32", ScalarValue::I32(-5)).unwrap(), r#"{"i32":-5}"#);
+        assert_eq!(json("s32", ScalarValue::I32(-5)).unwrap(), r#"{"s32":-5}"#);
+        assert_eq!(json("sf32", ScalarValue::I32(i32::MIN)).unwrap(), r#"{"sf32":-2147483648}"#);
+        assert_eq!(json("u32", ScalarValue::U64(4_000_000_000)).unwrap(), r#"{"u32":4000000000}"#);
+        assert_eq!(json("f32", ScalarValue::U64(4_294_967_295)).unwrap(), r#"{"f32":4294967295}"#);
+        // 64-bit integers are strings
+        assert_eq!(json("i64", ScalarValue::I64(-9)).unwrap(), r#"{"i64":"-9"}"#);
+        assert_eq!(json("s64", ScalarValue::I64(i64::MIN)).unwrap(), r#"{"s64":"-9223372036854775808"}"#);
+        assert_eq!(json("sf64", ScalarValue::I64(-1)).unwrap(), r#"{"sf64":"-1"}"#);
+        assert_eq!(json("u64", ScalarValue::U64(u64::MAX)).unwrap(), r#"{"u64":"18446744073709551615"}"#);
+        assert_eq!(json("f64", ScalarValue::U64(u64::MAX)).unwrap(), r#"{"f64":"18446744073709551615"}"#);
+    }
+
+    #[test]
+    fn a_value_arriving_as_the_other_integer_kind_still_prints_correctly() {
+        // The wire decoder may deliver a 64-bit value as I64 or U64.
+        assert_eq!(json("i64", ScalarValue::U64((-3i64) as u64)).unwrap(), r#"{"i64":"-3"}"#);
+        assert_eq!(json("u64", ScalarValue::I64(5)).unwrap(), r#"{"u64":"5"}"#);
+        assert_eq!(json("u32", ScalarValue::I32(-294_967_296)).unwrap(), r#"{"u32":4000000000}"#);
+    }
+
+    #[test]
+    fn floats_follow_the_proto3_json_mapping() {
+        assert_eq!(json("db", ScalarValue::F64(1.5)).unwrap(), r#"{"db":1.5}"#);
+        assert_eq!(json("db", ScalarValue::F64(-0.25)).unwrap(), r#"{"db":-0.25}"#);
+        assert_eq!(json("db", ScalarValue::F64(f64::NAN)).unwrap(), r#"{"db":"NaN"}"#);
+        assert_eq!(json("db", ScalarValue::F64(f64::INFINITY)).unwrap(), r#"{"db":"Infinity"}"#);
+        assert_eq!(json("db", ScalarValue::F64(f64::NEG_INFINITY)).unwrap(), r#"{"db":"-Infinity"}"#);
+        assert_eq!(json("fl", ScalarValue::F32(f32::NAN)).unwrap(), r#"{"fl":"NaN"}"#);
+        assert_eq!(json("fl", ScalarValue::F32(f32::INFINITY)).unwrap(), r#"{"fl":"Infinity"}"#);
+    }
+
+    #[test]
+    fn a_float_prints_as_the_float_it_is() {
+        // 0.1f32 is not 0.10000000149011612 to anyone reading the JSON.
+        assert_eq!(json("fl", ScalarValue::F32(0.1)).unwrap(), r#"{"fl":0.1}"#);
+        assert_eq!(json("fl", ScalarValue::F32(3.5)).unwrap(), r#"{"fl":3.5}"#);
+    }
+
+    #[test]
+    fn bytes_enums_booleans_and_strings() {
+        assert_eq!(json("by", ScalarValue::Bytes(vec![0xfb, 0xff])).unwrap(), r#"{"by":"+/8="}"#);
+        assert_eq!(json("by", ScalarValue::Bytes(vec![])).unwrap(), r#"{"by":""}"#);
+        assert_eq!(json("color", ScalarValue::U64(1)).unwrap(), r#"{"color":"GREEN"}"#);
+        assert_eq!(json("color", ScalarValue::U64(0)).unwrap(), r#"{"color":"RED"}"#);
+        assert_eq!(json("color", ScalarValue::U64(7)).unwrap(), r#"{"color":7}"#, "an unknown number stays a number");
+        assert_eq!(json("b", ScalarValue::Bool(true)).unwrap(), r#"{"b":true}"#);
+        assert_eq!(json("b", ScalarValue::Bool(false)).unwrap(), r#"{"b":false}"#);
+        assert_eq!(json("s", ScalarValue::String("a\"b\\c\n☃".into())).unwrap(), r#"{"s":"a\"b\\c\n☃"}"#);
+    }
+
+    #[test]
+    fn unknown_fields_are_not_written() {
+        assert_eq!(json("nope", ScalarValue::I32(1)).unwrap(), "{}");
+    }
+
+    #[test]
+    fn nested_messages_become_nested_objects() {
+        let mut ser = JsonModelSerializer::new(ProtoFileParser::parse(SRC).unwrap());
+        let mut w = Writer::new();
+        let mut ring = LoopBuf::with_capacity(512);
+        ser.start_message(&mut w, &mut ring, "demo.M").unwrap();
+        ser.field(&mut w, &mut ring, "i32", ScalarValue::I32(1)).unwrap();
+        ser.start_field(&mut w, &mut ring, "one", "demo.Inner").unwrap();
+        ser.field(&mut w, &mut ring, "v", ScalarValue::I32(2)).unwrap();
+        ser.end_field(&mut w, &mut ring).unwrap();
+        ser.end_message(&mut w, &mut ring).unwrap();
+        let (a, b) = ring.readable_spans();
+        assert_eq!(String::from_utf8([a, b].concat()).unwrap(), r#"{"i32":1,"one":{"v":2}}"#);
+    }
+
+    #[test]
+    fn an_unknown_message_type_is_an_error() {
+        let mut ser = JsonModelSerializer::new(ProtoFileParser::parse(SRC).unwrap());
+        let mut w = Writer::new();
+        let mut ring = LoopBuf::with_capacity(64);
+        assert!(ser.start_message(&mut w, &mut ring, "demo.Missing").is_err());
+        assert!(ser.start_message(&mut w, &mut ring, ".demo.M").is_ok(), "a leading dot is allowed");
     }
 }

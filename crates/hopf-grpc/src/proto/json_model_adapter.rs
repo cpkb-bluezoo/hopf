@@ -169,6 +169,25 @@ impl<H: ProtoMessageHandler> JsonModelAdapter<H> {
         Ok(())
     }
 
+    /// An enum value given by name (or as a number in a string).
+    fn enum_from_string(&self, enum_name: Option<&str>, s: &str) -> ParseResult<ScalarValue> {
+        if let Some(enm) = enum_name.and_then(|n| self.proto_file.enum_type(n)) {
+            if let Some(num) = enm.value_number(s) {
+                return Ok(ScalarValue::U64(num as u64));
+            }
+        }
+        if let Ok(n) = s.parse::<i32>() {
+            return Ok(ScalarValue::U64(n as u64));
+        }
+        Err(ParseError::new(format!("unknown enum value {s}")))
+    }
+
+    /// The enum a map field's values are of, if they are enums.
+    fn map_value_enum(&self, fd: &FieldDescriptor) -> Option<String> {
+        let name = fd.value_type_name.as_deref()?;
+        self.proto_file.enum_type(name).map(|_| name.to_string())
+    }
+
     fn convert_string(&self, fd: &FieldDescriptor, s: &str) -> ParseResult<ScalarValue> {
         match fd.field_type {
             FieldType::String => Ok(ScalarValue::String(s.to_string())),
@@ -177,54 +196,38 @@ impl<H: ProtoMessageHandler> JsonModelAdapter<H> {
                     base64::decode(s).ok_or_else(|| ParseError::new("invalid base64 bytes"))?;
                 Ok(ScalarValue::Bytes(bytes))
             }
-            FieldType::Enum => {
-                if let Some(ref enum_name) = fd.enum_type_name {
-                    if let Some(enm) = self.proto_file.enum_type(enum_name) {
-                        if let Some(num) = enm.value_number(s) {
-                            return Ok(ScalarValue::U64(num as u64));
-                        }
-                    }
-                }
-                if let Ok(n) = s.parse::<i32>() {
-                    return Ok(ScalarValue::U64(n as u64));
-                }
-                Err(ParseError::new(format!("unknown enum value {s}")))
-            }
-            FieldType::Int64 | FieldType::Sint64 | FieldType::Sfixed64 => {
-                let v: i64 = s
-                    .parse()
-                    .map_err(|_| ParseError::new("invalid int64 string"))?;
-                Ok(ScalarValue::I64(v))
-            }
-            FieldType::Uint64 | FieldType::Fixed64 => {
-                let v: u64 = s
-                    .parse()
-                    .map_err(|_| ParseError::new("invalid uint64 string"))?;
-                Ok(ScalarValue::U64(v))
-            }
+            FieldType::Enum => self.enum_from_string(fd.enum_type_name.as_deref(), s),
             FieldType::Int32
             | FieldType::Sint32
             | FieldType::Sfixed32
             | FieldType::Uint32
-            | FieldType::Fixed32 => {
-                let v: i64 = s
+            | FieldType::Fixed32
+            | FieldType::Int64
+            | FieldType::Sint64
+            | FieldType::Sfixed64
+            | FieldType::Uint64
+            | FieldType::Fixed64 => {
+                let v: i128 = s
                     .parse()
-                    .map_err(|_| ParseError::new("invalid integer string"))?;
-                if matches!(fd.field_type, FieldType::Uint32 | FieldType::Fixed32) {
-                    Ok(ScalarValue::U64(v as u64))
-                } else {
-                    Ok(ScalarValue::I32(v as i32))
-                }
+                    .map_err(|_| ParseError::new(format!("invalid integer string for field {}", fd.name)))?;
+                integer_scalar(&fd.field_type, v, &fd.name)
             }
             FieldType::Float | FieldType::Double => {
-                let v: f64 = s
-                    .parse()
-                    .map_err(|_| ParseError::new("invalid float string"))?;
-                if fd.field_type == FieldType::Float {
-                    Ok(ScalarValue::F32(v as f32))
-                } else {
-                    Ok(ScalarValue::F64(v))
-                }
+                // Only the three spelled-out non-finite values; "inf", "nan"
+                // and numbers too big for a double are not proto3 JSON.
+                let v: f64 = match s {
+                    "NaN" => f64::NAN,
+                    "Infinity" => f64::INFINITY,
+                    "-Infinity" => f64::NEG_INFINITY,
+                    _ => {
+                        let v: f64 = s.parse().map_err(|_| ParseError::new("invalid float string"))?;
+                        if !v.is_finite() {
+                            return Err(ParseError::new("float string out of range"));
+                        }
+                        v
+                    }
+                };
+                float_scalar(&fd.field_type, v, &fd.name)
             }
             FieldType::Bool => match s {
                 "true" => Ok(ScalarValue::Bool(true)),
@@ -275,50 +278,76 @@ impl<H: ProtoMessageHandler> JsonModelAdapter<H> {
     }
 }
 
+/// The integer a JSON number stands for: whole numbers however they are
+/// written (`1`, `1.0`, `1e2`), as proto3 JSON allows; `None` for anything else.
+fn whole_number(n: &Number) -> Option<i128> {
+    match n {
+        Number::I32(v) => Some(i128::from(*v)),
+        Number::I64(v) => Some(i128::from(*v)),
+        Number::BigInt(s) => s.parse().ok(),
+        Number::F64(f) if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e20 => Some(*f as i128),
+        Number::F64(_) => None,
+    }
+}
+
+/// `v` as the scalar for an integer field of type `ty`, or an error if it
+/// does not fit: a value is never truncated or wrapped into range.
+fn integer_scalar(ty: &FieldType, v: i128, name: &str) -> ParseResult<ScalarValue> {
+    let out = |lo: i128, hi: i128, wrap: fn(i128) -> ScalarValue| {
+        if (lo..=hi).contains(&v) {
+            Ok(wrap(v))
+        } else {
+            Err(ParseError::new(format!("value {v} out of range for field {name}")))
+        }
+    };
+    match ty {
+        FieldType::Int32 | FieldType::Sint32 | FieldType::Sfixed32 => {
+            out(i128::from(i32::MIN), i128::from(i32::MAX), |v| ScalarValue::I32(v as i32))
+        }
+        FieldType::Uint32 | FieldType::Fixed32 => out(0, i128::from(u32::MAX), |v| ScalarValue::U64(v as u64)),
+        FieldType::Int64 | FieldType::Sint64 | FieldType::Sfixed64 => {
+            out(i128::from(i64::MIN), i128::from(i64::MAX), |v| ScalarValue::I64(v as i64))
+        }
+        FieldType::Uint64 | FieldType::Fixed64 => out(0, i128::from(u64::MAX), |v| ScalarValue::U64(v as u64)),
+        _ => Err(ParseError::new(format!("not an integer field: {name}"))),
+    }
+}
+
+/// `v` as the scalar for a float or double field; a finite value too big
+/// for a `float` is an error rather than infinity.
+fn float_scalar(ty: &FieldType, v: f64, name: &str) -> ParseResult<ScalarValue> {
+    if *ty == FieldType::Float {
+        if v.is_finite() && v.abs() > f64::from(f32::MAX) {
+            return Err(ParseError::new(format!("value out of range for float field {name}")));
+        }
+        Ok(ScalarValue::F32(v as f32))
+    } else {
+        Ok(ScalarValue::F64(v))
+    }
+}
+
 fn convert_number(fd: &FieldDescriptor, n: &Number) -> ParseResult<ScalarValue> {
     match fd.field_type {
-        FieldType::Double => Ok(ScalarValue::F64(
-            n.as_f64()
-                .ok_or_else(|| ParseError::new("invalid double"))?,
-        )),
-        FieldType::Float => Ok(ScalarValue::F32(
-            n.as_f64()
-                .ok_or_else(|| ParseError::new("invalid float"))? as f32,
-        )),
+        FieldType::Double | FieldType::Float => {
+            let v = match n {
+                Number::BigInt(s) => s.parse::<f64>().ok(),
+                other => other.as_f64(),
+            }
+            .ok_or_else(|| ParseError::new("invalid floating point number"))?;
+            float_scalar(&fd.field_type, v, &fd.name)
+        }
         FieldType::Bool => Err(ParseError::new("expected boolean for bool field")),
         FieldType::String | FieldType::Bytes | FieldType::Message | FieldType::Map => Err(
             ParseError::new(format!("unexpected number for field {}", fd.name)),
         ),
-        FieldType::Int32 | FieldType::Sint32 | FieldType::Sfixed32 | FieldType::Enum => {
-            if let Some(v) = n.as_i32() {
-                Ok(ScalarValue::I32(v))
-            } else if let Some(v) = n.as_i64() {
-                Ok(ScalarValue::I32(v as i32))
-            } else {
-                Err(ParseError::new("invalid int32"))
-            }
+        FieldType::Enum => {
+            let v = whole_number(n).ok_or_else(|| ParseError::new("invalid enum number"))?;
+            integer_scalar(&FieldType::Int32, v, &fd.name)
         }
-        FieldType::Uint32 | FieldType::Fixed32 => {
-            let v = n
-                .as_i64()
-                .ok_or_else(|| ParseError::new("invalid uint32"))?;
-            Ok(ScalarValue::U64(v as u64))
-        }
-        FieldType::Int64 | FieldType::Sint64 | FieldType::Sfixed64 => {
-            let v = n
-                .as_i64()
-                .ok_or_else(|| ParseError::new("invalid int64"))?;
-            Ok(ScalarValue::I64(v))
-        }
-        FieldType::Uint64 | FieldType::Fixed64 => {
-            if let Some(v) = n.as_i64() {
-                Ok(ScalarValue::U64(v as u64))
-            } else if let Number::BigInt(s) = n {
-                let v: u64 = s.parse().map_err(|_| ParseError::new("invalid uint64"))?;
-                Ok(ScalarValue::U64(v))
-            } else {
-                Err(ParseError::new("invalid uint64"))
-            }
+        _ => {
+            let v = whole_number(n)
+                .ok_or_else(|| ParseError::new(format!("invalid integer for field {}", fd.name)))?;
+            integer_scalar(&fd.field_type, v, &fd.name)
         }
     }
 }
@@ -465,7 +494,7 @@ impl<H: ProtoMessageHandler> ContentHandler for JsonModelAdapter<H> {
                     .value_type_name
                     .clone()
                     .ok_or_else(|| ParseError::new("map missing value type"))?;
-                if !is_message_value_type(&value_type) {
+                if !is_message_value_type(&value_type) || self.proto_file.enum_type(&value_type).is_some() {
                     return Err(ParseError::new("expected scalar map value"));
                 }
                 let entry_type = map_entry_type_name(&field);
@@ -596,12 +625,21 @@ impl<H: ProtoMessageHandler> ContentHandler for JsonModelAdapter<H> {
             _ => return Err(ParseError::new("unexpected number")),
         };
         let scalar = if matches!(self.pending, Some(Pending::MapValue { .. })) {
-            map_value_from_number(&fd, value)?
+            if self.map_value_enum(&fd).is_some() {
+                let v = whole_number(value).ok_or_else(|| ParseError::new("invalid enum number"))?;
+                match integer_scalar(&FieldType::Int32, v, &fd.name)? {
+                    ScalarValue::I32(n) => ScalarValue::U64(n as u64),
+                    other => other,
+                }
+            } else {
+                map_value_from_number(&fd, value)?
+            }
         } else if fd.field_type == FieldType::Enum {
-            let v = value
-                .as_i64()
-                .ok_or_else(|| ParseError::new("invalid enum number"))?;
-            ScalarValue::U64(v as u64)
+            let v = whole_number(value).ok_or_else(|| ParseError::new("invalid enum number"))?;
+            match integer_scalar(&FieldType::Int32, v, &fd.name)? {
+                ScalarValue::I32(n) => ScalarValue::U64(n as u64),
+                other => other,
+            }
         } else {
             convert_number(&fd, value)?
         };
@@ -632,7 +670,10 @@ impl<H: ProtoMessageHandler> ContentHandler for JsonModelAdapter<H> {
             _ => return Err(ParseError::new("unexpected string")),
         };
         let scalar = if matches!(self.pending, Some(Pending::MapValue { .. })) {
-            map_value_from_string(&fd, &value)?
+            match self.map_value_enum(&fd) {
+                Some(enum_name) => self.enum_from_string(Some(&enum_name), &value)?,
+                None => map_value_from_string(&fd, &value)?,
+            }
         } else {
             self.convert_string(&fd, &value)?
         };
@@ -785,5 +826,233 @@ mod tests {
         let ev = adapter.into_handler().events;
         assert!(ev.iter().any(|e| e.contains(r#"field:text=String("hi")"#)));
         assert!(ev.iter().any(|e| e.contains("field:n=I32(7)")));
+    }
+
+    const SCALARS: &str = r#"
+        syntax = "proto3";
+        package demo;
+        enum Color { RED = 0; GREEN = 1; BLUE = 2; }
+        message Scalars {
+            int32 i32 = 1; uint32 u32 = 2; int64 i64 = 3; uint64 u64 = 4;
+            sint32 s32 = 5; fixed32 f32 = 6; sfixed64 sf64 = 7;
+            float fl = 8; double db = 9; bool b = 10; string s = 11; bytes by = 12;
+            Color color = 13;
+            repeated int32 nums = 14;
+            map<string, int32> counts = 15;
+            map<int32, string> names = 16;
+            map<bool, string> flags = 17;
+        }
+    "#;
+
+    /// The events the adapter produces for `json` as a `demo.Scalars`, or the error message.
+    fn adapt(json: &str) -> Result<Vec<String>, String> {
+        let proto = ProtoFileParser::parse(SCALARS).unwrap();
+        let mut adapter = JsonModelAdapter::new(proto, Collect { events: vec![] });
+        adapter.start_root_message("demo.Scalars").unwrap();
+        let result = {
+            let mut p = Parser::new(&mut adapter);
+            p.parse(json.as_bytes())
+        };
+        match result {
+            Ok(_) => {
+                adapter.end_root_message().unwrap();
+                Ok(adapter.into_handler().events)
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn fields(json: &str) -> Vec<String> {
+        adapt(json).unwrap_or_else(|e| panic!("{json}: {e}")).into_iter().filter(|e| e.starts_with("field:")).collect()
+    }
+
+    #[test]
+    fn integers_in_range_are_accepted_as_numbers_and_as_strings() {
+        assert_eq!(fields(r#"{"i32":-2147483648}"#), ["field:i32=I32(-2147483648)"]);
+        assert_eq!(fields(r#"{"i32":2147483647}"#), ["field:i32=I32(2147483647)"]);
+        assert_eq!(fields(r#"{"i32":"-7"}"#), ["field:i32=I32(-7)"]);
+        assert_eq!(fields(r#"{"u32":4294967295}"#), ["field:u32=U64(4294967295)"]);
+        assert_eq!(fields(r#"{"u32":"4294967295"}"#), ["field:u32=U64(4294967295)"]);
+        assert_eq!(fields(r#"{"i64":"-9223372036854775808"}"#), ["field:i64=I64(-9223372036854775808)"]);
+        assert_eq!(fields(r#"{"i64":9223372036854775807}"#), ["field:i64=I64(9223372036854775807)"]);
+        assert_eq!(fields(r#"{"u64":"18446744073709551615"}"#), ["field:u64=U64(18446744073709551615)"]);
+        assert_eq!(fields(r#"{"u64":18446744073709551615}"#), ["field:u64=U64(18446744073709551615)"]);
+        assert_eq!(fields(r#"{"s32":-1,"f32":5,"sf64":"-5"}"#).len(), 3);
+    }
+
+    #[test]
+    fn integers_out_of_range_are_errors_not_wrapped() {
+        for json in [
+            r#"{"i32":2147483648}"#,
+            r#"{"i32":-2147483649}"#,
+            r#"{"i32":"4294967297"}"#,
+            r#"{"i32":"-2147483649"}"#,
+            r#"{"s32":3000000000}"#,
+            r#"{"u32":4294967296}"#,
+            r#"{"u32":-1}"#,
+            r#"{"u32":"-1"}"#,
+            r#"{"u32":"4294967296"}"#,
+            r#"{"f32":-5}"#,
+            r#"{"i64":9223372036854775808}"#,
+            r#"{"i64":"9223372036854775808"}"#,
+            r#"{"u64":-1}"#,
+            r#"{"u64":"-1"}"#,
+            r#"{"u64":18446744073709551616}"#,
+            r#"{"u64":"18446744073709551616"}"#,
+            r#"{"i32":"abc"}"#,
+            r#"{"i32":""}"#,
+            r#"{"i64":"1.5"}"#,
+        ] {
+            assert!(adapt(json).is_err(), "{json} should be refused, got {:?}", adapt(json));
+        }
+    }
+
+    #[test]
+    fn an_integer_written_with_a_fraction_or_exponent_is_accepted_when_it_is_whole() {
+        // proto3 JSON: 1.0 and 1e2 are valid for integer fields; 1.5 is not.
+        assert_eq!(fields(r#"{"i32":1.0}"#), ["field:i32=I32(1)"]);
+        assert_eq!(fields(r#"{"i32":1e2}"#), ["field:i32=I32(100)"]);
+        assert_eq!(fields(r#"{"i64":2.0}"#), ["field:i64=I64(2)"]);
+        assert_eq!(fields(r#"{"u32":3.0}"#), ["field:u32=U64(3)"]);
+        assert!(adapt(r#"{"i32":1.5}"#).is_err());
+        assert!(adapt(r#"{"u64":0.5}"#).is_err());
+    }
+
+    #[test]
+    fn floats_and_doubles() {
+        assert_eq!(fields(r#"{"db":1.5}"#), ["field:db=F64(1.5)"]);
+        assert_eq!(fields(r#"{"fl":2}"#), ["field:fl=F32(2.0)"]);
+        assert_eq!(fields(r#"{"db":"-Infinity"}"#), ["field:db=F64(-inf)"]);
+        assert_eq!(fields(r#"{"db":"Infinity"}"#), ["field:db=F64(inf)"]);
+        assert_eq!(fields(r#"{"fl":"NaN"}"#), ["field:fl=F32(NaN)"]);
+        assert_eq!(fields(r#"{"db":"1.25"}"#), ["field:db=F64(1.25)"]);
+        assert!(adapt(r#"{"db":"abc"}"#).is_err());
+        // out of range for a float is an error, not infinity
+        assert!(adapt(r#"{"fl":1e39}"#).is_err());
+        assert!(adapt(r#"{"fl":-1e39}"#).is_err());
+        assert_eq!(fields(r#"{"fl":3.4e38}"#).len(), 1);
+    }
+
+    #[test]
+    fn booleans_strings_and_enums() {
+        assert_eq!(fields(r#"{"b":true}"#), ["field:b=Bool(true)"]);
+        assert!(adapt(r#"{"b":1}"#).is_err());
+        assert!(adapt(r#"{"s":5}"#).is_err());
+        assert!(adapt(r#"{"s":true}"#).is_err());
+        assert_eq!(fields(r#"{"s":"héllo ☃"}"#).len(), 1);
+        assert_eq!(fields(r#"{"color":"GREEN"}"#), ["field:color=U64(1)"]);
+        assert_eq!(fields(r#"{"color":2}"#), ["field:color=U64(2)"]);
+        assert!(adapt(r#"{"color":"PURPLE"}"#).is_err());
+        assert!(adapt(r#"{"color":2147483648}"#).is_err());
+    }
+
+    #[test]
+    fn bytes_take_both_base64_alphabets_and_reject_malformed_input() {
+        assert_eq!(fields(r#"{"by":"Zm9v"}"#), ["field:by=Bytes([102, 111, 111])"]);
+        assert_eq!(fields(r#"{"by":"Zg=="}"#), ["field:by=Bytes([102])"]);
+        assert_eq!(fields(r#"{"by":"Zg"}"#), ["field:by=Bytes([102])"], "padding is optional");
+        // URL-safe alphabet: 0xfb 0xff -> "-_8" ("+/8" in the standard one)
+        assert_eq!(fields(r#"{"by":"-_8"}"#), ["field:by=Bytes([251, 255])"]);
+        assert_eq!(fields(r#"{"by":"+/8="}"#), ["field:by=Bytes([251, 255])"]);
+        assert_eq!(fields(r#"{"by":""}"#), ["field:by=Bytes([])"]);
+        for bad in [r#"{"by":"Zm9v="}"#, r#"{"by":"Z"}"#, r#"{"by":"Zm=v"}"#, r#"{"by":"Zg==Zg=="}"#, r#"{"by":"Zm9v!"}"#, r#"{"by":"Zg==="}"#] {
+            assert!(adapt(bad).is_err(), "{bad} should be refused, got {:?}", adapt(bad));
+        }
+    }
+
+    #[test]
+    fn repeated_fields_maps_and_nulls() {
+        assert_eq!(fields(r#"{"nums":[1,2,3]}"#), ["field:nums=I32(1)", "field:nums=I32(2)", "field:nums=I32(3)"]);
+        assert!(adapt(r#"{"nums":[1,"x"]}"#).is_err());
+        assert!(adapt(r#"{"nums":[1,2147483648]}"#).is_err());
+        assert_eq!(fields(r#"{"nums":[]}"#), Vec::<String>::new());
+        // null means "not set"
+        assert_eq!(fields(r#"{"nums":null,"s":null,"i32":null}"#), Vec::<String>::new());
+        let m = adapt(r#"{"counts":{"a":1,"b":2}}"#).unwrap();
+        assert_eq!(m.iter().filter(|e| e.starts_with("field:key=")).count(), 2);
+        assert!(m.iter().any(|e| e == "field:key=String(\"a\")") && m.iter().any(|e| e == "field:value=I32(2)"));
+        let n = adapt(r#"{"names":{"7":"seven","-3":"minus"}}"#).unwrap();
+        assert!(n.iter().any(|e| e == "field:key=I32(7)") && n.iter().any(|e| e == "field:key=I32(-3)"));
+        let f = adapt(r#"{"flags":{"true":"yes","false":"no"}}"#).unwrap();
+        assert!(f.iter().any(|e| e == "field:key=Bool(true)"));
+        assert!(adapt(r#"{"names":{"x":"bad key"}}"#).is_err());
+        assert!(adapt(r#"{"names":{"2147483648":"too big"}}"#).is_err());
+        assert!(adapt(r#"{"counts":{"a":2147483648}}"#).is_err());
+        assert!(adapt(r#"{"counts":[1]}"#).is_err());
+    }
+
+    #[test]
+    fn unknown_fields_are_skipped_whatever_they_hold() {
+        let ev = fields(r#"{"nope":{"a":[1,{"b":null}],"c":"d"},"also":[1,2,[3]],"x":1,"i32":5,"y":"s","z":true,"n":null}"#);
+        assert_eq!(ev, ["field:i32=I32(5)"]);
+    }
+
+    #[test]
+    fn both_json_and_proto_names_are_accepted() {
+        let proto = ProtoFileParser::parse("syntax = \"proto3\"; package demo; message M { int32 foo_bar = 1; string long_name_x = 2; }").unwrap();
+        let mut a = JsonModelAdapter::new(proto, Collect { events: vec![] });
+        a.start_root_message("demo.M").unwrap();
+        {
+            let mut p = Parser::new(&mut a);
+            p.parse(&br#"{"fooBar":1,"long_name_x":"a"}"#[..]).unwrap();
+        }
+        a.end_root_message().unwrap();
+        let ev = a.into_handler().events;
+        assert!(ev.iter().any(|e| e == "field:foo_bar=I32(1)") && ev.iter().any(|e| e.starts_with("field:long_name_x=")));
+    }
+
+    #[test]
+    fn nested_messages_and_repeated_messages() {
+        let proto = ProtoFileParser::parse(
+            "syntax = \"proto3\"; package demo; message Inner { int32 v = 1; } message Outer { Inner one = 1; repeated Inner many = 2; map<string, Inner> by = 3; }",
+        )
+        .unwrap();
+        let mut a = JsonModelAdapter::new(proto, Collect { events: vec![] });
+        a.start_root_message("demo.Outer").unwrap();
+        {
+            let mut p = Parser::new(&mut a);
+            p.parse(&br#"{"one":{"v":1},"many":[{"v":2},{"v":3}],"by":{"k":{"v":4}}}"#[..]).unwrap();
+        }
+        a.end_root_message().unwrap();
+        let ev = a.into_handler().events;
+        let vs: Vec<_> = ev.iter().filter(|e| e.starts_with("field:v=")).cloned().collect();
+        assert_eq!(vs, ["field:v=I32(1)", "field:v=I32(2)", "field:v=I32(3)", "field:v=I32(4)"]);
+        let starts = ev.iter().filter(|e| e.starts_with("start:")).count();
+        let ends = ev.iter().filter(|e| *e == "end").count();
+        assert_eq!(starts, ends, "{ev:?}");
+    }
+
+    #[test]
+    fn structural_errors() {
+        assert!(adapt(r#"{"nums":{"a":1}}"#).is_err(), "object for a repeated scalar");
+        assert!(adapt(r#"{"i32":{"a":1}}"#).is_err());
+        assert!(adapt(r#"{"i32":[1]}"#).is_err());
+        assert!(adapt(r#"[1]"#).is_err(), "the root must be an object");
+    }
+
+    #[test]
+    fn an_unknown_root_message_is_an_error() {
+        let proto = ProtoFileParser::parse(SCALARS).unwrap();
+        let mut a = JsonModelAdapter::new(proto, Collect { events: vec![] });
+        assert!(a.start_root_message("demo.Missing").is_err());
+        assert!(a.start_root_message(".demo.Scalars").is_ok(), "a leading dot is allowed");
+    }
+
+    #[test]
+    fn enum_values_in_a_map() {
+        let proto = ProtoFileParser::parse(
+            "syntax = \"proto3\"; package demo; enum Color { RED = 0; GREEN = 1; } message M { map<string, Color> shades = 1; }",
+        )
+        .unwrap();
+        let mut a = JsonModelAdapter::new(proto, Collect { events: vec![] });
+        a.start_root_message("demo.M").unwrap();
+        {
+            let mut p = Parser::new(&mut a);
+            p.parse(&br#"{"shades":{"a":"GREEN","b":0}}"#[..]).unwrap();
+        }
+        a.end_root_message().unwrap();
+        let ev = a.into_handler().events;
+        let vals: Vec<_> = ev.iter().filter(|e| e.starts_with("field:value=")).cloned().collect();
+        assert_eq!(vals, ["field:value=U64(1)", "field:value=U64(0)"]);
     }
 }
