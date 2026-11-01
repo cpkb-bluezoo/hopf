@@ -357,4 +357,78 @@ mod tests {
         }
         assert_eq!(cfg.log_sinks.len(), 1);
     }
+
+    #[test]
+    fn a_level_set_accepts_what_was_put_in_it() {
+        assert!(LevelSet::INFO.accepts(LogLevel::Info));
+        assert!(!LevelSet::INFO.accepts(LogLevel::Warn));
+        assert!(!LevelSet::NONE.accepts(LogLevel::Error));
+        for level in [LogLevel::Info, LogLevel::Warn, LogLevel::Error] {
+            assert!(LevelSet::OPERATIONAL.accepts(level));
+        }
+        assert!(!LevelSet::OPERATIONAL.accepts(LogLevel::Access));
+        assert!(!LevelSet::OPERATIONAL.accepts(LogLevel::Qlog));
+        assert!(LevelSet::NONE.with(LogLevel::Qlog).accepts(LogLevel::Qlog));
+        let both = LevelSet::INFO.union(LevelSet::ERROR);
+        assert!(both.accepts(LogLevel::Info) && both.accepts(LogLevel::Error) && !both.accepts(LogLevel::Warn));
+    }
+
+    #[test]
+    fn a_base_endpoint_gives_the_three_signal_paths() {
+        let cfg = OtelConfig::new("svc").with_otlp_endpoint("http://collector:4318/");
+        assert_eq!(cfg.otlp_traces_endpoint.as_deref(), Some("http://collector:4318/v1/traces"));
+        assert_eq!(cfg.otlp_metrics_endpoint.as_deref(), Some("http://collector:4318/v1/metrics"));
+        match &cfg.log_sinks[0] {
+            LogSinkConfig::OtlpHttp { endpoint, levels } => {
+                assert_eq!(endpoint, "http://collector:4318/v1/logs");
+                assert_eq!(*levels, LevelSet::OPERATIONAL);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_new_config_has_no_sink_until_one_is_added() {
+        let cfg = OtelConfig::new("svc");
+        assert_eq!(cfg.service_name, "svc");
+        assert!(!cfg.has_sink());
+        assert!(!cfg.accepts(LogLevel::Info));
+        for with in [
+            OtelConfig::new("s").with_stderr_logs(),
+            OtelConfig::new("s").with_jsonl_traces("/tmp/t.jsonl"),
+            OtelConfig::new("s").with_jsonl_metrics("/tmp/m.jsonl"),
+            OtelConfig::new("s").with_otlp_endpoint("http://c"),
+        ] {
+            assert!(with.has_sink());
+        }
+    }
+
+    #[test]
+    fn each_sink_kind_reports_the_levels_it_takes() {
+        let cfg = OtelConfig::new("s")
+            .with_jsonl_log_sink("/tmp/a", LevelSet::WARN)
+            .with_otlp_log_sink("http://c/v1/logs", LevelSet::ERROR)
+            .with_stderr_log_sink(LevelSet::INFO)
+            .with_access_log("/tmp/b", AccessLogFormat::Clf, AccessLogUserSelection::ProtocolFirst)
+            .with_qlog_dir("/tmp/q");
+        let levels: Vec<LevelSet> = cfg.log_sinks.iter().map(LogSinkConfig::levels).collect();
+        assert_eq!(levels, [LevelSet::WARN, LevelSet::ERROR, LevelSet::INFO, LevelSet::ACCESS, LevelSet::QLOG]);
+    }
+
+    #[test]
+    fn logs_can_be_turned_off_whatever_the_sinks() {
+        let cfg = OtelConfig::new("s").with_stderr_logs().with_logs(false);
+        assert!(!cfg.accepts(LogLevel::Info));
+        let cfg = cfg.with_logs(true).with_traces(false).with_metrics(false);
+        assert!(cfg.accepts(LogLevel::Info));
+        assert!(!cfg.traces_enabled && !cfg.metrics_enabled);
+    }
+
+    #[test]
+    fn stderr_is_the_default_only_when_nothing_else_is_configured() {
+        let cfg = OtelConfig::new("s").with_default_stderr_if_empty();
+        assert!(matches!(cfg.log_sinks[..], [LogSinkConfig::Stderr { .. }]));
+        let cfg = OtelConfig::new("s").with_jsonl_logs("/tmp/x").with_default_stderr_if_empty();
+        assert_eq!(cfg.log_sinks.len(), 1);
+    }
 }

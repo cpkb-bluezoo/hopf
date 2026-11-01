@@ -205,4 +205,110 @@ mod tests {
             "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"
         );
     }
+
+    /// Records every call that reaches it.
+    #[derive(Default)]
+    struct Calls {
+        log: Vec<String>,
+        headers: Option<Headers>,
+    }
+
+    impl ClientWriter for Calls {
+        fn headers(&mut self, headers: Headers) {
+            self.log.push("headers".into());
+            self.headers = Some(headers);
+        }
+        fn start_request_body(&mut self) {
+            self.log.push("start".into());
+        }
+        fn request_body_content(&mut self, data: &[u8]) {
+            self.log.push(format!("content:{}", data.len()));
+        }
+        fn end_request_body(&mut self) {
+            self.log.push("end".into());
+        }
+        fn trailers(&mut self, _headers: Headers) {
+            self.log.push("trailers".into());
+        }
+        fn complete_request(&mut self) {
+            self.log.push("complete".into());
+        }
+        fn version(&self) -> hopf_http::HttpVersion {
+            hopf_http::HttpVersion::Http2
+        }
+        fn conn_handle(&self) -> hopf_core::ConnHandle {
+            hopf_core::ConnHandle::from_execute(std::sync::Arc::new(|task| task()))
+        }
+    }
+
+    const TP: &str = "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01";
+    const WHOLE: [&str; 6] = ["headers", "start", "content:3", "end", "trailers", "complete"];
+
+    fn drive(w: &mut dyn ClientWriter) -> hopf_http::HttpVersion {
+        w.headers(Headers::new());
+        w.start_request_body();
+        w.request_body_content(b"abc");
+        w.end_request_body();
+        w.trailers(Headers::new());
+        w.complete_request();
+        let _ = w.conn_handle();
+        w.version()
+    }
+
+    #[test]
+    fn the_borrowed_wrapper_passes_every_call_through_and_adds_the_header() {
+        let mut calls = Calls::default();
+        let version = {
+            let mut w = with_traceparent(&mut calls, Some(TP));
+            drive(&mut w)
+        };
+        assert_eq!(calls.log, WHOLE);
+        assert_eq!(version, hopf_http::HttpVersion::Http2);
+        assert_eq!(calls.headers.unwrap().get("traceparent").unwrap(), TP);
+    }
+
+    #[test]
+    fn the_borrowed_wrapper_with_nothing_to_add_leaves_the_headers_alone() {
+        let mut calls = Calls::default();
+        {
+            let mut w = with_traceparent(&mut calls, None);
+            drive(&mut w);
+        }
+        assert!(calls.headers.unwrap().get("traceparent").is_none());
+    }
+
+    #[test]
+    fn the_owned_wrapper_passes_every_call_through_and_adds_the_header() {
+        let mut calls = Calls::default();
+        let version = {
+            let mut w = OwnedPropagatingClientWriter::new(&mut calls, TP);
+            drive(&mut w)
+        };
+        assert_eq!(calls.log, WHOLE);
+        assert_eq!(version, hopf_http::HttpVersion::Http2);
+        assert_eq!(calls.headers.unwrap().get("traceparent").unwrap(), TP);
+    }
+
+    #[test]
+    fn a_wrapper_made_from_a_trace_sends_that_traces_header() {
+        let trace = Trace::new("c", SpanKind::Client);
+        let mut calls = Calls::default();
+        {
+            let mut w = with_trace(&mut calls, &trace);
+            w.headers(Headers::new());
+        }
+        assert_eq!(calls.headers.unwrap().get("traceparent").unwrap(), trace.traceparent());
+    }
+
+    #[test]
+    fn a_header_the_request_already_has_wins_over_the_wrapper() {
+        let mut calls = Calls::default();
+        {
+            let mut w = OwnedPropagatingClientWriter::new(&mut calls, TP);
+            let mut h = Headers::new();
+            h.set("traceparent", "00-11111111111111111111111111111111-2222222222222222-01");
+            w.headers(h);
+        }
+        assert!(calls.headers.unwrap().get("traceparent").unwrap().contains("1111"));
+    }
 }

@@ -189,4 +189,82 @@ mod tests {
         let _ = fs::remove_file(&info_path);
         let _ = fs::remove_file(&err_path);
     }
+
+    #[test]
+    fn an_otlp_sink_posts_the_batch_as_protobuf() {
+        let (port, rx) = crate::otlp_http::tests::serve_once("HTTP/1.1 200 OK\r\n\r\n");
+        let cfg = OtelConfig::new("otlp-test")
+            .with_otlp_log_sink(format!("http://127.0.0.1:{port}/v1/logs"), LevelSet::INFO);
+        let mut sinks = LogSinkInstance::from_config(&cfg);
+        assert_eq!(sinks.len(), 1);
+        let mut batch = vec![LogRecord::new(LogLevel::Info, "n").with_body("wire-body")];
+        LogSinkInstance::flush_batch(&mut sinks, &cfg, &mut batch);
+        assert!(batch.is_empty());
+        let req = rx.recv().unwrap();
+        let text = String::from_utf8_lossy(&req).into_owned();
+        assert!(text.starts_with("POST /v1/logs HTTP/1.1"), "{text}");
+        assert!(req.windows(9).any(|w| w == b"wire-body"), "the body carries the record");
+        assert!(req.windows(9).any(|w| w == b"otlp-test"), "and the service name");
+    }
+
+    #[test]
+    fn a_failing_export_does_not_keep_the_batch() {
+        let (port, _rx) = crate::otlp_http::tests::serve_once("HTTP/1.1 503 Busy\r\n\r\n");
+        let cfg = OtelConfig::new("t")
+            .with_otlp_log_sink(format!("http://127.0.0.1:{port}/v1/logs"), LevelSet::INFO);
+        let mut sinks = LogSinkInstance::from_config(&cfg);
+        let mut batch = vec![LogRecord::new(LogLevel::Info, "n").with_body("b")];
+        LogSinkInstance::flush_batch(&mut sinks, &cfg, &mut batch);
+        assert!(batch.is_empty(), "the failure is reported on stderr, not retried");
+    }
+
+    #[test]
+    fn an_endpoint_that_is_not_a_plain_http_url_gives_no_sink() {
+        let cfg = OtelConfig::new("t").with_otlp_log_sink("https://c/v1/logs", LevelSet::INFO);
+        assert!(LogSinkInstance::from_config(&cfg).is_empty());
+    }
+
+    #[test]
+    fn records_nobody_accepts_are_dropped_and_an_empty_batch_is_a_no_op() {
+        let cfg = OtelConfig::new("t").with_stderr_log_sink(LevelSet::ERROR);
+        let mut sinks = LogSinkInstance::from_config(&cfg);
+        let mut none: Vec<LogRecord> = Vec::new();
+        LogSinkInstance::flush_batch(&mut sinks, &cfg, &mut none);
+        let mut batch = vec![LogRecord::new(LogLevel::Info, "n")];
+        LogSinkInstance::flush_batch(&mut sinks, &cfg, &mut batch);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn access_and_qlog_sinks_take_only_their_own_levels() {
+        let dir = std::env::temp_dir().join(format!("hopf-otel-sinks-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = OtelConfig::new("t")
+            .with_access_log(
+                dir.join("access.log"),
+                crate::access_log::AccessLogFormat::Clf,
+                crate::access_log::AccessLogUserSelection::ProtocolFirst,
+            )
+            .with_qlog_dir(dir.join("qlog"))
+            .with_stderr_log_sink(LevelSet::WARN)
+            .with_jsonl_log_sink(dir.join("o.jsonl"), LevelSet::INFO);
+        let mut sinks = LogSinkInstance::from_config(&cfg);
+        assert_eq!(sinks.len(), 4);
+        let takes = |s: &LogSinkInstance| -> Vec<bool> {
+            [LogLevel::Info, LogLevel::Warn, LogLevel::Error, LogLevel::Access, LogLevel::Qlog]
+                .iter()
+                .map(|l| s.accepts(*l))
+                .collect()
+        };
+        assert_eq!(takes(&sinks[0]), [false, false, false, true, false]);
+        assert_eq!(takes(&sinks[1]), [false, false, false, false, true]);
+        assert_eq!(takes(&sinks[2]), [false, true, false, false, false]);
+        assert_eq!(takes(&sinks[3]), [true, false, false, false, false]);
+        for sink in &mut sinks {
+            sink.maintain(std::time::Instant::now());
+            sink.shutdown().unwrap();
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

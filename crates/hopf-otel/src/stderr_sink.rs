@@ -95,4 +95,30 @@ mod tests {
         assert!(line.contains("hello"));
         assert!(line.contains("host=example.com"));
     }
+
+    #[test]
+    fn attributes_of_every_kind_are_shown_in_order_and_a_bare_record_has_none() {
+        let mut rec = LogRecord::new(LogLevel::Info, "n").with_scope("s");
+        rec.attrs.push(("count".into(), hopf_core::AttrValue::Int(3)));
+        rec.attrs.push(("ok".into(), hopf_core::AttrValue::Bool(true)));
+        rec.attrs.push(("ratio".into(), hopf_core::AttrValue::Double(0.5)));
+        assert_eq!(format_stderr_line(&rec), "INFO [s] n:  (count=3 ok=true ratio=0.5)");
+        let bare = LogRecord::new(LogLevel::Error, "n").with_scope("s").with_body("b");
+        assert_eq!(format_stderr_line(&bare), "ERROR [s] n: b");
+    }
+
+    #[test]
+    fn the_sink_takes_only_its_levels() {
+        let sink = StderrLogSink::new(LevelSet::WARN.union(LevelSet::ERROR));
+        assert!(sink.accepts(LogLevel::Warn) && sink.accepts(LogLevel::Error));
+        assert!(!sink.accepts(LogLevel::Info));
+    }
+
+    #[test]
+    fn writing_and_shutting_down_succeed() {
+        let mut sink = StderrLogSink::new(LevelSet::OPERATIONAL);
+        let batch = [LogRecord::new(LogLevel::Info, "stderr-sink-test").with_scope("t")];
+        sink.write(&OtelConfig::new("t"), &batch).unwrap();
+        sink.shutdown().unwrap();
+    }
 }

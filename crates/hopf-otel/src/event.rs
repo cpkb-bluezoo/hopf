@@ -76,3 +76,55 @@ pub fn log_record_from_event(
     }
     record
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn attr<'a>(r: &'a LogRecord, key: &str) -> Option<&'a AttrValue> {
+        r.attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    #[test]
+    fn each_kind_has_a_level_and_a_name() {
+        let cases = [
+            (EventKind::Accept, LogLevel::Info, "connection.accept"),
+            (EventKind::Dial, LogLevel::Info, "connection.dial"),
+            (EventKind::Close, LogLevel::Info, "connection.close"),
+            (EventKind::Error, LogLevel::Error, "connection.error"),
+            (EventKind::Warn, LogLevel::Warn, "runtime.warn"),
+        ];
+        for (kind, level, name) in cases {
+            assert_eq!(kind.log_level(), level);
+            assert_eq!(kind.event_name(), name);
+        }
+    }
+
+    #[test]
+    fn an_inet_peer_adds_its_address_and_port() {
+        let peer = PeerAddr::Inet("192.0.2.7:4433".parse().unwrap());
+        let rec = log_record_from_event(EventKind::Accept, Some(peer), "hello");
+        assert_eq!(rec.body.as_deref(), Some("hello"));
+        assert_eq!(rec.name, "connection.accept");
+        assert!(matches!(attr(&rec, "net.peer.ip"), Some(AttrValue::String(s)) if s == "192.0.2.7"));
+        assert!(matches!(attr(&rec, "net.peer.port"), Some(AttrValue::String(s)) if s == "4433"));
+    }
+
+    #[test]
+    fn a_unix_peer_adds_its_family_and_path_when_it_has_one() {
+        let rec = log_record_from_event(EventKind::Close, Some(PeerAddr::Unix(Some(PathBuf::from("/run/x.sock")))), "m");
+        assert!(matches!(attr(&rec, "net.sock.family"), Some(AttrValue::String(s)) if s == "unix"));
+        assert!(matches!(attr(&rec, "net.sock.peer.name"), Some(AttrValue::String(s)) if s == "/run/x.sock"));
+        let unnamed = log_record_from_event(EventKind::Close, Some(PeerAddr::Unix(None)), "m");
+        assert!(attr(&unnamed, "net.sock.family").is_some());
+        assert!(attr(&unnamed, "net.sock.peer.name").is_none());
+    }
+
+    #[test]
+    fn no_peer_adds_nothing() {
+        let rec = log_record_from_event(EventKind::Warn, None, "careful");
+        assert!(rec.attrs.is_empty());
+        assert_eq!(rec.level, LogLevel::Warn);
+    }
+}
