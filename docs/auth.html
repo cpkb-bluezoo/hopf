@@ -115,10 +115,6 @@
 <td>Legacy draft</td>
 </tr>
 <tr>
-<td>CRAM-MD5</td>
-<td><a href="https://www.rfc-editor.org/rfc/rfc2195">RFC 2195</a></td>
-</tr>
-<tr>
 <td>DIGEST-MD5</td>
 <td><a href="https://www.rfc-editor.org/rfc/rfc2831">RFC 2831</a> (deprecated)</td>
 </tr>
@@ -128,7 +124,7 @@
 </tr>
 <tr>
 <td>SCRAM-SHA-256-PLUS</td>
-<td>RFC 5802bis / <a href="https://www.rfc-editor.org/rfc/rfc5929">RFC 5929</a> <code>tls-server-end-point</code> channel binding — not part of Gumdrop's original seven-mechanism set; excluded from <code>SaslMechanism::all()</code> since no protocol crate wires real channel-binding data through yet (see Limitations)</td>
+<td>RFC 5802bis / <a href="https://www.rfc-editor.org/rfc/rfc5929">RFC 5929</a> <code>tls-server-end-point</code> channel binding — not part of Gumdrop's original mechanism set; excluded from <code>SaslMechanism::all()</code> since no protocol crate wires real channel-binding data through yet (see Limitations)</td>
 </tr>
 <tr>
 <td>OAUTHBEARER</td>
@@ -237,7 +233,7 @@
 </tr>
 </tbody>
 </table>
-<p><code>CredentialStore</code> overridable methods: <code>password_match</code>, <code>plaintext_password</code>, <code>digest_ha1</code>, <code>cram_md5_digest</code>, <code>scram_credentials</code>, <code>validate_bearer</code>, <code>authenticate_certificate</code>, <code>authorize_as</code>, <code>supported_mechanisms</code>.</p>
+<p><code>CredentialStore</code> overridable methods: <code>password_match</code>, <code>plaintext_password</code>, <code>digest_ha1</code>, <code>scram_credentials</code>, <code>validate_bearer</code>, <code>authenticate_certificate</code>, <code>authorize_as</code>, <code>supported_mechanisms</code>.</p>
 <div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_auth::</span>PasswordStore<span class="op">;</span></span>
 <span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> store <span class="op">=</span> <span class="pp">PasswordStore::</span>new()</span>
@@ -250,7 +246,6 @@
 <div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">enum</span> SaslMechanism <span class="op">{</span></span>
 <span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>    Plain<span class="op">,</span></span>
 <span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    Login<span class="op">,</span></span>
-<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    CramMd5<span class="op">,</span></span>
 <span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    DigestMd5<span class="op">,</span></span>
 <span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    ScramSha256<span class="op">,</span></span>
 <span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    OauthBearer<span class="op">,</span></span>
@@ -306,7 +301,7 @@
 <span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> client <span class="op">=</span> create_client(<span class="pp">SaslMechanism::</span>ScramSha256<span class="op">,</span> <span class="st">&quot;alice&quot;</span><span class="op">,</span> <span class="st">&quot;secret&quot;</span><span class="op">,</span> <span class="st">&quot;localhost&quot;</span><span class="op">,</span> <span class="cn">None</span>)<span class="op">;</span></span>
 <span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="co">// Alternate challenge/response via server.step / client.evaluate</span></span></code></pre></div>
-<p>Symmetric client + server exchanges for all <strong>seven</strong> Gumdrop-parity mechanisms, plus SCRAM-SHA-256-PLUS. <code>requires_tls</code> guides operators (e.g. PLAIN should be under TLS).</p>
+<p>Symmetric client + server exchanges for all <strong>six</strong> Gumdrop-parity mechanisms (CRAM-MD5 is dropped: it is MD5-based), plus SCRAM-SHA-256-PLUS. <code>requires_tls</code> guides operators (e.g. PLAIN should be under TLS).</p>
 <h3 id="scram-channel-binding">SCRAM channel binding</h3>
 <p><code>ScramSha256Client::new_plus(username, password, channel_binding)</code> / <code>ScramSha256Server::with_channel_binding(channel_binding)</code> add real <code>tls-server-end-point</code> (RFC 5929 section 4) channel binding: the caller supplies this connection's channel-binding bytes (a hash of the server's TLS certificate — <code>hopf-auth</code> has no TLS awareness of its own, the same pattern <code>ExternalServer::with_peer_certificate</code> already uses). The server independently recomputes the expected <code>c=</code> value from the GS2 header the client actually sent plus its own channel-binding data and rejects a mismatch — the property that defeats a MITM relaying the SASL exchange across two different TLS connections. Not implemented: cross-mechanism downgrade detection (noticing a MITM stripped PLUS from the advertised mechanism list) — that needs the session/capability-advertisement layer, not this mechanism module.</p>
 <h2 id="http-digest-helpers">HTTP Digest helpers</h2>
@@ -385,7 +380,7 @@
 </tr>
 </tbody>
 </table>
-<p>Enrollment accepts a password once, then stores only SCRAM-SHA-256 material (and HA1 when a digest realm is set). <code>plaintext_password</code> always returns <code>None</code> — CRAM-MD5 and POP3 APOP are not supported by this store. <code>password_match</code> re-derives <code>StoredKey</code> and compares in constant time.</p>
+<p>Enrollment accepts a password once, then stores only SCRAM-SHA-256 material (and HA1 when a digest realm is set). <code>plaintext_password</code> always returns <code>None</code> — POP3 APOP is not supported by this store. <code>password_match</code> re-derives <code>StoredKey</code> and compares in constant time.</p>
 <p>No Cargo features for the demo store.</p>
 <h3 id="pamcredentialstore"><code>PamCredentialStore</code></h3>
 <p>Optional feature <code>pam</code> on <code>hopf-auth</code> (and umbrella <code>hopf</code> feature <code>pam</code>). Unix only; links <code>libpam</code> / OpenPAM via in-tree FFI.</p>
@@ -425,7 +420,7 @@
 <li>DIGEST-MD5 kept for parity only (deprecated by RFC 6331).</li>
 <li>OAUTHBEARER and XOAUTH2 carry the token in the client “password” slot.</li>
 <li><code>PasswordStore</code> is <strong>in-memory</strong> (demo-grade): enrolls from a password then keeps SCRAM (+ optional Digest HA1) only. For production password AUTH, use <a href="ldap.html"><code>LdapCredentialStore</code></a> or feature <code>pam</code>’s <code>PamCredentialStore</code>.</li>
-<li>CRAM-MD5 and POP3 APOP need a recoverable secret (or a custom <code>cram_md5_digest</code> / APOP verifier) — not provided by <code>PasswordStore</code>.</li>
+<li>POP3 APOP needs a recoverable secret (or a custom APOP verifier) — not provided by <code>PasswordStore</code>.</li>
 <li>SMTP wire currently advertises <strong>AUTH PLAIN</strong> only (<a href="smtp.html">SMTP</a>), even though the auth crate supports more mechanisms.</li>
 <li>SCRAM-SHA-256-PLUS has no cross-mechanism downgrade detection — see the <a href="#scram-channel-binding">channel binding</a> section.</li>
 <li>No protocol crate in this workspace wires real <code>tls-server-end-point</code> channel-binding data through to <code>create_server</code> yet, which is why <code>ScramSha256Plus</code> is excluded from <code>SaslMechanism::all()</code> (and so isn't advertised by any store's default <code>supported_mechanisms()</code>) even though the mechanism itself is fully implemented and tested.</li>

@@ -90,6 +90,10 @@ pub struct SmtpControlHandler {
     /// In-progress SASL exchange, between the `334` challenge and the
     /// client's continuation line.
     sasl: Option<Box<dyn SaslServer>>,
+    /// The user a SASL exchange has authenticated while the client has yet
+    /// to acknowledge the server's final data with an empty line (RFC 4954
+    /// section 4): the 235 follows that acknowledgement, not the 334.
+    sasl_ack: Option<String>,
     /// MAIL FROM commands seen this session (RFC 9422 MAILMAX counter).
     mail_transactions: u32,
     /// Real TCP peer for XCLIENT authorization (never overridden by ADDR).
@@ -178,6 +182,7 @@ impl SmtpControlHandler {
             deferred: Arc::new(std::sync::Mutex::new(None)),
             control_handle: None,
             sasl: None,
+            sasl_ack: None,
             mail_transactions: 0,
             tcp_peer: peer,
             otel_metrics: None,
@@ -502,16 +507,19 @@ impl SmtpControlHandler {
             SmtpCommand::SaslResponse(data) => self.handle_sasl_response(endpoint, data),
             SmtpCommand::SaslAbort => {
                 self.sasl = None;
+                self.sasl_ack = None;
                 self.send_enhanced(endpoint, 501, "5.0.0", "Authentication cancelled");
             }
             SmtpCommand::SaslResponseInvalid => {
                 self.sasl = None;
+                self.sasl_ack = None;
                 self.record_auth(false);
                 self.send_enhanced(endpoint, 535, "5.7.8", "Authentication credentials invalid");
             }
             SmtpCommand::Xclient(args) => self.cmd_xclient(endpoint, &args),
             SmtpCommand::Malformed { .. } => {
                 self.sasl = None;
+                self.sasl_ack = None;
                 self.record_auth(false);
                 self.send_enhanced(endpoint, 535, "5.7.8", "Authentication credentials invalid");
             }
@@ -1251,6 +1259,10 @@ impl SmtpControlHandler {
     }
 
     fn handle_sasl_response(&mut self, endpoint: &mut dyn Endpoint, response: Vec<u8>) {
+        if let Some(username) = self.sasl_ack.take() {
+            self.finish_auth(endpoint, username);
+            return;
+        }
         let Some(server) = self.sasl.take() else {
             return;
         };
@@ -1274,12 +1286,17 @@ impl SmtpControlHandler {
                     username,
                     final_message,
                 } if !first_step => {
-                    if let Some(fm) = final_message {
-                        if !fm.is_empty() {
+                    match final_message.filter(|fm| !fm.is_empty()) {
+                        Some(fm) => {
+                            // The server's last data goes out as a 334 and
+                            // the client answers it with an empty line;
+                            // only then is the exchange complete.
                             self.send_reply(endpoint, 334, &base64::encode(&fm));
+                            self.sasl_ack = Some(username);
+                            self.lexer.expect_sasl_response();
                         }
+                        None => self.finish_auth(endpoint, username),
                     }
-                    self.finish_auth(endpoint, username);
                 }
                 SaslServerStep::Complete { .. } | SaslServerStep::Failure => {
                     self.auth_failed(endpoint);

@@ -223,8 +223,7 @@ impl Pop3FetchDriver {
     fn choose_mechanism(sasl_mechs: &[String]) -> Option<SaslMechanism> {
         const PREFERENCE: &[SaslMechanism] = &[
             SaslMechanism::ScramSha256,
-            SaslMechanism::CramMd5,
-            SaslMechanism::Plain,
+                    SaslMechanism::Plain,
             SaslMechanism::Login,
         ];
         PREFERENCE

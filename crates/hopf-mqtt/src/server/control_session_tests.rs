@@ -966,7 +966,7 @@ fn an_unknown_method_or_a_server_without_credentials_refuses_the_connect() {
 fn switching_method_mid_exchange_ends_the_connection() {
     let mut peer = connection_with(&broker(), &auth_store(), None, None);
     run_for(&mut peer, &connect_with_method("PLAIN", None), 1);
-    let out = run_for(&mut peer, &auth_wire(reason::CONTINUE_AUTHENTICATION, "CRAM-MD5", Some(b"x")), 1);
+    let out = run_for(&mut peer, &auth_wire(reason::CONTINUE_AUTHENTICATION, "SCRAM-SHA-256", Some(b"x")), 1);
     assert_eq!(disconnect_reason(&out), Some(reason::BAD_AUTHENTICATION_METHOD));
     assert!(peer.is_closed());
 }

@@ -4,11 +4,10 @@
 //! ([#2](https://github.com/cpkb-bluezoo/hopf/issues/2)).
 //!
 //! SASL mechanisms (Gumdrop parity except GSSAPI, planned as optional feature):
-//! PLAIN, LOGIN, CRAM-MD5, DIGEST-MD5, SCRAM-SHA-256, OAUTHBEARER, EXTERNAL.
+//! PLAIN, LOGIN, DIGEST-MD5, SCRAM-SHA-256, OAUTHBEARER, EXTERNAL.
 
 #![warn(missing_docs)]
 
-pub mod cram_md5;
 pub mod crypto;
 pub mod digest_md5;
 pub mod external;

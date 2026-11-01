@@ -1030,7 +1030,7 @@ impl ImapControlHandler {
         };
 
         if server.server_first() && initial_response.is_none() {
-            // A server-first mechanism (e.g. CRAM-MD5) must send its
+            // A server-first mechanism (e.g. DIGEST-MD5) must send its
             // challenge before any client response exists to step on —
             // "complete" on this very first step would mean the mechanism
             // authenticated nobody, so treat it as failure, not success

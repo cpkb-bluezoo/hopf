@@ -9,8 +9,6 @@ pub enum SaslMechanism {
     Plain,
     /// Legacy two-step Base64 username/password (`draft-murchison-sasl-login`).
     Login,
-    /// RFC 2195.
-    CramMd5,
     /// RFC 2831 (deprecated by RFC 6331; kept for parity).
     DigestMd5,
     /// RFC 5802 / RFC 7677.
@@ -32,7 +30,6 @@ impl SaslMechanism {
         match self {
             Self::Plain => "PLAIN",
             Self::Login => "LOGIN",
-            Self::CramMd5 => "CRAM-MD5",
             Self::DigestMd5 => "DIGEST-MD5",
             Self::ScramSha256 => "SCRAM-SHA-256",
             Self::ScramSha256Plus => "SCRAM-SHA-256-PLUS",
@@ -47,7 +44,6 @@ impl SaslMechanism {
         match s.to_ascii_uppercase().as_str() {
             "PLAIN" => Some(Self::Plain),
             "LOGIN" => Some(Self::Login),
-            "CRAM-MD5" => Some(Self::CramMd5),
             "DIGEST-MD5" => Some(Self::DigestMd5),
             "SCRAM-SHA-256" => Some(Self::ScramSha256),
             "SCRAM-SHA-256-PLUS" => Some(Self::ScramSha256Plus),
@@ -62,7 +58,7 @@ impl SaslMechanism {
     pub fn is_challenge_response(self) -> bool {
         matches!(
             self,
-            Self::CramMd5 | Self::DigestMd5 | Self::ScramSha256 | Self::ScramSha256Plus
+            Self::DigestMd5 | Self::ScramSha256 | Self::ScramSha256Plus
         )
     }
 
@@ -92,7 +88,6 @@ impl SaslMechanism {
         &[
             Self::Plain,
             Self::Login,
-            Self::CramMd5,
             Self::DigestMd5,
             Self::ScramSha256,
             Self::OauthBearer,

@@ -193,11 +193,10 @@ fn start_imap_server_with_store(
     (rt, addr)
 }
 
-/// A store enrolling "alice"/"secret" that can drive CRAM-MD5 and
-/// DIGEST-MD5, not just SCRAM-SHA-256 — [`start_imap_server`]'s bare
-/// `PasswordStore` deliberately can't (see [`SlowStore`]'s doc comment),
-/// and has no digest realm set, so it can't either.
-fn cram_and_digest_capable_store() -> Arc<dyn CredentialStore> {
+/// A store enrolling "alice"/"secret" that can drive DIGEST-MD5, not just
+/// SCRAM-SHA-256 — [`start_imap_server`]'s bare `PasswordStore` has no
+/// digest realm set, so it can't.
+fn digest_capable_store() -> Arc<dyn CredentialStore> {
     Arc::new(SlowStore {
         inner: PasswordStore::new()
             .with_digest_realm("localhost")
@@ -207,7 +206,7 @@ fn cram_and_digest_capable_store() -> Arc<dyn CredentialStore> {
 }
 
 /// Wraps a [`PasswordStore`] and sleeps for `delay` inside `password_match`
-/// — deterministically widens the window a credential check spends offloaded
+/// and `scram_credentials` — deterministically widens the window a credential check spends offloaded
 /// to the storage pool (issue #181), so a pipelining regression test can
 /// reliably observe whether a command sent right behind LOGIN/AUTHENTICATE
 /// gets processed before or after the check resolves, rather than depending
@@ -219,33 +218,18 @@ struct SlowStore {
 
 impl CredentialStore for SlowStore {
     fn supported_mechanisms(&self) -> Vec<SaslMechanism> {
-        // `plaintext_password` below always resolves for enrolled users, so
-        // unlike `PasswordStore` this store really can drive CRAM-MD5 —
-        // advertise it (issue #218).
-        let mut mechs = self.inner.supported_mechanisms();
-        mechs.push(SaslMechanism::CramMd5);
-        mechs
+        self.inner.supported_mechanisms()
     }
     fn password_match(&self, username: &str, password: &str) -> bool {
         std::thread::sleep(self.delay);
         self.inner.password_match(username, password)
     }
-    fn plaintext_password(&self, username: &str) -> Option<String> {
-        // `PasswordStore` deliberately discards plaintext after enrollment
-        // (see its doc comment) and so can't drive CRAM-MD5, which needs a
-        // recoverable secret — override it here so `SlowStore` can, since
-        // CRAM-MD5's server-first, multi-round-trip shape is exactly what
-        // the pipelining regression test below needs to exercise the
-        // `first_step`/continuation offload path. CRAM-MD5 verification
-        // goes through this method (not `password_match`), so it needs the
-        // same artificial delay to make the offload's window observable.
-        std::thread::sleep(self.delay);
-        (username == "alice").then(|| "secret".to_string())
-    }
     fn digest_ha1(&self, username: &str, realm: &str) -> Option<String> {
         self.inner.digest_ha1(username, realm)
     }
     fn scram_credentials(&self, username: &str) -> Option<ScramCredentials> {
+        // SCRAM verifies against these, not `password_match`: the same delay.
+        std::thread::sleep(self.delay);
         self.inner.scram_credentials(username)
     }
     fn validate_bearer(&self, token: &str, cb: Cb<Option<TokenValidation>>) {
@@ -1083,44 +1067,63 @@ fn client_idle_exists_done_scripted() {
 
 // ── AUTHENTICATE: SASL mechanisms beyond PLAIN (issue #128) ────────────────────
 
-/// CRAM-MD5 doesn't require TLS, so this exercises the full non-PLAIN
-/// dispatch — mechanism lookup, server-first challenge, `create_server`,
-/// and completion — over a plain connection.
+/// SCRAM-SHA-256 doesn't require TLS, so this exercises the full non-PLAIN
+/// dispatch - mechanism lookup, `create_server`, the challenge round trips
+/// and completion - over a plain connection.
 #[test]
-fn server_authenticate_cram_md5_raw() {
+fn server_authenticate_scram_raw() {
     let dir = tempfile::tempdir().unwrap();
-    let (rt, addr) = start_imap_server_with_store(&dir, cram_and_digest_capable_store());
+    let (rt, addr) = start_imap_server_with_store(&dir, digest_capable_store());
 
     let mut stream = TcpStream::connect(addr).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let mut buf = vec![0u8; 8192];
     read_until(&mut stream, &mut buf, |s| s.contains("* OK"));
 
-    write_cmd(&mut stream, b"a1 AUTHENTICATE CRAM-MD5\r\n");
-    let r = read_until(&mut stream, &mut buf, |s| s.contains("+ ") && s.ends_with("\r\n"));
-    assert!(r.contains("+ "), "cram-md5 challenge: {r}");
-    let b64 = r.trim().strip_prefix("+ ").expect("continuation prefix");
-    let challenge = String::from_utf8(rmimeparser::charset::base64::decode(b64).unwrap())
-        .expect("challenge is ASCII");
-    let digest = hopf_auth::cram_md5::compute_response("secret", &challenge);
-    let response = format!("alice {digest}");
-    write_cmd(
-        &mut stream,
-        format!(
-            "{}\r\n",
-            rmimeparser::charset::base64::encode(response.as_bytes())
-        )
-        .as_bytes(),
-    );
-    let r = read_until(&mut stream, &mut buf, |s| s.contains("a1 "));
-    assert!(r.contains("a1 OK"), "authenticate cram-md5: {r}");
+    let mut client = scram_client();
+    write_cmd(&mut stream, b"a1 AUTHENTICATE SCRAM-SHA-256\r\n");
+    read_until(&mut stream, &mut buf, |s| s.starts_with("+") && s.ends_with("\r\n"));
+    let first = scram_step(&mut client, None);
+    write_cmd(&mut stream, format!("{first}\r\n").as_bytes());
+    let r = read_until(&mut stream, &mut buf, |s| s.starts_with("+ ") && s.ends_with("\r\n"));
+    let last = scram_step(&mut client, Some(r.trim().strip_prefix("+ ").unwrap()));
+    write_cmd(&mut stream, format!("{last}\r\n").as_bytes());
+    let r = read_until(&mut stream, &mut buf, |s| s.starts_with("+ ") || s.contains("a1 "));
+    let r = if let Some(server_final) = r.trim().strip_prefix("+ ") {
+        assert!(scram_done(&mut client, server_final), "the client accepts the server's signature");
+        write_cmd(&mut stream, b"\r\n");
+        read_until(&mut stream, &mut buf, |s| s.contains("a1 "))
+    } else {
+        r
+    };
+    assert!(r.contains("a1 OK"), "authenticate scram: {r}");
 
     write_cmd(&mut stream, b"a2 SELECT INBOX\r\n");
     let r = read_until(&mut stream, &mut buf, |s| s.contains("a2 "));
-    assert!(r.contains("a2 OK"), "select after CRAM-MD5 auth: {r}");
+    assert!(r.contains("a2 OK"), "select after SCRAM auth: {r}");
     drop(rt);
+}
+
+/// A SCRAM-SHA-256 client for alice/secret.
+fn scram_client() -> Box<dyn hopf_auth::SaslClient> {
+    hopf_auth::create_client(SaslMechanism::ScramSha256, "alice", "secret", "localhost", "imap", None)
+}
+
+/// One client step, as the base64 a protocol sends.
+fn scram_step(client: &mut Box<dyn hopf_auth::SaslClient>, challenge_b64: Option<&str>) -> String {
+    let challenge = challenge_b64.map(|c| rmimeparser::charset::base64::decode(c).unwrap());
+    match client.evaluate(challenge.as_deref()) {
+        hopf_auth::SaslClientStep::Response(d) | hopf_auth::SaslClientStep::Complete(d) => {
+            rmimeparser::charset::base64::encode(&d)
+        }
+        hopf_auth::SaslClientStep::Failure => panic!("the SCRAM client failed"),
+    }
+}
+
+/// Does the client accept the server's final message?
+fn scram_done(client: &mut Box<dyn hopf_auth::SaslClient>, server_final_b64: &str) -> bool {
+    let d = rmimeparser::charset::base64::decode(server_final_b64).unwrap();
+    matches!(client.evaluate(Some(&d)), hopf_auth::SaslClientStep::Complete(_))
 }
 
 /// LOGIN (the SASL mechanism, not the LOGIN command) requires TLS, matching
@@ -1174,7 +1177,7 @@ fn server_authenticate_unsupported_mechanism_is_rejected() {
 #[test]
 fn server_capability_lists_mechanisms_filtered_by_tls() {
     let dir = tempfile::tempdir().unwrap();
-    let (rt, addr) = start_imap_server_with_store(&dir, cram_and_digest_capable_store());
+    let (rt, addr) = start_imap_server_with_store(&dir, digest_capable_store());
 
     let mut stream = TcpStream::connect(addr).unwrap();
     stream
@@ -1183,7 +1186,7 @@ fn server_capability_lists_mechanisms_filtered_by_tls() {
     let mut buf = vec![0u8; 8192];
     let greet = read_until(&mut stream, &mut buf, |s| s.contains("* OK"));
 
-    for present in ["AUTH=CRAM-MD5", "AUTH=DIGEST-MD5", "AUTH=SCRAM-SHA-256"] {
+    for present in ["AUTH=DIGEST-MD5", "AUTH=SCRAM-SHA-256"] {
         assert!(greet.contains(present), "expected {present} in {greet}");
     }
     for absent in ["AUTH=PLAIN", "AUTH=LOGIN", "AUTH=OAUTHBEARER", "AUTH=EXTERNAL"] {
@@ -1237,13 +1240,14 @@ fn server_login_pipelined_with_select_waits_for_async_credential_check() {
     drop(rt);
 }
 
-/// Same race, but for the SASL path (issue #181), using CRAM-MD5 — a
-/// server-first, multi-round-trip mechanism (no TLS required) whose
-/// *first* step offload is the new `first_step` code path added for this
-/// issue. Challenge round-trip, then the client's response and a pipelined
-/// SELECT sent in the same write right behind it.
+/// The SASL path (issue #181), using SCRAM-SHA-256: a SELECT pipelined in
+/// the same write as the client-final message must not be run against
+/// pre-authentication state while the offloaded step is still in flight
+/// (SCRAM ends with the server's final data, which the client answers with
+/// an empty line before the command completes - so the SELECT is refused,
+/// not queued), and the exchange must still complete correctly.
 #[test]
-fn server_authenticate_pipelined_with_select_waits_for_async_step() {
+fn server_authenticate_pipelined_with_select_is_not_run_before_auth_completes() {
     let dir = tempfile::tempdir().unwrap();
     let store: Arc<dyn CredentialStore> = Arc::new(SlowStore {
         inner: PasswordStore::new().with_user("alice", "secret"),
@@ -1252,33 +1256,29 @@ fn server_authenticate_pipelined_with_select_waits_for_async_step() {
     let (rt, addr) = start_imap_server_with_store(&dir, store);
 
     let mut stream = TcpStream::connect(addr).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let mut buf = vec![0u8; 8192];
     read_until(&mut stream, &mut buf, |s| s.contains("* OK"));
 
-    write_cmd(&mut stream, b"a1 AUTHENTICATE CRAM-MD5\r\n");
-    let r = read_until(&mut stream, &mut buf, |s| s.contains("+ ") && s.ends_with("\r\n"));
-    let b64 = r.trim().strip_prefix("+ ").expect("continuation prefix");
-    let challenge = String::from_utf8(rmimeparser::charset::base64::decode(b64).unwrap())
-        .expect("challenge is ASCII");
-    let digest = hopf_auth::cram_md5::compute_response("secret", &challenge);
-    let response = rmimeparser::charset::base64::encode(format!("alice {digest}").as_bytes());
-    write_cmd(
-        &mut stream,
-        format!("{response}\r\na2 SELECT INBOX\r\n").as_bytes(),
-    );
+    let mut client = scram_client();
+    write_cmd(&mut stream, b"a1 AUTHENTICATE SCRAM-SHA-256\r\n");
+    read_until(&mut stream, &mut buf, |s| s.starts_with("+") && s.ends_with("\r\n"));
+    let first = scram_step(&mut client, None);
+    write_cmd(&mut stream, format!("{first}\r\n").as_bytes());
+    let r = read_until(&mut stream, &mut buf, |s| s.starts_with("+ ") && s.ends_with("\r\n"));
+    let last = scram_step(&mut client, Some(r.trim().strip_prefix("+ ").unwrap()));
+    write_cmd(&mut stream, format!("{last}\r\na2 SELECT INBOX\r\n").as_bytes());
 
-    let r = read_until(&mut stream, &mut buf, |s| {
-        s.contains("a1 OK") && s.contains("a2 ")
-    });
+    // The server's final message, and the pipelined SELECT refused.
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a2 "));
+    assert!(!r.contains("a2 OK") && !r.contains("EXISTS"), "SELECT ran before authentication: {r}");
+    write_cmd(&mut stream, b"\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a1 "));
     assert!(r.contains("a1 OK"), "authenticate: {r}");
-    assert!(
-        r.contains("a2 OK") && r.contains("1 EXISTS"),
-        "pipelined SELECT must be processed only after the offloaded SASL \
-         step completes, against authenticated state: {r}"
-    );
+
+    write_cmd(&mut stream, b"a3 SELECT INBOX\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a3 "));
+    assert!(r.contains("a3 OK") && r.contains("EXISTS"), "select after auth: {r}");
     drop(rt);
 }
 

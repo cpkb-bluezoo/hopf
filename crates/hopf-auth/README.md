@@ -7,7 +7,6 @@ TrustPolicy, IdentityMaterial, credential stores, and **SASL mechanisms**
 |-----------|-------------|
 | PLAIN | RFC 4616 |
 | LOGIN | legacy two-step |
-| CRAM-MD5 | RFC 2195 |
 | DIGEST-MD5 | RFC 2831 (deprecated; kept for parity) |
 | SCRAM-SHA-256 | RFC 5802 / 7677 |
 | OAUTHBEARER | RFC 7628 |

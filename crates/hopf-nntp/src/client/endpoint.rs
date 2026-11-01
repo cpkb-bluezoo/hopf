@@ -23,7 +23,6 @@ use super::session::{Command, Detail, NntpSession, Queue, Sink};
 /// Mechanisms tried for a password, in order of preference.
 const SASL_PREFERENCE: &[SaslMechanism] = &[
     SaslMechanism::ScramSha256,
-    SaslMechanism::CramMd5,
     SaslMechanism::Plain,
     SaslMechanism::Login,
 ];

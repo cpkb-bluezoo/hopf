@@ -160,8 +160,7 @@ pub(crate) fn ehlo_argument(hostname: &str, ep: &dyn Endpoint) -> String {
 pub(crate) fn choose_sasl_mechanism(auth_methods: &[String], bearer: bool) -> Option<SaslMechanism> {
     const PASSWORD: &[SaslMechanism] = &[
         SaslMechanism::ScramSha256,
-        SaslMechanism::CramMd5,
-        SaslMechanism::Plain,
+            SaslMechanism::Plain,
         SaslMechanism::Login,
     ];
     const BEARER: &[SaslMechanism] = &[SaslMechanism::XOauth2, SaslMechanism::OauthBearer];
@@ -174,7 +173,7 @@ pub(crate) fn choose_sasl_mechanism(auth_methods: &[String], bearer: bool) -> Op
 
 /// The failure text when credentials were given but nothing usable was offered.
 pub(crate) fn no_mechanism_message(auth_methods: &[String], bearer: bool) -> String {
-    let wanted = if bearer { "XOAUTH2 or OAUTHBEARER" } else { "SCRAM-SHA-256, CRAM-MD5, PLAIN or LOGIN" };
+    let wanted = if bearer { "XOAUTH2 or OAUTHBEARER" } else { "SCRAM-SHA-256, PLAIN or LOGIN" };
     if auth_methods.is_empty() {
         format!("server advertises no AUTH mechanisms ({wanted} needed)")
     } else {
@@ -820,17 +819,14 @@ impl SmtpClientDriver for SmtpSendDriver {
                 exchange.respond(&r);
             }
             SaslClientStep::Complete(r) => {
-                // Some mechanisms (e.g. SCRAM-SHA-256) send a trailing
-                // informational challenge (the server's `v=` verifier)
-                // after the exchange is otherwise done; our server sends
-                // it without waiting for a reply. Keep the client so a
-                // further `on_auth_challenge` call can absorb that
-                // instead of falling into the "no exchange" abort path.
+                // Our last message (SCRAM-SHA-256's client-final), or the
+                // empty answer to the server's last data (its `v=`
+                // verifier, sent as one more challenge before the 235;
+                // RFC 4954 section 4). Keep the client so that challenge
+                // finds it.
                 st.sasl_client = Some(client);
                 drop(st);
-                if !r.is_empty() {
-                    exchange.respond(&r);
-                }
+                exchange.respond(&r);
             }
             SaslClientStep::Failure => {
                 drop(st);

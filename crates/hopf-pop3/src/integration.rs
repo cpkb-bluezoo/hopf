@@ -203,21 +203,12 @@ impl CredentialStore for SlowStore {
         std::thread::sleep(self.delay);
         self.inner.password_match(username, password)
     }
-    fn plaintext_password(&self, username: &str) -> Option<String> {
-        // `PasswordStore` deliberately discards plaintext after enrollment
-        // and so can't drive CRAM-MD5, which needs a recoverable secret —
-        // override it here so `SlowStore` can, since CRAM-MD5's
-        // server-first, multi-round-trip shape is what the AUTH pipelining
-        // test below needs to exercise the `first_step`/continuation
-        // offload path. CRAM-MD5 verification goes through this method
-        // (not `password_match`), so it needs the same delay.
-        std::thread::sleep(self.delay);
-        (username == "alice").then(|| "secret".to_string())
-    }
     fn digest_ha1(&self, username: &str, realm: &str) -> Option<String> {
         self.inner.digest_ha1(username, realm)
     }
     fn scram_credentials(&self, username: &str) -> Option<ScramCredentials> {
+        // SCRAM verifies against these, not `password_match`: the same delay.
+        std::thread::sleep(self.delay);
         self.inner.scram_credentials(username)
     }
     fn validate_bearer(&self, token: &str, cb: Cb<Option<TokenValidation>>) {
@@ -516,13 +507,14 @@ fn server_pass_pipelined_with_stat_waits_for_async_credential_check() {
     drop(rt);
 }
 
-/// Same race, but for the SASL path (issue #181), using CRAM-MD5 — a
-/// server-first, multi-round-trip mechanism whose *first* step offload is
-/// the new `first_step` code path added for this issue. Challenge
-/// round-trip, then the client's response and a pipelined STAT sent in the
-/// same write right behind it.
+/// The SASL path (issue #181), using SCRAM-SHA-256: a STAT pipelined in the
+/// same write as the client-final message must not be run against
+/// pre-authentication state while the offloaded step is in flight (SCRAM
+/// ends with the server's final data, which the client answers with an
+/// empty line before the command completes - so the STAT is refused, not
+/// queued), and the exchange must still complete correctly.
 #[test]
-fn server_auth_pipelined_with_stat_waits_for_async_step() {
+fn server_auth_pipelined_with_stat_is_not_run_before_auth_completes() {
     let dir = tempfile::tempdir().unwrap();
     let store: Arc<dyn CredentialStore> = Arc::new(SlowStore {
         inner: PasswordStore::new().with_user("alice", "secret"),
@@ -531,30 +523,38 @@ fn server_auth_pipelined_with_stat_waits_for_async_step() {
     let (rt, addr) = start_pop3_server_with_store(&dir, store);
 
     let mut stream = TcpStream::connect(addr).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let mut buf = vec![0u8; 4096];
     read_until(&mut stream, &mut buf, |s| s.starts_with("+OK"));
 
-    write_cmd(&mut stream, b"AUTH CRAM-MD5\r\n");
-    let r = read_until(&mut stream, &mut buf, |s| s.contains("+ ") && s.ends_with("\r\n"));
-    let b64 = r.trim().strip_prefix("+ ").expect("continuation prefix");
-    let challenge = String::from_utf8(rmimeparser::charset::base64::decode(b64).unwrap())
-        .expect("challenge is ASCII");
-    let digest = hopf_auth::cram_md5::compute_response("secret", &challenge);
-    let response = rmimeparser::charset::base64::encode(format!("alice {digest}").as_bytes());
-    write_cmd(&mut stream, format!("{response}\r\nSTAT\r\n").as_bytes());
+    let mut client = hopf_auth::create_client(SaslMechanism::ScramSha256, "alice", "secret", "localhost", "pop", None);
+    let step = |client: &mut Box<dyn hopf_auth::SaslClient>, challenge: Option<&str>| {
+        let challenge = challenge.map(|c| rmimeparser::charset::base64::decode(c).unwrap());
+        match client.evaluate(challenge.as_deref()) {
+            hopf_auth::SaslClientStep::Response(d) | hopf_auth::SaslClientStep::Complete(d) => {
+                rmimeparser::charset::base64::encode(&d)
+            }
+            hopf_auth::SaslClientStep::Failure => panic!("the SCRAM client failed"),
+        }
+    };
+    write_cmd(&mut stream, b"AUTH SCRAM-SHA-256\r\n");
+    read_until(&mut stream, &mut buf, |s| s.starts_with("+") && s.ends_with("\r\n"));
+    let first = step(&mut client, None);
+    write_cmd(&mut stream, format!("{first}\r\n").as_bytes());
+    let r = read_until(&mut stream, &mut buf, |s| s.starts_with("+ ") && s.ends_with("\r\n"));
+    let last = step(&mut client, Some(r.trim().strip_prefix("+ ").expect("continuation prefix")));
+    write_cmd(&mut stream, format!("{last}\r\nSTAT\r\n").as_bytes());
 
-    let r = read_until(&mut stream, &mut buf, |s| {
-        s.contains("Mailbox opened") && s.contains("+OK 1 ")
-    });
+    // The server's final message, and the pipelined STAT refused.
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("-ERR") || s.contains("+OK 1 "));
+    assert!(!r.contains("+OK 1 "), "STAT ran before authentication: {r}");
+    write_cmd(&mut stream, b"\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("Mailbox opened"));
     assert!(r.contains("Mailbox opened"), "auth: {r}");
-    assert!(
-        r.contains("+OK 1 "),
-        "pipelined STAT must be processed only after the offloaded SASL \
-         step completes, against authenticated state: {r}"
-    );
+
+    write_cmd(&mut stream, b"STAT\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.starts_with("+OK") || s.starts_with("-ERR"));
+    assert!(r.starts_with("+OK 1 "), "STAT after auth: {r}");
     drop(rt);
 }
 

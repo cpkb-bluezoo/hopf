@@ -88,9 +88,8 @@ pub trait CredentialStore: Send + Sync {
 
     /// Look up a recoverable plaintext password.
     ///
-    /// **Only** for legacy mechanisms that require it (CRAM-MD5 default
-    /// path, POP3 APOP). Production stores should leave this as `None` and
-    /// override [`cram_md5_digest`] / supply a custom APOP verifier instead.
+    /// **Only** for legacy mechanisms that require it (POP3 APOP).
+    /// Production stores should leave this as `None`.
     fn plaintext_password(&self, username: &str) -> Option<String> {
         let _ = username;
         None
@@ -98,12 +97,6 @@ pub trait CredentialStore: Send + Sync {
 
     /// Precomputed `MD5(username:realm:password)` hex for DIGEST-MD5 / HTTP Digest.
     fn digest_ha1(&self, username: &str, realm: &str) -> Option<String>;
-
-    /// Expected CRAM-MD5 hex digest for `challenge` (RFC 2195).
-    fn cram_md5_digest(&self, username: &str, challenge: &str) -> Option<String> {
-        let password = self.plaintext_password(username)?;
-        Some(crate::cram_md5::compute_response(&password, challenge))
-    }
 
     /// SCRAM-SHA-256 credentials.
     fn scram_credentials(&self, username: &str) -> Option<ScramCredentials>;
@@ -146,8 +139,8 @@ struct StoredUser {
 /// Enrollment accepts a password **once**, then keeps only SCRAM-SHA-256
 /// material (and optional Digest HA1). Plaintext is not retained.
 ///
-/// Does **not** support CRAM-MD5 or POP3 APOP (those need a recoverable
-/// secret or a custom [`CredentialStore`]). DIGEST-MD5 / HTTP Digest work
+/// Does **not** support POP3 APOP (it needs a recoverable secret or a custom
+/// [`CredentialStore`]). DIGEST-MD5 / HTTP Digest work
 /// when [`Self::with_digest_realm`] matches the challenge realm.
 #[derive(Debug, Default)]
 pub struct PasswordStore {
@@ -428,9 +421,6 @@ impl CredentialStore for Arc<dyn CredentialStore> {
     fn digest_ha1(&self, username: &str, realm: &str) -> Option<String> {
         (**self).digest_ha1(username, realm)
     }
-    fn cram_md5_digest(&self, username: &str, challenge: &str) -> Option<String> {
-        (**self).cram_md5_digest(username, challenge)
-    }
     fn scram_credentials(&self, username: &str) -> Option<ScramCredentials> {
         (**self).scram_credentials(username)
     }
@@ -457,7 +447,6 @@ mod tests {
         assert!(!store.password_match("alice", "wrong"));
         assert!(!store.password_match("bob", "s3cret"));
         assert!(store.scram_credentials("alice").is_some());
-        assert!(!store.supported_mechanisms().contains(&SaslMechanism::CramMd5));
     }
 
     #[test]

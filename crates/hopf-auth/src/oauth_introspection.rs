@@ -159,9 +159,6 @@ impl CredentialStore for IntrospectionCredentialStore {
     fn digest_ha1(&self, username: &str, realm: &str) -> Option<String> {
         self.inner.digest_ha1(username, realm)
     }
-    fn cram_md5_digest(&self, username: &str, challenge: &str) -> Option<String> {
-        self.inner.cram_md5_digest(username, challenge)
-    }
     fn scram_credentials(&self, username: &str) -> Option<ScramCredentials> {
         self.inner.scram_credentials(username)
     }

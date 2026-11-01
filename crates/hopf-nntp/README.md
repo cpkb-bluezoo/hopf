@@ -8,8 +8,8 @@ NNTP / NNTPS **async client** for [Hopf](https://cpkb-bluezoo.github.io/hopf/)
 - **Async:** non-blocking, built on the hopf-core `Runtime` / `ProtocolHandler`
 - **DNS:** async hostname resolution via hopf-dns (`DnsResolver`)
 - **TLS:** implicit NNTPS (port 563) and STARTTLS, required or opportunistic
-- **Auth:** AUTHINFO USER/PASS and AUTHINFO SASL (SCRAM-SHA-256, CRAM-MD5,
-  PLAIN, LOGIN) chosen from CAPABILITIES
+- **Auth:** AUTHINFO USER/PASS and AUTHINFO SASL (SCRAM-SHA-256, PLAIN,
+  LOGIN) chosen from CAPABILITIES
 - **Session:** a cloneable `NntpSession` queues commands from any thread;
   replies and completions come back as callbacks
 - **Parsing:** one pass over the connection's ring, nothing buffered whole.

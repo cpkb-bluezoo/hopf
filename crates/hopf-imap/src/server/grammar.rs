@@ -1382,8 +1382,8 @@ mod tests {
             Ok(Request::Authenticate { mechanism: "PLAIN".into(), initial_response: Some("AGZvbwBiYXI=".into()) })
         );
         assert_eq!(
-            one("a AUTHENTICATE CRAM-MD5\r\n"),
-            Ok(Request::Authenticate { mechanism: "CRAM-MD5".into(), initial_response: None })
+            one("a AUTHENTICATE SCRAM-SHA-256\r\n"),
+            Ok(Request::Authenticate { mechanism: "SCRAM-SHA-256".into(), initial_response: None })
         );
         assert_eq!(one("a CREATE Work\r\n"), Ok(Request::Create { mailbox: "Work".into() }));
         assert_eq!(one("a CREATE Work (USE (\\Sent))\r\n"), Ok(Request::Create { mailbox: "Work".into() }));

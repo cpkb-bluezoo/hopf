@@ -101,7 +101,6 @@ pub fn create_server(
     match mechanism {
         SaslMechanism::Plain => Box::new(crate::plain::PlainServer::new(store)),
         SaslMechanism::Login => Box::new(crate::login::LoginServer::new(store)),
-        SaslMechanism::CramMd5 => Box::new(crate::cram_md5::CramMd5Server::new(store, opts.hostname)),
         SaslMechanism::DigestMd5 => {
             Box::new(crate::digest_md5::DigestMd5Server::new(store, opts.realm))
         }
@@ -143,7 +142,6 @@ pub fn create_client(
     match mechanism {
         SaslMechanism::Plain => Box::new(crate::plain::PlainClient::new(username, password)),
         SaslMechanism::Login => Box::new(crate::login::LoginClient::new(username, password)),
-        SaslMechanism::CramMd5 => Box::new(crate::cram_md5::CramMd5Client::new(username, password)),
         SaslMechanism::DigestMd5 => Box::new(crate::digest_md5::DigestMd5Client::new(
             username, password, host, service,
         )),

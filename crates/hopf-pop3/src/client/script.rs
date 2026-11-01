@@ -220,7 +220,7 @@ struct ScriptDriver {
 /// `Pop3Fetch`).
 fn choose_mechanism(sasl_mechs: &[String]) -> Option<SaslMechanism> {
     const PREFERENCE: &[SaslMechanism] =
-        &[SaslMechanism::ScramSha256, SaslMechanism::CramMd5, SaslMechanism::Plain, SaslMechanism::Login];
+        &[SaslMechanism::ScramSha256, SaslMechanism::Plain, SaslMechanism::Login];
     PREFERENCE.iter().copied().find(|m| sasl_mechs.iter().any(|s| s.eq_ignore_ascii_case(m.name())))
 }
 

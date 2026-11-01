@@ -105,7 +105,7 @@ impl SmtpVerify {
         self
     }
 
-    /// Prove a username/password (SCRAM-SHA-256, CRAM-MD5, PLAIN or LOGIN,
+    /// Prove a username/password (SCRAM-SHA-256, PLAIN or LOGIN,
     /// whichever strongest the server offers).
     pub fn credentials_password(self, user: impl Into<String>, pass: impl Into<String>) -> Self {
         let mut st = self.0.lock().unwrap();
@@ -288,11 +288,12 @@ impl SmtpClientDriver for SmtpVerifyDriver {
                 exchange.respond(&r);
             }
             SaslClientStep::Complete(r) => {
+                // Our last message, or the empty answer to the server's
+                // last data (RFC 4954 section 4); keep the client for the
+                // challenge that may still follow.
                 st.sasl_client = Some(client);
                 drop(st);
-                if !r.is_empty() {
-                    exchange.respond(&r);
-                }
+                exchange.respond(&r);
             }
             SaslClientStep::Failure => {
                 drop(st);
