@@ -38,7 +38,10 @@ pub use metrics::SmtpServerMetrics;
 pub use mime_pipeline::MimeAnalysisPipeline;
 pub use pipeline::{DiscardPipeline, NullPipeline, SmtpPipeline};
 pub use mailbox::{LocalDeliveryHandler, LocalDeliveryHandlerFactory, LocalDeliveryService};
-pub use relay::{SimpleRelayHandler, SimpleRelayHandlerFactory, SimpleRelayService};
+pub use relay::{
+    QueueScan, QueuedMessage, QueuedRecipient, RecipientStatus, RelayQueue, SimpleRelayHandler,
+    SimpleRelayHandlerFactory, SimpleRelayService,
+};
 pub use reply::{reply, reply_ehlo, reply_enhanced, reply_multiline};
 pub use service::{
     SmtpConfig, SmtpService, DEFAULT_MAX_MAIL_TRANSACTIONS, DEFAULT_MAX_MESSAGE_SIZE,

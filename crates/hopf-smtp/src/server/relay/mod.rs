@@ -7,7 +7,9 @@
 
 mod dane;
 mod handler;
+mod queue;
 mod service;
 
 pub use handler::{SimpleRelayHandler, SimpleRelayHandlerFactory};
+pub use queue::{QueueScan, QueuedMessage, QueuedRecipient, RecipientStatus, RelayQueue};
 pub use service::SimpleRelayService;
