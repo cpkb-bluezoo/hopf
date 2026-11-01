@@ -1891,6 +1891,64 @@ fn fetch_strips_authorization_header_on_a_cross_origin_redirect() {
     );
 }
 
+/// Follow `status` from a redirecting server to a capturing one with
+/// `method`/`headers`/`body`, and return the request line + headers the
+/// second server saw.
+fn captured_after_redirect(status: u16, method: &str, headers: Headers, body: Option<Vec<u8>>) -> String {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let (addr_b, captured) = start_raw_capturing_server(&rt);
+    let addr_a =
+        start_redirecting_server(&rt, status, format!("http://127.0.0.1:{}/final", addr_b.port()));
+    let out = Arc::new(Mutex::new(GumdropOutcome::default()));
+    let out2 = Arc::clone(&out);
+    let client = HttpClient::from_addr(addr_a).follow_redirects(RedirectPolicy::default());
+    client
+        .fetch(&rt, method, "/start", headers, body, Box::new(RecordingResponseHandler { out: out2 }))
+        .unwrap();
+    assert!(wait_gumdrop_done(&out, Duration::from_secs(5)), "fetch never completed");
+    assert_eq!(out.lock().unwrap().status, 200);
+    let head = captured.lock().unwrap().clone().expect("the redirect target should have received a request");
+    head
+}
+
+/// A 303 turns a POST into a GET and drops the body; the headers that
+/// described that body must not follow it, or the GET claims content it
+/// does not carry.
+#[test]
+fn a_303_after_a_post_drops_the_body_and_its_describing_headers() {
+    let mut headers = Headers::new();
+    headers.add("Content-Type", "text/plain");
+    headers.add("Content-Length", "7");
+    headers.add("X-Keep", "yes");
+    let head = captured_after_redirect(303, "POST", headers, Some(b"payload".to_vec()));
+    let lower = head.to_ascii_lowercase();
+    assert!(head.starts_with("GET /final "), "{head}");
+    assert!(!lower.contains("content-type") && !lower.contains("content-length"), "{head}");
+    assert!(lower.contains("x-keep: yes"), "{head}");
+}
+
+/// A 307 keeps method and body, so it keeps the headers describing it too.
+#[test]
+fn a_307_after_a_post_keeps_the_body_headers() {
+    let mut headers = Headers::new();
+    headers.add("Content-Type", "text/plain");
+    let head = captured_after_redirect(307, "POST", headers, Some(b"payload".to_vec()));
+    assert!(head.starts_with("POST /final "), "{head}");
+    assert!(head.to_ascii_lowercase().contains("content-type: text/plain"), "{head}");
+}
+
+/// An explicit `Host` names the origin the request was meant for: it must
+/// not follow a redirect to another one.
+#[test]
+fn an_explicit_host_header_does_not_follow_a_cross_origin_redirect() {
+    let mut headers = Headers::new();
+    headers.add("Host", "original.example");
+    let head = captured_after_redirect(302, "GET", headers, None);
+    let hosts: Vec<_> = head.lines().filter(|l| l.to_ascii_lowercase().starts_with("host:")).collect();
+    assert_eq!(hosts.len(), 1, "{head}");
+    assert!(!hosts[0].contains("original.example"), "{head}");
+}
+
 // ---------------------------------------------------------------------------
 // H2 session: several bodyless requests in flight on one connection
 // ---------------------------------------------------------------------------

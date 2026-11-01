@@ -73,57 +73,147 @@ impl RedirectTarget {
     }
 }
 
-/// Resolve a `Location` header value against the request that received it.
+/// Resolve a `Location` header value against the request that received it
+/// (RFC 9110 section 10.2.2 allows any URI reference; RFC 3986 section 5
+/// says how to resolve one).
 ///
-/// Supports an absolute `http`/`https` URL, a protocol-relative
-/// `//host[:port]/path`, or an absolute path (`/foo`). Does not support
-/// RFC 3986 relative-reference resolution against the current path (a
-/// bare `sibling`, a `../parent`, or a query-only `?x=y` reference) — a
-/// server issuing one of those is treated as unresolvable, since none of
-/// hopf-http's client code otherwise needs a general URI resolver.
+/// Handles an absolute `http`/`https` URL, a network-path reference
+/// (`//host/path`), an absolute path, a relative path (`sibling`,
+/// `../parent`), and a query-only reference (`?x=y`), with dot segments
+/// removed. A fragment is dropped - it is never sent to a server. Any other
+/// scheme, an empty value or an unusable authority gives `None`.
 pub(crate) fn resolve_location(current: &RedirectTarget, location: &str) -> Option<RedirectTarget> {
     let location = location.trim();
     if location.is_empty() {
         return None;
     }
-    if let Some(rest) = location.strip_prefix("http://") {
+    let location = location.split('#').next().unwrap_or("");
+    if location.is_empty() {
+        // "#frag" alone: the same document.
+        return Some(current.clone());
+    }
+    if let Some(rest) = strip_prefix_ignore_case(location, "http://") {
         return parse_authority_and_path(false, rest);
     }
-    if let Some(rest) = location.strip_prefix("https://") {
+    if let Some(rest) = strip_prefix_ignore_case(location, "https://") {
         return parse_authority_and_path(true, rest);
     }
     if let Some(rest) = location.strip_prefix("//") {
         return parse_authority_and_path(current.secure, rest);
     }
-    if location.starts_with('/') {
-        return Some(RedirectTarget {
-            secure: current.secure,
-            host: current.host.clone(),
-            port: current.port,
-            path: location.to_string(),
-        });
+    // Any other `scheme:` is a URI we do not follow (RFC 3986 section 4.2:
+    // a colon in the first segment makes it a scheme, not a path).
+    let first_segment_end = location.find(['/', '?']).unwrap_or(location.len());
+    if location[..first_segment_end].contains(':') {
+        return None;
     }
-    None
+    let (ref_path, ref_query) = match location.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (location, None),
+    };
+    let (base_path, base_query) = match current.path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (current.path.as_str(), None),
+    };
+    let (path, query) = if ref_path.is_empty() {
+        // query-only reference: the base path, the new query
+        (base_path.to_string(), ref_query.or(base_query))
+    } else if ref_path.starts_with('/') {
+        (remove_dot_segments(ref_path), ref_query)
+    } else {
+        let dir = &base_path[..base_path.rfind('/').map_or(0, |i| i + 1)];
+        let merged = if dir.is_empty() { format!("/{ref_path}") } else { format!("{dir}{ref_path}") };
+        (remove_dot_segments(&merged), ref_query)
+    };
+    let path = match query {
+        Some(q) => format!("{path}?{q}"),
+        None => path,
+    };
+    Some(RedirectTarget { secure: current.secure, host: current.host.clone(), port: current.port, path })
+}
+
+fn strip_prefix_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then(|| &s[prefix.len()..])
+}
+
+/// RFC 3986 section 5.2.4.
+fn remove_dot_segments(path: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut segments = path.split('/').peekable();
+    // the leading empty segment of an absolute path stays
+    let absolute = path.starts_with('/');
+    if absolute {
+        segments.next();
+    }
+    let mut trailing_slash = false;
+    while let Some(seg) = segments.next() {
+        let last = segments.peek().is_none();
+        match seg {
+            "." => trailing_slash = last,
+            ".." => {
+                out.pop();
+                trailing_slash = last;
+            }
+            _ => {
+                out.push(seg);
+                trailing_slash = false;
+            }
+        }
+    }
+    let mut result = String::from(if absolute { "/" } else { "" });
+    result.push_str(&out.join("/"));
+    if trailing_slash && !result.ends_with('/') {
+        result.push('/');
+    }
+    result
 }
 
 fn parse_authority_and_path(secure: bool, rest: &str) -> Option<RedirectTarget> {
-    let (authority, path) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], rest[idx..].to_string()),
-        None => (rest, "/".to_string()),
+    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    // "host?x=1" is the root path with a query
+    let tail = if tail.is_empty() {
+        "/".to_string()
+    } else if tail.starts_with('?') {
+        format!("/{tail}")
+    } else {
+        tail.to_string()
     };
-    if authority.is_empty() {
+    // userinfo is not part of the host
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, a)| a);
+    let default_port = if secure { 443 } else { 80 };
+    let (host, port) = if let Some(inner) = authority.strip_prefix('[') {
+        // an IPv6 literal: `[addr]` or `[addr]:port`; the address goes on bare,
+        // as `HttpClient::from_addr` does
+        let (addr, after) = inner.split_once(']')?;
+        let port = match after {
+            "" => default_port,
+            _ => after.strip_prefix(':')?.parse::<u16>().ok().or_else(|| after.eq(":").then_some(default_port))?,
+        };
+        (addr.to_string(), port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, "")) => (h.to_string(), default_port),
+            Some((h, p)) => (h.to_string(), p.parse::<u16>().ok()?),
+            None => (authority.to_string(), default_port),
+        }
+    };
+    if host.is_empty() {
         return None;
     }
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if !h.is_empty() => (h.to_string(), p.parse::<u16>().ok()?),
-        _ => (authority.to_string(), if secure { 443 } else { 80 }),
+    let path = {
+        let (p, q) = match tail.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (tail.as_str(), None),
+        };
+        let p = remove_dot_segments(p);
+        match q {
+            Some(q) => format!("{p}?{q}"),
+            None => p,
+        }
     };
-    Some(RedirectTarget {
-        secure,
-        host,
-        port,
-        path,
-    })
+    Some(RedirectTarget { secure, host, port, path })
 }
 
 /// RFC 9110 §15.4 request-rewrite rules for following a redirect: the
@@ -152,6 +242,34 @@ fn strip_cross_origin_headers(headers: &mut Headers) {
     headers.remove("authorization");
     headers.remove("cookie");
     headers.remove("proxy-authorization");
+}
+
+/// The headers for the request that follows a redirect.
+///
+/// Credentials never leave the origin they were meant for, and neither does
+/// an explicit `Host`; and when the body is dropped (a 303, or a POST
+/// turned into a GET) the headers that describe a body go with it, so the
+/// new request does not claim content it does not have.
+pub(crate) fn headers_for_next_hop(headers: &Headers, cross_origin: bool, body_dropped: bool) -> Headers {
+    let mut out = headers.clone();
+    if cross_origin {
+        strip_cross_origin_headers(&mut out);
+        out.remove("host");
+    }
+    if body_dropped {
+        let describing: Vec<String> = out
+            .iter()
+            .map(|f| f.name.clone())
+            .filter(|n| {
+                let n = n.to_ascii_lowercase();
+                n.starts_with("content-") || n == "transfer-encoding" || n == "expect"
+            })
+            .collect();
+        for name in describing {
+            out.remove(&name);
+        }
+    }
+    out
 }
 
 /// The 3xx statuses this module treats as followable redirects. Any other
@@ -409,12 +527,14 @@ impl HttpResponseHandler for HopResponseIntercept {
             );
             return;
         }
+        let had_body = self.body.is_some();
         let (next_method, next_body) =
             next_method_and_body(self.status, &self.method, self.body.take());
-        let mut next_headers = self.headers.clone();
-        if !next_target.same_origin(&self.target) {
-            strip_cross_origin_headers(&mut next_headers);
-        }
+        let next_headers = headers_for_next_hop(
+            &self.headers,
+            !next_target.same_origin(&self.target),
+            had_body && next_body.is_none(),
+        );
         FetchState::dial_hop(
             Arc::clone(&self.state),
             next_target,
@@ -529,12 +649,10 @@ mod tests {
     }
 
     #[test]
-    fn relative_reference_is_not_resolved() {
+    fn an_empty_or_unusable_location_is_not_a_target() {
         let current = target(true, "example.com", 443, "/a/b");
-        assert!(resolve_location(&current, "sibling").is_none());
-        assert!(resolve_location(&current, "../parent").is_none());
-        assert!(resolve_location(&current, "?query=only").is_none());
         assert!(resolve_location(&current, "").is_none());
+        assert!(resolve_location(&current, "   ").is_none());
     }
 
     #[test]
@@ -589,5 +707,186 @@ mod tests {
         assert!(!a.same_origin(&c));
         let d = target(false, "example.com", 443, "/b");
         assert!(!a.same_origin(&d));
+    }
+
+    fn resolved(base: &RedirectTarget, location: &str) -> Option<String> {
+        resolve_location(base, location).map(|t| {
+            format!("{}://{}:{}{}", if t.secure { "https" } else { "http" }, t.host, t.port, t.path)
+        })
+    }
+
+    #[test]
+    fn a_fragment_is_never_sent_to_the_server() {
+        let base = target(true, "example.com", 443, "/a");
+        assert_eq!(resolved(&base, "/b#section").as_deref(), Some("https://example.com:443/b"));
+        assert_eq!(resolved(&base, "https://x.example/p?q=1#frag").as_deref(), Some("https://x.example:443/p?q=1"));
+        assert_eq!(resolved(&base, "#only-a-fragment").as_deref(), Some("https://example.com:443/a"));
+    }
+
+    #[test]
+    fn scheme_names_are_not_case_sensitive() {
+        let base = target(false, "example.com", 80, "/a");
+        assert_eq!(resolved(&base, "HTTPS://Other.example/x").as_deref(), Some("https://Other.example:443/x"));
+        assert_eq!(resolved(&base, "Http://other.example/x").as_deref(), Some("http://other.example:80/x"));
+    }
+
+    #[test]
+    fn other_schemes_are_not_followed() {
+        let base = target(true, "example.com", 443, "/a");
+        for loc in ["ftp://x.example/f", "mailto:a@b.example", "javascript:alert(1)", "file:///etc/passwd", "gopher://x/"] {
+            assert!(resolve_location(&base, loc).is_none(), "{loc}");
+        }
+    }
+
+    #[test]
+    fn an_authority_ends_at_a_query_or_fragment_too() {
+        let base = target(true, "example.com", 443, "/a");
+        assert_eq!(resolved(&base, "https://other.example?x=1").as_deref(), Some("https://other.example:443/?x=1"));
+        assert_eq!(resolved(&base, "https://other.example#f").as_deref(), Some("https://other.example:443/"));
+        assert_eq!(resolved(&base, "http://other.example:8080?x=1").as_deref(), Some("http://other.example:8080/?x=1"));
+    }
+
+    #[test]
+    fn userinfo_is_not_part_of_the_host() {
+        let base = target(true, "example.com", 443, "/a");
+        assert_eq!(resolved(&base, "https://user:pw@other.example/x").as_deref(), Some("https://other.example:443/x"));
+        assert_eq!(resolved(&base, "https://user@other.example:8443/x").as_deref(), Some("https://other.example:8443/x"));
+    }
+
+    #[test]
+    fn ipv6_literals_resolve_with_and_without_a_port() {
+        let base = target(false, "example.com", 80, "/a");
+        assert_eq!(resolved(&base, "http://[::1]:8080/x").as_deref(), Some("http://::1:8080/x"));
+        assert_eq!(resolved(&base, "http://[2001:db8::7]/x").as_deref(), Some("http://2001:db8::7:80/x"));
+        assert_eq!(resolved(&base, "https://[::1]/").as_deref(), Some("https://::1:443/"));
+        assert!(resolve_location(&base, "http://[::1/x").is_none(), "unclosed bracket");
+    }
+
+    #[test]
+    fn bad_authorities_are_refused() {
+        let base = target(true, "example.com", 443, "/a");
+        for loc in ["http:///path", "https://", "http://host:99999/", "http://host:abc/", "http://:80/"] {
+            assert!(resolve_location(&base, loc).is_none(), "{loc}");
+        }
+        // an empty port means the default one
+        assert_eq!(resolved(&base, "http://host:/x").as_deref(), Some("http://host:80/x"));
+    }
+
+    #[test]
+    fn relative_references_resolve_against_the_current_path() {
+        // RFC 3986 section 5.4.1 examples, base http://a/b/c/d;p?q
+        let base = target(false, "a", 80, "/b/c/d;p?q");
+        for (reference, want) in [
+            ("g", "http://a:80/b/c/g"),
+            ("./g", "http://a:80/b/c/g"),
+            ("g/", "http://a:80/b/c/g/"),
+            ("/g", "http://a:80/g"),
+            ("//g", "http://g:80/"),
+            ("?y", "http://a:80/b/c/d;p?y"),
+            ("g?y", "http://a:80/b/c/g?y"),
+            (";x", "http://a:80/b/c/;x"),
+            ("g;x?y", "http://a:80/b/c/g;x?y"),
+            (".", "http://a:80/b/c/"),
+            ("./", "http://a:80/b/c/"),
+            ("..", "http://a:80/b/"),
+            ("../", "http://a:80/b/"),
+            ("../g", "http://a:80/b/g"),
+            ("../..", "http://a:80/"),
+            ("../../", "http://a:80/"),
+            ("../../g", "http://a:80/g"),
+            ("../../../g", "http://a:80/g"),
+            ("../../../../g", "http://a:80/g"),
+            ("/./g", "http://a:80/g"),
+            ("/../g", "http://a:80/g"),
+            ("g.", "http://a:80/b/c/g."),
+            (".g", "http://a:80/b/c/.g"),
+            ("g..", "http://a:80/b/c/g.."),
+            ("..g", "http://a:80/b/c/..g"),
+            ("./../g", "http://a:80/b/g"),
+            ("./g/.", "http://a:80/b/c/g/"),
+            ("g/./h", "http://a:80/b/c/g/h"),
+            ("g/../h", "http://a:80/b/c/h"),
+            ("g;x=1/./y", "http://a:80/b/c/g;x=1/y"),
+            ("g;x=1/../y", "http://a:80/b/c/y"),
+        ] {
+            let got = resolved(&base, reference);
+            assert_eq!(got.as_deref(), Some(want), "reference {reference:?}");
+        }
+    }
+
+    #[test]
+    fn dot_segments_in_an_absolute_path_are_removed() {
+        let base = target(true, "example.com", 443, "/a");
+        assert_eq!(resolved(&base, "/x/../y/./z").as_deref(), Some("https://example.com:443/y/z"));
+        assert_eq!(resolved(&base, "https://o.example/x/../../y").as_deref(), Some("https://o.example:443/y"));
+    }
+
+    #[test]
+    fn a_relative_reference_with_a_colon_in_its_first_segment_is_not_a_path() {
+        // "a:b" is a URI with scheme "a", not a relative path (RFC 3986 section 4.2).
+        let base = target(true, "example.com", 443, "/p/q");
+        assert!(resolve_location(&base, "a:b").is_none());
+        assert_eq!(resolved(&base, "./a:b").as_deref(), Some("https://example.com:443/p/a:b"));
+    }
+
+    fn names(h: &Headers) -> Vec<String> {
+        h.iter().map(|f| f.name.to_ascii_lowercase()).collect()
+    }
+
+    fn request_headers() -> Headers {
+        let mut h = Headers::new();
+        for (n, v) in [
+            ("Accept", "*/*"),
+            ("Host", "a.example"),
+            ("Authorization", "Bearer t"),
+            ("Cookie", "s=1"),
+            ("Proxy-Authorization", "Basic x"),
+            ("Content-Type", "text/plain"),
+            ("Content-Length", "7"),
+            ("Content-Encoding", "gzip"),
+            ("Transfer-Encoding", "chunked"),
+            ("Expect", "100-continue"),
+            ("X-Trace", "1"),
+        ] {
+            h.add(n, v);
+        }
+        h
+    }
+
+    #[test]
+    fn a_same_origin_hop_with_the_body_keeps_every_header() {
+        let out = headers_for_next_hop(&request_headers(), false, false);
+        assert_eq!(out.len(), request_headers().len());
+    }
+
+    #[test]
+    fn credentials_and_the_host_do_not_leave_the_origin() {
+        let out = headers_for_next_hop(&request_headers(), true, false);
+        let n = names(&out);
+        for gone in ["authorization", "cookie", "proxy-authorization", "host"] {
+            assert!(!n.contains(&gone.to_string()), "{gone} left the origin: {n:?}");
+        }
+        for kept in ["accept", "content-type", "content-length", "x-trace"] {
+            assert!(n.contains(&kept.to_string()), "{kept} kept: {n:?}");
+        }
+    }
+
+    #[test]
+    fn a_dropped_body_takes_its_describing_headers_with_it() {
+        // A GET after a 303 must not claim a body it does not have.
+        let out = headers_for_next_hop(&request_headers(), false, true);
+        let n = names(&out);
+        for gone in ["content-type", "content-length", "content-encoding", "transfer-encoding", "expect"] {
+            assert!(!n.contains(&gone.to_string()), "{gone} stayed: {n:?}");
+        }
+        for kept in ["accept", "host", "authorization", "cookie", "x-trace"] {
+            assert!(n.contains(&kept.to_string()), "{kept} kept: {n:?}");
+        }
+    }
+
+    #[test]
+    fn a_hop_that_is_both_cross_origin_and_bodyless_does_both() {
+        let out = headers_for_next_hop(&request_headers(), true, true);
+        assert_eq!(names(&out), ["accept", "x-trace"]);
     }
 }
