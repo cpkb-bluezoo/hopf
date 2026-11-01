@@ -4,6 +4,7 @@
 
 use std::io;
 
+use loopbuf::LoopBuf;
 use tractrix::{FeatureSet, NamespaceFilter, ParseError, ParseResult, Parser, XmlHandler};
 
 use crate::constants::{self, NAMESPACE, PREFIX};
@@ -129,6 +130,13 @@ impl ResponseWriter<'_> {
 /// Callback surface for streaming Multi-Status parse events.
 pub trait MultiStatusHandler {
     fn start_response(&mut self, href: &str);
+    /// A further `<href>` of the same response, after the first one given to
+    /// [`Self::start_response`]. RFC 4918 section 14.24 allows several
+    /// before a response's single status, for one status that applies to
+    /// each of those resources.
+    fn additional_href(&mut self, href: &str) {
+        let _ = href;
+    }
     fn response_status(&mut self, status_line: &str) {
         let _ = status_line;
     }
@@ -175,11 +183,22 @@ impl std::fmt::Display for MultiStatusParseError {
 
 impl std::error::Error for MultiStatusParseError {}
 
-/// Incremental Multi-Status parser: `feed` accumulates, `finish` runs tractrix once.
+/// How much of a document the parser holds at once: only a token still
+/// incomplete at the end of a `feed` stays in the ring for the next one.
+const PARSE_RING: usize = 64 * 1024;
+
+type Pipeline<H> = Parser<NamespaceFilter<MultistatusXmlAdapter<H>>>;
+
+/// Incremental Multi-Status parser: each `feed` delivers the events of the
+/// bytes it is given to the handler, holding none of the document but an
+/// unfinished token; `finish` ends the document and returns the handler.
 pub struct MultiStatusParser<H: MultiStatusHandler> {
-    handler: H,
-    buffer: Vec<u8>,
+    parser: Pipeline<H>,
+    ring: LoopBuf,
+    fed: usize,
     max_bytes: usize,
+    /// The first parse error, kept so every later call reports it too.
+    failed: Option<String>,
 }
 
 impl<H: MultiStatusHandler> MultiStatusParser<H> {
@@ -188,37 +207,59 @@ impl<H: MultiStatusHandler> MultiStatusParser<H> {
     }
 
     pub fn with_limit(handler: H, max_bytes: usize) -> Self {
+        let features = FeatureSet::default();
+        let filter = NamespaceFilter::new(MultistatusXmlAdapter::new(handler), false);
+        // Building a parser from the default feature set does not fail.
+        let parser = Parser::new(filter, &features, None, None, None)
+            .expect("a parser for the default feature set");
         Self {
-            handler,
-            buffer: Vec::new(),
+            parser,
+            ring: LoopBuf::with_capacity(PARSE_RING),
+            fed: 0,
             max_bytes,
+            failed: None,
         }
     }
 
     pub fn feed(&mut self, data: &[u8]) -> Result<(), MultiStatusParseError> {
-        if self.buffer.len().saturating_add(data.len()) > self.max_bytes {
+        if let Some(e) = &self.failed {
+            return Err(MultiStatusParseError::Parse(e.clone()));
+        }
+        if self.fed.saturating_add(data.len()) > self.max_bytes {
             return Err(MultiStatusParseError::TooLarge);
         }
-        self.buffer.extend_from_slice(data);
+        self.fed += data.len();
+        let mut rest = data;
+        while !rest.is_empty() {
+            let before = self.ring.len();
+            let taken = self.ring.extend_from_slice(rest);
+            rest = &rest[taken..];
+            if let Err(e) = self.parser.receive(&mut self.ring) {
+                return Err(self.fail(e.to_string()));
+            }
+            // A full ring that parsing did not make room in holds one token
+            // that will never fit.
+            if taken == 0 && self.ring.len() >= before {
+                return Err(self.fail("XML token too large for the Multi-Status parser".into()));
+            }
+        }
         Ok(())
     }
 
-    /// Parse the accumulated document and return the handler.
+    fn fail(&mut self, message: String) -> MultiStatusParseError {
+        self.failed = Some(message.clone());
+        MultiStatusParseError::Parse(message)
+    }
+
+    /// End the document and return the handler.
     pub fn finish(mut self) -> Result<H, MultiStatusParseError> {
-        let features = FeatureSet::default();
-        let mut adapter = MultistatusXmlAdapter::new(&mut self.handler);
-        {
-            let mut filter = NamespaceFilter::new(&mut adapter, false);
-            let mut parser = Parser::new(&mut filter, &features, None, None, None)
-                .map_err(|e| MultiStatusParseError::Parse(e.to_string()))?;
-            parser
-                .parse(self.buffer.as_slice())
-                .map_err(|e| MultiStatusParseError::Parse(e.to_string()))?;
+        if let Some(e) = self.failed.take() {
+            return Err(MultiStatusParseError::Parse(e));
         }
-        if let Some(err) = adapter.error.take() {
-            return Err(MultiStatusParseError::Parse(err));
-        }
-        Ok(self.handler)
+        self.parser
+            .close(&mut self.ring)
+            .map_err(|e| MultiStatusParseError::Parse(e.to_string()))?;
+        Ok(self.parser.into_handler().into_delegate().into_handler())
     }
 }
 
@@ -248,34 +289,40 @@ enum Frame {
     Other,
 }
 
-struct MultistatusXmlAdapter<'a, H: MultiStatusHandler> {
-    handler: &'a mut H,
+struct MultistatusXmlAdapter<H: MultiStatusHandler> {
+    handler: H,
     stack: Vec<Frame>,
     ns_stack: Vec<Vec<(String, String)>>,
     text: String,
     pending_href: Option<String>,
+    /// Further hrefs read before the response's status or propstat.
+    extra_hrefs: Vec<String>,
     response_started: bool,
     status_in_propstat: bool,
-    /// Property start deferred until `end_attributes` so xmlns on the element is visible.
-    pending_property: Option<(String, String)>,
+    /// The element just opened, to be classified once its attributes (and so
+    /// its `xmlns` declarations) have been read: `(prefix, local name)`.
+    pending_element: Option<(String, String)>,
     property_stack: Vec<(String, String)>,
-    error: Option<String>,
 }
 
-impl<'a, H: MultiStatusHandler> MultistatusXmlAdapter<'a, H> {
-    fn new(handler: &'a mut H) -> Self {
+impl<H: MultiStatusHandler> MultistatusXmlAdapter<H> {
+    fn new(handler: H) -> Self {
         Self {
             handler,
             stack: Vec::new(),
             ns_stack: Vec::new(),
             text: String::new(),
             pending_href: None,
+            extra_hrefs: Vec::new(),
             response_started: false,
             status_in_propstat: false,
-            pending_property: None,
+            pending_element: None,
             property_stack: Vec::new(),
-            error: None,
         }
+    }
+
+    fn into_handler(self) -> H {
+        self.handler
     }
 
     fn resolve_ns(&self, prefix: &str) -> String {
@@ -296,45 +343,45 @@ impl<'a, H: MultiStatusHandler> MultistatusXmlAdapter<'a, H> {
         }
     }
 
-    fn parent_frame(&self) -> Option<Frame> {
-        self.stack.last().copied()
-    }
-
     fn ensure_response_started(&mut self) {
         if !self.response_started {
             let href = self.pending_href.take().unwrap_or_default();
             self.handler.start_response(&href);
+            for extra in std::mem::take(&mut self.extra_hrefs) {
+                self.handler.additional_href(&extra);
+            }
             self.response_started = true;
         }
     }
 
-    fn flush_pending_property(&mut self) {
-        if let Some((prefix, local)) = self.pending_property.take() {
-            let ns = self.resolve_ns(&prefix);
-            self.handler.start_property(&ns, &local);
-            self.property_stack.push((ns, local));
-        }
-    }
-}
-
-impl<H: MultiStatusHandler> XmlHandler for MultistatusXmlAdapter<'_, H> {
-    fn start_element(&mut self, q_name: &str) -> ParseResult<()> {
-        if self.error.is_some() {
-            return Err(ParseError::new("multistatus xml error"));
-        }
-        self.ns_stack.push(Vec::new());
-        self.text.clear();
-        let (prefix, local) = Self::split_qname(q_name);
-        let parent = self.parent_frame();
-
-        let frame = match (parent, local) {
-            (_, constants::ELEM_MULTISTATUS)
-                if parent.is_none() || matches!(parent, Some(Frame::Other)) =>
-            {
+    /// Decide what the element opened last is, now that its namespace
+    /// declarations are known, and report whatever it starts.
+    fn classify_pending(&mut self) {
+        let Some((prefix, local)) = self.pending_element.take() else {
+            return;
+        };
+        // The element itself is the top of the stack; its parent is below.
+        let parent = self.stack.len().checked_sub(2).map(|i| self.stack[i]);
+        let ns = self.resolve_ns(&prefix);
+        let dav = ns == NAMESPACE;
+        let frame = match (parent, local.as_str()) {
+            // Anything below a property, or an error's conditions, is content
+            // to report, in whatever namespace it is.
+            (Some(Frame::Prop), _) | (Some(Frame::Property), _) | (Some(Frame::Error), _) => {
+                self.ensure_response_started();
+                self.handler.start_property(&ns, &local);
+                self.property_stack.push((ns, local));
+                Frame::Property
+            }
+            // The structure is DAV: elements only; a look-alike in another
+            // namespace is somebody's extension.
+            _ if !dav => Frame::Other,
+            (None, constants::ELEM_MULTISTATUS) | (Some(Frame::Other), constants::ELEM_MULTISTATUS) => {
                 Frame::Multistatus
             }
             (Some(Frame::Multistatus), constants::ELEM_RESPONSE) => {
                 self.pending_href = None;
+                self.extra_hrefs.clear();
                 self.response_started = false;
                 Frame::Response
             }
@@ -353,8 +400,7 @@ impl<H: MultiStatusHandler> XmlHandler for MultistatusXmlAdapter<'_, H> {
                 self.status_in_propstat = true;
                 Frame::Status
             }
-            (Some(Frame::Propstat), constants::ELEM_ERROR)
-            | (Some(Frame::Response), constants::ELEM_ERROR) => {
+            (Some(Frame::Propstat), constants::ELEM_ERROR) | (Some(Frame::Response), constants::ELEM_ERROR) => {
                 self.ensure_response_started();
                 self.handler.start_error();
                 Frame::Error
@@ -363,17 +409,24 @@ impl<H: MultiStatusHandler> XmlHandler for MultistatusXmlAdapter<'_, H> {
             | (Some(Frame::Response), constants::ELEM_RESPONSEDESCRIPTION) => Frame::Description,
             (Some(Frame::Response), constants::ELEM_LOCATION) => Frame::Location,
             (Some(Frame::Location), constants::ELEM_HREF) => Frame::LocationHref,
-            (Some(Frame::Prop), _)
-            | (Some(Frame::Property), _)
-            | (Some(Frame::Error), _) => {
-                self.ensure_response_started();
-                self.pending_property = Some((prefix.to_string(), local.to_string()));
-                Frame::Property
-            }
             _ => Frame::Other,
         };
+        if let Some(top) = self.stack.last_mut() {
+            *top = frame;
+        }
+    }
+}
 
-        self.stack.push(frame);
+impl<H: MultiStatusHandler> XmlHandler for MultistatusXmlAdapter<H> {
+    fn start_element(&mut self, q_name: &str) -> ParseResult<()> {
+        // An element opened without a call to `end_attributes` in between
+        // still has to be classified before its first child.
+        self.classify_pending();
+        self.ns_stack.push(Vec::new());
+        self.text.clear();
+        let (prefix, local) = Self::split_qname(q_name);
+        self.pending_element = Some((prefix.to_string(), local.to_string()));
+        self.stack.push(Frame::Other);
         Ok(())
     }
 
@@ -385,12 +438,13 @@ impl<H: MultiStatusHandler> XmlHandler for MultistatusXmlAdapter<'_, H> {
     }
 
     fn end_attributes(&mut self) -> ParseResult<()> {
-        self.flush_pending_property();
+        self.classify_pending();
         Ok(())
     }
 
     fn characters(&mut self, text: &str, _ignorable: bool) -> ParseResult<()> {
-        match self.parent_frame() {
+        self.classify_pending();
+        match self.stack.last().copied() {
             Some(Frame::Href)
             | Some(Frame::Status)
             | Some(Frame::Description)
@@ -406,9 +460,8 @@ impl<H: MultiStatusHandler> XmlHandler for MultistatusXmlAdapter<'_, H> {
     }
 
     fn end_element(&mut self) -> ParseResult<()> {
-        // Empty elements: end_attributes may not run before end in some paths —
-        // flush any deferred property start.
-        self.flush_pending_property();
+        // An empty element ends before anything else has classified it.
+        self.classify_pending();
 
         let frame = self
             .stack
@@ -418,7 +471,14 @@ impl<H: MultiStatusHandler> XmlHandler for MultistatusXmlAdapter<'_, H> {
 
         match frame {
             Frame::Href => {
-                self.pending_href = Some(std::mem::take(&mut self.text).trim().to_string());
+                let href = std::mem::take(&mut self.text).trim().to_string();
+                if self.response_started {
+                    self.handler.additional_href(&href);
+                } else if self.pending_href.is_none() {
+                    self.pending_href = Some(href);
+                } else {
+                    self.extra_hrefs.push(href);
+                }
             }
             Frame::Status => {
                 let status = std::mem::take(&mut self.text).trim().to_string();
@@ -587,5 +647,396 @@ mod tests {
             .iter()
             .any(|e| e == "response_status:HTTP/1.1 403 Forbidden"));
         assert!(h.events.iter().any(|e| e == "end_response"));
+    }
+
+    // The parser ------------------------------------------------------------
+
+    /// A recording handler the test can still read while the parser owns it.
+    #[derive(Clone, Default)]
+    struct Shared(std::sync::Arc<std::sync::Mutex<RecordingHandler>>);
+
+    impl Shared {
+        fn events(&self) -> Vec<String> {
+            self.0.lock().unwrap().events.clone()
+        }
+    }
+
+    macro_rules! forward {
+        ($($name:ident($($arg:ident: $ty:ty),*)),* $(,)?) => {
+            $(fn $name(&mut self, $($arg: $ty),*) { self.0.lock().unwrap().$name($($arg),*); })*
+        };
+    }
+
+    impl MultiStatusHandler for Shared {
+        forward!(
+            start_response(href: &str),
+            response_status(s: &str),
+            start_propstat(),
+            propstat_status(s: &str),
+            start_property(ns: &str, local: &str),
+            characters(t: &str),
+            end_property(ns: &str, local: &str),
+            end_propstat(),
+            start_error(),
+            end_error(),
+            response_description(t: &str),
+            location(h: &str),
+            end_response(),
+        );
+    }
+
+    fn two_responses() -> (Vec<u8>, Vec<u8>) {
+        let mut ms = MultistatusWriter::new();
+        ms.response("/a", |r| r.status("HTTP/1.1 200 OK")).unwrap();
+        let first = ms.take_written();
+        ms.response("/b", |r| r.status("HTTP/1.1 404 Not Found")).unwrap();
+        let second = ms.finish();
+        (first, second)
+    }
+
+    #[test]
+    fn events_are_delivered_as_the_document_arrives_not_when_it_ends() {
+        let (first, second) = two_responses();
+        let seen = Shared::default();
+        let mut p = MultiStatusParser::new(seen.clone());
+        p.feed(&first).unwrap();
+        let events = seen.events();
+        assert!(events.contains(&"start_response:/a".to_string()), "{events:?}");
+        assert!(events.contains(&"end_response".to_string()), "{events:?}");
+        assert!(!events.iter().any(|e| e.contains("/b")), "the second response has not been sent");
+        p.feed(&second).unwrap();
+        p.finish().unwrap();
+        assert!(seen.events().contains(&"start_response:/b".to_string()));
+    }
+
+    #[test]
+    fn the_events_are_the_same_whatever_the_chunking() {
+        let mut ms = MultistatusWriter::new();
+        ms.response("/a", |r| {
+            r.propstat("HTTP/1.1 200 OK", |w| {
+                write_live_property(w, NAMESPACE, constants::PROP_DISPLAYNAME, "A&B")
+            })
+        })
+        .unwrap();
+        ms.response("/b", |r| {
+            r.status("HTTP/1.1 424 Failed Dependency")?;
+            r.description("because of /a")
+        })
+        .unwrap();
+        let xml = ms.finish();
+        let run = |chunk: usize| {
+            let seen = Shared::default();
+            let mut p = MultiStatusParser::new(seen.clone());
+            for piece in xml.chunks(chunk) {
+                p.feed(piece).unwrap();
+            }
+            p.finish().unwrap();
+            seen.events()
+        };
+        let whole = run(xml.len());
+        assert!(whole.iter().any(|e| e.starts_with("characters:A")), "{whole:?}");
+        for chunk in [1, 2, 3, 7, 64] {
+            // Text may arrive in pieces; compare what it adds up to.
+            let join = |ev: Vec<String>| {
+                let mut out: Vec<String> = Vec::new();
+                for e in ev {
+                    match (e.strip_prefix("characters:"), out.last_mut()) {
+                        (Some(t), Some(last)) if last.starts_with("characters:") => last.push_str(t),
+                        _ => out.push(e),
+                    }
+                }
+                out
+            };
+            assert_eq!(join(run(chunk)), join(whole.clone()), "chunk {chunk}");
+        }
+    }
+
+    #[test]
+    fn a_very_large_document_streams_through_a_bounded_buffer() {
+        let mut ms = MultistatusWriter::new();
+        let mut doc = Vec::new();
+        for i in 0..3000 {
+            ms.response(&format!("/collection/member-{i}"), |r| {
+                r.propstat("HTTP/1.1 200 OK", |w| {
+                    write_live_property(w, NAMESPACE, constants::PROP_DISPLAYNAME, &format!("name {i}"))
+                })
+            })
+            .unwrap();
+            doc.extend(ms.take_written());
+        }
+        doc.extend(ms.finish());
+        assert!(doc.len() > 300_000, "bigger than any one buffer: {}", doc.len());
+
+        #[derive(Default)]
+        struct Count(usize);
+        impl MultiStatusHandler for Count {
+            fn start_response(&mut self, _href: &str) {
+                self.0 += 1;
+            }
+        }
+        let mut p = MultiStatusParser::with_limit(Count::default(), 10_000_000);
+        for piece in doc.chunks(1000) {
+            p.feed(piece).unwrap();
+        }
+        assert_eq!(p.finish().unwrap().0, 3000);
+    }
+
+    #[test]
+    fn the_size_limit_counts_everything_fed() {
+        let mut p = MultiStatusParser::with_limit(RecordingHandler::default(), 10);
+        p.feed(b"<a>").unwrap();
+        p.feed(b"<b>xy").unwrap();
+        p.feed(b"zz").unwrap();
+        assert!(matches!(p.feed(b"z"), Err(MultiStatusParseError::TooLarge)));
+        assert_eq!(MultiStatusParseError::TooLarge.to_string(), "Multi-Status body too large");
+    }
+
+    #[test]
+    fn mismatched_tags_are_a_parse_error() {
+        let r = parse_multistatus(b"<D:multistatus xmlns:D=\"DAV:\"><D:response></D:multistatus>", RecordingHandler::default());
+        assert!(matches!(r, Err(MultiStatusParseError::Parse(_))), "{:?}", r.map(|_| ()));
+    }
+
+    #[test]
+    fn a_truncated_document_is_a_parse_error() {
+        let (first, _) = two_responses();
+        let cut = &first[..first.len() - 10];
+        let r = parse_multistatus(cut, RecordingHandler::default());
+        assert!(matches!(r, Err(MultiStatusParseError::Parse(_))), "{:?}", r.map(|_| ()));
+    }
+
+    #[test]
+    fn nothing_at_all_is_a_parse_error() {
+        assert!(matches!(parse_multistatus(b"", RecordingHandler::default()), Err(MultiStatusParseError::Parse(_))));
+        assert!(matches!(parse_multistatus(b"   ", RecordingHandler::default()), Err(MultiStatusParseError::Parse(_))));
+    }
+
+    #[test]
+    fn text_that_is_not_xml_is_a_parse_error() {
+        assert!(matches!(
+            parse_multistatus(b"HTTP/1.1 500 oops", RecordingHandler::default()),
+            Err(MultiStatusParseError::Parse(_))
+        ));
+    }
+
+    // What the document means ---------------------------------------------------
+
+    fn events_of(xml: &str) -> Vec<String> {
+        parse_multistatus(xml.as_bytes(), RecordingHandler::default()).unwrap().events
+    }
+
+    const DAV: &str = "xmlns:D=\"DAV:\"";
+
+    #[test]
+    fn a_full_response_reports_each_part_in_order() {
+        let xml = format!(
+            "<D:multistatus {DAV}><D:response><D:href>/dir/</D:href>\
+             <D:propstat><D:prop><D:displayname>Dir</D:displayname><D:getcontentlength/></D:prop>\
+             <D:status>HTTP/1.1 200 OK</D:status></D:propstat>\
+             <D:propstat><D:prop><D:quota/></D:prop><D:status>HTTP/1.1 404 Not Found</D:status>\
+             <D:error><D:no-quota/></D:error><D:responsedescription>no quota here</D:responsedescription></D:propstat>\
+             <D:responsedescription>done</D:responsedescription>\
+             <D:location><D:href>/elsewhere/</D:href></D:location>\
+             </D:response></D:multistatus>"
+        );
+        assert_eq!(
+            events_of(&xml),
+            [
+                "start_response:/dir/",
+                "start_propstat",
+                "start_property:{DAV:}displayname",
+                "characters:Dir",
+                "end_property:{DAV:}displayname",
+                "start_property:{DAV:}getcontentlength",
+                "end_property:{DAV:}getcontentlength",
+                "propstat_status:HTTP/1.1 200 OK",
+                "end_propstat",
+                "start_propstat",
+                "start_property:{DAV:}quota",
+                "end_property:{DAV:}quota",
+                "propstat_status:HTTP/1.1 404 Not Found",
+                "start_error",
+                "start_property:{DAV:}no-quota",
+                "end_property:{DAV:}no-quota",
+                "end_error",
+                "description:no quota here",
+                "end_propstat",
+                "description:done",
+                "location:/elsewhere/",
+                "end_response",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_response_level_status_and_error_are_reported_as_such() {
+        let xml = format!(
+            "<D:multistatus {DAV}><D:response><D:href>/x</D:href><D:status>HTTP/1.1 423 Locked</D:status>\
+             <D:error><D:lock-token-submitted><D:href>/x</D:href></D:lock-token-submitted></D:error>\
+             </D:response></D:multistatus>"
+        );
+        let ev = events_of(&xml);
+        assert_eq!(ev[0], "start_response:/x");
+        assert!(ev.contains(&"response_status:HTTP/1.1 423 Locked".to_string()), "{ev:?}");
+        assert!(ev.contains(&"start_error".to_string()) && ev.contains(&"end_error".to_string()), "{ev:?}");
+        assert!(ev.contains(&"start_property:{DAV:}lock-token-submitted".to_string()), "{ev:?}");
+    }
+
+    #[test]
+    fn several_responses_come_one_after_another() {
+        let xml = format!(
+            "<D:multistatus {DAV}><D:response><D:href>/1</D:href><D:status>HTTP/1.1 200 OK</D:status></D:response>\
+             <D:response><D:href>/2</D:href><D:status>HTTP/1.1 404 Not Found</D:status></D:response></D:multistatus>"
+        );
+        let starts: Vec<String> = events_of(&xml).into_iter().filter(|e| e.starts_with("start_response")).collect();
+        assert_eq!(starts, ["start_response:/1", "start_response:/2"]);
+    }
+
+    #[test]
+    fn a_property_value_with_nested_xml_is_reported_element_by_element() {
+        let xml = format!(
+            "<D:multistatus {DAV}><D:response><D:href>/f</D:href><D:propstat><D:prop>\
+             <D:resourcetype><D:collection/></D:resourcetype>\
+             <x:custom xmlns:x=\"urn:example\"><x:inner>deep</x:inner></x:custom>\
+             </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"
+        );
+        let ev = events_of(&xml);
+        for expect in [
+            "start_property:{DAV:}resourcetype",
+            "start_property:{DAV:}collection",
+            "end_property:{DAV:}collection",
+            "end_property:{DAV:}resourcetype",
+            "start_property:{urn:example}custom",
+            "start_property:{urn:example}inner",
+            "characters:deep",
+            "end_property:{urn:example}inner",
+            "end_property:{urn:example}custom",
+        ] {
+            assert!(ev.contains(&expect.to_string()), "missing {expect} in {ev:?}");
+        }
+    }
+
+    #[test]
+    fn a_default_namespace_and_a_prefix_bound_on_a_property_are_both_resolved() {
+        let xml = "<multistatus xmlns=\"DAV:\"><response><href>/f</href><propstat>\
+                   <prop><displayname>n</displayname><z:flag xmlns:z=\"urn:z\"/></prop>\
+                   <status>HTTP/1.1 200 OK</status></propstat></response></multistatus>";
+        let ev = events_of(xml);
+        assert!(ev.contains(&"start_property:{DAV:}displayname".to_string()), "{ev:?}");
+        assert!(ev.contains(&"start_property:{urn:z}flag".to_string()), "{ev:?}");
+    }
+
+    #[test]
+    fn xml_entities_and_cdata_in_a_value_are_decoded() {
+        let xml = format!(
+            "<D:multistatus {DAV}><D:response><D:href>/a%20b&amp;c</D:href><D:propstat><D:prop>\
+             <D:displayname>x &lt; y <![CDATA[<raw>]]></D:displayname></D:prop>\
+             <D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"
+        );
+        let ev = events_of(&xml);
+        assert_eq!(ev[0], "start_response:/a%20b&c");
+        let text: String = ev.iter().filter_map(|e| e.strip_prefix("characters:")).collect();
+        assert_eq!(text, "x < y <raw>");
+    }
+
+    #[test]
+    fn whitespace_around_a_status_or_href_is_trimmed() {
+        let xml = format!(
+            "<D:multistatus {DAV}><D:response><D:href>\n  /spaced  \n</D:href>\
+             <D:status>\n  HTTP/1.1 200 OK \n</D:status></D:response></D:multistatus>"
+        );
+        let ev = events_of(&xml);
+        assert_eq!(ev[0], "start_response:/spaced");
+        assert!(ev.contains(&"response_status:HTTP/1.1 200 OK".to_string()), "{ev:?}");
+    }
+
+    #[test]
+    fn a_response_with_only_an_href_is_still_reported() {
+        let xml = format!("<D:multistatus {DAV}><D:response><D:href>/lonely</D:href></D:response></D:multistatus>");
+        assert_eq!(events_of(&xml), ["start_response:/lonely", "end_response"]);
+    }
+
+    #[test]
+    fn every_href_of_a_status_only_response_is_reported() {
+        // RFC 4918 section 14.24: `href*` before the status, for one status
+        // that applies to several resources.
+        #[derive(Default)]
+        struct Hrefs(Vec<String>);
+        impl MultiStatusHandler for Hrefs {
+            fn start_response(&mut self, href: &str) {
+                self.0.push(href.to_string());
+            }
+            fn additional_href(&mut self, href: &str) {
+                self.0.push(href.to_string());
+            }
+        }
+        let xml = format!(
+            "<D:multistatus {DAV}><D:response><D:href>/a</D:href><D:href>/b</D:href><D:href>/c</D:href>\
+             <D:status>HTTP/1.1 424 Failed Dependency</D:status></D:response></D:multistatus>"
+        );
+        let h = parse_multistatus(xml.as_bytes(), Hrefs::default()).unwrap();
+        assert_eq!(h.0, ["/a", "/b", "/c"]);
+    }
+
+    #[test]
+    fn elements_that_only_look_like_multistatus_ones_in_another_namespace_are_not_taken_for_them() {
+        let xml = format!(
+            "<D:multistatus {DAV} xmlns:x=\"urn:other\"><D:response><D:href>/a</D:href>\
+             <x:status>HTTP/1.1 500 Not The Status</x:status>\
+             <D:status>HTTP/1.1 200 OK</D:status></D:response></D:multistatus>"
+        );
+        let statuses: Vec<String> =
+            events_of(&xml).into_iter().filter(|e| e.starts_with("response_status")).collect();
+        assert_eq!(statuses, ["response_status:HTTP/1.1 200 OK"]);
+    }
+
+    #[test]
+    fn the_root_may_be_wrapped_or_preceded_by_a_declaration_and_comments() {
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?><!-- hello --><D:multistatus {DAV}>\
+             <D:response><D:href>/a</D:href><D:status>HTTP/1.1 200 OK</D:status></D:response></D:multistatus>"
+        );
+        assert_eq!(events_of(&xml)[0], "start_response:/a");
+    }
+
+    #[test]
+    fn a_document_in_utf16_is_read() {
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"utf-16\"?><D:multistatus {DAV}><D:response><D:href>/\u{e9}</D:href>\
+             <D:status>HTTP/1.1 200 OK</D:status></D:response></D:multistatus>"
+        );
+        let mut bytes = vec![0xFF, 0xFE];
+        for u in xml.encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        let ev = parse_multistatus(&bytes, RecordingHandler::default()).unwrap().events;
+        assert_eq!(ev[0], "start_response:/\u{e9}");
+    }
+
+    #[test]
+    fn what_the_writer_writes_the_parser_reads_back() {
+        let mut ms = MultistatusWriter::new();
+        ms.response("/dir/file", |r| {
+            r.propstat("HTTP/1.1 200 OK", |w| {
+                write_live_property(w, NAMESPACE, constants::PROP_DISPLAYNAME, "file")
+            })?;
+            r.status("HTTP/1.1 207 Multi-Status")?;
+            r.error(|w| write_live_property(w, NAMESPACE, "cannot-modify-protected-property", ""))?;
+            r.description("round trip")?;
+            r.location("/moved")
+        })
+        .unwrap();
+        let ev = events_of(&String::from_utf8(ms.finish()).unwrap());
+        for expect in [
+            "start_response:/dir/file",
+            "propstat_status:HTTP/1.1 200 OK",
+            "response_status:HTTP/1.1 207 Multi-Status",
+            "start_error",
+            "description:round trip",
+            "location:/moved",
+            "end_response",
+        ] {
+            assert!(ev.contains(&expect.to_string()), "missing {expect} in {ev:?}");
+        }
     }
 }
