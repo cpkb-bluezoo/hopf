@@ -16,6 +16,8 @@ pub enum DsnAction {
     Delivered,
     /// Permanent or temporary failure to deliver.
     Failed,
+    /// Not delivered yet but still being tried (RFC 3464 section 2.3.3).
+    Delayed,
 }
 
 impl DsnAction {
@@ -23,6 +25,7 @@ impl DsnAction {
         match self {
             Self::Delivered => "delivered",
             Self::Failed => "failed",
+            Self::Delayed => "delayed",
         }
     }
 
@@ -30,6 +33,7 @@ impl DsnAction {
         match self {
             Self::Delivered => "2.0.0",
             Self::Failed => "5.0.0",
+            Self::Delayed => "4.0.0",
         }
     }
 }
@@ -69,6 +73,7 @@ impl DeliveryStatusNotification {
         recipients.iter().any(|(params, action)| match action {
             DsnAction::Delivered => params.notify.wants_success(),
             DsnAction::Failed => params.notify.wants_failure(),
+            DsnAction::Delayed => params.notify.wants_delay(),
         })
     }
 
@@ -82,6 +87,7 @@ impl DeliveryStatusNotification {
                 let want = match report.action {
                     DsnAction::Delivered => params.notify.wants_success(),
                     DsnAction::Failed => params.notify.wants_failure(),
+                    DsnAction::Delayed => params.notify.wants_delay(),
                 };
                 want.then_some(report)
             })
@@ -110,7 +116,13 @@ impl DeliveryStatusNotification {
         let _ = writeln!(out, "To: {}", to.address());
         let _ = writeln!(out, "Date: {date}");
         let _ = writeln!(out, "Message-ID: {message_id}");
-        let _ = writeln!(out, "Subject: Delivery Status Notification");
+        let all_delayed = self.recipients.iter().all(|r| r.action == DsnAction::Delayed);
+        let subject = if all_delayed {
+            "Delayed Mail (still being retried)"
+        } else {
+            "Delivery Status Notification"
+        };
+        let _ = writeln!(out, "Subject: {subject}");
         let _ = writeln!(out, "MIME-Version: 1.0");
         let _ = writeln!(
             out,
@@ -288,6 +300,46 @@ mod tests {
         assert!(text.contains("Action: failed"));
         assert!(text.contains("text/rfc822-headers"));
         assert!(!text.contains("\r\nbody\r\n"));
+    }
+
+    fn notice(action: DsnAction, diagnostic: Option<&str>) -> String {
+        let dsn = DeliveryStatusNotification {
+            reporting_mta: "mail.example".into(),
+            reverse_path: Some(EmailAddress::new(None, "alice", "example.com", true)),
+            delivery: DeliveryRequirements::default(),
+            recipients: vec![DsnRecipientReport {
+                final_recipient: "bob@example.com".into(),
+                original_recipient: None,
+                action,
+                diagnostic: diagnostic.map(Into::into),
+            }],
+            original_message: b"Subject: s\r\n\r\nbody\r\n".to_vec(),
+        };
+        String::from_utf8(dsn.render().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_delay_notice_says_the_message_is_delayed_and_with_a_temporary_status() {
+        // RFC 3464 section 2.3.3 and 2.3.4: Action delayed, and a 4.X.X status.
+        let text = notice(DsnAction::Delayed, Some("451 4.2.1 mailbox busy"));
+        assert!(text.contains("Action: delayed\r\n") || text.contains("Action: delayed\n"), "{text}");
+        assert!(text.contains("Status: 4.0.0"), "{text}");
+        assert!(text.contains("Diagnostic-Code: smtp;451 4.2.1 mailbox busy"));
+        assert!(text.contains("Subject: Delayed Mail"), "{text}");
+        assert!(!text.contains("Action: failed"));
+    }
+
+    #[test]
+    fn a_failure_notice_keeps_its_subject() {
+        assert!(notice(DsnAction::Failed, None).contains("Subject: Delivery Status Notification"));
+    }
+
+    #[test]
+    fn only_a_recipient_that_asked_for_a_delay_notice_gets_one() {
+        let wants = DsnRecipientParams::default();
+        let no_delay = DsnRecipientParams { notify: DsnNotify { failure: true, ..Default::default() }, ..Default::default() };
+        assert!(DeliveryStatusNotification::should_notify(&[(wants, DsnAction::Delayed)]));
+        assert!(!DeliveryStatusNotification::should_notify(&[(no_delay, DsnAction::Delayed)]));
     }
 
     #[test]

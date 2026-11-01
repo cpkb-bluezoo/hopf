@@ -46,13 +46,20 @@ pub struct RelayOptions {
     queue_dir: Option<PathBuf>,
     retry: RetryPolicy,
     max_lifetime: Duration,
+    delay_notice_after: Duration,
 }
 
 impl Default for RelayOptions {
     /// A private temporary queue directory (not kept across restarts),
-    /// [`smtp_retry_policy`] backoff, and five days in the queue.
+    /// [`smtp_retry_policy`] backoff, five days in the queue, and a delay
+    /// notice to the sender after four hours.
     fn default() -> Self {
-        Self { queue_dir: None, retry: smtp_retry_policy(), max_lifetime: Duration::from_secs(5 * 24 * 60 * 60) }
+        Self {
+            queue_dir: None,
+            retry: smtp_retry_policy(),
+            max_lifetime: Duration::from_secs(5 * 24 * 60 * 60),
+            delay_notice_after: Duration::from_secs(4 * 60 * 60),
+        }
     }
 }
 
@@ -68,6 +75,15 @@ impl RelayOptions {
     /// [`Self::with_max_queue_lifetime`] says when to give up.
     pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
+        self
+    }
+
+    /// How long a message may be queued before a recipient that is still
+    /// waiting makes the relay tell the sender, once, that delivery is
+    /// delayed and being retried (a DSN with `Action: delayed`, if the sender
+    /// asked for delay notices, which RFC 3461 makes the default).
+    pub fn with_delay_notice_after(mut self, after: Duration) -> Self {
+        self.delay_notice_after = after;
         self
     }
 
@@ -108,20 +124,26 @@ fn verdict_for(outcome: &SmtpSendOutcome) -> Option<Verdict> {
 struct Settled {
     delivered: Vec<usize>,
     failed: Vec<usize>,
+    /// Still queued, and due a delay notice now.
+    delayed: Vec<usize>,
 }
 
 /// Fold an attempt's verdicts into the message. A recipient that stays
 /// queued is due again after the backoff for its attempt count, but never
 /// later than the end of the queue lifetime, so that the last try happens
-/// when the lifetime ends and not a whole backoff after it.
+/// when the lifetime ends and not a whole backoff after it. A recipient that
+/// asked for delay notices is also tried when `delay_notice_after` ends, and
+/// is noticed then, once.
 fn apply_verdicts(
     message: &mut QueuedMessage,
     verdicts: &[Option<Verdict>],
     now: SystemTime,
     retry: &RetryPolicy,
     max_lifetime: Duration,
+    delay_notice_after: Duration,
 ) -> Settled {
     let expiry = message.queued_at + max_lifetime;
+    let delay_notice_at = message.queued_at + delay_notice_after;
     let mut settled = Settled::default();
     for (i, verdict) in verdicts.iter().enumerate() {
         let Some(verdict) = verdict else { continue };
@@ -145,6 +167,14 @@ fn apply_verdicts(
             Verdict::Temporary(said) => {
                 r.diagnostic = Some(said.clone());
                 r.next_attempt = (now + retry.delay_for_attempt(r.attempts)).min(expiry);
+                if r.params.notify.wants_delay() && !r.delay_notified {
+                    if now >= delay_notice_at {
+                        r.delay_notified = true;
+                        settled.delayed.push(i);
+                    } else {
+                        r.next_attempt = r.next_attempt.min(delay_notice_at);
+                    }
+                }
             }
         }
     }
@@ -160,6 +190,8 @@ fn dsn_reports(message: &QueuedMessage, settled: &Settled) -> Vec<DsnRecipientRe
             (DsnAction::Delivered, r.params.notify.wants_success())
         } else if settled.failed.contains(&i) {
             (DsnAction::Failed, r.params.notify.wants_failure())
+        } else if settled.delayed.contains(&i) {
+            (DsnAction::Delayed, r.params.notify.wants_delay())
         } else {
             continue;
         };
@@ -168,7 +200,7 @@ fn dsn_reports(message: &QueuedMessage, settled: &Settled) -> Vec<DsnRecipientRe
                 final_recipient: r.address.clone(),
                 original_recipient: orcpt_field(&r.params),
                 action,
-                diagnostic: if action == DsnAction::Failed { r.diagnostic.clone() } else { None },
+                diagnostic: if action == DsnAction::Delivered { None } else { r.diagnostic.clone() },
             });
         }
     }
@@ -263,6 +295,7 @@ pub(super) struct RelayEngine {
     queue: RelayQueue,
     retry: RetryPolicy,
     max_lifetime: Duration,
+    delay_notice_after: Duration,
     /// For storage-pool completions that belong to no connection.
     handle: ConnHandle,
     /// Messages with an attempt running, so a message is never tried twice
@@ -313,6 +346,7 @@ impl RelayEngine {
             queue,
             retry: options.retry,
             max_lifetime: options.max_lifetime,
+            delay_notice_after: options.delay_notice_after,
             handle,
             in_flight: Mutex::new(HashSet::new()),
             owned_dir,
@@ -799,7 +833,14 @@ impl Attempt {
 
     fn settle(self) {
         let Attempt { engine, mut message, verdicts, .. } = self;
-        let settled = apply_verdicts(&mut message, &verdicts, SystemTime::now(), &engine.retry, engine.max_lifetime);
+        let settled = apply_verdicts(
+            &mut message,
+            &verdicts,
+            SystemTime::now(),
+            &engine.retry,
+            engine.max_lifetime,
+            engine.delay_notice_after,
+        );
         engine.finish_attempt(message, settled);
     }
 }
@@ -837,6 +878,8 @@ mod tests {
     }
 
     const DAY: Duration = Duration::from_secs(86_400);
+    /// A delay-notice interval that is never reached in a test.
+    const LATER: Duration = Duration::from_secs(4 * 86_400);
 
     fn temporary(said: &str) -> Option<Verdict> {
         Some(Verdict::Temporary(said.into()))
@@ -857,17 +900,17 @@ mod tests {
     fn a_temporary_refusal_keeps_the_recipient_queued_and_backs_off() {
         let mut m = message(vec![rcpt("bob@x.example", DsnNotify::default())]);
         let now = at(2000);
-        let s = apply_verdicts(&mut m, &[temporary("451 later")], now, &policy(), 5 * DAY);
+        let s = apply_verdicts(&mut m, &[temporary("451 later")], now, &policy(), 5 * DAY, LATER);
         assert_eq!(s, Settled::default());
         let r = &m.recipients[0];
         assert_eq!((r.status, r.attempts), (RecipientStatus::Pending, 1));
         assert_eq!(r.next_attempt, now + Duration::from_secs(60));
         assert_eq!(r.diagnostic.as_deref(), Some("451 later"));
         // each failure waits longer than the last, up to the cap
-        apply_verdicts(&mut m, &[temporary("451 later")], now, &policy(), 5 * DAY);
+        apply_verdicts(&mut m, &[temporary("451 later")], now, &policy(), 5 * DAY, LATER);
         assert_eq!(m.recipients[0].next_attempt, now + Duration::from_secs(120));
         for _ in 0..10 {
-            apply_verdicts(&mut m, &[temporary("451 later")], now, &policy(), 5 * DAY);
+            apply_verdicts(&mut m, &[temporary("451 later")], now, &policy(), 5 * DAY, LATER);
         }
         assert_eq!(m.recipients[0].next_attempt, now + Duration::from_secs(600));
     }
@@ -881,8 +924,9 @@ mod tests {
             at(2000),
             &policy(),
             5 * DAY,
+            LATER,
         );
-        assert_eq!(s, Settled { delivered: vec![0], failed: vec![1] });
+        assert_eq!(s, Settled { delivered: vec![0], failed: vec![1], delayed: vec![] });
         assert_eq!(m.recipients[0].status, RecipientStatus::Delivered);
         assert_eq!(m.recipients[1].status, RecipientStatus::Failed);
         assert_eq!(m.recipients[1].diagnostic.as_deref(), Some("550 no such user"));
@@ -893,7 +937,7 @@ mod tests {
     fn a_recipient_the_attempt_did_not_try_is_left_alone() {
         let mut m = message(vec![rcpt("a@x.example", DsnNotify::default()), rcpt("b@x.example", DsnNotify::default())]);
         m.recipients[1].next_attempt = at(9999);
-        apply_verdicts(&mut m, &[Some(Verdict::Delivered), None], at(2000), &policy(), 5 * DAY);
+        apply_verdicts(&mut m, &[Some(Verdict::Delivered), None], at(2000), &policy(), 5 * DAY, LATER);
         assert_eq!((m.recipients[1].attempts, m.recipients[1].next_attempt), (0, at(9999)));
         assert_eq!(m.recipients[1].status, RecipientStatus::Pending);
     }
@@ -901,7 +945,7 @@ mod tests {
     #[test]
     fn a_recipient_still_temporarily_refused_when_the_lifetime_ends_is_failed_with_the_last_reply() {
         let mut m = message(vec![rcpt("a@x.example", DsnNotify::default())]);
-        let s = apply_verdicts(&mut m, &[temporary("451 later")], at(1000) + 5 * DAY, &policy(), 5 * DAY);
+        let s = apply_verdicts(&mut m, &[temporary("451 later")], at(1000) + 5 * DAY, &policy(), 5 * DAY, LATER);
         assert_eq!(s.failed, [0]);
         let r = &m.recipients[0];
         assert_eq!(r.status, RecipientStatus::Failed);
@@ -913,9 +957,64 @@ mod tests {
     fn the_last_try_is_made_when_the_lifetime_ends_not_a_whole_backoff_after_it() {
         let mut m = message(vec![rcpt("a@x.example", DsnNotify::default())]);
         let near_end = at(1000) + 5 * DAY - Duration::from_secs(10);
-        apply_verdicts(&mut m, &[temporary("451 later")], near_end, &policy(), 5 * DAY);
+        apply_verdicts(&mut m, &[temporary("451 later")], near_end, &policy(), 5 * DAY, LATER);
         assert_eq!(m.recipients[0].status, RecipientStatus::Pending);
         assert_eq!(m.recipients[0].next_attempt, at(1000) + 5 * DAY);
+    }
+
+    #[test]
+    fn a_recipient_still_queued_after_the_delay_interval_is_noticed_once() {
+        let mut m = message(vec![rcpt("a@x.example", DsnNotify::default())]);
+        let delay = Duration::from_secs(3600);
+        // before the interval: no notice
+        let s = apply_verdicts(&mut m, &[temporary("451 later")], at(1000) + Duration::from_secs(60), &policy(), 5 * DAY, delay);
+        assert!(s.delayed.is_empty() && !m.recipients[0].delay_notified);
+        // at the interval: one notice, remembered
+        let s = apply_verdicts(&mut m, &[temporary("451 later")], at(1000) + delay, &policy(), 5 * DAY, delay);
+        assert_eq!(s.delayed, [0]);
+        assert!(m.recipients[0].delay_notified);
+        assert_eq!(m.recipients[0].status, RecipientStatus::Pending);
+        // later tries do not repeat it
+        let s = apply_verdicts(&mut m, &[temporary("451 later")], at(1000) + 2 * delay, &policy(), 5 * DAY, delay);
+        assert!(s.delayed.is_empty());
+    }
+
+    #[test]
+    fn a_try_is_made_when_the_delay_interval_ends_so_the_notice_is_not_late() {
+        let mut m = message(vec![rcpt("a@x.example", DsnNotify::default())]);
+        let delay = Duration::from_secs(100);
+        // the next backoff step (60 s) is within the interval, the one after is not
+        apply_verdicts(&mut m, &[temporary("451 later")], at(1000) + Duration::from_secs(50), &policy(), 5 * DAY, delay);
+        assert_eq!(m.recipients[0].next_attempt, at(1000) + Duration::from_secs(100));
+    }
+
+    #[test]
+    fn nothing_is_scheduled_for_a_notice_the_sender_did_not_ask_for() {
+        let failure_only = DsnNotify { failure: true, ..Default::default() };
+        let mut m = message(vec![rcpt("a@x.example", failure_only)]);
+        let delay = Duration::from_secs(100);
+        let now = at(1000) + Duration::from_secs(50);
+        let s = apply_verdicts(&mut m, &[temporary("451 later")], now, &policy(), 5 * DAY, delay);
+        assert_eq!(m.recipients[0].next_attempt, now + Duration::from_secs(60), "ordinary backoff");
+        let s2 = apply_verdicts(&mut m, &[temporary("451 later")], at(1000) + 2 * delay, &policy(), 5 * DAY, delay);
+        assert!(s.delayed.is_empty() && s2.delayed.is_empty());
+    }
+
+    #[test]
+    fn a_delay_notice_reports_the_last_reply_and_a_recipient_that_failed_gets_no_delay_notice() {
+        let mut m = message(vec![rcpt("slow@x.example", DsnNotify::default()), rcpt("bad@x.example", DsnNotify::default())]);
+        m.recipients[0].diagnostic = Some("451 later".into());
+        m.recipients[1].diagnostic = Some("550 gone".into());
+        let settled = Settled { delivered: vec![], failed: vec![1], delayed: vec![0] };
+        let got: Vec<(String, DsnAction, Option<String>)> =
+            dsn_reports(&m, &settled).into_iter().map(|r| (r.final_recipient, r.action, r.diagnostic)).collect();
+        assert_eq!(
+            got,
+            [
+                ("slow@x.example".to_string(), DsnAction::Delayed, Some("451 later".to_string())),
+                ("bad@x.example".to_string(), DsnAction::Failed, Some("550 gone".to_string())),
+            ]
+        );
     }
 
     #[test]
@@ -932,7 +1031,7 @@ mod tests {
         m.recipients[2].params.orcpt_type = Some("rfc822".into());
         m.recipients[2].params.orcpt_address = Some("orig@x.example".into());
         m.recipients[2].diagnostic = Some("550 gone".into());
-        let settled = Settled { delivered: vec![0, 1], failed: vec![2, 3] };
+        let settled = Settled { delivered: vec![0, 1], failed: vec![2, 3], delayed: vec![] };
         let got: Vec<(String, DsnAction, Option<String>, Option<String>)> = dsn_reports(&m, &settled)
             .into_iter()
             .map(|r| (r.final_recipient, r.action, r.original_recipient, r.diagnostic))

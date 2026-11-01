@@ -144,6 +144,13 @@ impl DsnNotify {
     pub fn wants_failure(self) -> bool {
         self.effective_failure()
     }
+
+    /// Sender wants a delay DSN for this recipient: the message is taking
+    /// long to deliver but is still being tried. RFC 3461 section 4.1: an
+    /// unspecified NOTIFY is `FAILURE,DELAY`.
+    pub fn wants_delay(self) -> bool {
+        !self.never && (!self.is_explicit() || self.delay)
+    }
 }
 
 /// Per-recipient DSN parameters from RCPT TO.
@@ -565,6 +572,16 @@ pub fn interpret_rcpt_to(args: &PathArgs) -> Result<(String, DsnRecipientParams)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_delay_notice_is_wanted_by_default_and_when_asked_for_but_never_with_never() {
+        // RFC 3461 section 4.1: an unspecified NOTIFY is FAILURE,DELAY.
+        assert!(DsnNotify::default().wants_delay());
+        assert!(DsnNotify { delay: true, ..Default::default() }.wants_delay());
+        assert!(!DsnNotify { failure: true, ..Default::default() }.wants_delay());
+        assert!(!DsnNotify { success: true, failure: true, ..Default::default() }.wants_delay());
+        assert!(!DsnNotify { never: true, ..Default::default() }.wants_delay());
+    }
 
     #[test]
     fn null_sender() {

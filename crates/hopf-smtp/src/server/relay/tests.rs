@@ -187,6 +187,10 @@ struct Relay {
 
 impl Relay {
     fn start(sink: &Sink, queue: &Path, lifetime: Duration) -> Self {
+        Self::start_with_delay_notice(sink, queue, lifetime, LONG)
+    }
+
+    fn start_with_delay_notice(sink: &Sink, queue: &Path, lifetime: Duration, delay_notice_after: Duration) -> Self {
         let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
         let options = RelayOptions::default()
             .with_queue_dir(queue)
@@ -196,7 +200,8 @@ impl Relay {
                     .with_max_delay(Duration::from_millis(200))
                     .with_jitter(0.0),
             )
-            .with_max_queue_lifetime(lifetime);
+            .with_max_queue_lifetime(lifetime)
+            .with_delay_notice_after(delay_notice_after);
         let config = SmtpConfig::new("127.0.0.1:0".parse().unwrap(), "relay.example.com").auth_required(false);
         let dns = loopback_dns(&rt);
         let service = SimpleRelayService::with_resolver_and_options(config, Arc::clone(&rt), dns, sink.port, options);
@@ -416,4 +421,52 @@ fn the_client_is_answered_only_once_the_message_is_in_the_queue() {
     let scan = RelayQueue::open(tmp.path()).unwrap().scan().unwrap();
     assert_eq!(scan.messages.len(), 1);
     assert_eq!(std::fs::read_to_string(RelayQueue::open(tmp.path()).unwrap().content_path(&scan.messages[0].id)).unwrap(), BODY);
+}
+
+#[test]
+fn the_sender_is_told_once_that_delivery_is_delayed_and_the_message_stays_queued() {
+    let sink = Sink::start(|_, cmd, line| (cmd == "RCPT" && line.contains("bob@")).then_some("451 4.2.1 mailbox busy\r\n"));
+    let tmp = tempfile::tempdir().unwrap();
+    let relay = Relay::start_with_delay_notice(&sink, tmp.path(), LONG, Duration::from_millis(350));
+    assert!(relay.submit(&["bob@example.com"], BODY));
+    assert!(wait_for(|| !sink.notices().is_empty(), 5000), "the sender is told it is delayed");
+    let notices = sink.notices();
+    assert_eq!(notices[0].rcpts, [SENDER]);
+    let body = &notices[0].body;
+    assert!(body.contains("Action: delayed") && body.contains("bob@example.com") && body.contains("451"), "{body}");
+    assert!(!body.contains("Action: failed"));
+
+    // it keeps trying, without repeating the notice or giving up
+    let tries = sink.connections.load(Ordering::SeqCst);
+    assert!(wait_for(|| sink.connections.load(Ordering::SeqCst) >= tries + 3, 5000));
+    assert_eq!(sink.notices().len(), 1, "one delay notice, not one per attempt");
+    let scan = RelayQueue::open(tmp.path()).unwrap().scan().unwrap();
+    let held: Vec<&QueuedMessage> = scan.messages.iter().filter(|m| m.sender.is_some()).collect();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].recipients[0].status, RecipientStatus::Pending);
+    assert!(held[0].recipients[0].delay_notified);
+}
+
+#[test]
+fn a_sender_who_asked_for_failure_notices_only_is_not_told_about_a_delay() {
+    let sink = Sink::start(|_, cmd, line| (cmd == "RCPT" && line.contains("bob@")).then_some("451 4.2.1 mailbox busy\r\n"));
+    let tmp = tempfile::tempdir().unwrap();
+    let relay = Relay::start_with_delay_notice(&sink, tmp.path(), LONG, Duration::from_millis(200));
+    let mut once = Some(BODY.as_bytes().to_vec());
+    let (tx, rx) = mpsc::channel();
+    let send = SmtpSend::new("client.example")
+        .mail_from(SENDER)
+        .rcpt_to_with(
+            "bob@example.com",
+            DsnRecipientParams { notify: crate::server::delivery::DsnNotify { failure: true, ..Default::default() }, ..Default::default() },
+        )
+        .message_with(move || once.take())
+        .on_complete(Box::new(move |ok| {
+            let _ = tx.send(ok);
+        }));
+    SmtpClient::from_addr(relay.addr).connect(&relay.rt, Arc::new(send)).unwrap();
+    assert!(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    // well past the interval, and several retries later
+    assert!(wait_for(|| sink.connections.load(Ordering::SeqCst) >= 6, 8000));
+    assert!(sink.notices().is_empty(), "{:?}", sink.notices());
 }

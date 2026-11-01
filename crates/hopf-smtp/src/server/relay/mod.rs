@@ -9,8 +9,11 @@
 //! delivered from there, per recipient: a 4xx reply (or no reply) from the next
 //! hop leaves the recipient queued for a retry with backoff, until the queue
 //! lifetime ends and it is bounced; a 5xx reply bounces it at once (RFC 5321
-//! section 4.5.4.1). See [`RelayOptions`] for the queue directory, backoff and
-//! lifetime. Messages left in the queue are delivered when the relay starts.
+//! section 4.5.4.1). A recipient still queued after a configurable interval makes
+//! the relay tell the sender once that delivery is delayed (RFC 3464
+//! `Action: delayed`). See [`RelayOptions`] for the queue directory, backoff,
+//! lifetime and delay interval. Messages left in the queue are delivered when
+//! the relay starts.
 
 mod dane;
 mod engine;
