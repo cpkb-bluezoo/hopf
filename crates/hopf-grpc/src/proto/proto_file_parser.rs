@@ -1,12 +1,14 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! Push-based parser for `.proto` files (proto3 language).
+//! Push-based parser for `.proto` files (proto2 and proto3 subset).
 //!
-//! Faithful port of Gumdrop `ProtoFileParser`. Limitations preserved:
-//! - `import` statements are skipped (path consumed, not resolved)
-//! - `syntax` is validated but not stored on the built [`ProtoFile`]
-//! - nested enums are not registered in the enum-name set used for field typing
-//! - options / reserved are parsed and discarded
+//! - `import` statements are skipped (path consumed, not resolved); the
+//!   `google.protobuf` well-known types are built in and added to the
+//!   [`ProtoFile`] when a field or rpc refers to them
+//! - options are parsed and discarded, except `json_name` (kept on the field)
+//!   and `allow_alias` (which permits enum aliases)
+//! - type names are resolved once the whole file has been read, innermost
+//!   scope first, so a type can be used before it is declared
 
 use std::collections::HashSet;
 
@@ -15,14 +17,21 @@ use super::{
     RpcDescriptor, ServiceDescriptor,
 };
 
+const MAX_FIELD_NUMBER: i64 = 536_870_911;
+const MAX_NESTING: usize = 64;
+
 /// Push-based parser for `.proto` files.
 pub struct ProtoFileParser {
     input: String,
+    /// Bytes of an incomplete UTF-8 sequence at the end of the last chunk.
+    partial: Vec<u8>,
     pos: usize,
     line: i32,
     column: i32,
     closed: bool,
-    enum_full_names: HashSet<String>,
+    syntax: String,
+    depth: usize,
+    defined: HashSet<String>,
 }
 
 impl Default for ProtoFileParser {
@@ -31,25 +40,86 @@ impl Default for ProtoFileParser {
     }
 }
 
+/// A constant on the right of an option; only strings and booleans are kept.
+enum Constant {
+    Str(String),
+    Bool(bool),
+    Other,
+}
+
+/// Numbers and names claimed by `reserved` statements.
+#[derive(Default)]
+struct Reserved {
+    ranges: Vec<(i64, i64)>,
+    names: HashSet<String>,
+}
+
+impl Reserved {
+    fn merge(&mut self, other: Reserved) {
+        self.ranges.extend(other.ranges);
+        self.names.extend(other.names);
+    }
+
+    fn has_number(&self, n: i64) -> bool {
+        self.ranges.iter().any(|&(lo, hi)| (lo..=hi).contains(&n))
+    }
+}
+
+/// Field numbers and names used so far in a message, oneofs included.
+#[derive(Default)]
+struct FieldSet {
+    numbers: HashSet<i32>,
+    names: HashSet<String>,
+    entries: Vec<(String, i32)>,
+}
+
 impl ProtoFileParser {
     pub fn new() -> Self {
         Self {
             input: String::new(),
+            partial: Vec::new(),
             pos: 0,
             line: 1,
             column: 1,
             closed: false,
-            enum_full_names: HashSet::new(),
+            syntax: "proto3".to_string(),
+            depth: 0,
+            defined: HashSet::new(),
         }
     }
 
-    /// Pushes bytes into the parser (UTF-8).
+    /// Pushes bytes into the parser (UTF-8). A character may be split
+    /// across calls.
     pub fn receive(&mut self, data: &[u8]) {
         if self.closed {
             panic!("Parser already closed");
         }
-        self.input
-            .push_str(&String::from_utf8_lossy(data));
+        self.partial.extend_from_slice(data);
+        loop {
+            match std::str::from_utf8(&self.partial) {
+                Ok(s) => {
+                    self.input.push_str(s);
+                    self.partial.clear();
+                    break;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    self.input
+                        .push_str(&String::from_utf8_lossy(&self.partial[..valid]));
+                    match e.error_len() {
+                        // The tail is the start of a character not yet complete.
+                        None => {
+                            self.partial.drain(..valid);
+                            break;
+                        }
+                        Some(n) => {
+                            self.input.push('\u{FFFD}');
+                            self.partial.drain(..valid + n);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Parses the accumulated input and returns the Proto model.
@@ -58,6 +128,10 @@ impl ProtoFileParser {
             panic!("Parser already closed");
         }
         self.closed = true;
+        if !self.partial.is_empty() {
+            self.input.push('\u{FFFD}');
+            self.partial.clear();
+        }
         self.parse_internal()
     }
 
@@ -73,66 +147,75 @@ impl ProtoFileParser {
         self.pos = 0;
         self.line = 1;
         self.column = 1;
+        self.depth = 0;
+        self.syntax = "proto3".to_string();
+        self.defined.clear();
 
-        let mut file_builder = ProtoFile::builder();
         let mut pkg = String::new();
-        self.enum_full_names.clear();
+        let mut messages: Vec<MessageDescriptor> = Vec::new();
+        let mut enums: Vec<EnumDescriptor> = Vec::new();
+        let mut services: Vec<ServiceDescriptor> = Vec::new();
 
-        self.skip_whitespace_and_comments()?;
-
-        while self.pos < self.input.len() {
-            if self.peek() == Some(';') {
-                self.consume()?;
-                self.skip_whitespace_and_comments()?;
-                continue;
+        loop {
+            self.skip_whitespace_and_comments()?;
+            match self.peek() {
+                None => break,
+                Some(';') => {
+                    self.consume()?;
+                    continue;
+                }
+                Some(_) => {}
             }
 
-            let tok = match self.next_identifier()? {
-                Some(t) => t,
-                None => break,
-            };
-
+            let tok = self.next_identifier()?.ok_or_else(|| self.unexpected())?;
             match tok.as_str() {
                 "syntax" => self.parse_syntax()?,
-                "package" => {
-                    pkg = self.parse_package()?;
-                    file_builder = file_builder.package_name(pkg.clone());
-                }
+                "package" => pkg = self.parse_package()?,
                 "import" => self.parse_import()?,
-                "option" => self.parse_option()?,
-                "message" => {
-                    let msg = self.parse_message(&pkg)?;
-                    file_builder = file_builder.add_message(msg);
+                "option" => {
+                    self.parse_option()?;
                 }
-                "enum" => {
-                    let enm = self.parse_enum(&pkg)?;
-                    self.enum_full_names.insert(enm.full_name.clone());
-                    file_builder = file_builder.add_enum(enm);
-                }
-                "service" => {
-                    let svc = self.parse_service(&pkg)?;
-                    file_builder = file_builder.add_service(svc);
-                }
-                _ => {
-                    let ch = self.peek().map(|c| c.to_string()).unwrap_or_default();
-                    return Err(self.parse_error_fmt(
-                        &format!("Unexpected character '{ch}' at line {}", self.line),
-                        &[],
-                    ));
+                "message" => messages.push(self.parse_message(&pkg)?),
+                "enum" => enums.push(self.parse_enum(&pkg)?),
+                "service" => services.push(self.parse_service(&pkg)?),
+                other => {
+                    return Err(self.parse_error(&format!("Unexpected '{other}'")));
                 }
             }
-
-            self.skip_whitespace_and_comments()?;
         }
 
+        let mut resolver = Resolver::new(&messages, &enums);
+        for m in &mut messages {
+            resolver.resolve_message(m);
+        }
+        for s in &mut services {
+            resolver.resolve_service(s);
+        }
+        for m in resolver.well_known_used() {
+            messages.push(m);
+        }
+
+        let mut file_builder = ProtoFile::builder()
+            .package_name(pkg)
+            .syntax(self.syntax.clone());
+        for m in messages {
+            file_builder = file_builder.add_message(m);
+        }
+        for e in enums {
+            file_builder = file_builder.add_enum(e);
+        }
+        for s in services {
+            file_builder = file_builder.add_service(s);
+        }
         Ok(file_builder.build())
     }
 
     fn parse_syntax(&mut self) -> Result<(), ProtoParseError> {
         self.expect('=')?;
         let val = self.next_string()?;
-        if val.as_deref() != Some("proto3") && val.as_deref() != Some("proto2") {
-            return Err(self.parse_error("Invalid syntax declaration"));
+        match val.as_deref() {
+            Some(v @ ("proto3" | "proto2")) => self.syntax = v.to_string(),
+            _ => return Err(self.parse_error("Invalid syntax declaration")),
         }
         self.expect(';')?;
         Ok(())
@@ -147,156 +230,310 @@ impl ProtoFileParser {
     }
 
     fn parse_import(&mut self) -> Result<(), ProtoParseError> {
-        // Gumdrop limitation: imports are skipped.
-        let _ = self.next_string()?;
+        // Imports are skipped, not resolved.
+        if let Some(modifier) = self.next_identifier()? {
+            if modifier != "public" && modifier != "weak" {
+                return Err(self.parse_error("Invalid import"));
+            }
+        }
+        if self.next_string()?.is_none() {
+            return Err(self.parse_error("Expected string"));
+        }
         self.expect(';')?;
         Ok(())
     }
 
-    fn parse_option(&mut self) -> Result<(), ProtoParseError> {
-        let _ = self.next_full_ident()?;
+    /// Parses `name = constant;` after the `option` keyword.
+    fn parse_option(&mut self) -> Result<(String, Constant), ProtoParseError> {
+        let name = self.next_option_name()?;
         self.expect('=')?;
-        self.parse_constant()?;
+        let value = self.parse_constant()?;
         self.expect(';')?;
-        Ok(())
+        Ok((name, value))
     }
 
-    fn parse_constant(&mut self) -> Result<(), ProtoParseError> {
+    /// An option name: `deprecated`, `(my.option)`, `(my.option).sub.path`.
+    fn next_option_name(&mut self) -> Result<String, ProtoParseError> {
+        let mut name = String::new();
+        loop {
+            self.skip_whitespace_and_comments()?;
+            if self.peek() == Some('(') {
+                self.consume()?;
+                let ext = self
+                    .next_type_name()?
+                    .ok_or_else(|| self.parse_error("Expected identifier"))?;
+                self.expect(')')?;
+                name.push('(');
+                name.push_str(&ext);
+                name.push(')');
+            } else {
+                let part = self
+                    .next_identifier()?
+                    .ok_or_else(|| self.parse_error("Expected identifier"))?;
+                name.push_str(&part);
+            }
+            self.skip_whitespace_and_comments()?;
+            if self.peek() == Some('.') {
+                self.consume()?;
+                name.push('.');
+            } else {
+                return Ok(name);
+            }
+        }
+    }
+
+    fn parse_constant(&mut self) -> Result<Constant, ProtoParseError> {
         self.skip_whitespace_and_comments()?;
         match self.peek() {
             Some('"') | Some('\'') => {
-                let _ = self.next_string()?;
-                return Ok(());
+                let mut s = self.next_string()?.unwrap_or_default();
+                // Adjacent string literals concatenate.
+                loop {
+                    self.skip_whitespace_and_comments()?;
+                    if matches!(self.peek(), Some('"') | Some('\'')) {
+                        s.push_str(&self.next_string()?.unwrap_or_default());
+                    } else {
+                        return Ok(Constant::Str(s));
+                    }
+                }
             }
-            Some('-') | Some('+') => {
-                let _ = self.next_number()?;
-                return Ok(());
+            Some('{') => {
+                self.skip_aggregate()?;
+                Ok(Constant::Other)
             }
-            Some(c) if c.is_ascii_digit() => {
-                let _ = self.next_number()?;
-                return Ok(());
+            Some(c) if c == '-' || c == '+' || c == '.' || c.is_ascii_digit() => {
+                self.skip_numeric()?;
+                Ok(Constant::Other)
             }
-            _ => {}
+            _ => match self.next_full_ident()?.as_deref() {
+                Some("true") => Ok(Constant::Bool(true)),
+                Some("false") => Ok(Constant::Bool(false)),
+                Some(_) => Ok(Constant::Other),
+                None => Err(self.parse_error("Expected constant")),
+            },
         }
-        if let Some(ident) = self.next_full_ident()? {
-            let _ = ident; // true / false / ident — discarded like Gumdrop
-            return Ok(());
-        }
-        Err(self.parse_error("Expected string"))
     }
 
-    fn parse_message(&mut self, pkg: &str) -> Result<MessageDescriptor, ProtoParseError> {
+    /// Skips a number in any notation (`-5`, `0x1F`, `1.5e-3`, `-inf`).
+    fn skip_numeric(&mut self) -> Result<(), ProtoParseError> {
+        if matches!(self.peek(), Some('-') | Some('+')) {
+            self.consume()?;
+        }
+        if self.peek().is_some_and(|c| c.is_alphabetic()) {
+            self.next_identifier()?;
+            return Ok(());
+        }
+        let start = self.pos;
+        let mut prev = ' ';
+        while let Some(c) = self.peek() {
+            let exponent_sign = (c == '+' || c == '-') && (prev == 'e' || prev == 'E');
+            if !(c.is_ascii_alphanumeric() || c == '.' || exponent_sign) {
+                break;
+            }
+            prev = c;
+            self.consume()?;
+        }
+        if self.pos == start {
+            return Err(self.parse_error("Expected number"));
+        }
+        Ok(())
+    }
+
+    /// Skips a `{ ... }` text-format value, braces inside strings included.
+    fn skip_aggregate(&mut self) -> Result<(), ProtoParseError> {
+        self.expect('{')?;
+        let mut depth = 1usize;
+        while depth > 0 {
+            self.skip_whitespace_and_comments()?;
+            match self.peek() {
+                None => return Err(self.parse_error("Unterminated option value")),
+                Some('"') | Some('\'') => {
+                    self.next_string()?;
+                }
+                Some('{') => {
+                    depth += 1;
+                    self.consume()?;
+                }
+                Some('}') => {
+                    depth -= 1;
+                    self.consume()?;
+                }
+                Some(_) => {
+                    self.consume()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn define(&mut self, full_name: &str) -> Result<(), ProtoParseError> {
+        if !self.defined.insert(full_name.to_string()) {
+            return Err(self.parse_error(&format!("Duplicate definition of {full_name}")));
+        }
+        Ok(())
+    }
+
+    fn parse_message(&mut self, parent: &str) -> Result<MessageDescriptor, ProtoParseError> {
         let name = self
             .next_identifier()?
             .ok_or_else(|| self.parse_error("Expected identifier"))?;
-        let full_name = if pkg.is_empty() {
-            name.clone()
-        } else {
-            format!("{pkg}.{name}")
-        };
+        let full_name = join_name(parent, &name);
+        self.define(&full_name)?;
         self.expect('{')?;
+        if self.depth >= MAX_NESTING {
+            return Err(self.parse_error("Messages nested too deeply"));
+        }
+        self.depth += 1;
 
         let mut msg_builder = MessageDescriptor::builder()
             .name(name)
             .full_name(full_name.clone());
+        let mut fields = FieldSet::default();
+        let mut reserved = Reserved::default();
 
-        let mut field_numbers: HashSet<i32> = HashSet::new();
-
-        self.skip_whitespace_and_comments()?;
-        while self.pos < self.input.len() && self.peek() != Some('}') {
-            if self.peek() == Some(';') {
-                self.consume()?;
-                self.skip_whitespace_and_comments()?;
-                continue;
+        loop {
+            self.skip_whitespace_and_comments()?;
+            match self.peek() {
+                None | Some('}') => break,
+                Some(';') => {
+                    self.consume()?;
+                    continue;
+                }
+                Some('.') => {
+                    let ty = self
+                        .next_type_name()?
+                        .ok_or_else(|| self.parse_error("Expected identifier"))?;
+                    let field = self.parse_field(None, &full_name, &mut fields, ty)?;
+                    msg_builder = msg_builder.add_field(field);
+                    continue;
+                }
+                Some(_) => {}
             }
 
-            let tok = match self.next_identifier()? {
-                Some(t) => t,
-                None => break,
-            };
-
+            let tok = self.next_identifier()?.ok_or_else(|| self.unexpected())?;
             match tok.as_str() {
-                "option" => self.parse_option()?,
-                "reserved" => self.parse_reserved()?,
+                "option" => {
+                    self.parse_option()?;
+                }
+                "reserved" => reserved.merge(self.parse_reserved(MAX_FIELD_NUMBER)?),
                 "message" => {
                     let nested = self.parse_message(&full_name)?;
                     msg_builder = msg_builder.add_nested_message(nested);
                 }
                 "enum" => {
-                    // Gumdrop limitation: nested enums are not added to enum_full_names.
                     let nested_enum = self.parse_enum(&full_name)?;
                     msg_builder = msg_builder.add_nested_enum(nested_enum);
                 }
                 "oneof" => {
-                    msg_builder =
-                        self.parse_oneof(msg_builder, &full_name, &mut field_numbers)?;
+                    msg_builder = self.parse_oneof(msg_builder, &full_name, &mut fields)?;
                 }
                 "map" => {
-                    if let Some(map_field) =
-                        self.parse_map_field(&full_name, &mut field_numbers)?
-                    {
-                        msg_builder = msg_builder.add_field(map_field);
-                    }
+                    let map_field = self.parse_map_field(&full_name, &mut fields)?;
+                    msg_builder = msg_builder.add_field(map_field);
                 }
-                "repeated" | "optional" => {
-                    if let Some(opt_field) =
-                        self.parse_field(Some(&tok), &full_name, &mut field_numbers, None)?
-                    {
-                        msg_builder = msg_builder.add_field(opt_field);
-                    }
+                "repeated" | "optional" | "required" => {
+                    let ty = self
+                        .next_type_name()?
+                        .ok_or_else(|| self.parse_error("Expected identifier"))?;
+                    let field = self.parse_field(Some(&tok), &full_name, &mut fields, ty)?;
+                    msg_builder = msg_builder.add_field(field);
                 }
                 _ => {
-                    if let Some(field) =
-                        self.parse_field(None, &full_name, &mut field_numbers, Some(&tok))?
-                    {
-                        msg_builder = msg_builder.add_field(field);
-                    }
+                    let ty = self.continue_full_ident(tok)?;
+                    let field = self.parse_field(None, &full_name, &mut fields, ty)?;
+                    msg_builder = msg_builder.add_field(field);
                 }
             }
-            self.skip_whitespace_and_comments()?;
         }
 
         self.expect('}')?;
+        self.depth -= 1;
+        for (name, number) in &fields.entries {
+            if reserved.has_number(i64::from(*number)) {
+                return Err(self.parse_error(&format!(
+                    "Field {name} uses reserved number {number} in message {full_name}"
+                )));
+            }
+            if reserved.names.contains(name) {
+                return Err(self.parse_error(&format!(
+                    "Field name {name} is reserved in message {full_name}"
+                )));
+            }
+        }
         Ok(msg_builder.build())
     }
 
-    fn parse_reserved(&mut self) -> Result<(), ProtoParseError> {
-        self.skip_whitespace_and_comments()?;
-        while self.peek() != Some(';') {
+    /// Parses the list after `reserved`: numbers, `a to b`, `a to max`, names.
+    fn parse_reserved(&mut self, max: i64) -> Result<Reserved, ProtoParseError> {
+        let mut reserved = Reserved::default();
+        loop {
+            self.skip_whitespace_and_comments()?;
             if matches!(self.peek(), Some('"') | Some('\'')) {
-                let _ = self.next_string()?;
+                let name = self.next_string()?.unwrap_or_default();
+                reserved.names.insert(name);
             } else {
-                let _ = self.next_number()?;
-                // "to" range: reserved 1 to 10;
-                if self.peek() == Some('t') {
-                    let _ = self.next_identifier()?;
-                    let _ = self.next_identifier()?;
+                let lo = self.next_number()?;
+                let mut hi = lo;
+                self.skip_whitespace_and_comments()?;
+                if self.peek().is_some_and(|c| c.is_alphabetic()) {
+                    if self.next_identifier()?.as_deref() != Some("to") {
+                        return Err(self.parse_error("Expected 'to'"));
+                    }
+                    self.skip_whitespace_and_comments()?;
+                    if self.peek().is_some_and(|c| c.is_alphabetic()) {
+                        if self.next_identifier()?.as_deref() != Some("max") {
+                            return Err(self.parse_error("Expected 'max'"));
+                        }
+                        hi = max;
+                    } else {
+                        hi = self.next_number()?;
+                    }
                 }
+                reserved.ranges.push((lo, hi));
             }
             self.skip_whitespace_and_comments()?;
             if self.peek() == Some(',') {
                 self.consume()?;
-                self.skip_whitespace_and_comments()?;
+            } else {
+                break;
             }
         }
         self.expect(';')?;
-        Ok(())
+        Ok(reserved)
     }
 
     fn parse_oneof(
         &mut self,
         mut msg_builder: MessageDescriptorBuilderOwned,
         parent_full_name: &str,
-        field_numbers: &mut HashSet<i32>,
+        fields: &mut FieldSet,
     ) -> Result<MessageDescriptorBuilderOwned, ProtoParseError> {
-        let _oneof_name = self.next_identifier()?;
+        let _oneof_name = self
+            .next_identifier()?
+            .ok_or_else(|| self.parse_error("Expected identifier"))?;
         self.expect('{')?;
-        self.skip_whitespace_and_comments()?;
-        while self.peek() != Some('}') {
-            if let Some(f) = self.parse_field(None, parent_full_name, field_numbers, None)? {
-                msg_builder = msg_builder.add_field(f);
-            }
+        loop {
             self.skip_whitespace_and_comments()?;
+            let ty = match self.peek() {
+                None | Some('}') => break,
+                Some(';') => {
+                    self.consume()?;
+                    continue;
+                }
+                Some('.') => self
+                    .next_type_name()?
+                    .ok_or_else(|| self.parse_error("Expected identifier"))?,
+                Some(_) => {
+                    let tok = self.next_identifier()?.ok_or_else(|| self.unexpected())?;
+                    if tok == "option" {
+                        self.parse_option()?;
+                        continue;
+                    }
+                    self.continue_full_ident(tok)?
+                }
+            };
+            let field = self.parse_field(None, parent_full_name, fields, ty)?;
+            msg_builder = msg_builder.add_field(field);
         }
         self.expect('}')?;
         Ok(msg_builder)
@@ -305,8 +542,8 @@ impl ProtoFileParser {
     fn parse_map_field(
         &mut self,
         parent_full_name: &str,
-        field_numbers: &mut HashSet<i32>,
-    ) -> Result<Option<FieldDescriptor>, ProtoParseError> {
+        fields: &mut FieldSet,
+    ) -> Result<FieldDescriptor, ProtoParseError> {
         self.expect('<')?;
         let key_type = self
             .next_identifier()?
@@ -320,306 +557,289 @@ impl ProtoFileParser {
             .next_identifier()?
             .ok_or_else(|| self.parse_error("Expected identifier"))?;
         self.expect('=')?;
-        let num = self.next_int()?;
-        if field_numbers.contains(&num) {
-            return Err(self.parse_error_fmt(
-                &format!("Duplicate field number {num} in message {parent_full_name}"),
-                &[],
-            ));
-        }
-        field_numbers.insert(num);
-        self.parse_field_options()?;
+        let num = self.next_field_number()?;
+        self.register_field(fields, &name, num, parent_full_name)?;
+        let json_name = self.parse_field_options()?;
         self.expect(';')?;
 
-        // The key must be a scalar; the value a scalar or a message/enum
-        // name, which resolves against the package like any field's type.
-        let _key_ft = self.scalar_type_from_name(&key_type)?;
-        let value_type = if is_scalar_type(&value_type) {
+        // The key must be a scalar that can be compared; the value a scalar
+        // or a message/enum name, resolved with the other type names later.
+        match self.scalar_type_from_name(&key_type)? {
+            FieldType::Double | FieldType::Float | FieldType::Bytes => {
+                return Err(self.parse_error(&format!("Invalid map key type: {key_type}")));
+            }
+            _ => {}
+        }
+        if is_scalar_type(&value_type) {
             self.scalar_type_from_name(&value_type)?;
-            value_type
-        } else if let Some(rest) = value_type.strip_prefix('.') {
-            rest.to_string()
-        } else if parent_full_name.is_empty() {
-            value_type
-        } else {
-            resolve_type(parent_full_name, &value_type)
-        };
+        }
 
-        Ok(Some(
-            FieldDescriptor::builder()
-                .number(num)
-                .name(name)
-                .field_type(FieldType::Map)
-                .key_type_name(key_type)
-                .value_type_name(value_type)
-                .build(),
-        ))
+        let mut b = FieldDescriptor::builder()
+            .number(num)
+            .name(name)
+            .field_type(FieldType::Map)
+            .key_type_name(key_type)
+            .value_type_name(value_type);
+        if let Some(j) = json_name {
+            b = b.json_name(j);
+        }
+        Ok(b.build())
+    }
+
+    fn register_field(
+        &self,
+        fields: &mut FieldSet,
+        name: &str,
+        number: i32,
+        parent_full_name: &str,
+    ) -> Result<(), ProtoParseError> {
+        if !fields.numbers.insert(number) {
+            return Err(self.parse_error(&format!(
+                "Duplicate field number {number} in message {parent_full_name}"
+            )));
+        }
+        if !fields.names.insert(name.to_string()) {
+            return Err(self.parse_error(&format!(
+                "Duplicate field name {name} in message {parent_full_name}"
+            )));
+        }
+        fields.entries.push((name.to_string(), number));
+        Ok(())
     }
 
     fn parse_field(
         &mut self,
         modifier: Option<&str>,
         parent_full_name: &str,
-        field_numbers: &mut HashSet<i32>,
-        type_override: Option<&str>,
-    ) -> Result<Option<FieldDescriptor>, ProtoParseError> {
+        fields: &mut FieldSet,
+        type_name: String,
+    ) -> Result<FieldDescriptor, ProtoParseError> {
         let repeated = modifier == Some("repeated");
         let optional = modifier == Some("optional");
 
-        let type_name = if let Some(t) = type_override {
-            t.to_string()
-        } else {
-            self.next_type_name()?
-                .ok_or_else(|| self.parse_error("Expected identifier"))?
-        };
         let name = self
             .next_identifier()?
             .ok_or_else(|| self.parse_error("Expected identifier"))?;
         self.expect('=')?;
-        let num = self.next_int()?;
-        if field_numbers.contains(&num) {
-            return Err(self.parse_error_fmt(
-                &format!("Duplicate field number {num} in message {parent_full_name}"),
-                &[],
-            ));
-        }
-        field_numbers.insert(num);
-        self.parse_field_options()?;
+        let num = self.next_field_number()?;
+        self.register_field(fields, &name, num, parent_full_name)?;
+        let json_name = self.parse_field_options()?;
         self.expect(';')?;
-
-        let (field_type, message_type_name, enum_type_name) = if is_scalar_type(&type_name) {
-            (
-                self.scalar_type_from_name(&type_name)?,
-                None,
-                None,
-            )
-        } else {
-            let full_type_name = if let Some(rest) = type_name.strip_prefix('.') {
-                rest.to_string()
-            } else if parent_full_name.is_empty() {
-                type_name.clone()
-            } else {
-                resolve_type(parent_full_name, &type_name)
-            };
-            if self.enum_full_names.contains(&full_type_name) {
-                (FieldType::Enum, None, Some(full_type_name))
-            } else {
-                let ft = if type_name == "map" {
-                    FieldType::Map
-                } else {
-                    FieldType::Message
-                };
-                let msg = if ft == FieldType::Message {
-                    Some(full_type_name)
-                } else {
-                    None
-                };
-                (ft, msg, None)
-            }
-        };
 
         let mut b = FieldDescriptor::builder()
             .number(num)
             .name(name)
-            .field_type(field_type)
             .repeated(repeated)
             .optional(optional);
-        if let Some(m) = message_type_name {
-            b = b.message_type_name(m);
+        if is_scalar_type(&type_name) {
+            b = b.field_type(self.scalar_type_from_name(&type_name)?);
+        } else {
+            // Message or enum: told apart, and made absolute, once the whole
+            // file has been read.
+            b = b.field_type(FieldType::Message).message_type_name(type_name);
         }
-        if let Some(e) = enum_type_name {
-            b = b.enum_type_name(e);
+        if let Some(j) = json_name {
+            b = b.json_name(j);
         }
-        Ok(Some(b.build()))
+        Ok(b.build())
     }
 
-    fn parse_field_options(&mut self) -> Result<(), ProtoParseError> {
+    /// Parses `[a = 1, (b.c) = "x", ...]`, returning the `json_name` if given.
+    fn parse_field_options(&mut self) -> Result<Option<String>, ProtoParseError> {
+        let mut json_name = None;
         self.skip_whitespace_and_comments()?;
         if self.peek() == Some('[') {
             self.consume()?;
-            // Faithful to Gumdrop: do { ... } while (peek == ',');
-            // (comma is not consumed — multi-option fields are unused in practice)
             loop {
-                let _ = self.next_full_ident()?;
+                let name = self.next_option_name()?;
                 self.expect('=')?;
-                self.parse_constant()?;
+                let value = self.parse_constant()?;
+                if name == "json_name" {
+                    if let Constant::Str(s) = value {
+                        json_name = Some(s);
+                    }
+                }
                 self.skip_whitespace_and_comments()?;
-                if self.peek() != Some(',') {
+                if self.peek() == Some(',') {
+                    self.consume()?;
+                } else {
                     break;
                 }
             }
             self.expect(']')?;
         }
-        Ok(())
+        Ok(json_name)
     }
 
-    fn parse_enum(&mut self, pkg: &str) -> Result<EnumDescriptor, ProtoParseError> {
+    fn parse_enum(&mut self, parent: &str) -> Result<EnumDescriptor, ProtoParseError> {
         let name = self
             .next_identifier()?
             .ok_or_else(|| self.parse_error("Expected identifier"))?;
-        let full_name = if pkg.is_empty() {
-            name.clone()
-        } else {
-            format!("{pkg}.{name}")
-        };
+        let full_name = join_name(parent, &name);
+        self.define(&full_name)?;
         self.expect('{')?;
 
         let mut enum_builder = EnumDescriptor::builder()
             .name(name)
-            .full_name(full_name);
+            .full_name(full_name.clone());
+        let mut reserved = Reserved::default();
+        let mut allow_alias = false;
+        let mut names: HashSet<String> = HashSet::new();
+        let mut numbers: HashSet<i32> = HashSet::new();
+        let mut values: Vec<(String, i32)> = Vec::new();
 
-        self.skip_whitespace_and_comments()?;
-        while self.pos < self.input.len() && self.peek() != Some('}') {
-            if self.peek() == Some(';') {
-                self.consume()?;
-                self.skip_whitespace_and_comments()?;
-                continue;
-            }
-
-            let tok = match self.next_identifier()? {
-                Some(t) => t,
-                None => break,
-            };
-
-            if tok == "option" || tok == "reserved" {
-                if tok == "option" {
-                    self.parse_option()?;
-                } else {
-                    self.parse_reserved()?;
-                }
-            } else {
-                let value_name = tok;
-                self.expect('=')?;
-                let num = self.next_int()?;
-                self.parse_field_options()?;
-                self.expect(';')?;
-                enum_builder = enum_builder.add_value(num, value_name);
-            }
+        loop {
             self.skip_whitespace_and_comments()?;
+            match self.peek() {
+                None | Some('}') => break,
+                Some(';') => {
+                    self.consume()?;
+                    continue;
+                }
+                Some(_) => {}
+            }
+
+            let tok = self.next_identifier()?.ok_or_else(|| self.unexpected())?;
+            match tok.as_str() {
+                "option" => {
+                    let (name, value) = self.parse_option()?;
+                    if name == "allow_alias" {
+                        allow_alias = matches!(value, Constant::Bool(true));
+                    }
+                }
+                "reserved" => reserved.merge(self.parse_reserved(i64::from(i32::MAX))?),
+                _ => {
+                    self.expect('=')?;
+                    let num = self.next_enum_number()?;
+                    self.parse_field_options()?;
+                    self.expect(';')?;
+                    if !names.insert(tok.clone()) {
+                        return Err(self.parse_error(&format!(
+                            "Duplicate enum value name {tok} in {full_name}"
+                        )));
+                    }
+                    values.push((tok, num));
+                }
+            }
         }
 
         self.expect('}')?;
+        for (value_name, num) in values {
+            if !numbers.insert(num) && !allow_alias {
+                return Err(self.parse_error(&format!(
+                    "Enum {full_name} reuses number {num} without allow_alias"
+                )));
+            }
+            if reserved.has_number(i64::from(num)) || reserved.names.contains(&value_name) {
+                return Err(self.parse_error(&format!(
+                    "Enum value {value_name} is reserved in {full_name}"
+                )));
+            }
+            enum_builder = enum_builder.add_value(num, value_name);
+        }
         Ok(enum_builder.build())
     }
 
-    fn parse_service(&mut self, pkg: &str) -> Result<ServiceDescriptor, ProtoParseError> {
+    fn parse_service(&mut self, parent: &str) -> Result<ServiceDescriptor, ProtoParseError> {
         let name = self
             .next_identifier()?
             .ok_or_else(|| self.parse_error("Expected identifier"))?;
-        let full_name = if pkg.is_empty() {
-            name.clone()
-        } else {
-            format!("{pkg}.{name}")
-        };
+        let full_name = join_name(parent, &name);
+        self.define(&full_name)?;
         self.expect('{')?;
 
-        let mut svc_builder = ServiceDescriptor::builder()
-            .name(name)
-            .full_name(full_name);
+        let mut svc_builder = ServiceDescriptor::builder().name(name).full_name(full_name);
 
-        self.skip_whitespace_and_comments()?;
-        while self.pos < self.input.len() && self.peek() != Some('}') {
-            if self.peek() == Some(';') {
-                self.consume()?;
-                self.skip_whitespace_and_comments()?;
-                continue;
-            }
-
-            let tok = match self.next_identifier()? {
-                Some(t) => t,
-                None => break,
-            };
-
-            if tok == "option" {
-                self.parse_option()?;
-            } else if tok == "rpc" {
-                let rpc = self.parse_rpc(pkg)?;
-                svc_builder = svc_builder.add_rpc(rpc);
-            }
+        loop {
             self.skip_whitespace_and_comments()?;
+            match self.peek() {
+                None | Some('}') => break,
+                Some(';') => {
+                    self.consume()?;
+                    continue;
+                }
+                Some(_) => {}
+            }
+
+            let tok = self.next_identifier()?.ok_or_else(|| self.unexpected())?;
+            match tok.as_str() {
+                "option" => {
+                    self.parse_option()?;
+                }
+                "rpc" => {
+                    let rpc = self.parse_rpc()?;
+                    svc_builder = svc_builder.add_rpc(rpc);
+                }
+                other => return Err(self.parse_error(&format!("Unexpected '{other}'"))),
+            }
         }
 
         self.expect('}')?;
         Ok(svc_builder.build())
     }
 
-    fn parse_rpc(&mut self, pkg: &str) -> Result<RpcDescriptor, ProtoParseError> {
+    /// `( [stream] Type )`: the type is left as written.
+    fn parse_rpc_type(&mut self) -> Result<(bool, String), ProtoParseError> {
+        self.expect('(')?;
+        let mut streaming = false;
+        let mut ty = self
+            .next_type_name()?
+            .ok_or_else(|| self.parse_error("Expected identifier"))?;
+        if ty == "stream" {
+            self.skip_whitespace_and_comments()?;
+            // A message that is itself called `stream` is `(stream)`.
+            if self.peek() != Some(')') {
+                streaming = true;
+                ty = self
+                    .next_type_name()?
+                    .ok_or_else(|| self.parse_error("Expected identifier"))?;
+            }
+        }
+        self.expect(')')?;
+        Ok((streaming, ty))
+    }
+
+    fn parse_rpc(&mut self) -> Result<RpcDescriptor, ProtoParseError> {
         let name = self
             .next_identifier()?
             .ok_or_else(|| self.parse_error("Expected identifier"))?;
-        self.expect('(')?;
-        let tok = self.next_identifier()?;
-        let client_streaming = tok.as_deref() == Some("stream");
-        let mut input_type = if client_streaming {
-            self.next_type_name()?
-                .ok_or_else(|| self.parse_error("Expected identifier"))?
-        } else if let Some(t) = tok {
-            t
-        } else {
-            self.next_type_name()?
-                .ok_or_else(|| self.parse_error("Expected identifier"))?
-        };
-        if !client_streaming && self.peek() == Some('.') {
-            self.consume()?;
-            let rest = self
-                .next_full_ident()?
-                .ok_or_else(|| self.parse_error("Expected identifier"))?;
-            input_type = format!("{input_type}.{rest}");
-        }
-        self.expect(')')?;
-        let returns = self.next_identifier()?;
-        if returns.as_deref() != Some("returns") {
+        let (client_streaming, input_type) = self.parse_rpc_type()?;
+        if self.next_identifier()?.as_deref() != Some("returns") {
             return Err(self.parse_error("Invalid rpc definition"));
         }
-        self.expect('(')?;
-        let tok = self.next_identifier()?;
-        let server_streaming = tok.as_deref() == Some("stream");
-        let mut output_type = if server_streaming {
-            self.next_type_name()?
-                .ok_or_else(|| self.parse_error("Expected identifier"))?
-        } else if let Some(t) = tok {
-            t
-        } else {
-            self.next_type_name()?
-                .ok_or_else(|| self.parse_error("Expected identifier"))?
-        };
-        if !server_streaming && self.peek() == Some('.') {
-            self.consume()?;
-            let rest = self
-                .next_full_ident()?
-                .ok_or_else(|| self.parse_error("Expected identifier"))?;
-            output_type = format!("{output_type}.{rest}");
-        }
-        self.expect(')')?;
+        let (server_streaming, output_type) = self.parse_rpc_type()?;
+
+        self.skip_whitespace_and_comments()?;
         if self.peek() == Some('{') {
-            self.expect('{')?;
-            while self.peek() != Some('}') {
-                self.parse_option()?;
+            self.consume()?;
+            loop {
+                self.skip_whitespace_and_comments()?;
+                match self.peek() {
+                    Some('}') => {
+                        self.consume()?;
+                        break;
+                    }
+                    Some(';') => {
+                        self.consume()?;
+                    }
+                    Some(_) => {
+                        if self.next_identifier()?.as_deref() != Some("option") {
+                            return Err(self.unexpected());
+                        }
+                        self.parse_option()?;
+                    }
+                    None => return Err(self.parse_error("Unexpected end of file")),
+                }
             }
-            self.expect('}')?;
         } else {
             self.expect(';')?;
         }
 
-        let in_full = if let Some(rest) = input_type.strip_prefix('.') {
-            rest.to_string()
-        } else if pkg.is_empty() {
-            input_type
-        } else {
-            format!("{pkg}.{input_type}")
-        };
-        let out_full = if let Some(rest) = output_type.strip_prefix('.') {
-            rest.to_string()
-        } else if pkg.is_empty() {
-            output_type
-        } else {
-            format!("{pkg}.{output_type}")
-        };
-
+        // Types are resolved against the file's names later.
         Ok(RpcDescriptor::builder()
             .name(name)
-            .input_type_name(in_full)
-            .output_type_name(out_full)
+            .input_type_name(input_type)
+            .output_type_name(output_type)
             .client_streaming(client_streaming)
             .server_streaming(server_streaming)
             .build())
@@ -664,46 +884,31 @@ impl ProtoFileParser {
     }
 
     fn skip_whitespace_and_comments(&mut self) -> Result<(), ProtoParseError> {
-        while self.pos < self.input.len() {
-            let c = self.input[self.pos..].chars().next().unwrap();
-            if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
-                self.consume()?;
-            } else if c == '/' && self.pos + 1 < self.input.len() {
-                let next = self.input[self.pos + 1..].chars().next().unwrap();
-                if next == '/' {
-                    self.pos += 2;
-                    while self.pos < self.input.len()
-                        && !self.input[self.pos..].starts_with('\n')
-                    {
-                        let ch = self.input[self.pos..].chars().next().unwrap();
-                        self.pos += ch.len_utf8();
-                    }
-                    if self.pos < self.input.len() {
-                        self.pos += 1; // '\n'
-                    }
-                    self.line += 1;
-                    self.column = 1;
-                } else if next == '*' {
-                    self.pos += 2;
-                    while self.pos + 1 < self.input.len() {
-                        let ch = self.input[self.pos..].chars().next().unwrap();
-                        if ch == '*' {
-                            let n2 = self.input[self.pos + 1..].chars().next().unwrap();
-                            if n2 == '/' {
-                                self.pos += 2;
-                                break;
-                            }
-                        }
-                        if ch == '\n' {
-                            self.line += 1;
-                        }
-                        self.pos += ch.len_utf8();
-                    }
-                } else {
-                    break;
+        loop {
+            let rest = &self.input[self.pos..];
+            let mut chars = rest.chars();
+            match chars.next() {
+                Some(' ') | Some('\t') | Some('\n') | Some('\r') => {
+                    self.consume()?;
                 }
-            } else {
-                break;
+                Some('/') => match chars.next() {
+                    Some('/') => {
+                        // Up to, not including, the newline: the loop counts it.
+                        let len = rest.find('\n').unwrap_or(rest.len());
+                        self.pos += len;
+                    }
+                    Some('*') => {
+                        let end = rest[2..]
+                            .find("*/")
+                            .ok_or_else(|| self.parse_error("Unterminated comment"))?;
+                        let len = 2 + end + 2;
+                        let lines = rest[..len].matches('\n').count() as i32;
+                        self.pos += len;
+                        self.line += lines;
+                    }
+                    _ => break,
+                },
+                _ => break,
             }
         }
         Ok(())
@@ -731,25 +936,28 @@ impl ProtoFileParser {
     }
 
     fn next_full_ident(&mut self) -> Result<Option<String>, ProtoParseError> {
-        let mut sb = String::new();
-        let part = match self.next_identifier()? {
-            Some(p) => p,
-            None => return Ok(None),
-        };
-        sb.push_str(&part);
+        match self.next_identifier()? {
+            Some(first) => self.continue_full_ident(first).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Extends an identifier already read with any `.part`s that follow.
+    fn continue_full_ident(&mut self, first: String) -> Result<String, ProtoParseError> {
+        let mut sb = first;
         self.skip_whitespace_and_comments()?;
-        while self.pos < self.input.len() && self.peek() == Some('.') {
+        while self.peek() == Some('.') {
             self.consume()?;
             match self.next_identifier()? {
                 Some(p) => {
                     sb.push('.');
                     sb.push_str(&p);
                 }
-                None => break,
+                None => return Err(self.parse_error("Expected identifier")),
             }
             self.skip_whitespace_and_comments()?;
         }
-        Ok(Some(sb))
+        Ok(sb)
     }
 
     fn next_type_name(&mut self) -> Result<Option<String>, ProtoParseError> {
@@ -772,26 +980,25 @@ impl ProtoFileParser {
         };
         self.consume()?;
         let mut sb = String::new();
-        while self.pos < self.input.len() {
-            let c = self.input[self.pos..].chars().next().unwrap();
+        loop {
+            let c = match self.peek() {
+                Some(c) => c,
+                None => return Err(self.parse_error("Unterminated string")),
+            };
             if c == quote {
-                self.pos += c.len_utf8();
-                self.column += 1;
-                break;
+                self.consume()?;
+                return Ok(Some(sb));
             }
             if c == '\\' {
                 self.consume()?;
-                if self.pos >= self.input.len() {
-                    return Err(self.parse_error("Unexpected end of file"));
-                }
-                let esc = self.input[self.pos..].chars().next().unwrap();
+                let esc = match self.peek() {
+                    Some(e) => e,
+                    None => return Err(self.parse_error("Unterminated string")),
+                };
                 match esc {
                     'n' => sb.push('\n'),
                     't' => sb.push('\t'),
                     'r' => sb.push('\r'),
-                    '\\' => sb.push('\\'),
-                    '\'' => sb.push('\''),
-                    '"' => sb.push('"'),
                     other => sb.push(other),
                 }
                 self.consume()?;
@@ -800,7 +1007,6 @@ impl ProtoFileParser {
                 self.consume()?;
             }
         }
-        Ok(Some(sb))
     }
 
     fn next_number(&mut self) -> Result<i64, ProtoParseError> {
@@ -827,8 +1033,22 @@ impl ProtoFileParser {
             .map_err(|_| self.parse_error("Expected number"))
     }
 
-    fn next_int(&mut self) -> Result<i32, ProtoParseError> {
-        Ok(self.next_number()? as i32)
+    /// A field number: 1 to 2^29 - 1, excluding the range the protobuf
+    /// implementation keeps for itself.
+    fn next_field_number(&mut self) -> Result<i32, ProtoParseError> {
+        let n = self.next_number()?;
+        if !(1..=MAX_FIELD_NUMBER).contains(&n) {
+            return Err(self.parse_error(&format!("Field number {n} out of range")));
+        }
+        if (19000..=19999).contains(&n) {
+            return Err(self.parse_error(&format!("Field number {n} is reserved")));
+        }
+        Ok(n as i32)
+    }
+
+    fn next_enum_number(&mut self) -> Result<i32, ProtoParseError> {
+        let n = self.next_number()?;
+        i32::try_from(n).map_err(|_| self.parse_error(&format!("Enum value {n} out of range")))
     }
 
     fn scalar_type_from_name(&self, name: &str) -> Result<FieldType, ProtoParseError> {
@@ -848,7 +1068,7 @@ impl ProtoFileParser {
             "bool" => Ok(FieldType::Bool),
             "string" => Ok(FieldType::String),
             "bytes" => Ok(FieldType::Bytes),
-            _ => Err(self.parse_error_fmt(&format!("Unknown type: {name}"), &[])),
+            _ => Err(self.parse_error(&format!("Unknown type: {name}"))),
         }
     }
 
@@ -856,12 +1076,25 @@ impl ProtoFileParser {
         ProtoParseError::new(format!("{msg} (line {})", self.line))
     }
 
-    fn parse_error_fmt(&self, msg: &str, _args: &[&str]) -> ProtoParseError {
-        ProtoParseError::new(format!("{msg} (line {})", self.line))
+    /// The character (or end of file) the parser is stuck on.
+    fn unexpected(&self) -> ProtoParseError {
+        let what = self
+            .peek()
+            .map(|c| format!("'{c}'"))
+            .unwrap_or_else(|| "end of file".to_string());
+        self.parse_error(&format!("Unexpected {what}"))
     }
 }
 
 type MessageDescriptorBuilderOwned = super::message_descriptor::MessageDescriptorBuilder;
+
+fn join_name(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}.{name}")
+    }
+}
 
 fn is_scalar_type(name: &str) -> bool {
     matches!(
@@ -884,15 +1117,193 @@ fn is_scalar_type(name: &str) -> bool {
     )
 }
 
-fn resolve_type(parent_full_name: &str, type_name: &str) -> String {
-    let parent_pkg = match parent_full_name.rfind('.') {
-        Some(dot) => &parent_full_name[..dot],
-        None => "",
+/// What a type name written in the file turned out to name.
+enum Resolved {
+    Message(String),
+    Enum(String),
+    /// Not defined in this file (an imported type): the name as written.
+    Unknown(String),
+}
+
+impl Resolved {
+    fn into_name(self) -> String {
+        match self {
+            Resolved::Message(n) | Resolved::Enum(n) | Resolved::Unknown(n) => n,
+        }
+    }
+}
+
+const WELL_KNOWN: &[&str] = &[
+    "Empty",
+    "Timestamp",
+    "Duration",
+    "FieldMask",
+    "Any",
+    "DoubleValue",
+    "FloatValue",
+    "Int64Value",
+    "UInt64Value",
+    "Int32Value",
+    "UInt32Value",
+    "BoolValue",
+    "StringValue",
+    "BytesValue",
+];
+
+/// Structure of a `google.protobuf` well-known type. The JSON mapping that
+/// some of them have (RFC 3339 timestamps and so on) is not applied.
+fn well_known_type(simple: &str) -> Option<MessageDescriptor> {
+    use FieldType::*;
+    let fields: &[(&str, FieldType, i32, bool)] = match simple {
+        "Empty" => &[],
+        "Timestamp" | "Duration" => &[("seconds", Int64, 1, false), ("nanos", Int32, 2, false)],
+        "FieldMask" => &[("paths", String, 1, true)],
+        "Any" => &[("type_url", String, 1, false), ("value", Bytes, 2, false)],
+        "DoubleValue" => &[("value", Double, 1, false)],
+        "FloatValue" => &[("value", Float, 1, false)],
+        "Int64Value" => &[("value", Int64, 1, false)],
+        "UInt64Value" => &[("value", Uint64, 1, false)],
+        "Int32Value" => &[("value", Int32, 1, false)],
+        "UInt32Value" => &[("value", Uint32, 1, false)],
+        "BoolValue" => &[("value", Bool, 1, false)],
+        "StringValue" => &[("value", String, 1, false)],
+        "BytesValue" => &[("value", Bytes, 1, false)],
+        _ => return None,
     };
-    if parent_pkg.is_empty() {
-        type_name.to_string()
-    } else {
-        format!("{parent_pkg}.{type_name}")
+    let mut b = MessageDescriptor::builder()
+        .name(simple)
+        .full_name(format!("google.protobuf.{simple}"));
+    for &(name, field_type, number, repeated) in fields {
+        b = b.add_field(
+            FieldDescriptor::builder()
+                .number(number)
+                .name(name)
+                .field_type(field_type)
+                .repeated(repeated)
+                .build(),
+        );
+    }
+    Some(b.build())
+}
+
+/// Turns type names as written into full names, once every type in the file
+/// is known.
+struct Resolver {
+    messages: HashSet<String>,
+    enums: HashSet<String>,
+    well_known_used: HashSet<String>,
+}
+
+impl Resolver {
+    fn new(messages: &[MessageDescriptor], enums: &[EnumDescriptor]) -> Self {
+        let mut r = Resolver {
+            messages: HashSet::new(),
+            enums: enums.iter().map(|e| e.full_name.clone()).collect(),
+            well_known_used: HashSet::new(),
+        };
+        r.collect(messages.iter());
+        r
+    }
+
+    fn collect<'a>(&mut self, messages: impl Iterator<Item = &'a MessageDescriptor>) {
+        for m in messages {
+            self.messages.insert(m.full_name.clone());
+            self.enums
+                .extend(m.nested_enums.values().map(|e| e.full_name.clone()));
+            self.collect(m.nested_messages.values());
+        }
+    }
+
+    fn is_well_known(&self, full_name: &str) -> bool {
+        full_name
+            .strip_prefix("google.protobuf.")
+            .is_some_and(|s| WELL_KNOWN.contains(&s))
+            && !self.messages.contains(full_name)
+    }
+
+    fn classify(&mut self, full_name: &str) -> Option<Resolved> {
+        if self.messages.contains(full_name) {
+            Some(Resolved::Message(full_name.to_string()))
+        } else if self.enums.contains(full_name) {
+            Some(Resolved::Enum(full_name.to_string()))
+        } else if self.is_well_known(full_name) {
+            self.well_known_used.insert(full_name.to_string());
+            Some(Resolved::Message(full_name.to_string()))
+        } else {
+            None
+        }
+    }
+
+    /// Looks `raw` up from `scope` outwards: `scope.raw`, then the scope's
+    /// parent, and so on to the top. A leading dot makes `raw` absolute.
+    fn resolve(&mut self, scope: &str, raw: &str) -> Resolved {
+        if let Some(abs) = raw.strip_prefix('.') {
+            return self
+                .classify(abs)
+                .unwrap_or_else(|| Resolved::Unknown(abs.to_string()));
+        }
+        let mut scope = scope;
+        loop {
+            let candidate = join_name(scope, raw);
+            if let Some(r) = self.classify(&candidate) {
+                return r;
+            }
+            match scope.rfind('.') {
+                Some(i) => scope = &scope[..i],
+                None if scope.is_empty() => return Resolved::Unknown(raw.to_string()),
+                None => scope = "",
+            }
+        }
+    }
+
+    fn resolve_message(&mut self, m: &mut MessageDescriptor) {
+        let scope = m.full_name.clone();
+        for f in &mut m.fields {
+            match f.field_type {
+                FieldType::Message => {
+                    if let Some(raw) = f.message_type_name.take() {
+                        match self.resolve(&scope, &raw) {
+                            Resolved::Enum(n) => {
+                                f.field_type = FieldType::Enum;
+                                f.enum_type_name = Some(n);
+                            }
+                            other => f.message_type_name = Some(other.into_name()),
+                        }
+                    }
+                }
+                FieldType::Map => {
+                    if let Some(raw) = f.value_type_name.take() {
+                        f.value_type_name = Some(if is_scalar_type(&raw) {
+                            raw
+                        } else {
+                            self.resolve(&scope, &raw).into_name()
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        for nested in m.nested_messages.values_mut() {
+            self.resolve_message(nested);
+        }
+    }
+
+    fn resolve_service(&mut self, s: &mut ServiceDescriptor) {
+        let scope = s.full_name.clone();
+        for rpc in &mut s.rpcs {
+            rpc.input_type_name = self.resolve(&scope, &rpc.input_type_name).into_name();
+            rpc.output_type_name = self.resolve(&scope, &rpc.output_type_name).into_name();
+        }
+    }
+
+    /// The well-known types the file refers to, to be added to it.
+    fn well_known_used(self) -> Vec<MessageDescriptor> {
+        let mut names: Vec<String> = self.well_known_used.into_iter().collect();
+        names.sort();
+        names
+            .iter()
+            .filter_map(|n| n.strip_prefix("google.protobuf.").and_then(well_known_type))
+            .collect()
     }
 }
 
@@ -928,5 +1339,392 @@ mod tests {
         "#;
         let pf = ProtoFileParser::parse(src).unwrap();
         assert!(pf.message("M").is_some());
+    }
+
+    fn parse(src: &str) -> ProtoFile {
+        ProtoFileParser::parse(src).unwrap_or_else(|e| panic!("{src}\n=> {}", e.message()))
+    }
+
+    fn refused(src: &str) -> String {
+        match ProtoFileParser::parse(src) {
+            Ok(_) => panic!("should have been refused:\n{src}"),
+            Err(e) => e.message().to_string(),
+        }
+    }
+
+    fn field<'a>(pf: &'a ProtoFile, msg: &str, name: &str) -> &'a FieldDescriptor {
+        pf.message(msg).unwrap_or_else(|| panic!("no message {msg}")).field_by_name(name).unwrap_or_else(|| panic!("no field {name}"))
+    }
+
+    // -- nested types and name resolution ------------------------------------
+
+    #[test]
+    fn nested_messages_and_enums_can_be_looked_up_by_full_name() {
+        let pf = parse(
+            "syntax = \"proto3\"; package demo;
+             message Outer { message Inner { message Deep { int32 d = 1; } Deep deep = 1; } enum Kind { A = 0; B = 1; } Inner i = 1; Kind k = 2; }",
+        );
+        assert!(pf.message("demo.Outer").is_some());
+        assert!(pf.message("demo.Outer.Inner").is_some());
+        assert!(pf.message("demo.Outer.Inner.Deep").is_some());
+        assert!(pf.enum_type("demo.Outer.Kind").is_some());
+    }
+
+    #[test]
+    fn a_field_naming_a_nested_type_resolves_to_it() {
+        let pf = parse(
+            "syntax = \"proto3\"; package demo;
+             message Outer { message Inner { int32 v = 1; } enum Kind { A = 0; } Inner i = 1; Kind k = 2; repeated Inner many = 3; }",
+        );
+        let i = field(&pf, "demo.Outer", "i");
+        assert_eq!((i.field_type, i.message_type_name.as_deref()), (FieldType::Message, Some("demo.Outer.Inner")));
+        let k = field(&pf, "demo.Outer", "k");
+        assert_eq!((k.field_type, k.enum_type_name.as_deref(), k.message_type_name.as_deref()), (FieldType::Enum, Some("demo.Outer.Kind"), None));
+        assert!(field(&pf, "demo.Outer", "many").repeated);
+    }
+
+    #[test]
+    fn a_type_may_be_used_before_it_is_declared() {
+        let pf = parse(
+            "syntax = \"proto3\"; package demo;
+             message A { B b = 1; Color c = 2; }
+             message B { int32 x = 1; }
+             enum Color { RED = 0; }",
+        );
+        assert_eq!(field(&pf, "demo.A", "b").message_type_name.as_deref(), Some("demo.B"));
+        let c = field(&pf, "demo.A", "c");
+        assert_eq!((c.field_type, c.enum_type_name.as_deref()), (FieldType::Enum, Some("demo.Color")));
+    }
+
+    #[test]
+    fn names_are_looked_up_from_the_innermost_scope_outwards() {
+        let pf = parse(
+            "syntax = \"proto3\"; package demo;
+             message Inner { int32 top = 1; }
+             message Outer {
+                 message Inner { int32 nested = 1; }
+                 message Mid { message Leaf { Inner i = 1; Sibling s = 2; Top t = 3; } message Sibling {} Inner j = 1; }
+                 Inner k = 1;
+             }
+             message Top {}",
+        );
+        assert_eq!(field(&pf, "demo.Outer", "k").message_type_name.as_deref(), Some("demo.Outer.Inner"), "the nested one hides the top-level one");
+        assert_eq!(field(&pf, "demo.Outer.Mid", "j").message_type_name.as_deref(), Some("demo.Outer.Inner"));
+        assert_eq!(field(&pf, "demo.Outer.Mid.Leaf", "i").message_type_name.as_deref(), Some("demo.Outer.Inner"));
+        assert_eq!(field(&pf, "demo.Outer.Mid.Leaf", "s").message_type_name.as_deref(), Some("demo.Outer.Mid.Sibling"));
+        assert_eq!(field(&pf, "demo.Outer.Mid.Leaf", "t").message_type_name.as_deref(), Some("demo.Top"));
+    }
+
+    #[test]
+    fn qualified_names_resolve_whatever_their_form() {
+        let pf = parse(
+            "syntax = \"proto3\"; package demo;
+             message Outer { message Inner {} }
+             message U { Outer.Inner a = 1; .demo.Outer.Inner b = 2; demo.Outer.Inner c = 3; }",
+        );
+        for f in ["a", "b", "c"] {
+            assert_eq!(field(&pf, "demo.U", f).message_type_name.as_deref(), Some("demo.Outer.Inner"), "{f}");
+        }
+    }
+
+    #[test]
+    fn a_type_from_elsewhere_keeps_the_name_it_was_written_with() {
+        // An imported type: not defined here, so not resolvable here.
+        let pf = parse("syntax = \"proto3\"; package demo; import \"other.proto\"; message M { other.pkg.Thing t = 1; }");
+        assert_eq!(field(&pf, "demo.M", "t").message_type_name.as_deref(), Some("other.pkg.Thing"));
+        let leading = parse("syntax = \"proto3\"; package demo; message M { .other.pkg.Thing t = 1; }");
+        assert_eq!(field(&leading, "demo.M", "t").message_type_name.as_deref(), Some("other.pkg.Thing"));
+    }
+
+    #[test]
+    fn map_values_resolve_like_field_types() {
+        let pf = parse(
+            "syntax = \"proto3\"; package demo;
+             message M { message V {} enum E { X = 0; } map<string, V> a = 1; map<int32, E> b = 2; map<string, Later> c = 3; map<string, int64> d = 4; }
+             message Later {}",
+        );
+        assert_eq!(field(&pf, "demo.M", "a").value_type_name.as_deref(), Some("demo.M.V"));
+        assert_eq!(field(&pf, "demo.M", "b").value_type_name.as_deref(), Some("demo.M.E"));
+        assert_eq!(field(&pf, "demo.M", "c").value_type_name.as_deref(), Some("demo.Later"));
+        assert_eq!(field(&pf, "demo.M", "d").value_type_name.as_deref(), Some("int64"));
+        assert_eq!(field(&pf, "demo.M", "b").key_type_name.as_deref(), Some("int32"));
+    }
+
+    #[test]
+    fn a_file_without_a_package_has_plain_names() {
+        let pf = parse("syntax = \"proto3\"; message A { B b = 1; message N {} N n = 2; } message B {}");
+        assert_eq!(field(&pf, "A", "b").message_type_name.as_deref(), Some("B"));
+        assert_eq!(field(&pf, "A", "n").message_type_name.as_deref(), Some("A.N"));
+    }
+
+    // -- services -----------------------------------------------------------
+
+    #[test]
+    fn rpcs_resolve_their_types_and_record_streaming() {
+        let pf = parse(
+            "syntax = \"proto3\"; package demo;
+             message Req {} message Resp {} message Outer { message In {} }
+             service S {
+                 rpc Unary (Req) returns (Resp);
+                 rpc ClientS (stream Req) returns (Resp);
+                 rpc ServerS (Req) returns (stream Resp);
+                 rpc Both (stream Req) returns (stream Resp);
+                 rpc Nested (Outer.In) returns (.demo.Resp);
+                 rpc Qual (demo.Req) returns (demo.Outer.In) {}
+                 rpc Opts (Req) returns (Resp) { option deprecated = true; ; }
+             }",
+        );
+        let s = pf.service("demo.S").unwrap();
+        let r = |n: &str| s.rpc(n).unwrap_or_else(|| panic!("no rpc {n}"));
+        assert_eq!((r("Unary").client_streaming, r("Unary").server_streaming), (false, false));
+        assert_eq!((r("ClientS").client_streaming, r("ClientS").server_streaming), (true, false));
+        assert_eq!((r("ServerS").client_streaming, r("ServerS").server_streaming), (false, true));
+        assert_eq!((r("Both").client_streaming, r("Both").server_streaming), (true, true));
+        assert_eq!(r("Unary").input_type_name, "demo.Req");
+        assert_eq!(r("Nested").input_type_name, "demo.Outer.In");
+        assert_eq!(r("Nested").output_type_name, "demo.Resp");
+        assert_eq!((r("Qual").input_type_name.as_str(), r("Qual").output_type_name.as_str()), ("demo.Req", "demo.Outer.In"));
+        assert!(pf.get_rpc_by_path("/demo.S/Both").is_some());
+        assert!(pf.get_rpc_by_path("/demo.S/Missing").is_none());
+        assert!(pf.get_rpc_by_path("demo.S/Both").is_none());
+        assert!(pf.get_rpc_by_path("/demo.S/").is_none());
+    }
+
+    #[test]
+    fn well_known_types_are_available_without_their_import() {
+        let pf = parse(
+            "syntax = \"proto3\"; package demo; import \"google/protobuf/empty.proto\"; import \"google/protobuf/timestamp.proto\";
+             message Ev { google.protobuf.Timestamp at = 1; google.protobuf.Duration d = 2; google.protobuf.StringValue name = 3; }
+             service S { rpc Ping (google.protobuf.Empty) returns (google.protobuf.Empty); rpc Get (google.protobuf.Empty) returns (Ev); }",
+        );
+        assert!(pf.message("google.protobuf.Empty").unwrap().fields.is_empty());
+        let ts = pf.message("google.protobuf.Timestamp").unwrap();
+        assert_eq!(ts.field_by_name("seconds").unwrap().field_type, FieldType::Int64);
+        assert_eq!(ts.field_by_name("nanos").unwrap().field_type, FieldType::Int32);
+        assert_eq!(pf.message("google.protobuf.StringValue").unwrap().field_by_name("value").unwrap().field_type, FieldType::String);
+        assert_eq!(field(&pf, "demo.Ev", "at").message_type_name.as_deref(), Some("google.protobuf.Timestamp"));
+        assert_eq!(pf.get_rpc_by_path("/demo.S/Ping").unwrap().input_type_name, "google.protobuf.Empty");
+    }
+
+    #[test]
+    fn only_the_well_known_types_that_are_used_are_added() {
+        let pf = parse("syntax = \"proto3\"; package demo; message M { google.protobuf.Duration d = 1; }");
+        assert!(pf.message("google.protobuf.Duration").is_some());
+        assert!(pf.message("google.protobuf.Empty").is_none());
+        assert!(pf.message("demo.M").is_some());
+    }
+
+    #[test]
+    fn a_stray_token_in_a_service_is_an_error() {
+        assert!(refused("syntax = \"proto3\"; service S { bogus; }").contains("line"));
+        assert!(refused("syntax = \"proto3\"; service S { rpc A (X) returns (Y) }").contains("line"));
+    }
+
+    // -- options -------------------------------------------------------------
+
+    #[test]
+    fn a_field_may_have_several_options() {
+        let pf = parse("syntax = \"proto3\"; message M { int32 a = 1 [deprecated = true, packed = false]; string b = 2 [ json_name = \"bee\" , deprecated = true ]; }");
+        assert!(pf.message("M").unwrap().field_by_name("a").is_some());
+    }
+
+    #[test]
+    fn json_name_overrides_the_default_json_key() {
+        let pf = parse("syntax = \"proto3\"; message M { string first_name = 1 [json_name = \"givenName\"]; string last_name = 2; }");
+        let m = pf.message("M").unwrap();
+        assert_eq!(m.field_by_json_key("givenName").unwrap().name, "first_name");
+        assert_eq!(m.field_by_json_key("first_name").unwrap().name, "first_name", "the proto name is accepted too");
+        assert!(m.field_by_json_key("firstName").is_none(), "the default is replaced, not added to");
+        assert_eq!(m.field_by_json_key("lastName").unwrap().name, "last_name");
+        assert_eq!(m.field_by_name("first_name").unwrap().json_key(), "givenName");
+        assert_eq!(m.field_by_name("last_name").unwrap().json_key(), "lastName");
+    }
+
+    #[test]
+    fn custom_options_of_every_form_are_skipped() {
+        parse(
+            "syntax = \"proto3\"; package demo;
+             import \"google/api/annotations.proto\";
+             option java_package = \"com.example\";
+             option optimize_for = SPEED;
+             option (my.file_opt) = { a: 1 b: \"s\" nested { c: [1, 2] } };
+             option (my.flag) = true;
+             message M {
+                 option (my.msg_opt) = \"x\";
+                 option deprecated = true;
+                 string s = 1 [(validate.rules).string.min_len = 1, (a.b) = 1.5e3, (c) = -inf, (d) = { x: 1 }];
+                 int32 n = 2 [(my.opt) = -5];
+             }
+             enum E { option allow_alias = true; A = 0 [(my.v) = \"a\"]; B = 0; }
+             service S {
+                 option (my.svc) = 1;
+                 rpc Get (M) returns (M) {
+                     option (google.api.http) = { get: \"/v1/m/{id}\" additional_bindings { post: \"/v1/m\" body: \"*\" } };
+                     option idempotency_level = NO_SIDE_EFFECTS;
+                 }
+             }",
+        );
+    }
+
+    #[test]
+    fn an_unbalanced_aggregate_option_is_an_error() {
+        refused("syntax = \"proto3\"; option (x) = { a: 1 ;");
+        refused("syntax = \"proto3\"; message M { string s = 1 [(x) = { a: 1 ]; }");
+    }
+
+    #[test]
+    fn braces_inside_an_option_string_do_not_confuse_the_skipping() {
+        parse("syntax = \"proto3\"; option (x) = { a: \"}\" b: \"{\" }; message M {}");
+    }
+
+    // -- numbers -------------------------------------------------------------
+
+    #[test]
+    fn field_numbers_are_checked() {
+        for ok in ["1", "15", "16", "18999", "20000", "536870911"] {
+            parse(&format!("syntax = \"proto3\"; message M {{ int32 a = {ok}; }}"));
+        }
+        for bad in ["0", "-1", "536870912", "4294967297", "19000", "19999", "99999999999999999999"] {
+            refused(&format!("syntax = \"proto3\"; message M {{ int32 a = {bad}; }}"));
+        }
+    }
+
+    #[test]
+    fn a_duplicate_field_number_or_name_is_an_error() {
+        assert!(refused("syntax = \"proto3\"; message M { int32 a = 1; int32 b = 1; }").contains("Duplicate field number"));
+        assert!(refused("syntax = \"proto3\"; message M { int32 a = 1; string a = 2; }").to_lowercase().contains("duplicate"));
+        refused("syntax = \"proto3\"; message M { oneof o { int32 a = 1; string b = 1; } }");
+    }
+
+    #[test]
+    fn enum_values_are_i32() {
+        let pf = parse("syntax = \"proto3\"; enum E { Z = 0; NEG = -5; MAX = 2147483647; MIN = -2147483648; }");
+        let e = pf.enum_type("E").unwrap();
+        assert_eq!((e.value_number("NEG"), e.value_number("MAX"), e.value_number("MIN")), (Some(-5), Some(i32::MAX), Some(i32::MIN)));
+        assert_eq!(e.value_name(-5), Some("NEG"));
+        refused("syntax = \"proto3\"; enum E { Z = 0; BIG = 2147483648; }");
+        refused("syntax = \"proto3\"; enum E { Z = 0; BIG = 4294967297; }");
+    }
+
+    #[test]
+    fn two_names_for_one_enum_number_are_allowed_with_allow_alias() {
+        let pf = parse("syntax = \"proto3\"; enum E { option allow_alias = true; A = 0; B = 0; C = 1; }");
+        let e = pf.enum_type("E").unwrap();
+        assert_eq!((e.value_number("A"), e.value_number("B"), e.value_number("C")), (Some(0), Some(0), Some(1)));
+    }
+
+    // -- duplicates ----------------------------------------------------------
+
+    #[test]
+    fn declaring_a_name_twice_is_an_error() {
+        refused("syntax = \"proto3\"; package d; message A {} message A {}");
+        refused("syntax = \"proto3\"; package d; enum E { Z = 0; } enum E { Z = 0; }");
+        refused("syntax = \"proto3\"; package d; service S {} service S {}");
+        refused("syntax = \"proto3\"; package d; message A { message N {} message N {} }");
+        refused("syntax = \"proto3\"; package d; message A {} enum A { Z = 0; }");
+    }
+
+    // -- the file as a whole -------------------------------------------------
+
+    #[test]
+    fn the_syntax_and_package_are_recorded() {
+        let pf = parse("syntax = \"proto3\"; package a.b.c; message M {}");
+        assert_eq!((pf.syntax.as_str(), pf.package_name.as_str()), ("proto3", "a.b.c"));
+        assert!(pf.message("a.b.c.M").is_some());
+        assert_eq!(parse("syntax = 'proto2'; message M {}").syntax, "proto2");
+        assert_eq!(parse("message M {}").syntax, "proto3", "proto3 when not stated");
+    }
+
+    #[test]
+    fn unsupported_or_invalid_syntax_is_refused() {
+        refused("syntax = \"proto4\"; message M {}");
+        refused("syntax = proto3; message M {}");
+        refused("edition = \"2023\"; message M {}");
+    }
+
+    #[test]
+    fn comments_may_go_anywhere_whitespace_may() {
+        parse(
+            "// leading\n/* block */ syntax /* c */ = /* c */ \"proto3\" /* c */ ; // t
+             package // c
+             demo;
+             /* multi
+                line */ message /* c */ M /* c */ { // x
+                 int32 /* t */ a /* n */ = /* e */ 1 /* o */ ; /* trailing */
+             } // end",
+        );
+    }
+
+    #[test]
+    fn errors_name_the_line() {
+        let e = refused("syntax = \"proto3\";\n\n\nmessage M {\n  int32 a = ;\n}\n");
+        assert!(e.contains("line 5"), "{e}");
+        let e = refused("syntax = \"proto3\";\r\nmessage M {\r\n  bogus\r\n}\r\n");
+        assert!(e.contains("line "), "{e}");
+    }
+
+    #[test]
+    fn unterminated_constructs_are_errors_not_silently_accepted() {
+        refused("syntax = \"proto3\"; import \"unterminated; message M {}");
+        refused("syntax = \"proto3\"; /* never closed message M {}");
+        refused("syntax = \"proto3\"; message M { int32 a = 1;");
+        refused("syntax = \"proto3\"; message M { oneof o { int32 a = 1;");
+        refused("syntax = \"proto3\"; enum E { Z = 0;");
+        refused("syntax = \"proto3\"; service S { rpc A (X) returns (Y);");
+        refused("syntax = \"proto3\"; message M { reserved 1, 2");
+        refused("syntax = \"proto3\"; message M { reserved \"a\"");
+    }
+
+    #[test]
+    fn string_escapes_in_option_values() {
+        parse("syntax = \"proto3\"; option (x) = \"a\\\"b\\\\c\\n\"; option y = 'it\\'s';");
+    }
+
+    #[test]
+    fn reserved_forms() {
+        let pf = parse(
+            "syntax = \"proto3\"; message M { reserved 2, 15, 9 to 11; reserved 40 to max; reserved \"foo\", \"bar\"; int32 a = 1; int32 b = 3; }",
+        );
+        assert!(pf.message("M").unwrap().field_by_number(3).is_some());
+        // a reserved number cannot be used
+        refused("syntax = \"proto3\"; message M { reserved 2; int32 a = 2; }");
+        refused("syntax = \"proto3\"; message M { reserved 9 to 11; int32 a = 10; }");
+        refused("syntax = \"proto3\"; message M { reserved \"a\"; int32 a = 1; }");
+    }
+
+    #[test]
+    fn oneof_fields_belong_to_the_message() {
+        let pf = parse("syntax = \"proto3\"; message M { oneof choice { option (x) = 1; string a = 1; int32 b = 2; } optional string c = 3; repeated int32 d = 4; }");
+        let m = pf.message("M").unwrap();
+        assert_eq!(m.fields.len(), 4);
+        assert!(m.field_by_name("c").unwrap().optional && m.field_by_name("d").unwrap().repeated);
+        assert!(!m.field_by_name("a").unwrap().optional);
+    }
+
+    #[test]
+    fn identifiers_may_be_non_ascii_letters() {
+        let pf = parse("syntax = \"proto3\"; message Café { string nom = 1; }");
+        assert!(pf.message("Café").is_some());
+    }
+
+    #[test]
+    fn the_source_may_arrive_in_pieces_even_in_the_middle_of_a_character() {
+        let src = "syntax = \"proto3\"; // café ☃\nmessage Café { string nom = 1; }\n";
+        for chunk in [1usize, 2, 3, 7] {
+            let mut p = ProtoFileParser::new();
+            for part in src.as_bytes().chunks(chunk) {
+                p.receive(part);
+            }
+            let pf = p.close().unwrap_or_else(|e| panic!("chunk {chunk}: {}", e.message()));
+            assert!(pf.message("Café").is_some(), "chunk {chunk}");
+        }
+    }
+
+    #[test]
+    fn an_empty_file_and_stray_semicolons() {
+        let pf = parse("");
+        assert!(pf.messages.is_empty());
+        parse(";;; syntax = \"proto3\"; ; message M {}; ;");
+        parse("/* only a comment */");
     }
 }

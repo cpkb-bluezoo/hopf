@@ -20,16 +20,27 @@ pub struct ProtoFile {
 }
 
 impl ProtoFile {
+    /// A message by full name, nested ones (`pkg.Outer.Inner`) included.
     pub fn message(&self, full_name: &str) -> Option<&MessageDescriptor> {
-        self.messages_by_full_name
-            .get(full_name)
-            .map(|&i| &self.messages[i])
+        if let Some(&i) = self.messages_by_full_name.get(full_name) {
+            return Some(&self.messages[i]);
+        }
+        self.messages.iter().find_map(|m| {
+            let rest = full_name
+                .strip_prefix(m.full_name.as_str())?
+                .strip_prefix('.')?;
+            rest.split('.')
+                .try_fold(m, |cur, part| cur.nested_messages.get(part))
+        })
     }
 
+    /// An enum by full name, nested ones (`pkg.Outer.Kind`) included.
     pub fn enum_type(&self, full_name: &str) -> Option<&EnumDescriptor> {
-        self.enums_by_full_name
-            .get(full_name)
-            .map(|&i| &self.enums[i])
+        if let Some(&i) = self.enums_by_full_name.get(full_name) {
+            return Some(&self.enums[i]);
+        }
+        let (parent, name) = full_name.rsplit_once('.')?;
+        self.message(parent)?.nested_enums.get(name)
     }
 
     pub fn service(&self, full_name: &str) -> Option<&ServiceDescriptor> {

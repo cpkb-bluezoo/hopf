@@ -1,5 +1,6 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
+use super::json_names::proto_json_name;
 use super::FieldType;
 
 /// Descriptor for a protobuf field.
@@ -14,9 +15,19 @@ pub struct FieldDescriptor {
     pub enum_type_name: Option<String>,
     pub key_type_name: Option<String>,
     pub value_type_name: Option<String>,
+    /// Explicit `json_name` option, replacing the default lowerCamelCase key.
+    pub json_name: Option<String>,
 }
 
 impl FieldDescriptor {
+    /// Key used for this field in proto3 JSON.
+    pub fn json_key(&self) -> String {
+        match &self.json_name {
+            Some(n) => n.clone(),
+            None => proto_json_name(&self.name),
+        }
+    }
+
     pub fn builder() -> FieldDescriptorBuilder {
         FieldDescriptorBuilder::default()
     }
@@ -33,6 +44,7 @@ pub struct FieldDescriptorBuilder {
     enum_type_name: Option<String>,
     key_type_name: Option<String>,
     value_type_name: Option<String>,
+    json_name: Option<String>,
 }
 
 impl FieldDescriptorBuilder {
@@ -72,6 +84,10 @@ impl FieldDescriptorBuilder {
         self.value_type_name = Some(name.into());
         self
     }
+    pub fn json_name(mut self, name: impl Into<String>) -> Self {
+        self.json_name = Some(name.into());
+        self
+    }
     pub fn build(self) -> FieldDescriptor {
         FieldDescriptor {
             number: self.number,
@@ -83,6 +99,7 @@ impl FieldDescriptorBuilder {
             enum_type_name: self.enum_type_name,
             key_type_name: self.key_type_name,
             value_type_name: self.value_type_name,
+            json_name: self.json_name,
         }
     }
 }

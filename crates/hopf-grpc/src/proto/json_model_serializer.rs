@@ -8,7 +8,6 @@ use loopbuf::LoopBuf;
 use rjsonparser::{WriteError, WriteResult, Writer};
 
 use super::base64;
-use super::json_names::proto_json_name;
 use super::{FieldDescriptor, FieldType, MessageDescriptor, ProtoFile, ScalarValue};
 
 /// Serializes messages to proto3 JSON from event-driven input.
@@ -69,7 +68,7 @@ impl JsonModelSerializer {
             Some(fd) => fd.clone(),
             None => return Ok(()),
         };
-        let key = proto_json_name(&fd.name);
+        let key = fd.json_key();
         writer.write_key(ring, &key)?;
         write_scalar(writer, ring, &fd, &self.proto_file, &value)
     }
@@ -82,10 +81,11 @@ impl JsonModelSerializer {
         name: &str,
         type_name: &str,
     ) -> WriteResult<()> {
-        if self.current_field(name).is_none() {
-            return Ok(());
-        }
-        writer.write_key(ring, &proto_json_name(name))?;
+        let key = match self.current_field(name) {
+            Some(fd) => fd.json_key(),
+            None => return Ok(()),
+        };
+        writer.write_key(ring, &key)?;
         self.start_message(writer, ring, type_name)
     }
 
