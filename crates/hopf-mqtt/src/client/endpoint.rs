@@ -301,10 +301,10 @@ impl MqttClientControl for ClientCtx<'_, '_> {
     }
 
     fn disconnect(&mut self, reason_code: u8) {
-        if self.handler.version.is_v5() {
-            let wire = encode::encode_disconnect(reason_code, &Properties::new(), self.handler.version);
-            self.endpoint.send(&wire);
-        }
+        // Always sent: without it a 3.1.1 broker sees an abnormal close and
+        // publishes the Will (the encoder drops the reason code for 3.1.1).
+        let wire = encode::encode_disconnect(reason_code, &Properties::new(), self.handler.version);
+        self.endpoint.send(&wire);
         self.endpoint.close();
     }
 }
@@ -371,7 +371,11 @@ impl MqttFrameHandler for ClientCtx<'_, '_> {
         }
     }
 
-    fn pubrec(&mut self, packet_id: u16, _reason_code: u8, _properties: Properties) {
+    fn pubrec(&mut self, packet_id: u16, reason_code: u8, _properties: Properties) {
+        // A refusal (0x80 and up) ends the exchange: no PUBREL follows.
+        if reason_code >= reason::UNSPECIFIED_ERROR {
+            return;
+        }
         // Our own outbound QoS 2 publish: broker acked receipt, complete
         // the handshake by releasing it.
         let wire = encode::encode_pubrel(packet_id, reason::SUCCESS, &Properties::new(), self.handler.version);
@@ -460,3 +464,7 @@ impl MqttFrameHandler for ClientCtx<'_, '_> {
         self.endpoint.close();
     }
 }
+
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod session_tests;

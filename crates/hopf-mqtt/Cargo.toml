@@ -31,4 +31,5 @@ hopf-websocket = { workspace = true, optional = true }
 hopf-http = { workspace = true, optional = true }
 
 [dev-dependencies]
+hopf-core = { workspace = true, features = ["testing"] }
 tempfile = { workspace = true }
