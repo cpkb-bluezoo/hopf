@@ -28,8 +28,20 @@ fn forward_with_user(
     username: &str,
 ) {
     let mut h = headers.clone();
-    h.set(AUTHENTICATED_USER, username);
+    // Not `set`: that would leave any further copies the client sent.
+    h.remove(AUTHENTICATED_USER);
+    h.add(AUTHENTICATED_USER, username);
     inner.headers(response, &h);
+}
+
+/// The credentials after `scheme` in an `Authorization` value. Scheme names
+/// are case-insensitive (RFC 9110 section 11.1) and are followed by
+/// whitespace.
+fn strip_scheme<'a>(value: &'a str, scheme: &str) -> Option<&'a str> {
+    let value = value.trim();
+    let head = value.get(..scheme.len())?;
+    let rest = value.get(scheme.len()..)?;
+    (head.eq_ignore_ascii_case(scheme) && rest.starts_with([' ', '\t'])).then(|| rest.trim_start())
 }
 
 /// Realm string for `WWW-Authenticate: Basic realm="…"`.
@@ -155,10 +167,7 @@ impl ServerHandler for BasicAuthHandler {
 
 /// Parse `Authorization: Basic …` into username/password material.
 pub fn parse_basic_authorization(value: Option<&str>) -> Option<IdentityMaterial> {
-    let value = value?.trim();
-    let rest = value
-        .strip_prefix("Basic ")
-        .or_else(|| value.strip_prefix("basic "))?;
+    let rest = strip_scheme(value?, "Basic")?;
     let decoded = decode_base64(rest.trim())?;
     let s = String::from_utf8(decoded).ok()?;
     let (username, password) = s.split_once(':')?;
@@ -172,6 +181,11 @@ pub fn parse_basic_authorization(value: Option<&str>) -> Option<IdentityMaterial
 /// RFC 7616 doesn't mandate a value; five minutes matches typical
 /// real-world Digest implementations.
 const DEFAULT_NONCE_TTL: Duration = Duration::from_secs(300);
+
+/// Most nonces a Digest factory remembers at once. Every unauthenticated
+/// request is given one, so without a bound a flood grows the table (and the
+/// scan that prunes it) without limit; the oldest are dropped first.
+const MAX_OUTSTANDING_NONCES: usize = 10_000;
 
 /// HTTP Digest configuration.
 #[derive(Debug, Clone)]
@@ -267,11 +281,7 @@ impl DigestAuthHandler {
     }
 
     fn check_auth(&mut self, headers: &Headers) -> Option<String> {
-        let auth = headers.get("authorization")?;
-        let auth = auth.trim();
-        let creds = auth
-            .strip_prefix("Digest ")
-            .or_else(|| auth.strip_prefix("digest "))?;
+        let creds = strip_scheme(headers.get("authorization")?, "Digest")?;
         let params = parse_params(creds);
         let username = params.get("username")?;
         let nonce = params.get("nonce")?;
@@ -284,6 +294,12 @@ impl DigestAuthHandler {
         }
         let ha1 = self.store.digest_ha1(username, &self.realm)?;
         let method = headers.method().unwrap_or("GET");
+        // The credentials must be for this request (RFC 7616 section 3.4).
+        if let (Some(signed), Some(target)) = (params.get("uri"), headers.path()) {
+            if signed != target {
+                return None;
+            }
+        }
         let uri = params
             .get("uri")
             .map(|s| s.as_str())
@@ -301,6 +317,12 @@ impl DigestAuthHandler {
         {
             let mut nonces = self.nonces.lock().unwrap();
             self.prune_expired_nonces(&mut nonces);
+            while nonces.len() >= MAX_OUTSTANDING_NONCES {
+                let Some(oldest) = nonces.iter().min_by_key(|(_, at)| **at).map(|(n, _)| n.clone()) else {
+                    break;
+                };
+                nonces.remove(&oldest);
+            }
             nonces.insert(nonce.clone(), Instant::now());
         }
         let mut h = Headers::new();
@@ -403,14 +425,7 @@ struct BearerAuthHandler {
 
 impl BearerAuthHandler {
     fn check_auth(&mut self, headers: &Headers) -> bool {
-        let Some(auth) = headers.get("authorization") else {
-            return false;
-        };
-        let auth = auth.trim();
-        let Some(token) = auth
-            .strip_prefix("Bearer ")
-            .or_else(|| auth.strip_prefix("bearer "))
-        else {
+        let Some(token) = headers.get("authorization").and_then(|a| strip_scheme(a, "Bearer")) else {
             return false;
         };
         self.policy.evaluate(
@@ -438,7 +453,11 @@ impl ServerHandler for BearerAuthHandler {
     fn headers(&mut self, response: &mut dyn ServerWriter, headers: &Headers) {
         if self.check_auth(headers) {
             self.authorized = true;
-            self.inner.headers(response, headers);
+            // Downstream code (WebDAV ACLs) trusts this header; the client
+            // must not be able to name itself.
+            let mut forwarded = headers.clone();
+            forwarded.remove(AUTHENTICATED_USER);
+            self.inner.headers(response, &forwarded);
         } else {
             self.send_challenge(response);
         }
@@ -777,3 +796,7 @@ mod tests {
     }
     }
 }
+
+#[cfg(test)]
+#[path = "auth_tests.rs"]
+mod unit_tests;

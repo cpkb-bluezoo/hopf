@@ -499,6 +499,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "h3")]
     #[test]
     fn content_length_from_pairs_rejects_conflicting_values() {
         assert_eq!(
