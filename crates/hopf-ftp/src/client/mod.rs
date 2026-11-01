@@ -741,6 +741,9 @@ fn resolve_literal(host: &str, port: u16) -> Option<SocketAddr> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod session_tests;
+
+#[cfg(test)]
 mod tests {
     use super::reply::{format_eprt_arg, format_port_arg, parse_epsv_port, parse_pasv_addr, parse_pwd_path};
 

@@ -24,5 +24,6 @@ hopf-dns = { workspace = true }
 hopf-otel = { workspace = true }
 
 [dev-dependencies]
+hopf-core = { workspace = true, features = ["testing"] }
 tempfile = { workspace = true }
 rcgen = { workspace = true }

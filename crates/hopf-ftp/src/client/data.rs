@@ -449,4 +449,188 @@ mod tests {
         let mut state = TransferState::retr(Box::new(StopAfterOne(0)));
         assert!(!state.push_content(b"first"));
     }
+
+    use hopf_core::testing::Peer;
+
+    type Seen = Arc<Mutex<(Vec<String>, Option<io::Result<()>>)>>;
+
+    /// Records every callback, in order, as text.
+    struct Recorder {
+        seen: Seen,
+        keep_going: bool,
+    }
+
+    impl MessageReceiveCallback for Recorder {
+        fn start_message(&mut self) {
+            self.seen.lock().unwrap().0.push("start".into());
+        }
+        fn message_content(&mut self, chunk: &[u8]) -> bool {
+            let text = String::from_utf8_lossy(chunk).into_owned();
+            self.seen.lock().unwrap().0.push(text);
+            self.keep_going
+        }
+        fn end_message(&mut self, result: io::Result<()>) {
+            let mut g = self.seen.lock().unwrap();
+            g.0.push("end".into());
+            g.1 = Some(result);
+        }
+    }
+
+    fn download(keep_going: bool) -> (Peer<FtpDataRetrHandler>, Arc<Mutex<TransferState>>, Seen) {
+        let seen = Seen::default();
+        let state = Arc::new(Mutex::new(TransferState::retr(Box::new(Recorder {
+            seen: Arc::clone(&seen),
+            keep_going,
+        }))));
+        let peer = Peer::connect(FtpDataRetrHandler::new(Arc::clone(&state)), |_| false);
+        (peer, state, seen)
+    }
+
+    #[test]
+    fn download_content_arrives_as_it_is_read() {
+        let (mut peer, _state, seen) = download(true);
+        peer.run("abc");
+        peer.run("def");
+        assert_eq!(seen.lock().unwrap().0, ["start", "abc", "def"]);
+    }
+
+    #[test]
+    fn download_ends_only_when_both_channels_are_done() {
+        let (mut peer, state, seen) = download(true);
+        peer.run("data");
+        peer.disconnect();
+        assert!(seen.lock().unwrap().1.is_none(), "control side has not said 226 yet");
+        {
+            let mut g = state.lock().unwrap();
+            g.ctrl_done = true;
+            g.maybe_complete();
+        }
+        let g = seen.lock().unwrap();
+        assert_eq!(g.0, ["start", "data", "end"]);
+        assert!(g.1.as_ref().unwrap().is_ok());
+    }
+
+    #[test]
+    fn download_whose_226_came_first_ends_when_the_data_closes() {
+        let (mut peer, state, seen) = download(true);
+        peer.run("data");
+        state.lock().unwrap().ctrl_done = true;
+        assert!(seen.lock().unwrap().1.is_none());
+        peer.disconnect();
+        assert_eq!(seen.lock().unwrap().0, ["start", "data", "end"]);
+    }
+
+    #[test]
+    fn an_empty_download_still_starts_and_ends_the_message() {
+        let (mut peer, state, seen) = download(true);
+        state.lock().unwrap().ctrl_done = true;
+        peer.disconnect();
+        assert_eq!(seen.lock().unwrap().0, ["start", "end"]);
+    }
+
+    #[test]
+    fn a_receiver_that_stops_closes_the_data_connection() {
+        let (mut peer, _state, seen) = download(false);
+        peer.run("first");
+        assert!(peer.is_closed());
+        assert_eq!(seen.lock().unwrap().0, ["start", "first"]);
+    }
+
+    #[test]
+    fn a_data_error_is_reported_as_the_transfers_result() {
+        let (mut peer, state, seen) = download(true);
+        peer.run("part");
+        state.lock().unwrap().ctrl_done = true;
+        let err = io::Error::new(io::ErrorKind::ConnectionReset, "reset");
+        peer.fail(&err);
+        let g = seen.lock().unwrap();
+        assert_eq!(g.0, ["start", "part", "end"]);
+        assert_eq!(g.1.as_ref().unwrap().as_ref().unwrap_err().kind(), io::ErrorKind::ConnectionReset);
+    }
+
+    #[test]
+    fn an_abort_wins_over_a_data_error() {
+        let (mut peer, state, seen) = download(true);
+        state.lock().unwrap().mark_aborted();
+        let err = io::Error::new(io::ErrorKind::ConnectionReset, "reset");
+        peer.fail(&err);
+        let g = seen.lock().unwrap();
+        assert_eq!(g.1.as_ref().unwrap().as_ref().unwrap_err().kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn the_completion_callback_fires_once() {
+        let (mut peer, state, seen) = download(true);
+        {
+            let mut g = state.lock().unwrap();
+            g.ctrl_done = true;
+        }
+        peer.disconnect();
+        state.lock().unwrap().maybe_complete();
+        let ends = seen.lock().unwrap().0.iter().filter(|e| *e == "end").count();
+        assert_eq!(ends, 1);
+    }
+
+    #[test]
+    fn an_upload_is_armed_only_once_the_server_has_said_150() {
+        let armed = Arc::new(AtomicBool::new(false));
+        let armed2 = Arc::clone(&armed);
+        let state = Arc::new(Mutex::new(TransferState::stor(
+            Box::new(move |_handle| armed2.store(true, Ordering::SeqCst)),
+            Box::new(|_| {}),
+        )));
+        let mut peer = Peer::connect(FtpDataStorHandler::new(Arc::clone(&state)), |_| false);
+        assert!(!armed.load(Ordering::SeqCst), "the 150 has not arrived");
+        assert!(state.lock().unwrap().data_conn.is_some());
+
+        state.lock().unwrap().start_ok = true;
+        let ready = state.lock().unwrap().try_arm();
+        let (ready, conn) = ready.expect("both halves are present");
+        ready(FtpStorHandle::new(conn));
+        assert!(armed.load(Ordering::SeqCst));
+        // Whatever the server sends on an upload's data channel is dropped.
+        peer.run("ignored");
+    }
+
+    #[test]
+    fn an_upload_whose_150_came_first_is_armed_when_the_data_connects() {
+        let armed = Arc::new(AtomicBool::new(false));
+        let armed2 = Arc::clone(&armed);
+        let state = Arc::new(Mutex::new(TransferState::stor(
+            Box::new(move |_handle| armed2.store(true, Ordering::SeqCst)),
+            Box::new(|_| {}),
+        )));
+        state.lock().unwrap().start_ok = true;
+        let _peer = Peer::connect(FtpDataStorHandler::new(Arc::clone(&state)), |_| false);
+        assert!(armed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_tls_upload_waits_for_the_handshake() {
+        let armed = Arc::new(AtomicBool::new(false));
+        let armed2 = Arc::clone(&armed);
+        let state = Arc::new(Mutex::new(TransferState::stor(
+            Box::new(move |_handle| armed2.store(true, Ordering::SeqCst)),
+            Box::new(|_| {}),
+        )));
+        state.lock().unwrap().start_ok = true;
+        let _peer = Peer::connect(FtpDataStorHandler::new_expect_tls(Arc::clone(&state)), |_| false);
+        assert!(!armed.load(Ordering::SeqCst), "no content before the handshake");
+        assert!(state.lock().unwrap().data_conn.is_none());
+    }
+
+    #[test]
+    fn stou_reports_the_name_the_server_assigned() {
+        let name = Arc::new(Mutex::new(None));
+        let name2 = Arc::clone(&name);
+        let mut state = TransferState::stou(
+            Box::new(|_handle| {}),
+            Box::new(move |r| *name2.lock().unwrap() = Some(r)),
+        );
+        state.assigned_name = "unique-7".into();
+        state.data_done = true;
+        state.ctrl_done = true;
+        state.maybe_complete();
+        assert_eq!(name.lock().unwrap().take().unwrap().unwrap(), "unique-7");
+    }
 }

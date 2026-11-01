@@ -183,6 +183,13 @@ impl<H: ProtocolHandler> Peer<H> {
         self.pump();
     }
 
+    /// The connection fails: the handler is told, and whatever it starts in
+    /// answer is seen through.
+    pub fn fail(&mut self, err: &std::io::Error) {
+        self.handler.error(&mut self.endpoint, err);
+        self.pump();
+    }
+
     /// Has the handler closed the connection?
     pub fn is_closed(&self) -> bool {
         self.wire.closed.load(Ordering::Relaxed)
