@@ -1300,8 +1300,9 @@ impl H2Endpoint {
 
     /// After SETTINGS exchange completes, deliver the h2c upgrade request
     /// to stream 1 without expecting a client HEADERS frame.
-    fn deliver_upgrade_stream(&mut self, upgrade_headers: Headers) {
+    fn deliver_upgrade_stream(&mut self, mut upgrade_headers: Headers) {
         const STREAM_ID: u32 = 1;
+        upgrade_headers.strip_server_internal();
         self.flow
             .open_stream(STREAM_ID, self.peer_initial_window_size);
 
@@ -1573,6 +1574,7 @@ impl H2Endpoint {
         };
         Self::bind_server_stream(&self.conn, &self.connection_info, &self.deferred_flush, &mut stream);
 
+        headers.strip_server_internal();
         stream.extended_connect = headers
             .get(":method")
             .is_some_and(|m| m.eq_ignore_ascii_case("CONNECT"))
@@ -4604,5 +4606,72 @@ mod request_body_events_tests {
             *events.lock().unwrap(),
             ["start", "content a", "content b", "content c", "end", "complete"]
         );
+    }
+}
+
+#[cfg(test)]
+mod internal_header_tests {
+    use super::*;
+    use crate::stream::{ServerHandler, ServerHandlerFactory, ServerWriter};
+
+    type Seen = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// Records every `x-hopf-authenticated-user` value the handler is shown.
+    struct Recording(Seen);
+    impl ServerHandler for Recording {
+        fn headers(&mut self, _response: &mut dyn ServerWriter, headers: &Headers) {
+            self.0.lock().unwrap().extend(
+                headers
+                    .iter()
+                    .filter(|f| f.name.eq_ignore_ascii_case(crate::auth::AUTHENTICATED_USER))
+                    .map(|f| f.value.clone()),
+            );
+        }
+        fn request_complete(&mut self, _response: &mut dyn ServerWriter) {}
+    }
+    struct RecordingFactory(Seen);
+    impl ServerHandlerFactory for RecordingFactory {
+        fn create_handler(&self) -> Box<dyn ServerHandler> {
+            Box::new(Recording(Arc::clone(&self.0)))
+        }
+    }
+
+    fn server(seen: &Seen) -> H2Endpoint {
+        H2Endpoint::server(Arc::new(RecordingFactory(Arc::clone(seen))), HttpLimits::default(), false)
+    }
+
+    /// The header is the server's own word about who the client is (WebDAV
+    /// ACLs trust it): a client's copy is dropped before any handler sees it.
+    #[test]
+    fn a_client_supplied_authenticated_user_header_is_dropped() {
+        let seen = Seen::default();
+        let mut ep = server(&seen);
+        let block = super::super::hpack::Encoder::new(4096).encode(
+            [
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":path", "/"),
+                (":authority", "x"),
+                ("x-hopf-authenticated-user", "root"),
+            ]
+            .into_iter(),
+        );
+        ep.process_server_headers_block(1, &block, true);
+        assert!(ep.out.is_empty(), "no error frame expected: {:?}", ep.out);
+        assert!(seen.lock().unwrap().is_empty(), "{:?}", seen.lock().unwrap());
+    }
+
+    /// The same for the request an h2c upgrade turns into stream 1.
+    #[test]
+    fn the_h2c_upgrade_request_loses_it_too() {
+        let seen = Seen::default();
+        let mut ep = server(&seen);
+        let mut h = Headers::new();
+        h.add_pseudo(":method", "GET");
+        h.add_pseudo(":path", "/");
+        h.add("host", "x");
+        h.add("X-Hopf-Authenticated-User", "root");
+        ep.deliver_upgrade_stream(h);
+        assert!(seen.lock().unwrap().is_empty(), "{:?}", seen.lock().unwrap());
     }
 }

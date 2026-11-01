@@ -765,6 +765,7 @@ impl H3FrameHandler for H3RequestStream {
             .method()
             .is_some_and(|m| m.eq_ignore_ascii_case("CONNECT"))
             && headers.contains(":protocol");
+        headers.strip_server_internal();
         let mut handler = self.factory.create_handler();
         handler.headers(&mut self.writer, &headers);
         if let Some(up) = self.writer.control.take_upgrade() {
@@ -2238,6 +2239,8 @@ mod request_validation_tests {
         body: Vec<u8>,
         /// Answer the request as soon as the headers arrive.
         answer_at_once: bool,
+        /// Every `x-hopf-authenticated-user` value the handler was shown.
+        user_headers: Vec<String>,
     }
 
     #[derive(Default)]
@@ -2258,10 +2261,16 @@ mod request_validation_tests {
         rec: Arc<Mutex<Recorded>>,
     }
     impl ServerHandler for RecordingHandler {
-        fn headers(&mut self, response: &mut dyn ServerWriter, _headers: &Headers) {
+        fn headers(&mut self, response: &mut dyn ServerWriter, headers: &Headers) {
             let answer = {
                 let mut r = self.rec.lock().unwrap();
                 r.opened += 1;
+                r.user_headers.extend(
+                    headers
+                        .iter()
+                        .filter(|f| f.name.eq_ignore_ascii_case(crate::auth::AUTHENTICATED_USER))
+                        .map(|f| f.value.clone()),
+                );
                 r.answer_at_once
             };
             if answer {
@@ -2311,6 +2320,24 @@ mod request_validation_tests {
             H3RequestStream::new(factory, HttpLimits::default(), 0, qpack, peer_state),
             rec,
         )
+    }
+
+    /// The authenticated-user header is the server's own word about who the
+    /// client is (WebDAV ACLs trust it): a client's copy is dropped before
+    /// any handler sees the request.
+    #[test]
+    fn a_client_supplied_authenticated_user_header_is_dropped() {
+        let (mut stream, rec) = stream_with_recorder();
+        stream.headers_frame(&encode(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", "/"),
+            (":authority", "x"),
+            ("x-hopf-authenticated-user", "root"),
+        ]));
+        let r = rec.lock().unwrap();
+        assert_eq!(r.opened, 1);
+        assert!(r.user_headers.is_empty(), "{:?}", r.user_headers);
     }
 
     /// A reset request stream (RESET_STREAM / STOP_SENDING / abrupt

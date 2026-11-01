@@ -99,6 +99,14 @@ impl Headers {
         self.get(name).is_some()
     }
 
+    /// Drop the fields only the server itself may put on a request (see
+    /// [`crate::auth::AUTHENTICATED_USER`]). Every transport calls this on a
+    /// request it has parsed, before any handler sees it, so a client cannot
+    /// name itself to the application.
+    pub(crate) fn strip_server_internal(&mut self) {
+        self.remove(crate::auth::AUTHENTICATED_USER);
+    }
+
     /// Remove all fields with this name.
     pub fn remove(&mut self, name: &str) {
         self.fields.retain(|h| !h.name.eq_ignore_ascii_case(name));

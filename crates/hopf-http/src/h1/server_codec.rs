@@ -462,7 +462,8 @@ impl<H: ServerHandler> Driver<H> {
             self.response.extend_out(b"HTTP/1.1 100 Continue\r\n\r\n");
         }
 
-        let hdrs = self.headers.clone();
+        let mut hdrs = self.headers.clone();
+        hdrs.strip_server_internal();
         self.capsule_mode = crate::capsule::capsule_protocol_enabled(&hdrs);
         self.with_app_response(|app, resp| app.headers(resp, &hdrs));
 
@@ -699,6 +700,8 @@ mod tests {
     struct Rec {
         events: Vec<String>,
         body: Vec<u8>,
+        /// Every `x-hopf-authenticated-user` value the handler was shown.
+        user_headers: Vec<String>,
     }
 
     impl ServerHandler for Arc<Mutex<Rec>> {
@@ -708,6 +711,12 @@ mod tests {
                 headers.method().unwrap_or("?"),
                 headers.path().unwrap_or("?")
             ));
+            self.lock().unwrap().user_headers.extend(
+                headers
+                    .iter()
+                    .filter(|f| f.name.eq_ignore_ascii_case(crate::auth::AUTHENTICATED_USER))
+                    .map(|f| f.value.clone()),
+            );
             let mut h = Headers::new();
             h.status(200);
             h.set("Content-Type", "text/plain");
@@ -768,6 +777,22 @@ mod tests {
             assert_eq!(g.body, b"hello", "split {split}");
             assert!(g.events.iter().any(|e| e == "complete"), "split {split}");
         }
+    }
+
+    /// The authenticated-user header is the server's own word about who
+    /// the client is (WebDAV ACLs trust it): whatever a client sends under
+    /// that name is dropped before any handler sees the request.
+    #[test]
+    fn a_client_supplied_authenticated_user_header_is_dropped() {
+        let rec = Arc::new(Mutex::new(Rec::default()));
+        let mut p = H1ServerCodec::new(Arc::clone(&rec), HttpLimits::default(), false);
+        feed_all(
+            &mut p,
+            &[b"GET / HTTP/1.1\r\nHost: x\r\nX-Hopf-Authenticated-User: root\r\nx-hopf-authenticated-user: admin\r\n\r\n"],
+        );
+        let g = rec.lock().unwrap();
+        assert_eq!(g.events.first().map(String::as_str), Some("headers GET /"));
+        assert!(g.user_headers.is_empty(), "{:?}", g.user_headers);
     }
 
     #[test]
