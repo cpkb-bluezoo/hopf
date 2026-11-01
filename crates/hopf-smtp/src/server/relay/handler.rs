@@ -81,6 +81,7 @@ impl SmtpHandlerFactory for SimpleRelayHandlerFactory {
             control_handle: None,
             inbound_tls: false,
             sender: None,
+            smtputf8: false,
             delivery: DeliveryRequirements::default(),
             recipients: Vec::new(),
             spool: None,
@@ -101,6 +102,8 @@ pub struct SimpleRelayHandler {
     control_handle: Option<ConnHandle>,
     inbound_tls: bool,
     sender: Option<EmailAddress>,
+    /// The inbound MAIL FROM carried SMTPUTF8 (RFC 6531).
+    smtputf8: bool,
     delivery: DeliveryRequirements,
     recipients: Vec<(EmailAddress, DsnRecipientParams)>,
     spool: Option<Arc<Mutex<SpoolPipeline>>>,
@@ -114,6 +117,7 @@ pub struct SimpleRelayHandler {
 impl SimpleRelayHandler {
     fn reset_transaction(&mut self) {
         self.sender = None;
+        self.smtputf8 = false;
         self.delivery = DeliveryRequirements::default();
         self.recipients.clear();
         self.spool = None;
@@ -181,10 +185,11 @@ impl MailFromHandler for SimpleRelayHandler {
         &mut self,
         state: &mut dyn MailFromState,
         sender: Option<&EmailAddress>,
-        _smtputf8: bool,
+        smtputf8: bool,
         delivery: &DeliveryRequirements,
     ) {
         self.sender = sender.cloned();
+        self.smtputf8 = smtputf8;
         self.delivery = delivery.clone();
         self.recipients.clear();
 
@@ -333,13 +338,7 @@ impl MessageDataHandler for SimpleRelayHandler {
             extra_header_lines: self.extra_header_lines.clone(),
             sender: self.sender.clone(),
             require_tls: self.delivery.is_require_tls(),
-            mail_params: MailFromParams {
-                require_tls: self.delivery.is_require_tls(),
-                dsn_ret: self.delivery.dsn_ret,
-                dsn_envid: self.delivery.dsn_envid.clone(),
-                priority: self.delivery.priority,
-                ..Default::default()
-            },
+            mail_params: outbound_mail_params(&self.delivery, self.smtputf8, std::time::SystemTime::now()),
             dns: Arc::clone(&self.dns),
             runtime: Arc::clone(&self.runtime),
             hostname: self.hostname.clone(),
@@ -354,6 +353,29 @@ impl MessageDataHandler for SimpleRelayHandler {
 
     fn message_aborted(&mut self) {
         self.reset_transaction();
+    }
+}
+
+/// The MAIL FROM parameters for an outbound hop: what the message arrived
+/// with that the next server needs to know. `BY` goes on with the time that
+/// is left, never the original interval (RFC 2852 section 4.1.4), and not
+/// as zero, which would ask for the impossible.
+fn outbound_mail_params(
+    delivery: &DeliveryRequirements,
+    smtputf8: bool,
+    now: std::time::SystemTime,
+) -> MailFromParams {
+    MailFromParams {
+        smtputf8,
+        require_tls: delivery.is_require_tls(),
+        dsn_ret: delivery.dsn_ret,
+        dsn_envid: delivery.dsn_envid.clone(),
+        priority: delivery.priority,
+        deliver_by: delivery.deliver_by.as_ref().map(|by| {
+            let left = by.deadline.duration_since(now).unwrap_or_default();
+            (left.max(Duration::from_secs(1)), by.return_on_fail)
+        }),
+        ..Default::default()
     }
 }
 
@@ -513,6 +535,12 @@ impl DeliveryTracker {
             return None;
         }
         self.dsn_sent = true;
+        // When no domain took the message the inbound client is told to try
+        // again later (a 4xx), and a failure notice on top of that would
+        // give the sender two different outcomes for one message.
+        if !self.any_success {
+            return None;
+        }
         let sender = self.sender.clone()?;
         let mut reports = Vec::new();
         for (addr, params) in &self.recipients {
@@ -1045,6 +1073,7 @@ mod tests {
             control_handle: None,
             inbound_tls: false,
             sender: None,
+            smtputf8: false,
             delivery: DeliveryRequirements::default(),
             recipients: Vec::new(),
             spool: None,
@@ -1172,5 +1201,242 @@ mod tests {
             tracker.build_dsn_reports().is_none(),
             "must not build/send a second DSN for the same tracker"
         );
+    }
+
+    fn tracker(
+        recipients: Vec<(EmailAddress, DsnRecipientParams)>,
+        results: &[(&str, bool)],
+        any_success: bool,
+        sender: Option<EmailAddress>,
+    ) -> DeliveryTracker {
+        let (rt, handle) = test_runtime_and_handle();
+        let dns = Arc::new(DnsResolver::for_runtime(&rt).unwrap());
+        DeliveryTracker {
+            deferred: None,
+            remaining: 0,
+            any_success,
+            spool_path: None,
+            hostname: "test.example.com".to_string(),
+            sender,
+            delivery: DeliveryRequirements::default(),
+            recipients,
+            domain_results: results.iter().map(|(d, ok)| (d.to_string(), *ok)).collect(),
+            dns,
+            runtime: rt,
+            smtp_timeout: Duration::from_secs(5),
+            outbound_port: 25,
+            tls_connector: None,
+            dsn_sent: false,
+            control_handle: handle,
+        }
+    }
+
+    fn rcpt(local: &str, domain: &str, notify: DsnNotify) -> (EmailAddress, DsnRecipientParams) {
+        (
+            EmailAddress::new(None, local, domain, true),
+            DsnRecipientParams { notify, ..Default::default() },
+        )
+    }
+
+    fn sender() -> Option<EmailAddress> {
+        Some(EmailAddress::new(None, "from", "sender.example", true))
+    }
+
+    use crate::server::delivery::DsnNotify;
+
+    #[test]
+    fn no_failure_notice_goes_out_when_the_whole_transaction_is_refused_with_a_temporary_error() {
+        // Nothing was delivered anywhere, so the inbound client is told to try
+        // again later (4xx). A bounce on top of that would tell the sender
+        // it failed while its client queues a retry: two outcomes for one message.
+        let mut t = tracker(
+            vec![rcpt("a", "down.example", DsnNotify::default())],
+            &[("down.example", false)],
+            false,
+            sender(),
+        );
+        assert!(t.build_dsn_reports().is_none());
+    }
+
+    #[test]
+    fn a_failure_notice_does_go_out_when_some_other_domain_took_the_message() {
+        let mut t = tracker(
+            vec![rcpt("a", "good.example", DsnNotify::default()), rcpt("b", "down.example", DsnNotify::default())],
+            &[("good.example", true), ("down.example", false)],
+            true,
+            sender(),
+        );
+        let (_, reports) = t.build_dsn_reports().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].final_recipient, "b@down.example");
+    }
+
+    #[test]
+    fn no_notice_without_a_sender_to_send_it_to() {
+        let mut t = tracker(
+            vec![rcpt("a", "down.example", DsnNotify::default()), rcpt("b", "good.example", DsnNotify::default())],
+            &[("down.example", false), ("good.example", true)],
+            true,
+            None,
+        );
+        assert!(t.build_dsn_reports().is_none());
+    }
+
+    #[test]
+    fn notify_decides_who_gets_a_report() {
+        let never = DsnNotify { never: true, ..Default::default() };
+        let success = DsnNotify { success: true, ..Default::default() };
+        let delay_only = DsnNotify { delay: true, ..Default::default() };
+        let mut t = tracker(
+            vec![
+                rcpt("ok-default", "good.example", DsnNotify::default()),
+                rcpt("ok-success", "good.example", success),
+                rcpt("bad-default", "down.example", DsnNotify::default()),
+                rcpt("bad-never", "down.example", never),
+                rcpt("bad-delay-only", "down.example", delay_only),
+            ],
+            &[("good.example", true), ("down.example", false)],
+            true,
+            sender(),
+        );
+        let (_, reports) = t.build_dsn_reports().unwrap();
+        let got: Vec<(String, DsnAction)> = reports.iter().map(|r| (r.final_recipient.clone(), r.action)).collect();
+        assert_eq!(
+            got,
+            [
+                ("ok-success@good.example".to_string(), DsnAction::Delivered),
+                ("bad-default@down.example".to_string(), DsnAction::Failed),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_recipient_with_notify_never_means_no_report() {
+        let never = DsnNotify { never: true, ..Default::default() };
+        let mut t = tracker(
+            vec![rcpt("a", "down.example", never), rcpt("b", "good.example", never)],
+            &[("down.example", false), ("good.example", true)],
+            true,
+            sender(),
+        );
+        assert!(t.build_dsn_reports().is_none());
+    }
+
+    #[test]
+    fn the_original_recipient_is_carried_into_the_report() {
+        let mut params = DsnRecipientParams::default();
+        params.orcpt_type = Some("rfc822".into());
+        params.orcpt_address = Some("orig@down.example".into());
+        let mut t = tracker(
+            vec![(EmailAddress::new(None, "a", "down.example", true), params), rcpt("b", "good.example", DsnNotify::default())],
+            &[("down.example", false), ("good.example", true)],
+            true,
+            sender(),
+        );
+        let (_, reports) = t.build_dsn_reports().unwrap();
+        assert_eq!(reports[0].original_recipient.as_deref(), Some("rfc822;orig@down.example"));
+    }
+
+    #[test]
+    fn a_recipient_whose_domain_never_reported_counts_as_failed() {
+        let mut t = tracker(
+            vec![rcpt("a", "silent.example", DsnNotify::default()), rcpt("b", "good.example", DsnNotify::default())],
+            &[("good.example", true)],
+            true,
+            sender(),
+        );
+        let (_, reports) = t.build_dsn_reports().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].action, DsnAction::Failed);
+    }
+
+    #[test]
+    fn recording_every_domain_finishes_the_tracker_once() {
+        let mut t = tracker(Vec::new(), &[], false, None);
+        t.remaining = 3;
+        t.record("a.example", true);
+        t.record("b.example", false);
+        assert_eq!(t.remaining, 1);
+        assert!(t.any_success && t.domain_results.len() == 2);
+        // a count that was already zero does not wrap
+        let mut z = tracker(Vec::new(), &[], false, None);
+        z.remaining = 0;
+        z.finish_if_needed_with_zero_domains();
+        assert_eq!(z.remaining, 0);
+    }
+
+    #[test]
+    fn extra_header_lines_are_crlf_terminated() {
+        assert_eq!(render_extra_header_lines(&[]), b"");
+        assert_eq!(
+            render_extra_header_lines(&["X-A: 1".into(), "X-B: 2".into()]),
+            b"X-A: 1\r\nX-B: 2\r\n"
+        );
+    }
+
+    #[test]
+    fn the_hop_carries_the_envelope_parameters_that_the_message_arrived_with() {
+        use std::time::SystemTime;
+        let now = SystemTime::now();
+        let d = DeliveryRequirements {
+            require_tls: true,
+            priority: Some(3),
+            dsn_ret: Some(crate::server::delivery::DsnReturn::Hdrs),
+            dsn_envid: Some("env-1".into()),
+            ..Default::default()
+        };
+        let p = outbound_mail_params(&d, false, now);
+        assert!(p.require_tls && p.priority == Some(3) && p.dsn_envid.as_deref() == Some("env-1"));
+        assert!(p.dsn_ret.is_some() && !p.smtputf8);
+    }
+
+    #[test]
+    fn smtputf8_is_carried_to_the_next_hop() {
+        // Without it a relay that accepted a UTF-8 address would hand the
+        // next server an address it has not been told it may receive.
+        let p = outbound_mail_params(&DeliveryRequirements::default(), true, std::time::SystemTime::now());
+        assert!(p.smtputf8);
+        let p = outbound_mail_params(&DeliveryRequirements::default(), false, std::time::SystemTime::now());
+        assert!(!p.smtputf8);
+    }
+
+    #[test]
+    fn a_delivery_deadline_is_carried_with_the_time_that_is_left() {
+        // RFC 2852 section 4.1.4: a relay passes BY on with the time
+        // remaining, never the original interval.
+        use std::time::SystemTime;
+        let now = SystemTime::now();
+        let d = DeliveryRequirements {
+            deliver_by: Some(crate::server::delivery::DeliverBy {
+                deadline: now + Duration::from_secs(300),
+                return_on_fail: true,
+            }),
+            ..Default::default()
+        };
+        let p = outbound_mail_params(&d, false, now);
+        assert_eq!(p.deliver_by, Some((Duration::from_secs(300), true)));
+        let later = now + Duration::from_secs(100);
+        let p = outbound_mail_params(&d, false, later);
+        assert_eq!(p.deliver_by, Some((Duration::from_secs(200), true)));
+        let n = DeliveryRequirements {
+            deliver_by: Some(crate::server::delivery::DeliverBy { deadline: now + Duration::from_secs(60), return_on_fail: false }),
+            ..Default::default()
+        };
+        assert_eq!(outbound_mail_params(&n, false, now).deliver_by, Some((Duration::from_secs(60), false)));
+    }
+
+    #[test]
+    fn a_deadline_about_to_pass_is_not_sent_as_zero() {
+        use std::time::SystemTime;
+        let now = SystemTime::now();
+        let d = DeliveryRequirements {
+            deliver_by: Some(crate::server::delivery::DeliverBy {
+                deadline: now + Duration::from_millis(200),
+                return_on_fail: true,
+            }),
+            ..Default::default()
+        };
+        let p = outbound_mail_params(&d, false, now);
+        assert_eq!(p.deliver_by.map(|(t, _)| t), Some(Duration::from_secs(1)));
     }
 }
