@@ -1494,29 +1494,7 @@ fn resp_text_await(ctx: RespCtx, code: Option<ImapResponseCode>) -> AwaitLfKind 
 }
 
 pub(super) fn apply_capability_token(caps: &mut ImapCapabilities, upper: &str) {
-    match upper {
-        "STARTTLS" => caps.starttls = true,
-        "LITERAL-" => caps.literal_minus = true,
-        "IDLE" => caps.idle = true,
-        "LOGINDISABLED" => caps.login_disabled = true,
-        "MOVE" => caps.move_ = true,
-        "UIDPLUS" => caps.uidplus = true,
-        "NAMESPACE" => caps.namespace = true,
-        "ENABLE" => caps.enable = true,
-        "CONDSTORE" => caps.condstore = true,
-        "QRESYNC" => caps.qresync = true,
-        "UNSELECT" => caps.unselect = true,
-        "ID" => caps.id = true,
-        "QUOTA" => caps.quota = true,
-        _ => {
-            if let Some(mech) = upper.strip_prefix("AUTH=") {
-                if mech == "PLAIN" {
-                    caps.auth_plain = true;
-                }
-            }
-        }
-    }
-    caps.tokens.push(upper.to_string());
+    caps.apply_token(upper);
 }
 
 #[cfg(test)]

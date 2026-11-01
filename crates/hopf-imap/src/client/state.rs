@@ -60,38 +60,45 @@ impl ImapCapabilities {
     pub fn parse(text: &str) -> Self {
         let mut caps = Self::default();
         for tok in text.split_whitespace() {
-            let u = tok.to_ascii_uppercase();
-            match u.as_str() {
-                "STARTTLS" => caps.starttls = true,
-                "LITERAL-" => caps.literal_minus = true,
-                "IDLE" => caps.idle = true,
-                "LOGINDISABLED" => caps.login_disabled = true,
-                "MOVE" => caps.move_ = true,
-                "UIDPLUS" => caps.uidplus = true,
-                "NAMESPACE" => caps.namespace = true,
-                "ENABLE" => caps.enable = true,
-                "CONDSTORE" => caps.condstore = true,
-                "QRESYNC" => caps.qresync = true,
-                "UNSELECT" => caps.unselect = true,
-                "ID" => caps.id = true,
-                "QUOTA" => caps.quota = true,
-                "COMPRESS=DEFLATE" => caps.compress_deflate = true,
-                "UTF8=ACCEPT" => caps.utf8_accept = true,
-                "LIST-EXTENDED" => caps.list_extended = true,
-                "LIST-STATUS" => caps.list_status = true,
-                "SPECIAL-USE" => caps.special_use = true,
-                "CHILDREN" => caps.children = true,
-                _ => {
-                    if let Some(mech) = u.strip_prefix("AUTH=") {
-                        if mech == "PLAIN" {
-                            caps.auth_plain = true;
-                        }
+            caps.apply_token(&tok.to_ascii_uppercase());
+        }
+        caps
+    }
+
+    /// Record one upper-cased capability token: the flag it sets, if it has
+    /// one, and the token itself. Every route a capability list reaches us
+    /// by (the text parser, a `[CAPABILITY ...]` code, an untagged
+    /// `CAPABILITY` line) goes through this, so none can lag behind another.
+    pub(crate) fn apply_token(&mut self, upper: &str) {
+        match upper {
+            "STARTTLS" => self.starttls = true,
+            "LITERAL-" => self.literal_minus = true,
+            "IDLE" => self.idle = true,
+            "LOGINDISABLED" => self.login_disabled = true,
+            "MOVE" => self.move_ = true,
+            "UIDPLUS" => self.uidplus = true,
+            "NAMESPACE" => self.namespace = true,
+            "ENABLE" => self.enable = true,
+            "CONDSTORE" => self.condstore = true,
+            "QRESYNC" => self.qresync = true,
+            "UNSELECT" => self.unselect = true,
+            "ID" => self.id = true,
+            "QUOTA" => self.quota = true,
+            "COMPRESS=DEFLATE" => self.compress_deflate = true,
+            "UTF8=ACCEPT" => self.utf8_accept = true,
+            "LIST-EXTENDED" => self.list_extended = true,
+            "LIST-STATUS" => self.list_status = true,
+            "SPECIAL-USE" => self.special_use = true,
+            "CHILDREN" => self.children = true,
+            _ => {
+                if let Some(mech) = upper.strip_prefix("AUTH=") {
+                    if mech == "PLAIN" {
+                        self.auth_plain = true;
                     }
                 }
             }
-            caps.tokens.push(u);
         }
-        caps
+        self.tokens.push(upper.to_string());
     }
 
     /// Whether `name` (case-insensitive) is advertised.

@@ -229,6 +229,21 @@ mod tests {
     }
 
     #[test]
+    fn a_capability_code_carries_every_capability_a_server_lists() {
+        // What the hopf server sends with a successful LOGIN.
+        let words = "IMAP4rev2 IDLE NAMESPACE QUOTA MOVE CONDSTORE QRESYNC COMPRESS=DEFLATE UTF8=ACCEPT \
+                     SORT THREAD=ORDEREDSUBJECT THREAD=REFERENCES STATUS=SIZE OBJECTID METADATA NOTIFY \
+                     UNSELECT UIDPLUS CHILDREN LIST-EXTENDED LIST-STATUS LITERAL- ID ENABLE";
+        match code(&format!("CAPABILITY {words}")) {
+            Some(ImapResponseCode::Capability(caps)) => {
+                assert_eq!(caps, ImapCapabilities::parse(words));
+                assert!(caps.compress_deflate && caps.idle);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn capability_and_permanentflags_agree_with_the_text_parsers() {
         for words in ["IMAP4rev2 STARTTLS", "imap4rev1 IDLE AUTH=PLAIN LOGINDISABLED", "IMAP4rev2"] {
             assert_eq!(code(&format!("CAPABILITY {words}")), Some(ImapResponseCode::Capability(ImapCapabilities::parse(words))), "{words}");
