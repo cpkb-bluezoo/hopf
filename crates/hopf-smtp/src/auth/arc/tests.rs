@@ -440,3 +440,130 @@ fn recorded_results_expose_spf_and_dkim_verdicts() {
     assert_eq!(rec.spf, Some((SpfResult::Pass, Some("example.com".to_string()))));
     assert_eq!(rec.dkim, vec![(DkimResult::Pass, Some("example.com".to_string()))]);
 }
+
+fn recorded(value: &str) -> ArcRecordedResults {
+    ArcRecordedResults::parse(&format!("ARC-Authentication-Results: i=1; {value}"))
+}
+
+#[test]
+fn recorded_dkim_domain_comes_from_header_i_when_there_is_no_header_d() {
+    // Gmail and others report `header.i=@domain` rather than `header.d=`.
+    let rec = recorded("mx.example; dkim=pass header.i=@example.com header.s=sel");
+    assert_eq!(rec.dkim, vec![(DkimResult::Pass, Some("example.com".to_string()))]);
+}
+
+#[test]
+fn recorded_header_d_wins_over_header_i() {
+    let rec = recorded("mx.example; dkim=pass header.i=@other.example header.d=example.com");
+    assert_eq!(rec.dkim, vec![(DkimResult::Pass, Some("example.com".to_string()))]);
+}
+
+#[test]
+fn recorded_comments_may_contain_semicolons_and_equals_signs() {
+    let rec = recorded(
+        "mx.example; spf=pass (domain of x; designates 1.2.3.4 as permitted sender) smtp.mailfrom=example.com; \
+         dkim=pass (key a=b; ok) header.d=example.org",
+    );
+    assert_eq!(rec.spf, Some((SpfResult::Pass, Some("example.com".to_string()))));
+    assert_eq!(rec.dkim, vec![(DkimResult::Pass, Some("example.org".to_string()))]);
+}
+
+#[test]
+fn recorded_results_keep_every_dkim_entry_and_prefer_mailfrom_for_spf() {
+    let rec = recorded(
+        "mx.example; dkim=pass header.d=a.example; dkim=fail header.d=b.example; \
+         spf=softfail smtp.helo=helo.example smtp.mailfrom=bounce@c.example",
+    );
+    assert_eq!(
+        rec.dkim,
+        vec![
+            (DkimResult::Pass, Some("a.example".to_string())),
+            (DkimResult::Fail, Some("b.example".to_string())),
+        ]
+    );
+    assert_eq!(rec.spf, Some((SpfResult::SoftFail, Some("c.example".to_string()))));
+}
+
+#[test]
+fn recorded_spf_can_report_the_helo_domain() {
+    let rec = recorded("mx.example; spf=pass smtp.helo=Mail.Example.COM.");
+    assert_eq!(rec.spf, Some((SpfResult::Pass, Some("mail.example.com".to_string()))));
+}
+
+#[test]
+fn recorded_unknown_methods_results_and_empty_segments_are_ignored() {
+    let rec = recorded("mx.example; ; auth=pass; spf=weird; dkim=bogus header.d=x.example; dmarc=pass");
+    assert_eq!(rec, ArcRecordedResults::default());
+}
+
+#[test]
+fn recorded_results_without_a_value_are_empty() {
+    assert_eq!(ArcRecordedResults::parse("no colon here"), ArcRecordedResults::default());
+    assert_eq!(recorded("mx.example"), ArcRecordedResults::default());
+}
+
+#[test]
+fn recorded_results_are_case_insensitive_about_methods_and_results() {
+    let rec = recorded("mx.example; SPF=PASS SMTP.MailFrom=Example.com; DKIM=Pass Header.D=Example.org");
+    assert_eq!(rec.spf, Some((SpfResult::Pass, Some("example.com".to_string()))));
+    assert_eq!(rec.dkim, vec![(DkimResult::Pass, Some("example.org".to_string()))]);
+}
+
+#[test]
+fn every_dkim_result_name_is_understood() {
+    for (name, want) in [
+        ("pass", DkimResult::Pass),
+        ("fail", DkimResult::Fail),
+        ("none", DkimResult::None),
+        ("temperror", DkimResult::TempError),
+        ("permerror", DkimResult::PermError),
+        ("policy", DkimResult::Policy),
+        ("neutral", DkimResult::Neutral),
+    ] {
+        let rec = recorded(&format!("mx.example; dkim={name} header.d=x.example"));
+        assert_eq!(rec.dkim[0].0, want, "{name}");
+    }
+}
+
+#[test]
+fn every_spf_result_name_is_understood() {
+    for (name, want) in [
+        ("pass", SpfResult::Pass),
+        ("fail", SpfResult::Fail),
+        ("softfail", SpfResult::SoftFail),
+        ("neutral", SpfResult::Neutral),
+        ("none", SpfResult::None),
+        ("temperror", SpfResult::TempError),
+        ("permerror", SpfResult::PermError),
+    ] {
+        let rec = recorded(&format!("mx.example; spf={name} smtp.mailfrom=x.example"));
+        assert_eq!(rec.spf.unwrap().0, want, "{name}");
+    }
+}
+
+#[test]
+fn arc_cv_names_round_trip() {
+    for cv in [ArcCv::None, ArcCv::Pass, ArcCv::Fail] {
+        assert_eq!(ArcCv::parse(cv.as_str()), Some(cv));
+        assert_eq!(ArcCv::parse(&cv.as_str().to_ascii_uppercase()), Some(cv));
+    }
+    assert_eq!(ArcCv::parse("maybe"), None);
+}
+
+#[test]
+fn sealer_domain_and_selector_come_from_the_seal() {
+    let chain = ArcChain::from_headers(&one_hop()).unwrap();
+    let set = &chain.sets[0];
+    assert_eq!(set.sealer_domain().as_deref(), Some("list.example"));
+    assert_eq!(set.sealer_selector().as_deref(), Some("arc"));
+}
+
+#[test]
+fn tag_values_are_exact_names_and_trimmed() {
+    let h = RawHeader::new("X", b"X: a=1 ; bb = two ;c=3\r\n\t;\r\n".to_vec());
+    assert_eq!(tag_value(&h, "a").as_deref(), Some("1"));
+    assert_eq!(tag_value(&h, "bb").as_deref(), Some("two"));
+    assert_eq!(tag_value(&h, "b"), None);
+    assert_eq!(tag_value(&h, "c").as_deref(), Some("3"));
+    assert_eq!(tag_value(&h, "zz"), None);
+}

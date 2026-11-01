@@ -153,17 +153,25 @@ pub fn evaluate(
 ) {
     let from_domain = from_domain.trim_end_matches('.').to_ascii_lowercase();
     let query_name = format!("_dmarc.{from_domain}");
-    let from_domain_cb = from_domain.clone();
     let dns_inner = Arc::clone(&dns);
     dns.query_txt(
         &query_name,
-        Box::new(move |lookup| match lookup {
-            Lookup::TempError => cb(empty_outcome(DmarcResult::TempError, from_domain_cb)),
-            Lookup::Answers(txts) => match select_record(&txts) {
-                Ok(text) => match parse_record(&text) {
+        Box::new(move |lookup| {
+            let selected = match lookup {
+                Lookup::TempError => {
+                    return cb(empty_outcome(DmarcResult::TempError, from_domain));
+                }
+                Lookup::Answers(txts) => match select_record(&txts) {
+                    Ok(selected) => selected,
+                    Err(()) => return cb(empty_outcome(DmarcResult::PermError, from_domain)),
+                },
+                Lookup::NxDomain | Lookup::NoData => None,
+            };
+            match selected {
+                Some(text) => match parse_record(&text) {
                     Ok(record) => finish_with_record(
-                        Arc::clone(&dns_inner),
-                        from_domain_cb,
+                        dns_inner,
+                        from_domain,
                         false,
                         record,
                         psl,
@@ -173,25 +181,29 @@ pub fn evaluate(
                         dkim_results,
                         cb,
                     ),
-                    Err(()) => cb(empty_outcome(DmarcResult::PermError, from_domain_cb)),
+                    Err(()) => cb(empty_outcome(DmarcResult::PermError, from_domain)),
                 },
-                Err(()) => cb(empty_outcome(DmarcResult::PermError, from_domain_cb)),
-            },
-            Lookup::NxDomain | Lookup::NoData => match psl.organizational_domain(&from_domain_cb) {
-                Some(org) if org != from_domain_cb => {
-                    let org_query = format!("_dmarc.{org}");
-                    let dns2 = Arc::clone(&dns_inner);
-                    dns_inner.query_txt(
-                        &org_query,
-                        Box::new(move |lookup2| match lookup2 {
-                            Lookup::TempError => {
-                                cb(empty_outcome(DmarcResult::TempError, from_domain_cb))
-                            }
-                            Lookup::Answers(txts) => match select_record(&txts) {
-                                Ok(text) => match parse_record(&text) {
-                                    Ok(record) => finish_with_record(
+                // No DMARC record at the name (RFC 7489 section 6.6.3 step 3):
+                // other TXT records there do not count, so try the
+                // organizational domain.
+                None => match psl.organizational_domain(&from_domain) {
+                    Some(org) if org != from_domain => {
+                        let org_query = format!("_dmarc.{org}");
+                        let dns2 = Arc::clone(&dns_inner);
+                        dns_inner.query_txt(
+                            &org_query,
+                            Box::new(move |lookup2| match lookup2 {
+                                Lookup::TempError => {
+                                    cb(empty_outcome(DmarcResult::TempError, from_domain))
+                                }
+                                Lookup::Answers(txts) => match select_record(&txts)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|text| parse_record(&text).ok())
+                                {
+                                    Some(record) => finish_with_record(
                                         dns2,
-                                        from_domain_cb,
+                                        from_domain,
                                         true,
                                         record,
                                         psl,
@@ -201,18 +213,17 @@ pub fn evaluate(
                                         dkim_results,
                                         cb,
                                     ),
-                                    Err(()) => cb(empty_outcome(DmarcResult::None, from_domain_cb)),
+                                    None => cb(empty_outcome(DmarcResult::None, from_domain)),
                                 },
-                                Err(()) => cb(empty_outcome(DmarcResult::None, from_domain_cb)),
-                            },
-                            Lookup::NxDomain | Lookup::NoData => {
-                                cb(empty_outcome(DmarcResult::None, from_domain_cb))
-                            }
-                        }),
-                    );
-                }
-                _ => cb(empty_outcome(DmarcResult::None, from_domain_cb)),
-            },
+                                Lookup::NxDomain | Lookup::NoData => {
+                                    cb(empty_outcome(DmarcResult::None, from_domain))
+                                }
+                            }),
+                        );
+                    }
+                    _ => cb(empty_outcome(DmarcResult::None, from_domain)),
+                },
+            }
         }),
     );
 }
@@ -380,11 +391,13 @@ pub fn domain_aligns(
 }
 
 /// Exactly one `v=DMARC1` record must be present at the queried name (RFC
-/// 7489 §6.6.3); zero or multiple is an error.
-fn select_record(txts: &[String]) -> Result<String, ()> {
+/// 7489 §6.6.3). Non-DMARC records are discarded: none left is `Ok(None)`,
+/// more than one is an error.
+fn select_record(txts: &[String]) -> Result<Option<String>, ()> {
     let matching: Vec<&String> = txts.iter().filter(|t| is_dmarc_record(t)).collect();
     match matching.len() {
-        1 => Ok(matching[0].clone()),
+        0 => Ok(None),
+        1 => Ok(Some(matching[0].clone())),
         _ => Err(()),
     }
 }
@@ -409,7 +422,7 @@ fn parse_tag_list(value: &str) -> HashMap<String, String> {
 }
 
 fn parse_policy(s: &str) -> Result<DmarcPolicy, ()> {
-    match s {
+    match s.to_ascii_lowercase().as_str() {
         "none" => Ok(DmarcPolicy::None),
         "quarantine" => Ok(DmarcPolicy::Quarantine),
         "reject" => Ok(DmarcPolicy::Reject),
@@ -435,17 +448,17 @@ fn parse_record(txt: &str) -> Result<DmarcRecord, ()> {
         Some(s) => Some(parse_policy(s)?),
         None => None,
     };
-    let psd = match tags.get("psd").map(|s| s.as_str()) {
+    let psd = match tags.get("psd").map(|s| s.to_ascii_lowercase()).as_deref() {
         Some("y") | Some("yes") => true,
         Some("n") | Some("no") | None => false,
         Some(_) => return Err(()),
     };
-    let adkim = match tags.get("adkim").map(|s| s.as_str()) {
+    let adkim = match tags.get("adkim").map(|s| s.to_ascii_lowercase()).as_deref() {
         Some("s") => Alignment::Strict,
         Some("r") | None => Alignment::Relaxed,
         Some(_) => return Err(()),
     };
-    let aspf = match tags.get("aspf").map(|s| s.as_str()) {
+    let aspf = match tags.get("aspf").map(|s| s.to_ascii_lowercase()).as_deref() {
         Some("s") => Alignment::Strict,
         Some("r") | None => Alignment::Relaxed,
         Some(_) => return Err(()),
@@ -462,11 +475,19 @@ fn parse_record(txt: &str) -> Result<DmarcRecord, ()> {
     };
     let rua = tags
         .get("rua")
-        .map(|s| s.split(',').map(|u| u.trim().to_string()).collect())
+        .map(|s| s.split(',')
+                .map(|u| u.trim())
+                .filter(|u| !u.is_empty())
+                .map(String::from)
+                .collect())
         .unwrap_or_default();
     let ruf = tags
         .get("ruf")
-        .map(|s| s.split(',').map(|u| u.trim().to_string()).collect())
+        .map(|s| s.split(',')
+                .map(|u| u.trim())
+                .filter(|u| !u.is_empty())
+                .map(String::from)
+                .collect())
         .unwrap_or_default();
     let fo = tags
         .get("fo")

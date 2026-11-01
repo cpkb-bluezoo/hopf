@@ -115,13 +115,15 @@ pub struct ArcRecordedResults {
     /// `spf=` result and the `smtp.mailfrom` / `smtp.helo` domain it
     /// authenticated, if reported.
     pub spf: Option<(SpfResult, Option<String>)>,
-    /// One entry per `dkim=` result: the result and its `header.d` domain.
+    /// One entry per `dkim=` result: the result and its `header.d` domain
+    /// (or the domain of `header.i` when there is no `header.d`).
     pub dkim: Vec<(DkimResult, Option<String>)>,
 }
 
 impl ArcRecordedResults {
     fn parse(header_line: &str) -> Self {
         let value = header_line.split_once(':').map(|(_, v)| v).unwrap_or("");
+        let value = strip_comments(value);
         let mut out = ArcRecordedResults::default();
         // Skip `i=N` and the authserv-id, then one resinfo per `;` segment.
         for segment in value.split(';').skip(2) {
@@ -129,11 +131,15 @@ impl ArcRecordedResults {
             let Some((method, result)) = parts.next().and_then(|p| p.split_once('=')) else {
                 continue;
             };
+            // Properties are tried in the order given, so earlier names win.
             let domain_of = |prop: &[&str], parts: std::str::SplitWhitespace<'_>| {
-                parts
-                    .filter_map(|p| p.split_once('='))
-                    .find(|(k, _)| prop.iter().any(|w| k.eq_ignore_ascii_case(w)))
-                    .map(|(_, v)| domain_part(v))
+                let props: Vec<(&str, &str)> = parts.filter_map(|p| p.split_once('=')).collect();
+                prop.iter().find_map(|w| {
+                    props
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(w))
+                        .map(|(_, v)| domain_part(v))
+                })
             };
             match method.to_ascii_lowercase().as_str() {
                 "spf" => {
@@ -144,7 +150,7 @@ impl ArcRecordedResults {
                 }
                 "dkim" => {
                     if let Some(r) = parse_dkim_result(result) {
-                        out.dkim.push((r, domain_of(&["header.d"], parts)));
+                        out.dkim.push((r, domain_of(&["header.d", "header.i"], parts)));
                     }
                 }
                 _ => {}
@@ -152,6 +158,33 @@ impl ArcRecordedResults {
         }
         out
     }
+}
+
+/// `value` without its RFC 5322 comments (parenthesized, nestable, with
+/// backslash escapes), which may themselves contain `;` and `=`.
+fn strip_comments(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut depth = 0u32;
+    let mut escaped = false;
+    for c in value.chars() {
+        if depth == 0 {
+            if c == '(' {
+                depth = 1;
+                out.push(' ');
+            } else {
+                out.push(c);
+            }
+        } else if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '(' {
+            depth += 1;
+        } else if c == ')' {
+            depth -= 1;
+        }
+    }
+    out
 }
 
 fn domain_part(v: &str) -> String {
