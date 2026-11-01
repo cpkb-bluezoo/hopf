@@ -11,6 +11,7 @@ use hopf_dns::DnsResolver;
 
 use crate::server::service::{SmtpConfig, SmtpService};
 
+use super::engine::RelayOptions;
 use super::handler::SimpleRelayHandlerFactory;
 
 /// MX-based open-relay SMTP service (Gumdrop `SimpleRelayService`).
@@ -26,6 +27,7 @@ use super::handler::SimpleRelayHandlerFactory;
 /// start.
 pub struct SimpleRelayService {
     smtp: SmtpService,
+    factory: Arc<SimpleRelayHandlerFactory>,
     dns: Arc<DnsResolver>,
     hostname: String,
 }
@@ -42,19 +44,20 @@ impl SimpleRelayService {
         runtime: Arc<Runtime>,
         dns_timeout: Duration,
     ) -> std::io::Result<Self> {
-        let hostname = config.hostname.clone();
+        Self::with_options(config, runtime, dns_timeout, RelayOptions::default())
+    }
+
+    /// As [`Self::with_dns_timeout`] with explicit queue and retry
+    /// [`RelayOptions`].
+    pub fn with_options(
+        config: SmtpConfig,
+        runtime: Arc<Runtime>,
+        dns_timeout: Duration,
+        options: RelayOptions,
+    ) -> std::io::Result<Self> {
         let dns = Arc::new(DnsResolver::for_runtime(&runtime)?);
         dns.set_timeout(dns_timeout);
-        let factory = Arc::new(
-            SimpleRelayHandlerFactory::new(Arc::clone(&dns), Arc::clone(&runtime), hostname.clone())
-                .with_outbound_port(25),
-        );
-        let smtp = SmtpService::with_handler_factory(config, factory);
-        Ok(Self {
-            smtp,
-            dns,
-            hostname,
-        })
+        Ok(Self::with_resolver_and_options(config, runtime, dns, 25, options))
     }
 
     /// Use an already-configured resolver (e.g. custom upstreams / test stub).
@@ -64,14 +67,28 @@ impl SimpleRelayService {
         dns: Arc<DnsResolver>,
         outbound_port: u16,
     ) -> Self {
+        Self::with_resolver_and_options(config, runtime, dns, outbound_port, RelayOptions::default())
+    }
+
+    /// As [`Self::with_resolver`] with explicit queue and retry
+    /// [`RelayOptions`].
+    pub fn with_resolver_and_options(
+        config: SmtpConfig,
+        runtime: Arc<Runtime>,
+        dns: Arc<DnsResolver>,
+        outbound_port: u16,
+        options: RelayOptions,
+    ) -> Self {
         let hostname = config.hostname.clone();
         let factory = Arc::new(
             SimpleRelayHandlerFactory::new(Arc::clone(&dns), Arc::clone(&runtime), hostname.clone())
-                .with_outbound_port(outbound_port),
+                .with_outbound_port(outbound_port)
+                .with_options(options),
         );
-        let smtp = SmtpService::with_handler_factory(config, factory);
+        let smtp = SmtpService::with_handler_factory(config, factory.clone());
         Self {
             smtp,
+            factory,
             dns,
             hostname,
         }
@@ -92,7 +109,8 @@ impl SimpleRelayService {
         &self.smtp
     }
 
-    /// Register the SMTP listener; returns bound address.
+    /// Register the SMTP listener; returns bound address. Messages an earlier
+    /// run left in the queue are delivered from now on.
     ///
     /// When [`SmtpConfig::acl`] has an empty allow list (open to every peer),
     /// emits a telemetry warning — open relays without a CIDR allowlist are
@@ -108,6 +126,7 @@ impl SimpleRelayService {
                 hopf_core::log_warn("smtp.relay.open_acl", msg);
             }
         }
+        self.factory.start_queue()?;
         self.smtp.start(runtime)
     }
 }

@@ -10,10 +10,11 @@
 //! fanned out to several outbound MX connections) streams back off the
 //! spooled file afterward rather than replaying an in-memory copy.
 //!
-//! This is *not* the "custody spool" a store-and-forward MTA uses for
-//! cross-failure retry — it's a bounded, transient staging file for the
-//! single already-in-flight transaction, deleted right after use. Neither
-//! handler retries a failed delivery from it after the transaction ends.
+//! This is a bounded, transient staging file for the single already-in-flight
+//! transaction. [`crate::LocalDeliveryHandler`] deletes it right after use and
+//! does not retry. [`crate::SimpleRelayHandler`] hands it over to the relay's
+//! durable queue (`RelayQueue`), which is what keeps the message across a
+//! failed delivery or a restart.
 //!
 //! Chunk writes are offloaded to [`hopf_core::StorageExecutor`] (issue
 //! #184) rather than done inline on the reactor thread — `message_content`

@@ -39,7 +39,7 @@ pub use mime_pipeline::MimeAnalysisPipeline;
 pub use pipeline::{DiscardPipeline, NullPipeline, SmtpPipeline};
 pub use mailbox::{LocalDeliveryHandler, LocalDeliveryHandlerFactory, LocalDeliveryService};
 pub use relay::{
-    QueueScan, QueuedMessage, QueuedRecipient, RecipientStatus, RelayQueue, SimpleRelayHandler,
+    QueueScan, QueuedMessage, QueuedRecipient, RecipientStatus, RelayOptions, RelayQueue, SimpleRelayHandler,
     SimpleRelayHandlerFactory, SimpleRelayService,
 };
 pub use reply::{reply, reply_ehlo, reply_enhanced, reply_multiline};

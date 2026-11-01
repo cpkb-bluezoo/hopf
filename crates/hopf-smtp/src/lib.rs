@@ -33,7 +33,7 @@ pub use server::{
     HelloState, LocalDeliveryHandler, LocalDeliveryHandlerFactory, LocalDeliveryService,
     MailFromHandler, MailFromParse, MailFromState, MessageDataHandler,
     MessageEndState, MessageStartState, MimeAnalysisPipeline, NullPipeline, ParamParseError, RecipientHandler,
-    QueueScan, QueuedMessage, QueuedRecipient, RecipientState, RecipientStatus, RelayQueue, ResetState, SimpleRelayHandler, SimpleRelayHandlerFactory,
+    QueueScan, QueuedMessage, QueuedRecipient, RecipientState, RecipientStatus, RelayOptions, RelayQueue, ResetState, SimpleRelayHandler, SimpleRelayHandlerFactory,
     SimpleRelayService, SmtpClientConnected, SmtpCommand, SmtpConfig, SmtpConnectionMetadata,
     SmtpControlHandler, SmtpHandlerFactory, SmtpPipeline, SmtpServerLexer, SmtpServerMetrics,
     SmtpService, SmtpSessionState, DEFAULT_MAX_MAIL_TRANSACTIONS, DEFAULT_MAX_MESSAGE_SIZE,

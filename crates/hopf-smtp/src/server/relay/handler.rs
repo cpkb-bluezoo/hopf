@@ -1,29 +1,27 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! [`SimpleRelayHandler`] — spool message, MX lookup, deliver via async
-//! [`SmtpClient`], streamed from the spool to each destination.
+//! [`SimpleRelayHandler`] - receives a message, puts it in the relay queue,
+//! and accepts it; the [engine](super::engine) delivers it from there.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use hopf_core::{ConnHandle, Runtime, SharedTlsConnector, StorageError};
 use hopf_dns::DnsResolver;
 use rmimeparser::EmailAddress;
 
-use crate::client::{MailFromParams, SmtpClient, SmtpClientTimeouts, SmtpSend};
 use crate::server::delivery::{DeliveryRequirements, DsnRecipientParams};
-use crate::server::dsn::{orcpt_field, DeliveryStatusNotification, DsnAction, DsnRecipientReport};
 use crate::server::handler::{
-    AuthenticateState, ConnectedState, DeferredDelivery, HelloHandler, HelloState, MailFromHandler,
-    MailFromState, MessageDataHandler, MessageEndState, MessageStartState, RecipientHandler,
-    RecipientState, ResetState, SmtpClientConnected, SmtpConnectionMetadata, SmtpHandlerFactory,
+    AuthenticateState, ConnectedState, HelloHandler, HelloState, MailFromHandler, MailFromState,
+    MessageDataHandler, MessageEndState, MessageStartState, RecipientHandler, RecipientState,
+    ResetState, SmtpClientConnected, SmtpConnectionMetadata, SmtpHandlerFactory,
 };
 use crate::server::pipeline::SmtpPipeline;
 use crate::server::spool::{SpoolPipeline, SpoolPipelineHandle};
 
-use super::dane;
+use super::engine::{RelayEngine, RelayOptions};
+use super::queue::{QueuedMessage, QueuedRecipient, RelayQueue};
 
 /// Factory for [`SimpleRelayHandler`].
 pub struct SimpleRelayHandlerFactory {
@@ -34,6 +32,9 @@ pub struct SimpleRelayHandlerFactory {
     outbound_port: u16,
     /// Optional TLS connector for REQUIRETLS outbound (STARTTLS to MX).
     tls_connector: Option<SharedTlsConnector>,
+    options: RelayOptions,
+    /// Made on first use, once the builder methods above have been applied.
+    engine: Mutex<Option<Arc<RelayEngine>>>,
 }
 
 impl SimpleRelayHandlerFactory {
@@ -46,6 +47,8 @@ impl SimpleRelayHandlerFactory {
             smtp_timeout: Duration::from_secs(60),
             outbound_port: 25,
             tls_connector: None,
+            options: RelayOptions::default(),
+            engine: Mutex::new(None),
         }
     }
 
@@ -67,17 +70,56 @@ impl SimpleRelayHandlerFactory {
         self.tls_connector = Some(connector);
         self
     }
+
+    /// Where the queue is kept, how often a message is retried and for how
+    /// long. Without this the queue is in a private temporary directory and
+    /// does not survive a restart.
+    pub fn with_options(mut self, options: RelayOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Open the queue and start delivering whatever an earlier run left in
+    /// it. [`SimpleRelayService::start`](super::SimpleRelayService::start) does
+    /// this; call it yourself when the factory is used with a bare
+    /// [`SmtpService`](crate::SmtpService).
+    pub fn start_queue(&self) -> io::Result<()> {
+        self.engine()?.resume();
+        Ok(())
+    }
+
+    fn engine(&self) -> io::Result<Arc<RelayEngine>> {
+        let mut slot = self.engine.lock().unwrap();
+        if let Some(engine) = &*slot {
+            return Ok(Arc::clone(engine));
+        }
+        let engine = RelayEngine::new(
+            Arc::clone(&self.dns),
+            Arc::clone(&self.runtime),
+            self.hostname.clone(),
+            self.smtp_timeout,
+            self.outbound_port,
+            self.tls_connector.clone(),
+            self.options.clone(),
+        )?;
+        *slot = Some(Arc::clone(&engine));
+        Ok(engine)
+    }
 }
 
 impl SmtpHandlerFactory for SimpleRelayHandlerFactory {
     fn create(&self) -> Box<dyn SmtpClientConnected> {
+        let engine = match self.engine() {
+            Ok(engine) => Some(engine),
+            Err(e) => {
+                hopf_core::log_warn("smtp.relay.queue", format!("cannot open the relay queue: {e}"));
+                None
+            }
+        };
         Box::new(SimpleRelayHandler {
-            dns: Arc::clone(&self.dns),
             runtime: Arc::clone(&self.runtime),
             hostname: self.hostname.clone(),
-            smtp_timeout: self.smtp_timeout,
-            outbound_port: self.outbound_port,
-            tls_connector: self.tls_connector.clone(),
+            engine,
             control_handle: None,
             inbound_tls: false,
             sender: None,
@@ -90,15 +132,15 @@ impl SmtpHandlerFactory for SimpleRelayHandlerFactory {
     }
 }
 
-/// Gumdrop-style open relay: accept all, MX lookup, forward with async [`SmtpClient`].
+/// Gumdrop-style open relay: accept all, queue, then MX lookup and forward
+/// with the async [`SmtpClient`](crate::SmtpClient), retrying temporary
+/// failures from the queue.
 #[derive(Clone)]
 pub struct SimpleRelayHandler {
-    dns: Arc<DnsResolver>,
     runtime: Arc<Runtime>,
     hostname: String,
-    smtp_timeout: Duration,
-    outbound_port: u16,
-    tls_connector: Option<SharedTlsConnector>,
+    /// `None` when the queue could not be opened: nothing is accepted then.
+    engine: Option<Arc<RelayEngine>>,
     control_handle: Option<ConnHandle>,
     inbound_tls: bool,
     sender: Option<EmailAddress>,
@@ -108,7 +150,7 @@ pub struct SimpleRelayHandler {
     recipients: Vec<(EmailAddress, DsnRecipientParams)>,
     spool: Option<Arc<Mutex<SpoolPipeline>>>,
     /// Extra header field values (each without a trailing CRLF) to prepend
-    /// ahead of the spooled content for every outbound destination — see
+    /// ahead of the spooled content for every outbound destination - see
     /// [`crate::server::LocalDeliveryHandler::set_extra_header_lines`] for
     /// the same mechanism on the local-delivery side.
     extra_header_lines: Vec<String>,
@@ -263,92 +305,72 @@ impl MessageDataHandler for SimpleRelayHandler {
             })
             .unwrap_or((None, None));
 
+        let Some(engine) = self.engine.clone() else {
+            remove_spool(&self.runtime, self.control_handle(), spool_path);
+            state.reject_message_temporary("relay queue unavailable", Box::new(self.clone()));
+            self.reset_transaction();
+            return;
+        };
+
         if let Some(err) = spool_error {
-            if let Some(path) = spool_path.clone() {
-                remove_spool_file_async(&self.runtime, self.control_handle(), path);
-            }
-            state.reject_message_temporary(
-                &format!("could not stage message: {err}"),
-                Box::new(self.clone()),
-            );
+            remove_spool(&self.runtime, self.control_handle(), spool_path);
+            state.reject_message_temporary(&format!("could not stage message: {err}"), Box::new(self.clone()));
             self.reset_transaction();
             return;
         }
 
         // RFC 2852: if the DELIVERBY deadline has passed by the time we
-        // finish receiving, refuse delivery (return-mode → permanent feel
+        // finish receiving, refuse delivery (return-mode -> permanent feel
         // via temporary reject that still triggers a failure DSN).
         if let Some(by) = &self.delivery.deliver_by {
-            if by.deadline <= std::time::SystemTime::now() {
-                maybe_send_failure_dsn(
-                    &self.hostname,
-                    self.sender.as_ref(),
-                    &self.delivery,
-                    &self.recipients,
-                    spool_path.clone(),
-                    "DELIVERBY deadline exceeded before relay",
-                    &self.dns,
-                    &self.runtime,
-                    self.smtp_timeout,
-                    self.outbound_port,
-                    self.tls_connector.clone(),
+            if by.deadline <= SystemTime::now() {
+                engine.bounce(
                     self.control_handle(),
+                    self.sender.as_ref().map(EmailAddress::address),
+                    self.delivery.clone(),
+                    self.recipients.iter().map(|(r, p)| (r.address(), p.clone())).collect(),
+                    spool_path,
+                    "DELIVERBY deadline exceeded before relay",
                 );
-                if let Some(path) = spool_path.clone() {
-                    remove_spool_file_async(&self.runtime, self.control_handle(), path);
-                }
-                state.reject_message_temporary(
-                    "DELIVERBY deadline exceeded",
-                    Box::new(self.clone()),
-                );
+                state.reject_message_temporary("DELIVERBY deadline exceeded", Box::new(self.clone()));
                 self.reset_transaction();
                 return;
             }
         }
 
+        // The message is accepted once it is in the queue: from then on the
+        // relay is responsible for it (RFC 5321 section 6.1), and a failure
+        // to deliver it is reported by retrying or by a notice, not by the
+        // reply to the client, which has long gone by then.
         let deferred = state.defer(Box::new(self.clone()));
-        let by_domain = group_by_domain(&self.recipients);
-        let domains: Vec<String> = by_domain.keys().cloned().collect();
-        let tracker = Arc::new(Mutex::new(DeliveryTracker {
-            deferred: Some(deferred),
-            remaining: domains.len(),
-            any_success: false,
-            spool_path: spool_path.clone(),
-            hostname: self.hostname.clone(),
-            sender: self.sender.clone(),
+        let now = SystemTime::now();
+        let message = QueuedMessage {
+            id: RelayQueue::new_id(),
+            queued_at: now,
+            sender: self.sender.as_ref().map(EmailAddress::address),
+            smtputf8: self.smtputf8,
             delivery: self.delivery.clone(),
-            recipients: self.recipients.clone(),
-            domain_results: HashMap::new(),
-            dns: Arc::clone(&self.dns),
-            runtime: Arc::clone(&self.runtime),
-            smtp_timeout: self.smtp_timeout,
-            outbound_port: self.outbound_port,
-            tls_connector: self.tls_connector.clone(),
-            dsn_sent: false,
-            control_handle: self.control_handle(),
-        }));
-        if domains.is_empty() {
-            tracker.lock().unwrap().finish_if_needed_with_zero_domains();
-        }
-        let ctx = DeliveryContext {
-            tracker,
-            domains,
-            recipients_by_domain: by_domain,
-            spool_path,
             extra_header_lines: self.extra_header_lines.clone(),
-            sender: self.sender.clone(),
-            require_tls: self.delivery.is_require_tls(),
-            mail_params: outbound_mail_params(&self.delivery, self.smtputf8, std::time::SystemTime::now()),
-            dns: Arc::clone(&self.dns),
-            runtime: Arc::clone(&self.runtime),
-            hostname: self.hostname.clone(),
-            smtp_timeout: self.smtp_timeout,
-            outbound_port: self.outbound_port,
-            tls_connector: self.tls_connector.clone(),
-            current: 0,
+            recipients: self
+                .recipients
+                .iter()
+                .map(|(r, params)| QueuedRecipient::new(r.address(), params.clone(), now))
+                .collect(),
         };
+        let id = message.id.clone();
         self.reset_transaction();
-        ctx.deliver_next();
+        engine.submit(
+            self.control_handle(),
+            message,
+            spool_path,
+            Box::new(move |queued| {
+                if queued {
+                    deferred.accept(Some(&id));
+                } else {
+                    deferred.reject_temporary("could not queue message");
+                }
+            }),
+        );
     }
 
     fn message_aborted(&mut self) {
@@ -356,229 +378,12 @@ impl MessageDataHandler for SimpleRelayHandler {
     }
 }
 
-/// The MAIL FROM parameters for an outbound hop: what the message arrived
-/// with that the next server needs to know. `BY` goes on with the time that
-/// is left, never the original interval (RFC 2852 section 4.1.4), and not
-/// as zero, which would ask for the impossible.
-fn outbound_mail_params(
-    delivery: &DeliveryRequirements,
-    smtputf8: bool,
-    now: std::time::SystemTime,
-) -> MailFromParams {
-    MailFromParams {
-        smtputf8,
-        require_tls: delivery.is_require_tls(),
-        dsn_ret: delivery.dsn_ret,
-        dsn_envid: delivery.dsn_envid.clone(),
-        priority: delivery.priority,
-        deliver_by: delivery.deliver_by.as_ref().map(|by| {
-            let left = by.deadline.duration_since(now).unwrap_or_default();
-            (left.max(Duration::from_secs(1)), by.return_on_fail)
-        }),
-        ..Default::default()
-    }
-}
-
-/// Each line plus a trailing CRLF, concatenated — small and bounded (a
-/// handful of header field values), unlike the message body this precedes.
-fn render_extra_header_lines(lines: &[String]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for line in lines {
-        out.extend_from_slice(line.as_bytes());
-        out.extend_from_slice(b"\r\n");
-    }
-    out
-}
-
-fn group_by_domain(
-    recipients: &[(EmailAddress, DsnRecipientParams)],
-) -> HashMap<String, Vec<(EmailAddress, DsnRecipientParams)>> {
-    let mut map = HashMap::new();
-    for (r, params) in recipients {
-        let domain = r.domain().to_ascii_lowercase();
-        map.entry(domain)
-            .or_insert_with(Vec::new)
-            .push((r.clone(), params.clone()));
-    }
-    map
-}
-
-// ── Completion tracking ───────────────────────────────────────────────────────
-
-/// Result of rendering a DSN report: the envelope sender and rendered
-/// message bytes to spool, if there was anything to report.
-type DsnRenderResult = Result<Option<(EmailAddress, Vec<u8>)>, Box<dyn std::error::Error + Send + Sync>>;
-
-/// Tracks how many of the destination domains have finished (successfully or
-/// not) and issues the single deferred SMTP reply once every domain has
-/// reported. Shared across all in-flight per-domain deliveries, which may
-/// complete concurrently and in any order.
-struct DeliveryTracker {
-    deferred: Option<DeferredDelivery>,
-    remaining: usize,
-    any_success: bool,
-    spool_path: Option<PathBuf>,
-    hostname: String,
-    sender: Option<EmailAddress>,
-    delivery: DeliveryRequirements,
-    recipients: Vec<(EmailAddress, DsnRecipientParams)>,
-    /// Domain → ok for DSN generation once every domain has reported.
-    domain_results: HashMap<String, bool>,
-    dns: Arc<DnsResolver>,
-    runtime: Arc<Runtime>,
-    smtp_timeout: Duration,
-    outbound_port: u16,
-    tls_connector: Option<SharedTlsConnector>,
-    dsn_sent: bool,
-    control_handle: ConnHandle,
-}
-
-impl DeliveryTracker {
-    /// Record one domain's outcome. Once every domain has reported, issues
-    /// the final SMTP reply. Partial success accepts the transaction (250)
-    /// and relies on failure DSNs for undelivered recipients — rejecting
-    /// after some domains already got the message would invite client
-    /// retry and duplicate delivery.
-    fn record(&mut self, domain: &str, ok: bool) {
-        self.domain_results.insert(domain.to_string(), ok);
-        if ok {
-            self.any_success = true;
-        }
-        self.remaining = self.remaining.saturating_sub(1);
-        if self.remaining == 0 {
-            self.finish();
-        }
-    }
-
-    fn finish_if_needed_with_zero_domains(&mut self) {
-        if self.remaining == 0 {
-            self.finish();
-        }
-    }
-
-    /// Reads the spool file (for the DSN's original-message attachment) and
-    /// removes it — combined into one offloaded job (issue #184) since both
-    /// are blocking filesystem work and must run in that order (removing
-    /// first would make the read fail). `deferred.accept`/`reject_temporary`
-    /// move into the completion callback too, so the final reply only goes
-    /// out once this has actually finished, not while it's still in flight.
-    fn finish(&mut self) {
-        let dsn_input = self.build_dsn_reports();
-        let spool_path = self.spool_path.take();
-        let deferred = self.deferred.take();
-        let any_success = self.any_success;
-        let hostname = self.hostname.clone();
-        let hostname_for_op = self.hostname.clone();
-        let delivery = self.delivery.clone();
-        let dns = Arc::clone(&self.dns);
-        let runtime = Arc::clone(&self.runtime);
-        let smtp_timeout = self.smtp_timeout;
-        let outbound_port = self.outbound_port;
-        let tls_connector = self.tls_connector.clone();
-        let require_tls = self.delivery.is_require_tls();
-
-        self.runtime.storage().submit_on(
-            self.control_handle.clone(),
-            move || -> DsnRenderResult {
-                let rendered = dsn_input.and_then(|(sender, reports)| {
-                    let original = spool_path
-                        .as_ref()
-                        .and_then(|p| std::fs::read(p).ok())
-                        .unwrap_or_default();
-                    let bytes = DeliveryStatusNotification {
-                        reporting_mta: hostname_for_op,
-                        reverse_path: Some(sender.clone()),
-                        delivery,
-                        recipients: reports,
-                        original_message: original,
-                    }
-                    .render();
-                    bytes.map(|b| (sender, b))
-                });
-                if let Some(path) = &spool_path {
-                    let _ = std::fs::remove_file(path);
-                }
-                Ok(rendered)
-            },
-            move |result: Result<Option<(EmailAddress, Vec<u8>)>, StorageError>| {
-                if let Ok(Some((sender, bytes))) = result {
-                    send_dsn_message(
-                        &bytes,
-                        &sender,
-                        &hostname,
-                        &dns,
-                        &runtime,
-                        smtp_timeout,
-                        outbound_port,
-                        tls_connector,
-                        require_tls,
-                    );
-                }
-                let Some(deferred) = deferred else {
-                    return;
-                };
-                if any_success {
-                    // Accept even when some domains failed — DSNs cover the rest.
-                    deferred.accept(None);
-                } else {
-                    deferred.reject_temporary("No recipient domains could be delivered");
-                }
-            },
-        );
-    }
-
-    /// Builds the DSN recipient reports and reverse-path in memory (no I/O)
-    /// if a DSN needs to be sent — `None` once already sent, with no
-    /// sender, or nothing wants a report. Idempotent via `dsn_sent`.
-    fn build_dsn_reports(&mut self) -> Option<(EmailAddress, Vec<DsnRecipientReport>)> {
-        if self.dsn_sent {
-            return None;
-        }
-        self.dsn_sent = true;
-        // When no domain took the message the inbound client is told to try
-        // again later (a 4xx), and a failure notice on top of that would
-        // give the sender two different outcomes for one message.
-        if !self.any_success {
-            return None;
-        }
-        let sender = self.sender.clone()?;
-        let mut reports = Vec::new();
-        for (addr, params) in &self.recipients {
-            let domain = addr.domain().to_ascii_lowercase();
-            let ok = self.domain_results.get(&domain).copied().unwrap_or(false);
-            let action = if ok {
-                DsnAction::Delivered
-            } else {
-                DsnAction::Failed
-            };
-            let want = match action {
-                DsnAction::Delivered => params.notify.wants_success(),
-                DsnAction::Failed => params.notify.wants_failure(),
-            };
-            if !want {
-                continue;
-            }
-            reports.push(DsnRecipientReport {
-                final_recipient: addr.address(),
-                original_recipient: orcpt_field(params),
-                action,
-                diagnostic: if ok {
-                    None
-                } else {
-                    Some("relay to recipient domain failed".into())
-                },
-            });
-        }
-        if reports.is_empty() {
-            return None;
-        }
-        Some((sender, reports))
-    }
-}
-
-/// Remove `path` off the reactor thread, fire-and-forget (issue #184) —
+/// Remove a spool file off the reactor thread, fire-and-forget (issue #184) -
 /// cleanup nothing else waits on.
-fn remove_spool_file_async(runtime: &Runtime, handle: ConnHandle, path: PathBuf) {
+fn remove_spool(runtime: &Runtime, handle: ConnHandle, path: Option<std::path::PathBuf>) {
+    let Some(path) = path else {
+        return;
+    };
     runtime.storage().submit_on(
         handle,
         move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -587,856 +392,4 @@ fn remove_spool_file_async(runtime: &Runtime, handle: ConnHandle, path: PathBuf)
         },
         |_: Result<(), StorageError>| {},
     );
-}
-
-#[derive(Clone)]
-struct DeliveryContext {
-    tracker: Arc<Mutex<DeliveryTracker>>,
-    domains: Vec<String>,
-    recipients_by_domain: HashMap<String, Vec<(EmailAddress, DsnRecipientParams)>>,
-    spool_path: Option<PathBuf>,
-    extra_header_lines: Vec<String>,
-    sender: Option<EmailAddress>,
-    require_tls: bool,
-    mail_params: MailFromParams,
-    dns: Arc<DnsResolver>,
-    runtime: Arc<Runtime>,
-    hostname: String,
-    smtp_timeout: Duration,
-    outbound_port: u16,
-    tls_connector: Option<SharedTlsConnector>,
-    current: usize,
-}
-
-impl DeliveryContext {
-    fn deliver_next(self) {
-        if self.current >= self.domains.len() {
-            return;
-        }
-        let domain = self.domains[self.current].clone();
-        let recipients = self
-            .recipients_by_domain
-            .get(&domain)
-            .cloned()
-            .unwrap_or_default();
-        let dns = Arc::clone(&self.dns);
-        let domain_query = domain.clone();
-        let domain_fallback = domain.clone();
-        dns.query_mx(
-            &domain_query,
-            Box::new(move |result| match result {
-                Ok(msg) => {
-                    let mut mx: Vec<(u16, String)> =
-                        msg.answers.iter().filter_map(|rr| rr.as_mx()).collect();
-                    mx.sort_by_key(|(pref, _)| *pref);
-                    let mut hosts: Vec<String> = mx
-                        .into_iter()
-                        .map(|(_, ex)| ex.trim_end_matches('.').to_string())
-                        .collect();
-                    if hosts.is_empty() {
-                        // RFC 5321 §5.1: no MX records at all — try the
-                        // domain name itself as an implicit MX.
-                        hosts.push(domain_fallback);
-                    }
-                    self.deliver_to_mx(domain, hosts, 0, recipients);
-                }
-                Err(_) => {
-                    self.fail_domain(&domain);
-                }
-            }),
-        );
-    }
-
-    fn fail_domain(mut self, domain: &str) {
-        self.tracker.lock().unwrap().record(domain, false);
-        self.current += 1;
-        self.deliver_next();
-    }
-
-    /// Try MX host `mx_hosts[mx_index]` for `domain`. On a connection-level
-    /// failure (couldn't resolve/connect/negotiate TLS — see
-    /// [`Self::resolve_tls_and_deliver`]'s dispatch), advances to
-    /// `mx_index + 1` (RFC 5321 §5.1's "try the remaining MXs in order",
-    /// and RFC 7672's DANE fallback semantics) rather than failing the
-    /// whole domain on the first host's trouble. Once every MX host has
-    /// been tried, [`Self::fail_domain`] runs.
-    fn deliver_to_mx(
-        self,
-        domain: String,
-        mx_hosts: Vec<String>,
-        mx_index: usize,
-        recipients: Vec<(EmailAddress, DsnRecipientParams)>,
-    ) {
-        if mx_index >= mx_hosts.len() {
-            self.fail_domain(&domain);
-            return;
-        }
-        let host = mx_hosts[mx_index].clone();
-        let port = self.outbound_port;
-        let dns = Arc::clone(&self.dns);
-        let host_query = host.clone();
-        dns.resolve(
-            &host_query,
-            port,
-            Box::new(move |result| match result {
-                Ok(addrs) if !addrs.is_empty() => {
-                    let addr = addrs[0];
-                    self.resolve_tls_and_deliver(domain, mx_hosts, mx_index, host, addr, recipients);
-                }
-                _ => {
-                    self.deliver_to_mx(domain, mx_hosts, mx_index + 1, recipients);
-                }
-            }),
-        );
-    }
-
-    /// Decides what TLS policy applies to this hop, then dials.
-    ///
-    /// A message-level `REQUIRETLS` (RFC 8689) hop keeps today's behavior
-    /// exactly: the admin-configured, already-trusted
-    /// [`Self::tls_connector`], mandatory STARTTLS, no DANE lookup — this
-    /// is a different, separately-authenticated requirement, not
-    /// DANE-related. Otherwise, DANE applies if usable (issue #352/#353):
-    /// look up TLSA for `_<port>._tcp.<host>`, and if DNSSEC-Secure
-    /// records exist, require STARTTLS and authenticate against them; if
-    /// not usable, fall back to ordinary opportunistic STARTTLS (upgrade
-    /// if offered, plaintext otherwise — never a hard requirement, and
-    /// never authenticated, since there's nothing trustworthy to check
-    /// the certificate against).
-    fn resolve_tls_and_deliver(
-        self,
-        domain: String,
-        mx_hosts: Vec<String>,
-        mx_index: usize,
-        host: String,
-        addr: std::net::SocketAddr,
-        recipients: Vec<(EmailAddress, DsnRecipientParams)>,
-    ) {
-        if self.require_tls {
-            if self.tls_connector.is_none() {
-                self.fail_domain(&domain);
-                return;
-            }
-            let connector = self.tls_connector.clone();
-            self.deliver_smtp(
-                domain, mx_hosts, mx_index, host, addr, recipients, connector, true, false,
-            );
-            return;
-        }
-
-        let port = self.outbound_port;
-        let dns = Arc::clone(&self.dns);
-        let host_for_dane = host.clone();
-        dane::lookup_dane_usability(
-            &dns,
-            &host_for_dane,
-            port,
-            Box::new(move |usability| {
-                let (connector, mandatory, opportunistic) = match usability {
-                    dane::DaneUsability::Usable(records) => {
-                        (Some(build_dane_connector(records)), true, false)
-                    }
-                    dane::DaneUsability::NotUsable => {
-                        (Some(hopf_core::insecure_connector(&[])), false, true)
-                    }
-                };
-                self.deliver_smtp(
-                    domain,
-                    mx_hosts,
-                    mx_index,
-                    host,
-                    addr,
-                    recipients,
-                    connector,
-                    mandatory,
-                    opportunistic,
-                );
-            }),
-        );
-    }
-
-    /// Dials `addr` and attempts delivery. `mandatory_tls`/`opportunistic_tls`
-    /// map to [`SmtpSend::require_starttls`]/[`SmtpSend::opportunistic_starttls`]
-    /// respectively (mutually exclusive by construction from
-    /// [`Self::resolve_tls_and_deliver`]'s two call sites).
-    ///
-    /// The outcome decides how to continue (issue #353): a real SMTP-level
-    /// reply — delivered or rejected — is authoritative for this domain
-    /// (any working MX host should give the same verdict for a given
-    /// recipient, so trying another one would just repeat it), and moves
-    /// on to the next domain. A connection/TLS/DANE-level failure (no real
-    /// reply obtained at all) tries the next MX host instead.
-    #[allow(clippy::too_many_arguments)]
-    fn deliver_smtp(
-        self,
-        domain: String,
-        mx_hosts: Vec<String>,
-        mx_index: usize,
-        host: String,
-        addr: std::net::SocketAddr,
-        recipients: Vec<(EmailAddress, DsnRecipientParams)>,
-        connector: Option<SharedTlsConnector>,
-        mandatory_tls: bool,
-        opportunistic_tls: bool,
-    ) {
-        let hostname = self.hostname.clone();
-        let sender = self.sender.as_ref().map(|s| s.address());
-
-        let timeouts = SmtpClientTimeouts {
-            stage: self.smtp_timeout,
-            message: self.smtp_timeout * 10,
-            ..Default::default()
-        };
-
-        let mut send = SmtpSend::new(hostname);
-        send = send.mail_from_params(self.mail_params.clone());
-        if mandatory_tls {
-            send = send.require_starttls(true);
-        } else if opportunistic_tls {
-            send = send.opportunistic_starttls(true);
-        }
-        send = match &self.spool_path {
-            Some(path) if self.extra_header_lines.is_empty() => send.message_file(path.clone()),
-            // Issue #212: previously routed through `message_with`, whose
-            // closure opened and read the spool file inline on the reactor
-            // thread — same class of blocking-I/O risk #184 fixed for the
-            // no-extra-headers case just above. `message_file_with_prefix`
-            // reuses that same offloaded file-read path, with the rendered
-            // extra header lines sent immediately ahead of the file's
-            // content.
-            Some(path) => send.message_file_with_prefix(
-                path.clone(),
-                render_extra_header_lines(&self.extra_header_lines),
-            ),
-            None => send.message_empty(),
-        };
-
-        if let Some(s) = sender {
-            send = send.mail_from(s);
-        }
-        for (addr, params) in &recipients {
-            send = send.rcpt_to_with(addr.address(), params.clone());
-        }
-
-        let domain_for_result = domain.clone();
-        let mx_hosts_for_result = mx_hosts.clone();
-        let recipients_for_result = recipients.clone();
-        let context_for_result = self.clone();
-        send = send.on_result(Box::new(move |outcome| {
-            let mut this = context_for_result;
-            match outcome {
-                crate::SmtpSendOutcome::Delivered => {
-                    this.tracker.lock().unwrap().record(&domain_for_result, true);
-                    this.current += 1;
-                    this.deliver_next();
-                }
-                crate::SmtpSendOutcome::Rejected { .. } => {
-                    this.tracker.lock().unwrap().record(&domain_for_result, false);
-                    this.current += 1;
-                    this.deliver_next();
-                }
-                crate::SmtpSendOutcome::Failed(_) => {
-                    this.deliver_to_mx(
-                        domain_for_result,
-                        mx_hosts_for_result,
-                        mx_index + 1,
-                        recipients_for_result,
-                    );
-                }
-            }
-        }));
-
-        let mut client = SmtpClient::from_addr(addr);
-        if let Some(connector) = connector {
-            client = client.starttls(connector, host);
-        }
-
-        let result = client.timeouts(timeouts).connect(&self.runtime, Arc::new(send));
-        if result.is_err() {
-            // Synchronous dial-setup failure — the `on_result` closure
-            // above never fires for a `send` that was never actually
-            // wired to a connection, so drive the same "try the next MX
-            // host" fallback directly.
-            self.deliver_to_mx(domain, mx_hosts, mx_index + 1, recipients);
-        }
-    }
-}
-
-/// Build a [`SharedTlsConnector`] that authenticates the peer against
-/// `records` via [`hopf_dns::dane::verify_dane_chain`] (issue #352) — used
-/// for a DANE-authenticated hop's mandatory STARTTLS.
-fn build_dane_connector(records: Vec<hopf_dns::TlsaRecord>) -> SharedTlsConnector {
-    hopf_core::connector_with_verify_override(
-        Arc::new(move |chain, server_name| hopf_dns::dane::verify_dane_chain(&records, chain, server_name)),
-        &[],
-    )
-}
-
-/// Builds and sends a failure DSN for a message that never reaches the
-/// per-domain delivery stage (e.g. DELIVERBY deadline already exceeded).
-/// The spool read is offloaded (issue #184) — `handle` bounces the
-/// completion back to the reactor thread that owns it.
-// Each parameter is an independent DSN-rendering input threaded through from the caller.
-#[allow(clippy::too_many_arguments)]
-fn maybe_send_failure_dsn(
-    hostname: &str,
-    sender: Option<&EmailAddress>,
-    delivery: &DeliveryRequirements,
-    recipients: &[(EmailAddress, DsnRecipientParams)],
-    spool_path: Option<PathBuf>,
-    diagnostic: &str,
-    dns: &Arc<DnsResolver>,
-    runtime: &Arc<Runtime>,
-    smtp_timeout: Duration,
-    outbound_port: u16,
-    tls_connector: Option<SharedTlsConnector>,
-    handle: ConnHandle,
-) {
-    let Some(sender) = sender else {
-        return;
-    };
-    let reports: Vec<_> = recipients
-        .iter()
-        .filter(|(_, p)| p.notify.wants_failure())
-        .map(|(addr, params)| DsnRecipientReport {
-            final_recipient: addr.address(),
-            original_recipient: orcpt_field(params),
-            action: DsnAction::Failed,
-            diagnostic: Some(diagnostic.into()),
-        })
-        .collect();
-    if reports.is_empty() {
-        return;
-    }
-    let sender = sender.clone();
-    let sender_for_op = sender.clone();
-    let hostname_owned = hostname.to_string();
-    let hostname_for_op = hostname_owned.clone();
-    let delivery = delivery.clone();
-    let dns = Arc::clone(dns);
-    let runtime2 = Arc::clone(runtime);
-    let tls_connector2 = tls_connector.clone();
-    let require_tls = delivery.is_require_tls();
-
-    runtime.storage().submit_on(
-        handle,
-        move || -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
-            let original = spool_path
-                .and_then(|p| std::fs::read(p).ok())
-                .unwrap_or_default();
-            let dsn = DeliveryStatusNotification {
-                reporting_mta: hostname_for_op,
-                reverse_path: Some(sender_for_op),
-                delivery,
-                recipients: reports,
-                original_message: original,
-            };
-            Ok(dsn.render())
-        },
-        move |result: Result<Option<Vec<u8>>, StorageError>| {
-            if let Ok(Some(bytes)) = result {
-                send_dsn_message(
-                    &bytes,
-                    &sender,
-                    &hostname_owned,
-                    &dns,
-                    &runtime2,
-                    smtp_timeout,
-                    outbound_port,
-                    tls_connector2,
-                    require_tls,
-                );
-            }
-        },
-    );
-}
-
-// Each parameter is an independent delivery-context input threaded through from the caller.
-#[allow(clippy::too_many_arguments)]
-fn send_dsn_message(
-    message: &[u8],
-    reverse_path: &EmailAddress,
-    hostname: &str,
-    dns: &Arc<DnsResolver>,
-    runtime: &Arc<Runtime>,
-    smtp_timeout: Duration,
-    outbound_port: u16,
-    tls_connector: Option<SharedTlsConnector>,
-    require_tls: bool,
-) {
-    let domain = reverse_path.domain().to_ascii_lowercase();
-    let to = reverse_path.address();
-    let hostname = hostname.to_string();
-    let message = message.to_vec();
-    let runtime = Arc::clone(runtime);
-    let dns2 = Arc::clone(dns);
-    let domain_for_cb = domain.clone();
-    dns.query_mx(
-        &domain,
-        Box::new(move |result| {
-            let host = match result {
-                Ok(msg) => {
-                    let mut mx: Vec<(u16, String)> =
-                        msg.answers.iter().filter_map(|rr| rr.as_mx()).collect();
-                    mx.sort_by_key(|(pref, _)| *pref);
-                    mx.first()
-                        .map(|(_, ex)| ex.trim_end_matches('.').to_string())
-                        .unwrap_or(domain_for_cb)
-                }
-                Err(_) => return,
-            };
-            let host_for_tls = host.clone();
-            dns2.resolve(
-                &host,
-                outbound_port,
-                Box::new(move |result| {
-                    let Ok(addrs) = result else {
-                        return;
-                    };
-                    let Some(&addr) = addrs.first() else {
-                        return;
-                    };
-                    let timeouts = SmtpClientTimeouts {
-                        stage: smtp_timeout,
-                        message: smtp_timeout * 10,
-                        ..Default::default()
-                    };
-                    let mut body = Some(message);
-                    let mut send = SmtpSend::new(hostname)
-                        .mail_from("")
-                        .rcpt_to(to)
-                        .message_with(move || body.take());
-                    if require_tls {
-                        send = send
-                            .require_starttls(true)
-                            .mail_from_params(MailFromParams {
-                                require_tls: true,
-                                ..Default::default()
-                            });
-                    }
-                    let mut client = SmtpClient::from_addr(addr);
-                    if require_tls {
-                        if let Some(connector) = tls_connector {
-                            client = client.starttls(connector, host_for_tls);
-                        }
-                    }
-                    let _ = client.timeouts(timeouts).connect(&runtime, Arc::new(send));
-                }),
-            );
-        }),
-    );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::server::handler::DeferredSlot;
-    use hopf_core::RuntimeConfig;
-    use std::sync::Mutex as StdMutex;
-
-    #[test]
-    fn group_by_domain_buckets_case_insensitively() {
-        let recipients = vec![
-            (
-                EmailAddress::new(None, "a", "Example.com", true),
-                DsnRecipientParams::default(),
-            ),
-            (
-                EmailAddress::new(None, "b", "example.COM", true),
-                DsnRecipientParams::default(),
-            ),
-            (
-                EmailAddress::new(None, "c", "other.example", true),
-                DsnRecipientParams::default(),
-            ),
-        ];
-        let groups = group_by_domain(&recipients);
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups.get("example.com").map(Vec::len), Some(2));
-        assert_eq!(groups.get("other.example").map(Vec::len), Some(1));
-    }
-
-    fn test_runtime_and_handle() -> (Arc<Runtime>, ConnHandle) {
-        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
-        let handle = ConnHandle::from_execute(Arc::new(|task| task()));
-        (rt, handle)
-    }
-
-    fn dummy_relay_handler(dns: Arc<DnsResolver>, runtime: Arc<Runtime>) -> SimpleRelayHandler {
-        SimpleRelayHandler {
-            dns,
-            runtime,
-            hostname: "test.example.com".to_string(),
-            smtp_timeout: Duration::from_secs(5),
-            outbound_port: 25,
-            tls_connector: None,
-            control_handle: None,
-            inbound_tls: false,
-            sender: None,
-            smtputf8: false,
-            delivery: DeliveryRequirements::default(),
-            recipients: Vec::new(),
-            spool: None,
-            extra_header_lines: Vec::new(),
-        }
-    }
-
-    /// Spin-wait up to `max_ms` for `pred` to return true.
-    fn wait_for(pred: impl Fn() -> bool, max_ms: u64) -> bool {
-        for _ in 0..(max_ms / 5).max(1) {
-            if pred() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        pred()
-    }
-
-    /// Issue #184: `finish()`'s spool read+remove is offloaded off the
-    /// reactor thread, and the deferred SMTP reply must not complete until
-    /// that offloaded work actually lands.
-    #[test]
-    fn finish_removes_spool_file_and_completes_deferred_after_offload() {
-        let (rt, handle) = test_runtime_and_handle();
-        let dns = Arc::new(DnsResolver::for_runtime(&rt).unwrap());
-
-        let spool_path = std::env::temp_dir().join(format!(
-            "hopf-smtp-relay-finish-test-{}-{}.tmp",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::write(&spool_path, b"Subject: hi\r\n\r\nbody\r\n").unwrap();
-
-        let slot = Arc::new(StdMutex::new(Some(DeferredSlot {
-            resume: Box::new(dummy_relay_handler(Arc::clone(&dns), Arc::clone(&rt))),
-            outcome: None,
-        })));
-        let deferred = DeferredDelivery::new(handle.clone(), Arc::clone(&slot));
-
-        let tracker = Arc::new(Mutex::new(DeliveryTracker {
-            deferred: Some(deferred),
-            remaining: 0,
-            any_success: true,
-            spool_path: Some(spool_path.clone()),
-            hostname: "test.example.com".to_string(),
-            // No sender means no DSN to build/send — isolates this test to
-            // the read/remove/deferred-completion race, without needing a
-            // live DNS/SMTP round trip.
-            sender: None,
-            delivery: DeliveryRequirements::default(),
-            recipients: Vec::new(),
-            domain_results: HashMap::new(),
-            dns,
-            runtime: Arc::clone(&rt),
-            smtp_timeout: Duration::from_secs(5),
-            outbound_port: 25,
-            tls_connector: None,
-            dsn_sent: false,
-            control_handle: handle,
-        }));
-
-        tracker.lock().unwrap().finish();
-
-        assert!(
-            wait_for(|| !spool_path.exists(), 2000),
-            "spool file must be removed once finish()'s offloaded job completes"
-        );
-        assert!(
-            wait_for(
-                || slot.lock().unwrap().as_ref().unwrap().outcome.is_some(),
-                2000
-            ),
-            "deferred reply must complete once finish()'s offloaded job lands"
-        );
-    }
-
-    /// `build_dsn_reports` (in-memory, no I/O) must report exactly the
-    /// recipients whose domain failed and who asked for a failure notice,
-    /// and must be idempotent (issue #184's `dsn_sent` latch).
-    #[test]
-    fn build_dsn_reports_covers_failed_domains_and_is_idempotent() {
-        let (rt, handle) = test_runtime_and_handle();
-        let dns = Arc::new(DnsResolver::for_runtime(&rt).unwrap());
-        let sender = EmailAddress::new(None, "from", "sender.example", true);
-        let ok_recipient = EmailAddress::new(None, "ok", "good.example", true);
-        let failed_recipient = EmailAddress::new(None, "bad", "down.example", true);
-
-        let mut domain_results = HashMap::new();
-        domain_results.insert("good.example".to_string(), true);
-        domain_results.insert("down.example".to_string(), false);
-
-        let mut tracker = DeliveryTracker {
-            deferred: None,
-            remaining: 0,
-            any_success: true,
-            spool_path: None,
-            hostname: "test.example.com".to_string(),
-            sender: Some(sender),
-            delivery: DeliveryRequirements::default(),
-            recipients: vec![
-                (ok_recipient, DsnRecipientParams::default()),
-                (failed_recipient.clone(), DsnRecipientParams::default()),
-            ],
-            domain_results,
-            dns,
-            runtime: rt,
-            smtp_timeout: Duration::from_secs(5),
-            outbound_port: 25,
-            tls_connector: None,
-            dsn_sent: false,
-            control_handle: handle,
-        };
-
-        let (_sender, reports) = tracker
-            .build_dsn_reports()
-            .expect("a failed domain with default NOTIFY wants a failure report");
-        assert_eq!(reports.len(), 1, "only the failed recipient is reported: {reports:?}");
-        assert_eq!(reports[0].final_recipient, failed_recipient.address());
-        assert_eq!(reports[0].action, DsnAction::Failed);
-
-        assert!(
-            tracker.build_dsn_reports().is_none(),
-            "must not build/send a second DSN for the same tracker"
-        );
-    }
-
-    fn tracker(
-        recipients: Vec<(EmailAddress, DsnRecipientParams)>,
-        results: &[(&str, bool)],
-        any_success: bool,
-        sender: Option<EmailAddress>,
-    ) -> DeliveryTracker {
-        let (rt, handle) = test_runtime_and_handle();
-        let dns = Arc::new(DnsResolver::for_runtime(&rt).unwrap());
-        DeliveryTracker {
-            deferred: None,
-            remaining: 0,
-            any_success,
-            spool_path: None,
-            hostname: "test.example.com".to_string(),
-            sender,
-            delivery: DeliveryRequirements::default(),
-            recipients,
-            domain_results: results.iter().map(|(d, ok)| (d.to_string(), *ok)).collect(),
-            dns,
-            runtime: rt,
-            smtp_timeout: Duration::from_secs(5),
-            outbound_port: 25,
-            tls_connector: None,
-            dsn_sent: false,
-            control_handle: handle,
-        }
-    }
-
-    fn rcpt(local: &str, domain: &str, notify: DsnNotify) -> (EmailAddress, DsnRecipientParams) {
-        (
-            EmailAddress::new(None, local, domain, true),
-            DsnRecipientParams { notify, ..Default::default() },
-        )
-    }
-
-    fn sender() -> Option<EmailAddress> {
-        Some(EmailAddress::new(None, "from", "sender.example", true))
-    }
-
-    use crate::server::delivery::DsnNotify;
-
-    #[test]
-    fn no_failure_notice_goes_out_when_the_whole_transaction_is_refused_with_a_temporary_error() {
-        // Nothing was delivered anywhere, so the inbound client is told to try
-        // again later (4xx). A bounce on top of that would tell the sender
-        // it failed while its client queues a retry: two outcomes for one message.
-        let mut t = tracker(
-            vec![rcpt("a", "down.example", DsnNotify::default())],
-            &[("down.example", false)],
-            false,
-            sender(),
-        );
-        assert!(t.build_dsn_reports().is_none());
-    }
-
-    #[test]
-    fn a_failure_notice_does_go_out_when_some_other_domain_took_the_message() {
-        let mut t = tracker(
-            vec![rcpt("a", "good.example", DsnNotify::default()), rcpt("b", "down.example", DsnNotify::default())],
-            &[("good.example", true), ("down.example", false)],
-            true,
-            sender(),
-        );
-        let (_, reports) = t.build_dsn_reports().unwrap();
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0].final_recipient, "b@down.example");
-    }
-
-    #[test]
-    fn no_notice_without_a_sender_to_send_it_to() {
-        let mut t = tracker(
-            vec![rcpt("a", "down.example", DsnNotify::default()), rcpt("b", "good.example", DsnNotify::default())],
-            &[("down.example", false), ("good.example", true)],
-            true,
-            None,
-        );
-        assert!(t.build_dsn_reports().is_none());
-    }
-
-    #[test]
-    fn notify_decides_who_gets_a_report() {
-        let never = DsnNotify { never: true, ..Default::default() };
-        let success = DsnNotify { success: true, ..Default::default() };
-        let delay_only = DsnNotify { delay: true, ..Default::default() };
-        let mut t = tracker(
-            vec![
-                rcpt("ok-default", "good.example", DsnNotify::default()),
-                rcpt("ok-success", "good.example", success),
-                rcpt("bad-default", "down.example", DsnNotify::default()),
-                rcpt("bad-never", "down.example", never),
-                rcpt("bad-delay-only", "down.example", delay_only),
-            ],
-            &[("good.example", true), ("down.example", false)],
-            true,
-            sender(),
-        );
-        let (_, reports) = t.build_dsn_reports().unwrap();
-        let got: Vec<(String, DsnAction)> = reports.iter().map(|r| (r.final_recipient.clone(), r.action)).collect();
-        assert_eq!(
-            got,
-            [
-                ("ok-success@good.example".to_string(), DsnAction::Delivered),
-                ("bad-default@down.example".to_string(), DsnAction::Failed),
-            ]
-        );
-    }
-
-    #[test]
-    fn every_recipient_with_notify_never_means_no_report() {
-        let never = DsnNotify { never: true, ..Default::default() };
-        let mut t = tracker(
-            vec![rcpt("a", "down.example", never), rcpt("b", "good.example", never)],
-            &[("down.example", false), ("good.example", true)],
-            true,
-            sender(),
-        );
-        assert!(t.build_dsn_reports().is_none());
-    }
-
-    #[test]
-    fn the_original_recipient_is_carried_into_the_report() {
-        let mut params = DsnRecipientParams::default();
-        params.orcpt_type = Some("rfc822".into());
-        params.orcpt_address = Some("orig@down.example".into());
-        let mut t = tracker(
-            vec![(EmailAddress::new(None, "a", "down.example", true), params), rcpt("b", "good.example", DsnNotify::default())],
-            &[("down.example", false), ("good.example", true)],
-            true,
-            sender(),
-        );
-        let (_, reports) = t.build_dsn_reports().unwrap();
-        assert_eq!(reports[0].original_recipient.as_deref(), Some("rfc822;orig@down.example"));
-    }
-
-    #[test]
-    fn a_recipient_whose_domain_never_reported_counts_as_failed() {
-        let mut t = tracker(
-            vec![rcpt("a", "silent.example", DsnNotify::default()), rcpt("b", "good.example", DsnNotify::default())],
-            &[("good.example", true)],
-            true,
-            sender(),
-        );
-        let (_, reports) = t.build_dsn_reports().unwrap();
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0].action, DsnAction::Failed);
-    }
-
-    #[test]
-    fn recording_every_domain_finishes_the_tracker_once() {
-        let mut t = tracker(Vec::new(), &[], false, None);
-        t.remaining = 3;
-        t.record("a.example", true);
-        t.record("b.example", false);
-        assert_eq!(t.remaining, 1);
-        assert!(t.any_success && t.domain_results.len() == 2);
-        // a count that was already zero does not wrap
-        let mut z = tracker(Vec::new(), &[], false, None);
-        z.remaining = 0;
-        z.finish_if_needed_with_zero_domains();
-        assert_eq!(z.remaining, 0);
-    }
-
-    #[test]
-    fn extra_header_lines_are_crlf_terminated() {
-        assert_eq!(render_extra_header_lines(&[]), b"");
-        assert_eq!(
-            render_extra_header_lines(&["X-A: 1".into(), "X-B: 2".into()]),
-            b"X-A: 1\r\nX-B: 2\r\n"
-        );
-    }
-
-    #[test]
-    fn the_hop_carries_the_envelope_parameters_that_the_message_arrived_with() {
-        use std::time::SystemTime;
-        let now = SystemTime::now();
-        let d = DeliveryRequirements {
-            require_tls: true,
-            priority: Some(3),
-            dsn_ret: Some(crate::server::delivery::DsnReturn::Hdrs),
-            dsn_envid: Some("env-1".into()),
-            ..Default::default()
-        };
-        let p = outbound_mail_params(&d, false, now);
-        assert!(p.require_tls && p.priority == Some(3) && p.dsn_envid.as_deref() == Some("env-1"));
-        assert!(p.dsn_ret.is_some() && !p.smtputf8);
-    }
-
-    #[test]
-    fn smtputf8_is_carried_to_the_next_hop() {
-        // Without it a relay that accepted a UTF-8 address would hand the
-        // next server an address it has not been told it may receive.
-        let p = outbound_mail_params(&DeliveryRequirements::default(), true, std::time::SystemTime::now());
-        assert!(p.smtputf8);
-        let p = outbound_mail_params(&DeliveryRequirements::default(), false, std::time::SystemTime::now());
-        assert!(!p.smtputf8);
-    }
-
-    #[test]
-    fn a_delivery_deadline_is_carried_with_the_time_that_is_left() {
-        // RFC 2852 section 4.1.4: a relay passes BY on with the time
-        // remaining, never the original interval.
-        use std::time::SystemTime;
-        let now = SystemTime::now();
-        let d = DeliveryRequirements {
-            deliver_by: Some(crate::server::delivery::DeliverBy {
-                deadline: now + Duration::from_secs(300),
-                return_on_fail: true,
-            }),
-            ..Default::default()
-        };
-        let p = outbound_mail_params(&d, false, now);
-        assert_eq!(p.deliver_by, Some((Duration::from_secs(300), true)));
-        let later = now + Duration::from_secs(100);
-        let p = outbound_mail_params(&d, false, later);
-        assert_eq!(p.deliver_by, Some((Duration::from_secs(200), true)));
-        let n = DeliveryRequirements {
-            deliver_by: Some(crate::server::delivery::DeliverBy { deadline: now + Duration::from_secs(60), return_on_fail: false }),
-            ..Default::default()
-        };
-        assert_eq!(outbound_mail_params(&n, false, now).deliver_by, Some((Duration::from_secs(60), false)));
-    }
-
-    #[test]
-    fn a_deadline_about_to_pass_is_not_sent_as_zero() {
-        use std::time::SystemTime;
-        let now = SystemTime::now();
-        let d = DeliveryRequirements {
-            deliver_by: Some(crate::server::delivery::DeliverBy {
-                deadline: now + Duration::from_millis(200),
-                return_on_fail: true,
-            }),
-            ..Default::default()
-        };
-        let p = outbound_mail_params(&d, false, now);
-        assert_eq!(p.deliver_by.map(|(t, _)| t), Some(Duration::from_secs(1)));
-    }
 }

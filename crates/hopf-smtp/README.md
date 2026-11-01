@@ -8,7 +8,8 @@ DATA (dot-stuffing) and BDAT. Stock handlers:
 
 - `AcceptAllSmtpHandler` — accept and discard
 - `SimpleRelayService` / `SimpleRelayHandler` — open MX relay via `hopf-dns`
-  (dev/test only)
+  (dev/test only), with a durable on-disk queue: temporary failures are
+  retried with backoff, permanent ones bounced (`RelayOptions`)
 - `LocalDeliveryService` / `LocalDeliveryHandler` — deliver to local INBOXes
   via `hopf-mailbox` (mbox or Maildir++)
 
