@@ -605,6 +605,17 @@ impl Ctx<'_, '_> {
         self.endpoint.close();
     }
 
+    /// Only CONNECT may open a connection: any other packet before the
+    /// session is established closes it (MQTT 3.1.1 section 3.1). Returns
+    /// whether the session is established.
+    fn require_connected(&mut self) -> bool {
+        if matches!(self.handler.session, SessionState::Connected(_)) {
+            return true;
+        }
+        self.disconnect_and_close(reason::PROTOCOL_ERROR);
+        false
+    }
+
     /// Close the connection, first sending a server-initiated DISCONNECT
     /// with `reason_code` if the session is established and v5 (MQTT 5.0
     /// §3.14 — v3.1.1 has no server-initiated DISCONNECT, and pre-CONNECT
@@ -690,6 +701,7 @@ impl MqttFrameHandler for Ctx<'_, '_> {
         }
         if matches!(self.handler.session, SessionState::Connected(_))
             || self.handler.busy.load(Ordering::Relaxed)
+            || self.handler.pending_auth.is_some()
         {
             // A second CONNECT on an established session is a protocol
             // violation (MQTT 3.1.1 §3.1) — also rejected while a SASL
@@ -732,8 +744,12 @@ impl MqttFrameHandler for Ctx<'_, '_> {
         };
         let session_expiry_secs = if version.is_v5() {
             packet.properties.get_u32(property::SESSION_EXPIRY_INTERVAL).unwrap_or(0)
-        } else {
+        } else if packet.clean_session {
             0
+        } else {
+            // MQTT 3.1.1 section 3.1.2.4: with CleanSession 0 the server
+            // keeps the session until the client comes back.
+            u32::MAX
         };
         let client_topic_alias_max = if version.is_v5() {
             packet.properties.get_u16(property::TOPIC_ALIAS_MAXIMUM).unwrap_or(0)
@@ -757,6 +773,10 @@ impl MqttFrameHandler for Ctx<'_, '_> {
                 receive_maximum,
                 session_expiry_secs,
                 client_topic_alias_max,
+                extras: crate::server::auth::ConnackExtras {
+                    assigned_client_id: packet.client_id.is_empty().then(|| client_id.clone()),
+                    ..Default::default()
+                },
                 version,
             };
             offload_authorize(self.handler, self.endpoint, packet, pending_connect);
@@ -941,6 +961,9 @@ impl MqttFrameHandler for Ctx<'_, '_> {
     }
 
     fn puback(&mut self, packet_id: u16, _reason_code: u8, _properties: Properties) {
+        if !self.require_connected() {
+            return;
+        }
         // Client acked a QoS 1 message we forwarded to it as a subscriber —
         // frees one Receive Maximum credit.
         if let SessionState::Connected(session) = &self.handler.session {
@@ -949,18 +972,30 @@ impl MqttFrameHandler for Ctx<'_, '_> {
         }
     }
 
-    fn pubrec(&mut self, _packet_id: u16, _reason_code: u8, _properties: Properties) {}
+    fn pubrec(&mut self, _packet_id: u16, _reason_code: u8, _properties: Properties) {
+        self.require_connected();
+    }
 
     fn pubrel(&mut self, packet_id: u16, _reason_code: u8, _properties: Properties) {
         let SessionState::Connected(session) = &mut self.handler.session else {
+            self.disconnect_and_close(reason::PROTOCOL_ERROR);
             return;
         };
-        session.awaiting_pubrel.remove(&packet_id);
-        let wire = encode::encode_pubcomp(packet_id, reason::SUCCESS, &Properties::new(), session.version);
+        let known = session.awaiting_pubrel.remove(&packet_id);
+        // 3.1.1 has only the one PUBCOMP; 5.0 says when it has no such exchange.
+        let code = if known || !session.version.is_v5() {
+            reason::SUCCESS
+        } else {
+            reason::PACKET_IDENTIFIER_NOT_FOUND
+        };
+        let wire = encode::encode_pubcomp(packet_id, code, &Properties::new(), session.version);
         self.endpoint.send(&wire);
     }
 
     fn pubcomp(&mut self, packet_id: u16, _reason_code: u8, _properties: Properties) {
+        if !self.require_connected() {
+            return;
+        }
         // Client completed the QoS 2 handshake for a message we forwarded
         // to it as a subscriber — frees one Receive Maximum credit.
         if let SessionState::Connected(session) = &self.handler.session {
@@ -1049,6 +1084,9 @@ impl MqttFrameHandler for Ctx<'_, '_> {
     }
 
     fn ping_req(&mut self) {
+        if !self.require_connected() {
+            return;
+        }
         self.endpoint.send(&encode::encode_pingresp());
     }
 
@@ -1056,15 +1094,21 @@ impl MqttFrameHandler for Ctx<'_, '_> {
         self.disconnect_and_close(reason::PROTOCOL_ERROR); // servers don't receive PINGRESP
     }
 
-    fn disconnect(&mut self, _reason_code: u8, _properties: Properties) {
+    fn disconnect(&mut self, reason_code: u8, _properties: Properties) {
         if let SessionState::Connected(session) = &mut self.handler.session {
-            session.graceful_disconnect = true;
+            // Reason 0x04 asks for the Will to be published anyway (MQTT 5.0 section 3.14.2.1).
+            session.graceful_disconnect = reason_code != reason::DISCONNECT_WITH_WILL_MESSAGE;
         }
         self.endpoint.close();
     }
 
     fn auth(&mut self, _reason_code: u8, properties: Properties) {
         // Enhanced AUTH continues in `server::auth` once CONNECT requested a method.
+        if matches!(self.handler.session, SessionState::AwaitingConnect) && self.handler.pending_auth.is_none() {
+            // Nothing to continue and nothing to re-authenticate.
+            self.disconnect_and_close(reason::PROTOCOL_ERROR);
+            return;
+        }
         crate::server::auth::handle_auth_packet(self.handler, self.endpoint, properties);
     }
 
@@ -1130,6 +1174,7 @@ pub(crate) fn finish_connect_after_auth(
         // by this point, which `connect()`'s existing guard already rejects
         // regardless of any busy flag.
         let outcome = PendingConnackOutcome {
+            extras: pc.extras.clone(),
             session_present,
             receive_maximum: pc.receive_maximum,
             session_expiry_secs: pc.session_expiry_secs,
@@ -1168,12 +1213,13 @@ pub(crate) fn finish_connect_after_auth(
     }
     arm_retransmit_timer(handler, endpoint);
 
-    let connack_props = connack_properties(
+    let mut connack_props = connack_properties(
         version,
         pc.receive_maximum,
         pc.session_expiry_secs,
         server_topic_alias_max,
     );
+    pc.extras.apply(&mut connack_props, version);
     endpoint.send(&encode::encode_connack(session_present, 0, &connack_props, version));
 }
 
@@ -1183,6 +1229,7 @@ pub(crate) fn finish_connect_after_auth(
 /// — everything `finish_connect_after_auth`'s tail (arm the retransmit
 /// timer, send CONNACK) used to do inline once `drain_offline` returned.
 pub(crate) struct PendingConnackOutcome {
+    extras: crate::server::auth::ConnackExtras,
     session_present: bool,
     receive_maximum: u16,
     session_expiry_secs: u32,
@@ -1197,6 +1244,7 @@ pub(crate) struct PendingConnackOutcome {
 /// `sync_pending_authorize`.
 fn sync_pending_connack(handler: &mut MqttControlHandler, endpoint: &mut dyn Endpoint) {
     let Some(PendingConnackOutcome {
+        extras,
         session_present,
         receive_maximum,
         session_expiry_secs,
@@ -1207,8 +1255,9 @@ fn sync_pending_connack(handler: &mut MqttControlHandler, endpoint: &mut dyn End
         return;
     };
     arm_retransmit_timer(handler, endpoint);
-    let connack_props =
+    let mut connack_props =
         connack_properties(version, receive_maximum, session_expiry_secs, server_topic_alias_max);
+    extras.apply(&mut connack_props, version);
     endpoint.send(&encode::encode_connack(session_present, 0, &connack_props, version));
 }
 
@@ -1302,6 +1351,10 @@ fn sync_pending_authorize(handler: &mut MqttControlHandler, endpoint: &mut dyn E
         }
     }
 }
+
+#[cfg(test)]
+#[path = "control_session_tests.rs"]
+mod session_tests;
 
 #[cfg(test)]
 mod publish_finish_tests {

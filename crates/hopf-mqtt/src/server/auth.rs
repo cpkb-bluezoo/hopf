@@ -30,6 +30,34 @@ pub(crate) struct PendingAuth {
     pub(crate) pending_connect: Option<PendingConnectAuth>,
 }
 
+/// What the CONNACK must say beyond the usual capabilities: the identifier
+/// the server chose for a client that sent none (MQTT 5.0 section 3.2.2.3.7)
+/// and, after enhanced authentication, the method and the server's last
+/// authentication data (section 4.12.1).
+#[derive(Clone, Default)]
+pub(crate) struct ConnackExtras {
+    pub(crate) assigned_client_id: Option<String>,
+    pub(crate) auth_method: Option<String>,
+    pub(crate) auth_data: Option<Vec<u8>>,
+}
+
+impl ConnackExtras {
+    pub(crate) fn apply(&self, props: &mut Properties, version: ProtocolVersion) {
+        if !version.is_v5() {
+            return;
+        }
+        if let Some(id) = &self.assigned_client_id {
+            props.set_utf8(property::ASSIGNED_CLIENT_IDENTIFIER, id.as_str());
+        }
+        if let Some(method) = &self.auth_method {
+            props.set_utf8(property::AUTHENTICATION_METHOD, method.as_str());
+        }
+        if let Some(data) = &self.auth_data {
+            props.set_binary(property::AUTHENTICATION_DATA, data.as_slice());
+        }
+    }
+}
+
 /// CONNECT fields held until enhanced AUTH (or, issue #210, an offloaded
 /// plain-CONNECT `authorize()` call) completes.
 pub(crate) struct PendingConnectAuth {
@@ -40,6 +68,7 @@ pub(crate) struct PendingConnectAuth {
     pub(crate) receive_maximum: u16,
     pub(crate) session_expiry_secs: u32,
     pub(crate) client_topic_alias_max: u16,
+    pub(crate) extras: ConnackExtras,
     /// Enhanced AUTH is MQTT5-only, so `finish_connect_after_auth` used to
     /// hardcode `ProtocolVersion::V5` — issue #210's plain-CONNECT offload
     /// reuses the same continuation for v3.1.1 connections too, so the
@@ -173,17 +202,23 @@ pub(crate) fn sync_pending_auth_check(handler: &mut MqttControlHandler, endpoint
             });
         }
         SaslServerStep::Complete { final_message, .. } => {
-            if let Some(data) = final_message.filter(|d| !d.is_empty()) {
-                let mut props = Properties::new();
-                props.set_utf8(property::AUTHENTICATION_METHOD, &method);
-                props.set_binary(property::AUTHENTICATION_DATA, data);
-                endpoint.send(&encode::encode_auth(reason::SUCCESS, &props));
-            }
+            let data = final_message.filter(|d| !d.is_empty());
             handler.record_auth(true);
             if for_connect {
-                if let Some(pc) = pending_connect {
+                // The server's last data travels in the CONNACK; an AUTH
+                // with reason Success is only for re-authentication.
+                if let Some(mut pc) = pending_connect {
+                    pc.extras.auth_method = Some(method);
+                    pc.extras.auth_data = data;
                     crate::server::control::finish_connect_after_auth(handler, endpoint, pc);
                 }
+            } else {
+                let mut props = Properties::new();
+                props.set_utf8(property::AUTHENTICATION_METHOD, &method);
+                if let Some(data) = data {
+                    props.set_binary(property::AUTHENTICATION_DATA, data);
+                }
+                endpoint.send(&encode::encode_auth(reason::SUCCESS, &props));
             }
         }
         SaslServerStep::Failure => {
@@ -263,6 +298,10 @@ pub(crate) fn maybe_start_connect_auth(
         receive_maximum,
         session_expiry_secs,
         client_topic_alias_max,
+        extras: ConnackExtras {
+            assigned_client_id: packet.client_id.is_empty().then(|| client_id.to_string()),
+            ..ConnackExtras::default()
+        },
         version: packet.version,
     };
 

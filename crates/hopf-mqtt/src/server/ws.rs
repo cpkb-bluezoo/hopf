@@ -494,6 +494,16 @@ impl WsCtx<'_, '_, '_> {
         self.session.send_close(1002, "mqtt CONNECT refused");
     }
 
+    /// Only CONNECT may open a connection: any other packet before the
+    /// session is established closes it (MQTT 3.1.1 section 3.1).
+    fn require_connected(&mut self) -> bool {
+        if matches!(self.handler.session, SessionState::Connected(_)) {
+            return true;
+        }
+        self.disconnect_and_close(reason::PROTOCOL_ERROR);
+        false
+    }
+
     fn disconnect_and_close(&mut self, reason_code: u8) {
         if let SessionState::Connected(session) = &self.handler.session {
             if session.version.is_v5() {
@@ -546,8 +556,12 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
         };
         let session_expiry_secs = if version.is_v5() {
             packet.properties.get_u32(property::SESSION_EXPIRY_INTERVAL).unwrap_or(0)
-        } else {
+        } else if packet.clean_session {
             0
+        } else {
+            // MQTT 3.1.1 section 3.1.2.4: with CleanSession 0 the server
+            // keeps the session until the client comes back.
+            u32::MAX
         };
         let client_topic_alias_max = if version.is_v5() {
             packet.properties.get_u16(property::TOPIC_ALIAS_MAXIMUM).unwrap_or(0)
@@ -562,13 +576,17 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
         // via `finish_ws_connect_after_auth` by `sync_pending_ws_authorize`,
         // once the result is back.
         let pending_connect = crate::server::auth::PendingConnectAuth {
-            client_id,
+            client_id: client_id.clone(),
             clean_session: packet.clean_session,
             keep_alive_raw: packet.keep_alive,
             will: packet.will.clone(),
             receive_maximum,
             session_expiry_secs,
             client_topic_alias_max,
+            extras: crate::server::auth::ConnackExtras {
+                assigned_client_id: packet.client_id.is_empty().then(|| client_id.clone()),
+                ..Default::default()
+            },
             version,
         };
         offload_ws_authorize(self.handler, packet, pending_connect);
@@ -734,24 +752,39 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
     }
 
     fn puback(&mut self, packet_id: u16, _reason_code: u8, _properties: Properties) {
+        if !self.require_connected() {
+            return;
+        }
         if let SessionState::Connected(session) = &self.handler.session {
             self.broker().ack_delivered(session.subscriber_id);
             self.broker().store.ack_inflight(session.subscriber_id, packet_id);
         }
     }
 
-    fn pubrec(&mut self, _packet_id: u16, _reason_code: u8, _properties: Properties) {}
+    fn pubrec(&mut self, _packet_id: u16, _reason_code: u8, _properties: Properties) {
+        self.require_connected();
+    }
 
     fn pubrel(&mut self, packet_id: u16, _reason_code: u8, _properties: Properties) {
         let SessionState::Connected(session) = &mut self.handler.session else {
+            self.disconnect_and_close(reason::PROTOCOL_ERROR);
             return;
         };
-        session.awaiting_pubrel.lock().unwrap().remove(&packet_id);
-        let wire = encode::encode_pubcomp(packet_id, reason::SUCCESS, &Properties::new(), session.version);
+        let known = session.awaiting_pubrel.lock().unwrap().remove(&packet_id);
+        // 3.1.1 has only the one PUBCOMP; 5.0 says when it has no such exchange.
+        let code = if known || !session.version.is_v5() {
+            reason::SUCCESS
+        } else {
+            reason::PACKET_IDENTIFIER_NOT_FOUND
+        };
+        let wire = encode::encode_pubcomp(packet_id, code, &Properties::new(), session.version);
         self.session.send_binary(&wire);
     }
 
     fn pubcomp(&mut self, packet_id: u16, _reason_code: u8, _properties: Properties) {
+        if !self.require_connected() {
+            return;
+        }
         if let SessionState::Connected(session) = &self.handler.session {
             self.broker().ack_delivered(session.subscriber_id);
             self.broker().store.ack_inflight(session.subscriber_id, packet_id);
@@ -834,6 +867,9 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
     }
 
     fn ping_req(&mut self) {
+        if !self.require_connected() {
+            return;
+        }
         self.session.send_binary(&encode::encode_pingresp());
     }
 
@@ -841,9 +877,10 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
         self.disconnect_and_close(reason::PROTOCOL_ERROR);
     }
 
-    fn disconnect(&mut self, _reason_code: u8, _properties: Properties) {
+    fn disconnect(&mut self, reason_code: u8, _properties: Properties) {
         if let SessionState::Connected(session) = &mut self.handler.session {
-            session.graceful_disconnect = true;
+            // Reason 0x04 asks for the Will to be published anyway (MQTT 5.0 section 3.14.2.1).
+            session.graceful_disconnect = reason_code != reason::DISCONNECT_WITH_WILL_MESSAGE;
         }
         self.session.send_close(1000, "");
     }
@@ -1003,12 +1040,13 @@ fn finish_ws_connect_after_auth(
     }
     handler.arm_retransmit_timer();
 
-    let connack_props = connack_properties(
+    let mut connack_props = connack_properties(
         version,
         pc.receive_maximum,
         pc.session_expiry_secs,
         server_topic_alias_max,
     );
+    pc.extras.apply(&mut connack_props, version);
     let wire = encode::encode_connack(session_present, 0, &connack_props, version);
     session.send_binary(&wire);
 }
