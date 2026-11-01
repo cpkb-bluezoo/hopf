@@ -12,6 +12,7 @@ mod metrics;
 mod reply;
 mod service;
 mod session;
+mod throttle;
 mod utf8;
 
 pub use ascii::{format_ftp_mtime, normalize_ascii_newlines};
@@ -32,4 +33,5 @@ pub use reply::{
 };
 pub use service::{FtpConfig, FtpService};
 pub use session::{DataMode, TransferType};
+pub use throttle::LoginLimits;
 pub use utf8::{decode_arg, encode_name, encode_text, PathnameCharsetError};

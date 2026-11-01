@@ -15,6 +15,7 @@ use crate::server::handler::{
     FtpConnectionHandlerFactory, FilesystemFtpHandlerFactory,
 };
 use crate::server::metrics::FtpServerMetrics;
+use crate::server::throttle::{LoginLimits, LoginThrottle};
 
 /// FTP server configuration.
 #[derive(Clone)]
@@ -56,6 +57,11 @@ pub struct FtpConfig {
     pub pasv_port_max: Option<u16>,
     /// Read-only filesystem.
     pub read_only: bool,
+    /// How hard the server makes it to guess a password (issue #518).
+    pub login_limits: LoginLimits,
+    /// Failed logins by source address, shared by every connection that
+    /// uses this configuration (clones share it), for lockout.
+    pub(crate) throttle: Arc<LoginThrottle>,
 }
 
 impl FtpConfig {
@@ -79,6 +85,8 @@ impl FtpConfig {
             pasv_port_min: None,
             pasv_port_max: None,
             read_only: false,
+            login_limits: LoginLimits::default(),
+            throttle: Arc::new(LoginThrottle::default()),
         }
     }
 
@@ -106,6 +114,15 @@ impl FtpConfig {
     /// Implicit FTPS on the control listener.
     pub fn implicit_ftps(mut self) -> Self {
         self.implicit_tls = true;
+        self
+    }
+
+    /// Set the limits on failed logins: by default a connection is closed
+    /// after 3, each failure is answered a second late, and a source address
+    /// with 10 failures in ten minutes is locked out for ten minutes. Use
+    /// [`LoginLimits::unlimited`] to turn them all off.
+    pub fn with_login_limits(mut self, limits: LoginLimits) -> Self {
+        self.login_limits = limits;
         self
     }
 

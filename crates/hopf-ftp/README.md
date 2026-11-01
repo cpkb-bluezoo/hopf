@@ -8,6 +8,11 @@ FTP / FTPS **server** and callback-driven **client** for Hopf — Gumdrop
 Control and data connections, PASV via dynamic `Runtime` listeners, stock
 `FilesystemFtpHandler` (chrooted root + storage API), and TrustPolicy auth.
 
+Password guessing is limited by default (`FtpConfig::with_login_limits`): a
+connection is closed after 3 failed logins, each failure is answered a second
+late, and a source address with 10 failures in ten minutes is refused for ten
+minutes. `LoginLimits::unlimited()` turns it all off.
+
 ## Async client
 
 - `FtpClient` — builder + `connect(&Arc<Runtime>, pipeline)`; returns immediately

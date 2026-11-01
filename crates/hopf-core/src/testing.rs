@@ -8,7 +8,10 @@
 //! work the handler hands to the storage pool: the callbacks a worker posts
 //! with [`ConnHandle::with_endpoint`] are queued, and run against the
 //! recording endpoint on the test's own thread, so a whole session can be
-//! scripted and its replies asserted on.
+//! scripted and its replies asserted on. Timers the handler schedules fire
+//! on that thread too, once they are due and while the peer is being pumped
+//! (a handler that waits for one reports itself busy, as it does for the
+//! storage pool, so the peer keeps pumping until it has gone off).
 //!
 //! ```ignore
 //! let mut peer = Peer::connect(handler, |h| h.is_busy());
@@ -31,14 +34,57 @@ use crate::{LoopBuf, StartTlsError, TimerHandle};
 
 type Job = Box<dyn FnOnce(&mut dyn Endpoint) + Send>;
 
+/// A timer the handler scheduled, run by [`Peer::pump`] when it is due.
+struct Timer {
+    due: Instant,
+    cancelled: Arc<AtomicBool>,
+    callback: Box<dyn FnOnce() + Send>,
+}
+
 /// What the connection has seen, shared by the endpoint and its handle.
 #[derive(Default)]
 pub struct Wire {
     out: Mutex<Vec<u8>>,
     jobs: Mutex<VecDeque<Job>>,
+    timers: Mutex<Vec<Timer>>,
     poked: AtomicBool,
     paused: AtomicBool,
     closed: AtomicBool,
+}
+
+impl Wire {
+    fn add_timer(&self, delay: Duration, callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.timers.lock().unwrap().push(Timer {
+            due: Instant::now() + delay,
+            cancelled: Arc::clone(&cancelled),
+            callback,
+        });
+        TimerHandle::from_cancel(move || cancelled.store(true, Ordering::Relaxed))
+    }
+
+    /// Run the timers that are due, oldest first; a cancelled one is dropped.
+    fn fire_due_timers(&self) {
+        let now = Instant::now();
+        let mut due = Vec::new();
+        {
+            let mut timers = self.timers.lock().unwrap();
+            let mut i = 0;
+            while i < timers.len() {
+                if timers[i].cancelled.load(Ordering::Relaxed) {
+                    timers.remove(i);
+                } else if timers[i].due <= now {
+                    due.push(timers.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        due.sort_by_key(|t| t.due);
+        for timer in due {
+            (timer.callback)();
+        }
+    }
 }
 
 struct Backend(Arc<Wire>);
@@ -56,8 +102,8 @@ impl ConnHandleBackend for Backend {
         !self.0.closed.load(Ordering::Relaxed)
     }
 
-    fn schedule_timer(&self, _delay: Duration, _callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
-        TimerHandle::from_cancel(|| {})
+    fn schedule_timer(&self, delay: Duration, callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
+        self.0.add_timer(delay, callback)
     }
 }
 
@@ -100,8 +146,8 @@ impl Endpoint for TestEndpoint {
     fn execute(&self, task: Box<dyn FnOnce() + Send>) {
         task();
     }
-    fn schedule_timer(&self, _delay: Duration, _callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
-        TimerHandle::from_cancel(|| {})
+    fn schedule_timer(&self, delay: Duration, callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
+        self.0.add_timer(delay, callback)
     }
     fn handle(&self) -> ConnHandle {
         ConnHandle::from_backend(Arc::new(Backend(Arc::clone(&self.0))))
@@ -235,6 +281,7 @@ impl<H: ProtocolHandler> Peer<H> {
     pub fn pump(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
+            self.wire.fire_due_timers();
             loop {
                 let job = self.wire.jobs.lock().unwrap().pop_front();
                 match job {

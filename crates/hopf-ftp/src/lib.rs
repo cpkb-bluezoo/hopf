@@ -31,6 +31,7 @@ pub use server::{
     FilesystemFtpHandlerFactory, FtpAuthResult, FtpCommand, FtpConfig, FtpConnectionHandler,
     FtpConnectionHandlerFactory, FtpConnectionMetadata, FtpFileInfo, FtpFileOpResult,
     FtpFileSystem, FtpControlHandler, FtpOperation, FtpServerLexer, FtpServerMetrics, FtpService,
+    LoginLimits,
     PathnameCharsetError, StorTransfer, TransferObserver, TransferTelemetry, TransferType,
     UniqueName,
     MAX_COMMAND_LINE,

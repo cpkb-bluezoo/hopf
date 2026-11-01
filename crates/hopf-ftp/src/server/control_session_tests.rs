@@ -16,6 +16,7 @@ use hopf_core::{Runtime, RuntimeConfig};
 use super::*;
 use crate::server::fs::FtpFileSystem;
 use crate::server::handler::{FilesystemFtpHandler, FtpAuthResult, FtpConnectionHandler, FtpOperation};
+use crate::server::throttle::{LoginLimits, LoginThrottle};
 
 /// What the authorization hook was asked, and what it refuses.
 #[derive(Default)]
@@ -80,7 +81,10 @@ impl Session {
             policy: Arc::clone(&policy),
         };
         let local: SocketAddr = "127.0.0.1:2121".parse().unwrap();
-        let config = tweak(FtpConfig::new(local, root.path(), tp));
+        // The tests that are not about the login limits should not wait out
+        // the delay a real server puts after a failed login.
+        let no_delay = LoginLimits { failure_delay: Duration::ZERO, ..LoginLimits::default() };
+        let config = tweak(FtpConfig::new(local, root.path(), tp).with_login_limits(no_delay));
         let handler = FtpControlHandler::new(
             Box::new(app),
             runtime(),
@@ -89,7 +93,9 @@ impl Session {
             "127.0.0.1:50000".parse().unwrap(),
             local,
         );
-        let mut peer = Peer::connect(handler, |h| h.busy.load(std::sync::atomic::Ordering::Relaxed));
+        let mut peer = Peer::connect(handler, |h| {
+            h.busy.load(std::sync::atomic::Ordering::Relaxed) || h.login_gate.load(std::sync::atomic::Ordering::Relaxed)
+        });
         let greeting = peer.take();
         Session { peer, policy, root, greeting }
     }
@@ -187,6 +193,158 @@ fn login_needs_user_then_pass() {
     assert!(s.run("PWD").starts_with("257 "));
     assert_eq!(s.peer.handler.metrics.auth_ok.load(std::sync::atomic::Ordering::Relaxed), 1);
     assert_eq!(s.peer.handler.metrics.auth_fail.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+// -- login limits (issue #518) -----------------------------------------------
+
+fn limits(tweak: impl FnOnce(&mut LoginLimits)) -> impl FnOnce(FtpConfig) -> FtpConfig {
+    move |c| {
+        let mut l = LoginLimits { failure_delay: Duration::ZERO, ..LoginLimits::default() };
+        tweak(&mut l);
+        c.with_login_limits(l)
+    }
+}
+
+#[test]
+fn a_connection_that_keeps_failing_to_log_in_is_closed_at_the_limit() {
+    let mut s = Session::with(limits(|l| l.max_failures_per_connection = 3));
+    assert!(s.run("USER u").starts_with("331 "));
+    assert!(s.run("PASS wrong1").starts_with("530 "));
+    assert!(s.run("PASS wrong2").starts_with("530 "));
+    assert!(!s.peer.is_closed());
+    let last = s.run("PASS wrong3");
+    assert!(last.starts_with("421 "), "{last}");
+    assert!(s.peer.is_closed());
+}
+
+#[test]
+fn the_right_password_after_the_limit_gets_nowhere() {
+    let mut s = Session::with(limits(|l| l.max_failures_per_connection = 2));
+    s.run("USER u");
+    s.run("PASS wrong1");
+    assert!(s.run("PASS wrong2").starts_with("421 "));
+    assert!(s.peer.is_closed());
+    assert!(s.run("PASS p").is_empty(), "nothing is answered on a closed connection");
+}
+
+#[test]
+fn a_login_that_works_is_not_counted_against_the_limit() {
+    let mut s = Session::with(limits(|l| l.max_failures_per_connection = 2));
+    s.run("USER u");
+    s.run("PASS wrong");
+    assert!(s.run("PASS p").starts_with("230 "), "one failure, then the right password");
+    assert!(!s.peer.is_closed());
+}
+
+#[test]
+fn a_limit_of_zero_means_no_limit() {
+    let mut s = Session::with(limits(|l| {
+        l.max_failures_per_connection = 0;
+        l.lockout_after = 0;
+    }));
+    s.run("USER u");
+    for _ in 0..20 {
+        assert!(s.run("PASS wrong").starts_with("530 "));
+    }
+    assert!(s.run("PASS p").starts_with("230 "));
+}
+
+#[test]
+fn a_failed_login_is_answered_only_after_the_delay() {
+    let mut s = Session::with(limits(|l| l.failure_delay = Duration::from_millis(250)));
+    s.run("USER u");
+    let started = Instant::now();
+    let reply = s.run("PASS wrong");
+    assert!(reply.starts_with("530 "), "{reply}");
+    assert!(started.elapsed() >= Duration::from_millis(250), "answered after {:?}", started.elapsed());
+}
+
+#[test]
+fn commands_sent_behind_a_failed_login_wait_for_it_and_are_answered_in_order() {
+    let mut s = Session::with(limits(|l| l.failure_delay = Duration::from_millis(150)));
+    s.run("USER u");
+    // a client that does not wait for the answer cannot get ahead of the delay
+    let started = Instant::now();
+    let replies = s.peer.run("PASS wrong\r\nPASS p\r\nPWD\r\n");
+    assert!(started.elapsed() >= Duration::from_millis(150));
+    let codes: Vec<&str> = replies.lines().map(|l| &l[..3]).collect();
+    assert_eq!(codes, ["530", "230", "257"], "{replies}");
+}
+
+#[test]
+fn a_login_that_works_is_not_delayed() {
+    let mut s = Session::with(limits(|l| l.failure_delay = Duration::from_secs(5)));
+    let started = Instant::now();
+    s.login();
+    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+}
+
+#[test]
+fn guesses_pipelined_in_one_burst_stop_at_the_limit() {
+    let mut s = Session::with(limits(|l| l.max_failures_per_connection = 3));
+    s.run("USER u");
+    let replies = s.peer.run("PASS a\r\nPASS b\r\nPASS c\r\nPASS p\r\n");
+    let codes: Vec<&str> = replies.lines().map(|l| &l[..3]).collect();
+    assert_eq!(codes, ["530", "530", "421"], "the correct password at the end is never looked at: {replies}");
+    assert!(s.peer.is_closed());
+}
+
+#[test]
+fn failures_from_one_address_lock_it_out_across_connections() {
+    let shared = Arc::new(LoginThrottle::default());
+    let session = |shared: &Arc<LoginThrottle>| {
+        let shared = Arc::clone(shared);
+        Session::with(move |c| {
+            let mut c = limits(|l| {
+                l.max_failures_per_connection = 3;
+                l.lockout_after = 5;
+                l.lockout_duration = Duration::from_millis(400);
+            })(c);
+            c.throttle = shared;
+            c
+        })
+    };
+    let mut first = session(&shared);
+    first.run("USER u");
+    first.run("PASS x");
+    first.run("PASS x");
+    assert!(first.run("PASS x").starts_with("421 "), "three failures: the connection limit");
+    // the second connection adds two more and reaches the five
+    let mut second = session(&shared);
+    assert!(second.greeting.starts_with("220 "));
+    second.run("USER u");
+    assert!(second.run("PASS x").starts_with("530 "));
+    let r = second.run("PASS x");
+    assert!(r.starts_with("421 "), "the fifth failure from the address locks it out: {r}");
+    // a third is turned away before it can try anything
+    let third = session(&shared);
+    assert!(third.greeting.starts_with("421 "), "{}", third.greeting);
+    assert!(third.peer.is_closed());
+    // and it is let in again when the lockout ends
+    std::thread::sleep(Duration::from_millis(450));
+    let mut later = session(&shared);
+    assert!(later.greeting.starts_with("220 "), "{}", later.greeting);
+    later.login();
+}
+
+#[test]
+fn lockout_can_be_turned_off() {
+    let shared = Arc::new(LoginThrottle::default());
+    for _ in 0..4 {
+        let shared = Arc::clone(&shared);
+        let mut s = Session::with(move |c| {
+            let mut c = limits(|l| {
+                l.max_failures_per_connection = 2;
+                l.lockout_after = 0;
+            })(c);
+            c.throttle = shared;
+            c
+        });
+        assert!(s.greeting.starts_with("220 "));
+        s.run("USER u");
+        s.run("PASS x");
+        assert!(s.run("PASS x").starts_with("421 "));
+    }
 }
 
 #[test]

@@ -2,11 +2,12 @@
 
 //! FTP control connection (`ProtocolHandler`).
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::UNIX_EPOCH;
+use std::time::{Instant, UNIX_EPOCH};
 
 use hopf_core::{
     BindingId, Endpoint, ProtocolHandler, Runtime, StorageError, StorageExecutor,
@@ -67,6 +68,40 @@ pub struct FtpControlHandler {
     /// [`PendingOpenOutcome`]).
     busy: Arc<AtomicBool>,
     pending_open: Arc<Mutex<Option<PendingOpenOutcome>>>,
+    /// Failed USER/PASS attempts on this connection (issue #518).
+    failed_logins: u32,
+    /// Set while a failed login is being left unanswered (see
+    /// [`LoginLimits::failure_delay`](crate::LoginLimits::failure_delay)):
+    /// commands that arrive meanwhile wait in `held`.
+    login_gate: Arc<AtomicBool>,
+    /// The reply to the failed login that the delay is holding back.
+    delayed_reply: Option<(u16, &'static str)>,
+    held: VecDeque<FtpCommand>,
+}
+
+/// Commands held behind a failed login before the connection is dropped: a
+/// client that has sent this many without waiting for an answer is not
+/// waiting for the delay either.
+const MAX_HELD_COMMANDS: usize = 64;
+
+/// Release the commands held behind a failed login once its delay is over:
+/// send the reply the delay was holding back, then run the commands in
+/// order, stopping again if one of them is another failed login.
+fn sync_login_delay(handler: &mut FtpControlHandler, endpoint: &mut dyn Endpoint) {
+    while !handler.login_gate.load(Ordering::Relaxed) {
+        if endpoint.is_closing() {
+            // Closed (too many failures): what was sent behind them is not answered.
+            handler.held.clear();
+            return;
+        }
+        if let Some((code, text)) = handler.delayed_reply.take() {
+            handler.send_reply(endpoint, code, text);
+        }
+        let Some(cmd) = handler.held.pop_front() else {
+            return;
+        };
+        handler.dispatch(endpoint, cmd);
+    }
 }
 
 /// A RETR/STOR file-open offloaded via `file_system_handle` (issue #188),
@@ -203,6 +238,10 @@ impl FtpControlHandler {
             conn_trace: None,
             busy: Arc::new(AtomicBool::new(false)),
             pending_open: Arc::new(Mutex::new(None)),
+            failed_logins: 0,
+            login_gate: Arc::new(AtomicBool::new(false)),
+            delayed_reply: None,
+            held: VecDeque::new(),
         }
     }
 
@@ -582,11 +621,42 @@ impl FtpControlHandler {
             FtpAuthResult::NeedPassword => {
                 self.send_reply(endpoint, 331, "User name okay, need password");
             }
-            _ => {
-                self.record_auth(false);
-                self.send_reply(endpoint, 530, "Login incorrect");
-            }
+            _ => self.login_failed(endpoint),
         }
+    }
+
+    /// A USER or PASS was refused. Count it against the connection and the
+    /// source address; close the connection if that is too many; otherwise
+    /// answer after the configured delay, so that each guess costs time
+    /// (issue #518).
+    fn login_failed(&mut self, endpoint: &mut dyn Endpoint) {
+        self.record_auth(false);
+        self.failed_logins += 1;
+        let limits = self.config.login_limits;
+        let locked = self.config.throttle.record_failure(self.meta.peer.ip(), &limits, Instant::now());
+        let too_many = limits.max_failures_per_connection > 0 && self.failed_logins >= limits.max_failures_per_connection;
+        if locked || too_many {
+            self.send_reply(endpoint, 421, "Too many failed login attempts");
+            endpoint.close();
+            return;
+        }
+        let Some(handle) = self.control_handle.clone().filter(|_| !limits.failure_delay.is_zero()) else {
+            self.send_reply(endpoint, 530, "Login incorrect");
+            return;
+        };
+        self.delayed_reply = Some((530, "Login incorrect"));
+        self.login_gate.store(true, Ordering::Relaxed);
+        let gate = Arc::clone(&self.login_gate);
+        let wake = handle.clone();
+        handle.schedule_timer(
+            limits.failure_delay,
+            Box::new(move || {
+                wake.with_endpoint(move |ep| {
+                    gate.store(false, Ordering::Relaxed);
+                    ep.poke_handler();
+                });
+            }),
+        );
     }
 
     fn cmd_pass(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
@@ -607,10 +677,7 @@ impl FtpControlHandler {
             FtpAuthResult::NeedAccount => {
                 self.send_reply(endpoint, 332, "Need account for login");
             }
-            _ => {
-                self.record_auth(false);
-                self.send_reply(endpoint, 530, "Login incorrect");
-            }
+            _ => self.login_failed(endpoint),
         }
     }
 
@@ -1550,6 +1617,16 @@ impl ProtocolHandler for FtpControlHandler {
         if let Some(b) = &self.bridge {
             b.set_control(endpoint.handle());
         }
+        if self.config.throttle.is_locked(self.meta.peer.ip(), Instant::now()) {
+            // A source that has been locked out is not given a banner, and
+            // under implicit TLS not even a refusal: there is no handshake
+            // to carry one.
+            if !self.config.implicit_tls {
+                self.send_reply(endpoint, 421, "Too many failed logins from your address; try again later");
+            }
+            endpoint.close();
+            return;
+        }
         if self.config.implicit_tls {
             // Implicit FTPS: the TLS handshake happens automatically before
             // any bytes are decrypted or encrypted — the welcome banner has
@@ -1563,6 +1640,11 @@ impl ProtocolHandler for FtpControlHandler {
 
     fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
         hopf_core::with_slice(buf, |data| {
+            if endpoint.is_closing() {
+                // Take what arrived without reading it, so it is not offered again.
+                *data = &data[data.len()..];
+                return;
+            }
             // Dispatch first so an `ABOR` in this burst can mark the bridge
             // aborted before [`sync_pending_open`] applies a RETR/STOR that
             // finished on the storage pool between commands (otherwise a
@@ -1570,9 +1652,14 @@ impl ProtocolHandler for FtpControlHandler {
             // ABOR would reply 426/226 — the flake seen on CI for
             // `abor_racing_ahead_of_a_pending_open_suppresses_the_transfer`).
             let cmds = self.lexer.feed(data);
-            for cmd in cmds {
-                self.dispatch(endpoint, cmd);
+            self.held.extend(cmds);
+            if self.held.len() > MAX_HELD_COMMANDS {
+                self.held.clear();
+                self.send_reply(endpoint, 421, "Too many commands without waiting for a reply");
+                endpoint.close();
+                return;
             }
+            sync_login_delay(self, endpoint);
             sync_pending_open(self, endpoint);
         });
     }
