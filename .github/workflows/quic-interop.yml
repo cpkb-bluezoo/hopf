@@ -15,8 +15,6 @@ on:
         description: 'hopf commit, branch or tag to build from (empty = this commit)'
         default: ''
         type: string
-  schedule:
-    - cron: '0 4 * * 1'
 
 permissions:
   contents: read
@@ -53,7 +51,7 @@ jobs:
         env:
           PEERS: ${{ inputs.peers }}
         run: |
-          if [ "$GITHUB_EVENT_NAME" = schedule ] || [ -z "$PEERS" ]; then
+          if [ -z "$PEERS" ]; then
             PEERS="$DEFAULT_PEERS"
           fi
           curl -fsSL https://raw.githubusercontent.com/quic-interop/quic-interop-runner/master/implementations_quic.json > known.json
