@@ -51,6 +51,18 @@ pub struct WebDavConfig {
     /// related properties. Privileges are checked via
     /// [`RolePolicy::is_user_in_role`] using role names prefixed with
     /// [`crate::constants::ROLE_PREFIX`] (e.g. `webdav:read`).
+    ///
+    /// The privileges are also **enforced**: before a method runs, the
+    /// authenticated user must hold the privileges RFC 3744 appendix B names
+    /// for it (`read` for GET, HEAD and PROPFIND; `write-properties` for
+    /// PROPPATCH; `write-content` to replace a resource and `bind` on its
+    /// collection to create one with PUT, MKCOL or LOCK; `unbind` for DELETE;
+    /// `read` and `bind` for COPY and `unbind` and `bind` for MOVE, with more
+    /// when the destination exists; `unlock` for UNLOCK). A user who lacks one
+    /// gets `403` with the `DAV:need-privileges` precondition. A privilege is
+    /// a role held on every resource: there are no per-resource ACLs. A
+    /// request without an authenticated user holds nothing, so authentication
+    /// must be arranged in front of the factory. `OPTIONS` needs no privilege.
     pub role_policy: Option<Arc<dyn RolePolicy>>,
     /// `Cache-Control` sent on file `GET`/`HEAD` responses (and their `304`s),
     /// telling caches how long a file stays fresh. `None` (the default) sends

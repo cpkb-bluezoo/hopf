@@ -83,6 +83,7 @@
 <ul>
 <li><a href="#standards">Standards</a></li>
 <li><a href="#architecture">Architecture</a></li>
+<li><a href="#access-control-rfc-3744">Access control (RFC 3744)</a></li>
 <li><a href="#methods-and-allow-matrix">Methods and Allow matrix</a></li>
 <li><a href="#depth-headers-and-locks">Depth, headers, and locks</a></li>
 <li><a href="#live-and-dead-properties">Live and dead properties</a></li>
@@ -129,6 +130,29 @@ WebDavFactory → WebDavHandler (ServerHandler)
         ├── WebDavLockManager (in-memory, or file-backed under lock_root)
         └── DeadPropertyStore (xattr | sidecar [next to resource | under sidecar_root] | none)</code></pre>
 <p>Auth is <strong>not</strong> implemented in this crate. Put HTTP Basic/Digest/Bearer (<a href="auth.html">Auth</a> / <code>hopf-http</code> auth factories) or ACL (<a href="access-control.html">Access control</a>) around the listener.</p>
+<h2 id="access-control-rfc-3744">Access control (RFC 3744)</h2>
+<p>Set <code>WebDavConfig::role_policy</code> (with <code>webdav_enabled</code>) and the crate reports <code>DAV:current-user-privilege-set</code> and the other RFC 3744 properties and <strong>enforces</strong> privileges. A privilege is a role named <code>webdav:</code> plus the privilege, such as <code>webdav:read</code> or <code>webdav:bind</code>; <code>webdav:all</code> and <code>webdav:write</code> hold the privileges below them in the supported-privilege-set. The user is the one the authentication wrapper in front of the factory has set; a request without one holds nothing.</p>
+<p>Before a method does anything, the user must hold the privileges RFC 3744 appendix B names for it, or the response is <code>403</code> with the <code>DAV:need-privileges</code> precondition naming the resource and privilege.</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Privileges</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>GET, HEAD, PROPFIND</td><td><code>read</code> on the resource</td></tr>
+<tr><td>PROPPATCH</td><td><code>write-properties</code> on the resource</td></tr>
+<tr><td>PUT, LOCK</td><td><code>write-content</code> on an existing resource; <code>bind</code> on its collection to create one</td></tr>
+<tr><td>MKCOL</td><td><code>bind</code> on the parent collection</td></tr>
+<tr><td>DELETE</td><td><code>unbind</code> on the parent collection</td></tr>
+<tr><td>COPY</td><td><code>read</code> on the source; <code>bind</code> on the destination's collection, or <code>write-content</code> and <code>write-properties</code> on an existing destination</td></tr>
+<tr><td>MOVE</td><td><code>unbind</code> on the source's collection and <code>bind</code> on the destination's; also <code>unbind</code> on the destination's when it exists</td></tr>
+<tr><td>UNLOCK</td><td><code>unlock</code> on the resource</td></tr>
+<tr><td>OPTIONS</td><td>none</td></tr>
+</tbody>
+</table>
+<p>Privileges are roles, so a user holds a privilege on every resource alike; there are no per-resource ACLs, and the <code>ACL</code> method answers <code>403</code>.</p>
 <h2 id="methods-and-allow-matrix">Methods and Allow matrix</h2>
 <table>
 <colgroup>
@@ -478,7 +502,7 @@ WebDavFactory → WebDavHandler (ServerHandler)
 <h2 id="limitations">Limitations</h2>
 <ul>
 <li>Locks are <strong>in-memory per factory</strong> by default (not clustered); set <code>WebDavConfig::lock_root</code> to share file-backed lock records across handlers pointed at the same content, but only on a filesystem with atomic create-new and immediately-visible writes (a local disk, not NFS).</li>
-<li>No in-crate auth or ACL — compose with HTTP auth / <code>PeerAcl</code>.</li>
+<li>No in-crate authentication — compose with HTTP auth / <code>PeerAcl</code>. RFC 3744 privileges are enforced as roles held on every resource; no per-resource ACLs.</li>
 <li>Feature <code>xattr</code> required for real xattrs; <code>Auto</code> falls back to sidecar.</li>
 <li>Not a standalone service crate; always behind HTTP.</li>
 <li>No Gumdrop-style separate WebDAV RBAC surface in this crate.</li>

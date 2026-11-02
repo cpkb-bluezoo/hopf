@@ -19,11 +19,12 @@ use hopf_http::{
     ServerResponseHandle, ServerWriter, Validators,
 };
 
-use crate::acl::{acl_live_property_names, write_acl_live_properties, AclContext};
+use crate::acl::{acl_live_property_names, parent_href, write_acl_live_properties, AclContext, AclDenied};
 use crate::constants::{
     self, CONTENT_TYPE_XML, DEPTH_0, DEPTH_1, DEPTH_INFINITY, HEADER_DAV, HEADER_DEPTH,
     HEADER_DESTINATION, HEADER_IF, HEADER_LOCK_TOKEN, HEADER_OVERWRITE,
-    MAX_WEBDAV_REQUEST_BODY, NAMESPACE,
+    MAX_WEBDAV_REQUEST_BODY, NAMESPACE, PRIV_BIND, PRIV_READ, PRIV_UNBIND, PRIV_UNLOCK,
+    PRIV_WRITE_CONTENT, PRIV_WRITE_PROPERTIES,
 };
 use crate::dead_props::{DeadPropertyStore, is_sidecar_file, is_sidecar_name};
 use crate::factory::WebDavConfig;
@@ -157,6 +158,23 @@ impl WebDavHandler {
         w.complete();
     }
 
+    /// `403` with the `DAV:need-privileges` precondition (RFC 3744 section 7.1.1).
+    fn send_denied(w: &mut dyn ServerWriter, denied: &AclDenied) {
+        Self::send_bytes(w, 403, CONTENT_TYPE_XML, &denied.body());
+    }
+
+    /// Does the user hold the privileges `needs`? If not the request has
+    /// been refused. Privileges are checked before a method does anything.
+    fn permitted(&self, w: &mut dyn ServerWriter, needs: &[(&str, &'static str)]) -> bool {
+        match self.acl_context().require(needs) {
+            Ok(()) => true,
+            Err(denied) => {
+                Self::send_denied(w, &denied);
+                false
+            }
+        }
+    }
+
     fn send_bytes(w: &mut dyn ServerWriter, code: u16, content_type: &str, body: &[u8]) {
         let mut h = Headers::new();
         h.status(code);
@@ -185,7 +203,10 @@ impl WebDavHandler {
                 rh.execute(move |writer| match result {
                     Ok(v) => on_ok(v, writer),
                     Err(StorageError::Rejected) => Self::send_error(writer, 503),
-                    Err(StorageError::Task(_)) => Self::send_error(writer, 500),
+                    Err(StorageError::Task(e)) => match e.downcast::<AclDenied>() {
+                        Ok(denied) => Self::send_denied(writer, &denied),
+                        Err(_) => Self::send_error(writer, 500),
+                    },
                 });
             },
         );
@@ -249,8 +270,11 @@ impl ServerHandler for WebDavHandler {
                 self.start_webdav_body(response)
             }
             "MKCOL" if self.config.webdav_enabled && self.config.allow_write => {
-                self.mkcol_pending = true;
-                self.mkcol_had_body = false;
+                let parent = parent_href(&self.href());
+                if self.permitted(response, &[(&parent, PRIV_BIND)]) {
+                    self.mkcol_pending = true;
+                    self.mkcol_had_body = false;
+                }
             }
             "COPY" if self.config.webdav_enabled && self.config.allow_write => {
                 self.handle_copy(response)
@@ -387,8 +411,18 @@ impl WebDavHandler {
     }
 
     fn start_webdav_body(&mut self, w: &mut dyn ServerWriter) {
+        // LOCK is checked once it is known whether the resource exists.
+        let privilege = match self.method.as_str() {
+            "PROPFIND" => Some(PRIV_READ),
+            "PROPPATCH" => Some(PRIV_WRITE_PROPERTIES),
+            _ => None,
+        };
+        if let Some(privilege) = privilege {
+            if !self.permitted(w, &[(&self.href(), privilege)]) {
+                return;
+            }
+        }
         self.webdav_parser = Some(WebDavRequestParser::new(MAX_WEBDAV_REQUEST_BODY));
-        let _ = w;
     }
 
     fn finish_webdav(&mut self, w: &mut dyn ServerWriter, parsed: WebDavParsed) {
@@ -401,6 +435,9 @@ impl WebDavHandler {
     }
 
     fn handle_get_head(&mut self, w: &mut dyn ServerWriter) {
+        if !self.permitted(w, &[(&self.href(), PRIV_READ)]) {
+            return;
+        }
         let preconditions = self.preconditions.clone();
         let method = self.method.clone();
         let cache_control = self.config.cache_control.as_ref().filter(|c| !c.is_empty()).map(|c| c.to_string());
@@ -592,6 +629,8 @@ impl WebDavHandler {
         let canonical = self.canonical_root.clone();
         let storage = Arc::clone(&self.storage);
         let preconditions = self.preconditions.clone();
+        let acl = self.acl_context();
+        let href = self.href();
 
         let op_state = Arc::clone(&state);
         let cb_state = Arc::clone(&state);
@@ -603,6 +642,13 @@ impl WebDavHandler {
                 let Some(resolved) = canonicalize_path(&root, &canonical, &lexical) else {
                     return Ok(Some(403));
                 };
+                // Replacing a resource writes its content; creating one binds
+                // it into its collection (RFC 3744 appendix B).
+                if resolved.exists() {
+                    acl.require(&[(&href, PRIV_WRITE_CONTENT)])?;
+                } else {
+                    acl.require(&[(&parent_href(&href), PRIV_BIND)])?;
+                }
                 if resolved.is_dir() {
                     return Ok(Some(409));
                 }
@@ -630,9 +676,17 @@ impl WebDavHandler {
                 }
             },
             move |result: Result<Option<u16>, StorageError>| {
+                let mut denied = None;
                 let status = match result {
                     Ok(Some(status)) => Some(status),
                     Ok(None) => None,
+                    Err(StorageError::Task(e)) => match e.downcast::<AclDenied>() {
+                        Ok(d) => {
+                            denied = Some(d);
+                            Some(403)
+                        }
+                        Err(_) => Some(500),
+                    },
                     Err(_) => Some(500),
                 };
                 let mut g = cb_state.lock().unwrap();
@@ -645,7 +699,10 @@ impl WebDavHandler {
                     g.done = true;
                     g.queue.clear();
                     drop(g);
-                    cb_rh.execute(move |w| Self::send_error(w, status));
+                    cb_rh.execute(move |w| match denied {
+                        Some(d) => Self::send_denied(w, &d),
+                        None => Self::send_error(w, status),
+                    });
                     return;
                 }
                 g.open_done = true;
@@ -667,6 +724,9 @@ impl WebDavHandler {
     }
 
     fn handle_delete(&mut self, w: &mut dyn ServerWriter) {
+        if !self.permitted(w, &[(&parent_href(&self.href()), PRIV_UNBIND)]) {
+            return;
+        }
         if !self.check_mutating_preconditions(w) {
             return;
         }
@@ -779,7 +839,17 @@ impl WebDavHandler {
         let depth = self.depth;
         let mut store = self.dead_store.clone();
         let max_tree_entries = self.config.max_tree_entries;
+        let acl = self.acl_context();
+        let src_href = self.href();
+        let dest_href = href_for_path(destination_path_part(&dest_hdr));
         self.offload(w, move || {
+            // MOVE unbinds the source from its collection; COPY reads it
+            // (RFC 3744 appendix B).
+            if is_move {
+                acl.require(&[(&parent_href(&src_href), PRIV_UNBIND)])?;
+            } else {
+                acl.require(&[(&src_href, PRIV_READ)])?;
+            }
             let Some(src_lex) = src else {
                 return Ok(404u16);
             };
@@ -795,7 +865,19 @@ impl WebDavHandler {
             if is_move && depth == DEPTH_0 {
                 return Ok(403);
             }
-            if dest_path.exists() {
+            let dest_exists = dest_path.exists();
+            let dest_parent = parent_href(&dest_href);
+            if is_move {
+                acl.require(&[(&dest_parent, PRIV_BIND)])?;
+                if dest_exists {
+                    acl.require(&[(&dest_parent, PRIV_UNBIND)])?;
+                }
+            } else if dest_exists {
+                acl.require(&[(&dest_href, PRIV_WRITE_CONTENT), (&dest_href, PRIV_WRITE_PROPERTIES)])?;
+            } else {
+                acl.require(&[(&dest_parent, PRIV_BIND)])?;
+            }
+            if dest_exists {
                 if !overwrite {
                     return Ok(412);
                 }
@@ -833,6 +915,9 @@ impl WebDavHandler {
     }
 
     fn handle_unlock(&mut self, w: &mut dyn ServerWriter) {
+        if !self.permitted(w, &[(&self.href(), PRIV_UNLOCK)]) {
+            return;
+        }
         let token = self
             .lock_token
             .clone()
@@ -867,6 +952,7 @@ impl WebDavHandler {
         let lock_mgr = Arc::clone(&self.lock_manager);
         let lock_req = parsed.lock.unwrap_or_default();
         let refresh_token = self.lock_token.clone();
+        let acl = self.acl_context();
 
         if let Some(token) = refresh_token {
             let token = token.trim().trim_matches(|c| c == '<' || c == '>').to_string();
@@ -891,6 +977,7 @@ impl WebDavHandler {
             return;
         }
 
+        let acl_href = href.clone();
         self.offload(w, move || {
             let Some(lex) = path else {
                 return Ok(LockOutcome::Status(404));
@@ -898,6 +985,14 @@ impl WebDavHandler {
             let Some(resolved) = canonicalize_path(&root, &canonical, &lex) else {
                 return Ok(LockOutcome::Status(404));
             };
+            // Locking a resource needs write-content on it; locking an
+            // unmapped URL creates it, which binds it into its collection
+            // (RFC 3744 appendix B).
+            if resolved.exists() {
+                acl.require(&[(&acl_href, PRIV_WRITE_CONTENT)])?;
+            } else {
+                acl.require(&[(&parent_href(&acl_href), PRIV_BIND)])?;
+            }
             // RFC 4918 §7.3: LOCK on an unmapped URL creates a locked empty
             // non-collection resource (recommended model). Parent collections
             // must already exist — we do not mkdir -p here.
@@ -1407,18 +1502,22 @@ fn format_http_date(secs: i64) -> String {
     )
 }
 
+/// The path of a `Destination` header, which may be an absolute URI.
+fn destination_path_part(dest: &str) -> &str {
+    if let Some(idx) = dest.find("://") {
+        let rest = &dest[idx + 3..];
+        rest.find('/').map(|i| &rest[i..]).unwrap_or("/")
+    } else {
+        dest
+    }
+}
+
 fn resolve_destination(
     root: &Path,
     canonical: &Path,
     dest: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let path_part = if let Some(idx) = dest.find("://") {
-        let rest = &dest[idx + 3..];
-        rest.find('/').map(|i| &rest[i..]).unwrap_or("/")
-    } else {
-        dest
-    };
-    let req = path_part.trim_start_matches('/');
+    let req = destination_path_part(dest).trim_start_matches('/');
     let lexical = resolve_path_lexical(root, req).ok_or_else(|| io_err("bad destination"))?;
     canonicalize_path(root, canonical, &lexical).ok_or_else(|| io_err("bad destination"))
 }

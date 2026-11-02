@@ -25,6 +25,69 @@ pub(crate) struct AclContext {
     pub roles: Option<Arc<dyn RolePolicy>>,
 }
 
+/// A request refused because the user lacks privileges (RFC 3744 section 7.1.1):
+/// each missing privilege with the resource it was needed on.
+#[derive(Debug)]
+pub(crate) struct AclDenied(pub Vec<(String, &'static str)>);
+
+impl std::fmt::Display for AclDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "missing privileges:")?;
+        for (href, privilege) in &self.0 {
+            write!(f, " {privilege} on {href}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for AclDenied {}
+
+impl AclDenied {
+    /// The `403` body: the `DAV:need-privileges` precondition.
+    pub(crate) fn body(&self) -> Vec<u8> {
+        crate::xml_out::write_need_privileges(&self.0)
+    }
+}
+
+impl AclContext {
+    /// Does the user hold every privilege in `needs`, each given with the
+    /// href of the resource it is needed on? Privileges are roles, held
+    /// alike on every resource, so the href is only for the report. Not
+    /// enforced, and always satisfied, when ACL is not enabled. Names every
+    /// privilege that is missing, not only the first.
+    pub(crate) fn require(&self, needs: &[(&str, &'static str)]) -> Result<(), AclDenied> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let missing: Vec<(String, &'static str)> = needs
+            .iter()
+            .filter(|(_, privilege)| !self.holds(privilege))
+            .map(|(href, privilege)| (href.to_string(), *privilege))
+            .collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(AclDenied(missing))
+        }
+    }
+
+    fn holds(&self, privilege: &str) -> bool {
+        match self.roles.as_deref() {
+            Some(roles) => has_privilege(roles, self.username.as_deref(), privilege),
+            None => false,
+        }
+    }
+}
+
+/// The href of the collection that contains `href`.
+pub(crate) fn parent_href(href: &str) -> String {
+    let trimmed = href.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(i) => trimmed[..=i].to_string(),
+        None => "/".to_string(),
+    }
+}
+
 const LEAF_PRIVILEGES: &[&str] = &[
     PRIV_READ,
     PRIV_WRITE_PROPERTIES,
@@ -444,6 +507,83 @@ mod tests {
         let mut w = crate::xml_out::PropXmlWriter::new_vec();
         let ctx = AclContext { enabled: true, username: Some("alice".into()), roles: None };
         assert_eq!(write_acl_live_properties(&mut w, &ctx), Err(500));
+    }
+
+    #[test]
+    fn require_is_satisfied_by_the_privileges_held_and_those_that_contain_them() {
+        let write = ctx_for(Some("w"), RoleMembership::new().with_role("w", "webdav:write"));
+        for p in ["write-content", "bind", "unbind", "write-properties", "unlock"] {
+            assert!(write.require(&[("/x", p)]).is_ok(), "write holds {p}");
+        }
+        assert!(write.require(&[("/x", "read")]).is_err(), "write does not hold read");
+        let all = ctx_for(Some("a"), RoleMembership::new().with_role("a", "webdav:all"));
+        assert!(all.require(&[("/", "read"), ("/", "bind"), ("/x", "write-content")]).is_ok());
+        let leaf = ctx_for(Some("l"), RoleMembership::new().with_role("l", "webdav:bind"));
+        assert!(leaf.require(&[("/", "bind")]).is_ok());
+        assert!(leaf.require(&[("/", "unbind")]).is_err(), "a leaf is only itself");
+    }
+
+    #[test]
+    fn require_names_every_privilege_that_is_missing_and_where() {
+        let ctx = ctx_for(Some("u"), RoleMembership::new().with_role("u", "webdav:read"));
+        let denied = ctx
+            .require(&[("/a", "read"), ("/a", "write-content"), ("/b/", "bind")])
+            .unwrap_err();
+        assert_eq!(denied.0, [("/a".to_string(), "write-content"), ("/b/".to_string(), "bind")]);
+    }
+
+    #[test]
+    fn require_refuses_an_anonymous_user_and_a_missing_policy() {
+        let anonymous = ctx_for(None, RoleMembership::new().with_role("alice", "webdav:all"));
+        assert!(anonymous.require(&[("/", "read")]).is_err());
+        let no_policy = AclContext { enabled: true, username: Some("alice".into()), roles: None };
+        assert!(no_policy.require(&[("/", "read")]).is_err(), "fails closed");
+    }
+
+    #[test]
+    fn require_asks_nothing_when_acl_is_disabled() {
+        let off = AclContext { enabled: false, username: None, roles: None };
+        assert!(off.require(&[("/", "read"), ("/", "write-content")]).is_ok());
+    }
+
+    #[test]
+    fn the_need_privileges_body_groups_privileges_by_resource() {
+        let denied = AclDenied(vec![
+            ("/a".to_string(), "write-content"),
+            ("/b/".to_string(), "bind"),
+            ("/a".to_string(), "write-properties"),
+        ]);
+        let body = String::from_utf8(denied.body()).unwrap();
+        assert_eq!(
+            body,
+            "<D:error xmlns:D=\"DAV:\"><D:need-privileges>\
+             <D:resource><D:href>/a</D:href>\
+             <D:privilege><D:write-content/></D:privilege>\
+             <D:privilege><D:write-properties/></D:privilege></D:resource>\
+             <D:resource><D:href>/b/</D:href><D:privilege><D:bind/></D:privilege></D:resource>\
+             </D:need-privileges></D:error>"
+        );
+    }
+
+    #[test]
+    fn a_resource_href_is_escaped_in_the_body() {
+        let denied = AclDenied(vec![("/a&b<c>".to_string(), "read")]);
+        let body = String::from_utf8(denied.body()).unwrap();
+        assert!(body.contains("<D:href>/a&amp;b&lt;c&gt;</D:href>"), "{body}");
+    }
+
+    #[test]
+    fn the_parent_of_an_href_is_the_collection_that_contains_it() {
+        for (href, parent) in [
+            ("/f.txt", "/"),
+            ("/sub/f.txt", "/sub/"),
+            ("/sub/", "/"),
+            ("/a/b/c/", "/a/b/"),
+            ("/", "/"),
+            ("", "/"),
+        ] {
+            assert_eq!(parent_href(href), parent, "parent of {href:?}");
+        }
     }
 
     #[test]

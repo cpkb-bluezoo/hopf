@@ -39,6 +39,15 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
 
 ### Changed
 
+- **hopf-webdav (behaviour change):** RFC 3744 privileges are now enforced
+  whenever a `role_policy` is set; before, they were only reported (#512).
+  A method runs only if the authenticated user holds the privileges RFC 3744
+  appendix B requires for it, and is otherwise refused with `403` and the
+  `DAV:need-privileges` precondition. A deployment that set `role_policy` only
+  to report privileges must give its users the `webdav:*` roles they need, and
+  authenticate them; a request with no authenticated user holds no
+  privileges. Privileges are roles, held on every resource: per-resource ACLs
+  and the `ACL` method are still not supported.
 - Unit tests (`cargo test --lib`) do no socket or file I/O and do not wait
   for the clock. Those that do are behind each crate's `integration` feature.
   `scripts/check-hermetic-tests.sh` runs the unit tests with no network and a

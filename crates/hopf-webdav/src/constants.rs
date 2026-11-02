@@ -78,6 +78,8 @@ pub const ELEM_DESCRIPTION: &str = "description";
 pub const ELEM_AUTHENTICATED: &str = "authenticated";
 pub const ELEM_UNAUTHENTICATED: &str = "unauthenticated";
 pub const ELEM_ALL: &str = "all";
+pub const ELEM_NEED_PRIVILEGES: &str = "need-privileges";
+pub const ELEM_RESOURCE: &str = "resource";
 
 pub const PRIV_READ: &str = "read";
 pub const PRIV_WRITE_PROPERTIES: &str = "write-properties";

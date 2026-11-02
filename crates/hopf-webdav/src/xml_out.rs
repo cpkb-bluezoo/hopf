@@ -223,6 +223,38 @@ pub fn write_lock_discovery(w: &mut DavWriter, locks: &[WebDavLock], href: &str)
     dav_end(w)
 }
 
+/// The body of a `403` for a request refused for lack of privileges: the
+/// `DAV:need-privileges` precondition of RFC 3744 section 7.1.1, with one
+/// `DAV:resource` per resource and a `DAV:privilege` for each one missing.
+pub(crate) fn write_need_privileges(missing: &[(String, &'static str)]) -> Vec<u8> {
+    let mut w = dav_writer();
+    let written = (|| -> io::Result<()> {
+        dav_start(&mut w, constants::ELEM_ERROR)?;
+        w.write_namespace(PREFIX, NAMESPACE)?;
+        dav_start(&mut w, constants::ELEM_NEED_PRIVILEGES)?;
+        let mut hrefs: Vec<&str> = Vec::new();
+        for (href, _) in missing {
+            if !hrefs.contains(&href.as_str()) {
+                hrefs.push(href);
+            }
+        }
+        for href in hrefs {
+            dav_start(&mut w, constants::ELEM_RESOURCE)?;
+            dav_element_text(&mut w, constants::ELEM_HREF, href)?;
+            for (_, privilege) in missing.iter().filter(|(h, _)| h == href) {
+                dav_start(&mut w, constants::ELEM_PRIVILEGE)?;
+                dav_empty(&mut w, privilege)?;
+                dav_end(&mut w)?;
+            }
+            dav_end(&mut w)?;
+        }
+        dav_end(&mut w)?;
+        dav_end(&mut w)
+    })();
+    written.expect("XmlWriter");
+    finish(w)
+}
+
 pub fn write_active_lock(lock: &WebDavLock, lock_root_href: &str) -> Vec<u8> {
     let mut w = dav_writer();
     write_active_lock_into(&mut w, lock, lock_root_href).expect("XmlWriter");

@@ -956,3 +956,353 @@ fn sidecar_root_keeps_dead_properties_out_of_the_content_tree() {
 
     rt.shutdown();
 }
+
+// Issue #512: RFC 3744 privileges are enforced before each method runs.
+
+/// The password every test user has.
+fn acl_password() -> &'static str {
+    static PASSWORD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PASSWORD.get_or_init(|| hopf_auth::crypto::generate_nonce_hex(16))
+}
+
+fn basic_auth(user: &str) -> String {
+    format!(
+        "Basic {}",
+        hopf_auth::crypto::encode_base64(format!("{user}:{}", acl_password()).as_bytes())
+    )
+}
+
+/// A server with a role policy behind Basic authentication, and one user who
+/// holds exactly the privileges `privileges`.
+fn listen_acl(root: &std::path::Path, user: &str, privileges: &[&str]) -> (Runtime, std::net::SocketAddr) {
+    use hopf_auth::{PasswordStore, RolePolicy, TrustPolicy};
+    use hopf_http::auth::{BasicAuthConfig, BasicAuthFactory};
+
+    let mut store = PasswordStore::new().with_user(user, acl_password());
+    for p in privileges {
+        store = store.with_role(user, &format!("webdav:{p}"));
+    }
+    let store = Arc::new(store);
+    let roles: Arc<dyn RolePolicy> = store.clone();
+    let trust: Arc<dyn TrustPolicy> = store;
+    let storage = Arc::new(StorageExecutor::new(StorageConfig::default()));
+    let inner = Arc::new(
+        WebDavFactory::new(
+            WebDavConfig {
+                root_path: root.to_path_buf(),
+                allow_write: true,
+                webdav_enabled: true,
+                allow_unauthenticated_access: true,
+                role_policy: Some(roles),
+                ..Default::default()
+            },
+            storage,
+        )
+        .unwrap(),
+    );
+    let factory = Arc::new(BasicAuthFactory::new(inner, trust, BasicAuthConfig::new("test")));
+    let rt = Runtime::start(RuntimeConfig::default()).unwrap();
+    let (addr, _) = rt
+        .add_tcp_listener(TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
+            Box::new(CleartextHttpEndpoint::new(
+                Arc::clone(&factory) as Arc<dyn ServerHandlerFactory>,
+                HttpLimits::default(),
+            )) as Box<dyn ProtocolHandler>
+        }))
+        .unwrap();
+    thread::sleep(Duration::from_millis(50));
+    (rt, addr)
+}
+
+const PROPFIND_BODY: &str =
+    r#"<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:allprop/></D:propfind>"#;
+const PROPPATCH_BODY: &str = r#"<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:" xmlns:Z="urn:z"><D:set><D:prop><Z:colour>red</Z:colour></D:prop></D:set></D:propertyupdate>"#;
+const LOCK_BODY: &str = r#"<?xml version="1.0"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>"#;
+
+struct AclCase {
+    name: &'static str,
+    /// The files that exist before the request.
+    setup: fn(&std::path::Path),
+    /// The request, for the user named in the header.
+    request: fn(&str) -> String,
+    /// Each privilege the method needs, and on which resource.
+    needs: &'static [(&'static str, &'static str)],
+    /// Status when every privilege is held.
+    ok: u16,
+    /// Does the method change anything a refused request must leave alone?
+    mutates: bool,
+    /// Did the method do its work?
+    effect: fn(&std::path::Path) -> bool,
+}
+
+fn as_user(user: &str, method: &str, path: &str, fields: &[(&str, &str)], body: &str) -> String {
+    let authorization = basic_auth(user);
+    let mut f = vec![("Authorization", authorization.as_str())];
+    if body.is_empty() && !matches!(method, "GET" | "HEAD" | "PUT") {
+        f.push(("Content-Length", "0"));
+    }
+    f.extend_from_slice(fields);
+    req(method, path, &f, body)
+}
+
+fn acl_cases() -> Vec<AclCase> {
+    vec![
+        AclCase {
+            name: "GET",
+            setup: |d| fs::write(d.join("f.txt"), b"x").unwrap(),
+            request: |u| as_user(u, "GET", "/f.txt", &[], ""),
+            needs: &[("/f.txt", "read")],
+            ok: 200,
+            mutates: false,
+            effect: |_| true,
+        },
+        AclCase {
+            name: "PROPFIND",
+            setup: |d| fs::write(d.join("f.txt"), b"x").unwrap(),
+            request: |u| as_user(u, "PROPFIND", "/f.txt", &[("Depth", "0")], PROPFIND_BODY),
+            needs: &[("/f.txt", "read")],
+            ok: 207,
+            mutates: false,
+            effect: |_| true,
+        },
+        AclCase {
+            name: "PROPPATCH",
+            setup: |d| fs::write(d.join("f.txt"), b"x").unwrap(),
+            request: |u| as_user(u, "PROPPATCH", "/f.txt", &[], PROPPATCH_BODY),
+            needs: &[("/f.txt", "write-properties")],
+            ok: 207,
+            mutates: false,
+            effect: |_| true,
+        },
+        AclCase {
+            name: "PUT creating",
+            setup: |_| {},
+            request: |u| as_user(u, "PUT", "/new.txt", &[], "data"),
+            needs: &[("/", "bind")],
+            ok: 201,
+            mutates: true,
+            effect: |d| d.join("new.txt").exists(),
+        },
+        AclCase {
+            name: "PUT replacing",
+            setup: |d| fs::write(d.join("f.txt"), b"old").unwrap(),
+            request: |u| as_user(u, "PUT", "/f.txt", &[], "new"),
+            needs: &[("/f.txt", "write-content")],
+            ok: 201,
+            mutates: true,
+            effect: |d| fs::read(d.join("f.txt")).unwrap() == b"new",
+        },
+        AclCase {
+            name: "MKCOL",
+            setup: |_| {},
+            request: |u| as_user(u, "MKCOL", "/col", &[], ""),
+            needs: &[("/", "bind")],
+            ok: 201,
+            mutates: true,
+            effect: |d| d.join("col").is_dir(),
+        },
+        AclCase {
+            name: "DELETE",
+            setup: |d| fs::write(d.join("f.txt"), b"x").unwrap(),
+            request: |u| as_user(u, "DELETE", "/f.txt", &[], ""),
+            needs: &[("/", "unbind")],
+            ok: 204,
+            mutates: true,
+            effect: |d| !d.join("f.txt").exists(),
+        },
+        AclCase {
+            name: "DELETE in a collection",
+            setup: |d| {
+                fs::create_dir(d.join("sub")).unwrap();
+                fs::write(d.join("sub/f.txt"), b"x").unwrap();
+            },
+            request: |u| as_user(u, "DELETE", "/sub/f.txt", &[], ""),
+            needs: &[("/sub/", "unbind")],
+            ok: 204,
+            mutates: true,
+            effect: |d| !d.join("sub/f.txt").exists(),
+        },
+        AclCase {
+            name: "COPY to a new name",
+            setup: |d| fs::write(d.join("f.txt"), b"x").unwrap(),
+            request: |u| as_user(u, "COPY", "/f.txt", &[("Destination", "/g.txt")], ""),
+            needs: &[("/f.txt", "read"), ("/", "bind")],
+            ok: 201,
+            mutates: true,
+            effect: |d| d.join("g.txt").exists(),
+        },
+        AclCase {
+            name: "COPY over an existing resource",
+            setup: |d| {
+                fs::write(d.join("f.txt"), b"source").unwrap();
+                fs::write(d.join("g.txt"), b"target").unwrap();
+            },
+            request: |u| as_user(u, "COPY", "/f.txt", &[("Destination", "/g.txt")], ""),
+            needs: &[("/f.txt", "read"), ("/g.txt", "write-content"), ("/g.txt", "write-properties")],
+            ok: 201,
+            mutates: true,
+            effect: |d| fs::read(d.join("g.txt")).unwrap() == b"source",
+        },
+        AclCase {
+            name: "MOVE to a new name",
+            setup: |d| fs::write(d.join("f.txt"), b"x").unwrap(),
+            request: |u| as_user(u, "MOVE", "/f.txt", &[("Destination", "/g.txt")], ""),
+            needs: &[("/", "unbind"), ("/", "bind")],
+            ok: 201,
+            mutates: true,
+            effect: |d| d.join("g.txt").exists() && !d.join("f.txt").exists(),
+        },
+        AclCase {
+            name: "MOVE over an existing resource",
+            setup: |d| {
+                fs::write(d.join("f.txt"), b"source").unwrap();
+                fs::create_dir(d.join("sub")).unwrap();
+                fs::write(d.join("sub/g.txt"), b"target").unwrap();
+            },
+            request: |u| {
+                as_user(u, "MOVE", "/f.txt", &[("Destination", "http://localhost/sub/g.txt")], "")
+            },
+            needs: &[("/", "unbind"), ("/sub/", "bind"), ("/sub/", "unbind")],
+            ok: 201,
+            mutates: true,
+            effect: |d| fs::read(d.join("sub/g.txt")).unwrap() == b"source" && !d.join("f.txt").exists(),
+        },
+        AclCase {
+            name: "LOCK of an existing resource",
+            setup: |d| fs::write(d.join("f.txt"), b"x").unwrap(),
+            request: |u| as_user(u, "LOCK", "/f.txt", &[("Depth", "0")], LOCK_BODY),
+            needs: &[("/f.txt", "write-content")],
+            ok: 200,
+            mutates: false,
+            effect: |_| true,
+        },
+        AclCase {
+            name: "LOCK of an unmapped URL",
+            setup: |_| {},
+            request: |u| as_user(u, "LOCK", "/n.txt", &[("Depth", "0")], LOCK_BODY),
+            needs: &[("/", "bind")],
+            ok: 201,
+            mutates: true,
+            effect: |d| d.join("n.txt").exists(),
+        },
+        AclCase {
+            name: "UNLOCK",
+            setup: |d| fs::write(d.join("f.txt"), b"x").unwrap(),
+            request: |u| as_user(u, "UNLOCK", "/f.txt", &[("Lock-Token", "<opaquelocktoken:none>")], ""),
+            needs: &[("/f.txt", "unlock")],
+            // No such lock: past the privilege check, the method itself says so.
+            ok: 409,
+            mutates: false,
+            effect: |_| true,
+        },
+    ]
+}
+
+/// Every method needs each of its privileges: a user holding all the others is
+/// refused with the `DAV:need-privileges` precondition naming the missing one,
+/// does nothing, and a user holding them all is served.
+#[test]
+fn every_method_checks_the_privileges_rfc_3744_requires() {
+    for case in acl_cases() {
+        for (_, missing) in case.needs {
+            let dir = tempdir().unwrap();
+            (case.setup)(dir.path());
+            let held: Vec<&str> = case.needs.iter().map(|(_, p)| *p).filter(|p| p != missing).collect();
+            let (rt, addr) = listen_acl(dir.path(), "partial", &held);
+            let resp = exchange(addr, &(case.request)("partial"));
+            assert_eq!(status_of(&resp), 403, "{} without {missing}: {resp}", case.name);
+            assert!(
+                header_value(&resp, "content-type").is_some_and(|t| t.starts_with("application/xml")),
+                "{} without {missing}: {resp}",
+                case.name
+            );
+            assert!(resp.contains("need-privileges"), "{} without {missing}: {resp}", case.name);
+            assert!(
+                resp.contains(&format!(":{missing}/>")),
+                "{} without {missing}: the privilege is named: {resp}",
+                case.name
+            );
+            // The server may report only the first violation (RFC 3744
+            // section 7.1.1): a resource that needs the privilege is named.
+            let needing: Vec<&str> =
+                case.needs.iter().filter(|(_, p)| p == missing).map(|(h, _)| *h).collect();
+            assert!(
+                needing.iter().any(|h| resp.contains(&format!(">{h}</D:href>"))),
+                "{} without {missing}: a resource needing it ({needing:?}) is named: {resp}",
+                case.name
+            );
+            assert!(
+                !case.mutates || !(case.effect)(dir.path()),
+                "{} did its work although refused",
+                case.name
+            );
+            rt.shutdown();
+        }
+
+        let dir = tempdir().unwrap();
+        (case.setup)(dir.path());
+        let held: Vec<&str> = case.needs.iter().map(|(_, p)| *p).collect();
+        let (rt, addr) = listen_acl(dir.path(), "full", &held);
+        let resp = exchange(addr, &(case.request)("full"));
+        assert_eq!(status_of(&resp), case.ok, "{} with every privilege: {resp}", case.name);
+        assert!((case.effect)(dir.path()), "{} did not do its work: {resp}", case.name);
+        rt.shutdown();
+    }
+}
+
+#[test]
+fn options_needs_no_privilege() {
+    let dir = tempdir().unwrap();
+    let (rt, addr) = listen_acl(dir.path(), "nobody", &[]);
+    let resp = exchange(addr, &as_user("nobody", "OPTIONS", "/", &[], ""));
+    assert_eq!(status_of(&resp), 200, "{resp}");
+    rt.shutdown();
+}
+
+#[test]
+fn a_user_with_no_privileges_is_refused_everything_else() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("f.txt"), b"x").unwrap();
+    let (rt, addr) = listen_acl(dir.path(), "nobody", &[]);
+    for (method, path, body) in [("GET", "/f.txt", ""), ("HEAD", "/f.txt", ""), ("PUT", "/n.txt", "x"), ("DELETE", "/f.txt", "")] {
+        let resp = exchange(addr, &as_user("nobody", method, path, &[], body));
+        assert_eq!(status_of(&resp), 403, "{method}: {resp}");
+    }
+    assert!(dir.path().join("f.txt").exists());
+    rt.shutdown();
+}
+
+/// `all` is every privilege, `write` is the write privileges and not `read`,
+/// and `read` is not any of the write privileges.
+#[test]
+fn aggregate_roles_grant_what_the_supported_privilege_set_says() {
+    for (role, can_read, can_write) in [("all", true, true), ("write", false, true), ("read", true, false)] {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("f.txt"), b"x").unwrap();
+        let (rt, addr) = listen_acl(dir.path(), "u", &[role]);
+        let get = exchange(addr, &as_user("u", "GET", "/f.txt", &[], ""));
+        assert_eq!(status_of(&get) == 200, can_read, "{role} GET: {get}");
+        let put = exchange(addr, &as_user("u", "PUT", "/f.txt", &[], "y"));
+        assert_eq!(status_of(&put) == 201, can_write, "{role} PUT: {put}");
+        let del = exchange(addr, &as_user("u", "DELETE", "/f.txt", &[], ""));
+        assert_eq!(status_of(&del) == 204, can_write, "{role} DELETE: {del}");
+        rt.shutdown();
+    }
+}
+
+/// A refused PUT is answered before its body has arrived. The body is never
+/// taken for a request of its own: here it is a DELETE that the user is not
+/// allowed to make, and it must have no effect.
+#[test]
+fn the_body_of_a_refused_put_is_not_read_as_a_request() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("f.txt"), b"x").unwrap();
+    let (rt, addr) = listen_acl(dir.path(), "reader", &["read"]);
+    let smuggled = as_user("reader", "DELETE", "/f.txt", &[], "");
+    let resp = exchange(addr, &as_user("reader", "PUT", "/n.txt", &[], &smuggled));
+    assert_eq!(status_of(&resp), 403, "{resp}");
+    thread::sleep(Duration::from_millis(100));
+    assert!(dir.path().join("f.txt").exists(), "the smuggled DELETE ran");
+    assert!(!dir.path().join("n.txt").exists());
+    rt.shutdown();
+}
