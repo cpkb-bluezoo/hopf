@@ -17,6 +17,17 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
   `Peer::advance`. A handler that is waiting only for a timer it set no
   longer makes a test wait for the time to pass: the peer's clock skips ahead.
 
+### Fixed
+
+- **hopf-core:** a connection closed because its outbound buffer overflowed
+  (or a TLS send failed) now reports the error to the protocol handler
+  before `disconnected`, instead of closing silently. A connection closed
+  from inside `connected` is likewise now closed properly, so its handler
+  hears `disconnected`; before, it was left registered and never notified.
+- **hopf-http:** an HTTP/1 client request that is still sending its body when
+  the connection closes now fails with an error, instead of its handler
+  never being called.
+
 ### Changed
 
 - Unit tests (`cargo test --lib`) do no socket or file I/O and do not wait

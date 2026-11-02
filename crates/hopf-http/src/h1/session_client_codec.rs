@@ -583,6 +583,15 @@ impl H1SessionInner {
                 "incomplete HTTP response",
             ));
             self.fail(HttpError::new(0, "incomplete HTTP response"));
+        } else if self.in_flight {
+            // The parser is idle while the request body is still being
+            // written, so no response has begun; the request is lost all the
+            // same.
+            self.settle_failed(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed before the request body was sent",
+            ));
+            self.fail(HttpError::new(0, "connection closed before the request body was sent"));
         }
         self.open = false;
         self.take_error()
@@ -1108,5 +1117,36 @@ mod tests {
         let g = second.lock().unwrap();
         assert!(g.done && !g.failed, "chained response delivered");
         assert_eq!(g.body, b"two");
+    }
+
+    /// The connection closing while a request body is still being written
+    /// (no response bytes have arrived, so the parser is idle) must fail that
+    /// request; otherwise its handler is never told and the caller waits
+    /// forever.
+    #[test]
+    fn close_while_the_request_body_is_still_being_sent_fails_the_request() {
+        let slot = Arc::new(Mutex::new(None));
+        let config = Arc::new(H1SessionConfig {
+            host: "ex.com".into(),
+            port: 80,
+            limits: HttpLimits::default(),
+            secure: false,
+            handler: Mutex::new(Some(Box::new(KeepSession(Arc::clone(&slot))))),
+            stage: Duration::ZERO,
+        });
+        let mut codec = H1SessionClientCodec::new(config);
+        codec.on_connected(ConnHandle::from_execute(Arc::new(|task| task())));
+        let mut session = slot.lock().unwrap().clone().expect("session handed over");
+
+        let rec = Arc::new(Mutex::new(TurnRec::default()));
+        let mut req = session.put("/upload");
+        req.start_request_body(Box::new(TurnHandler(Arc::clone(&rec)))).unwrap();
+        req.request_body_content(b"part of the body").unwrap();
+        codec.take_outbound();
+
+        assert!(codec.close().is_err(), "the lost request is reported to the caller as well");
+        let g = rec.lock().unwrap();
+        assert!(g.failed, "in-flight upload reported as failed");
+        assert!(!g.done, "and not as completed");
     }
 }

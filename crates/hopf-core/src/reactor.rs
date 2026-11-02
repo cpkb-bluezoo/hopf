@@ -298,7 +298,9 @@ impl Reactor {
             }
         }
         if !conn.is_open() {
+            // Closed from inside `connected`: the handler still has to be told.
             let _ = self.poll.registry().deregister(&mut conn.stream);
+            conn.finish_close();
             conn.release_buffers();
             return Ok(());
         }
@@ -319,7 +321,7 @@ impl Reactor {
         if conn.poll_connect() {
             conn.call_connected();
             if !conn.is_open() {
-                return Ok(());
+                return self.sync_or_close(token);
             }
         }
         if conn.is_connecting() {
@@ -370,7 +372,7 @@ impl Reactor {
         if conn.poll_connect() {
             conn.call_connected();
             if !conn.is_open() {
-                return Ok(());
+                return self.sync_or_close(token);
             }
         }
         match conn.write_to_socket() {

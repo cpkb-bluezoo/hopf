@@ -150,6 +150,10 @@ pub(crate) struct TcpConnection {
     open: bool,
     closing: bool,
     close_requested: bool,
+    /// Why the connection was force-closed from inside a callback, where the
+    /// handler is out of the connection and cannot be told yet; delivered by
+    /// [`Self::finish_close`] ahead of `disconnected`.
+    close_error: Option<io::Error>,
     /// Nonblocking dial in progress — defer `connected` until SO_ERROR / peer_addr.
     connecting: bool,
     /// Cancel flag for the dial connect-timeout timer (`None` if no timer armed).
@@ -319,6 +323,7 @@ impl TcpConnection {
             open: true,
             closing: false,
             close_requested: false,
+            close_error: None,
             connecting,
             connect_timeout_cancel: None,
             write_ready: None,
@@ -804,11 +809,25 @@ impl TcpConnection {
         self.interest_dirty = true;
     }
 
+    /// Force-close for a failure the handler must hear about. This runs
+    /// while the handler is mid-callback (it is out of the connection), so
+    /// the error is held for [`Self::finish_close`] rather than delivered
+    /// here. The first reason wins.
+    fn close_with_error(&mut self, err: io::Error) {
+        if self.close_error.is_none() {
+            self.close_error = Some(err);
+        }
+        self.force_close();
+    }
+
     pub fn finish_close(&mut self) {
         self.open = false;
         self.open_flag.store(false, Ordering::Release);
         self.closing = true;
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        if let Some(err) = self.close_error.take() {
+            self.call_error(&err);
+        }
         self.call_disconnected();
         if let Some(t) = &self.telemetry {
             t.on_close(self.remote.clone());
@@ -830,14 +849,12 @@ impl TcpConnection {
         }
         let new_len = self.net_out.len() + data.len();
         if new_len > self.max_net_out {
-            self.log_runtime_error(
-                "connection.outbound.overflow",
-                format!(
-                    "outbound buffer overflow on {} ({new_len} > {})",
-                    self.remote, self.max_net_out
-                ),
+            let message = format!(
+                "outbound buffer overflow on {} ({new_len} > {})",
+                self.remote, self.max_net_out
             );
-            self.force_close();
+            self.log_runtime_error("connection.outbound.overflow", message.clone());
+            self.close_with_error(io::Error::new(ErrorKind::OutOfMemory, message));
             return;
         }
         if new_len > self.net_out.capacity() {
@@ -875,7 +892,7 @@ impl TcpConnection {
                     "connection.tls.send_failed",
                     format!("TLS send failed on {}: {e}", self.remote),
                 );
-                self.force_close();
+                self.close_with_error(e);
             }
         } else {
             self.append_out(data);
@@ -1105,5 +1122,44 @@ mod tests {
             Ok(_) => panic!("TLS dial with no server_name must fail, not default to \"localhost\""),
             Err(e) => assert_eq!(e.kind(), ErrorKind::InvalidInput),
         }
+    }
+
+    /// Reports each lifecycle callback it receives, and sends more than the
+    /// connection's outbound cap as soon as it is connected.
+    struct Overfill(std::sync::mpsc::Sender<String>);
+
+    impl crate::handler::ProtocolHandler for Overfill {
+        fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+            endpoint.send(&[0u8; 4096]);
+        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, _buf: &mut loopbuf::LoopBuf) {}
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
+            let _ = self.0.send("disconnected".into());
+        }
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, err: &io::Error) {
+            let _ = self.0.send(format!("error {:?}", err.kind()));
+        }
+    }
+
+    /// An outbound buffer overflow closes the connection, and the protocol
+    /// handler must be told why before it is told the connection is gone;
+    /// otherwise whatever it had in flight waits forever.
+    #[test]
+    fn outbound_overflow_reports_an_error_to_the_handler_before_disconnecting() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let rt = crate::Runtime::start(crate::RuntimeConfig::default()).unwrap();
+        rt.connect(
+            crate::TcpConnectorConfig::new(addr, move || Box::new(Overfill(tx.clone())))
+                .max_net_out(1024),
+        )
+        .unwrap();
+        // The peer accepts and never reads.
+        let _peer = listener.accept().unwrap();
+
+        let timeout = std::time::Duration::from_secs(5);
+        assert_eq!(rx.recv_timeout(timeout).unwrap(), "error OutOfMemory");
+        assert_eq!(rx.recv_timeout(timeout).unwrap(), "disconnected");
     }
 }
