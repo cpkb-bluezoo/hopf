@@ -152,19 +152,31 @@ impl H1SessionClientCodec {
     }
 
     pub fn take_outbound(&mut self) -> Vec<u8> {
-        // `out` is always empty afterward, so any registered short-write
-        // backpressure callback can now safely accept more body bytes. Fire
-        // it only after releasing the lock — it commonly calls straight
-        // back into `request_body_content`, which would deadlock on a
-        // still-held `std::sync::Mutex`.
-        let (out, cb) = {
-            let mut inner = self.inner.lock().unwrap();
-            (inner.take_outbound(), inner.take_writable_callback())
-        };
-        if let Some(cb) = cb {
-            cb();
+        self.inner.lock().unwrap().take_outbound()
+    }
+
+    /// If a short-write resume callback is registered (see
+    /// [`MAX_UNFLUSHED_BODY`]), have it run once `endpoint` has drained
+    /// everything sent to it so far, and not before: the staging buffer being
+    /// handed over says nothing about the socket, and a writer that carries on
+    /// at every callback would outrun a slow peer. Call after the bytes from
+    /// [`Self::take_outbound`] have been sent.
+    pub fn arm_writable(&mut self, endpoint: &mut dyn Endpoint) {
+        if !self.inner.lock().unwrap().has_writable_callback() {
+            return;
         }
-        out
+        let inner = Arc::clone(&self.inner);
+        endpoint.on_write_ready(Some(Box::new(move |ep| {
+            // The callback commonly calls straight back into
+            // `request_body_content`, which takes this lock, so it runs only
+            // after the lock is released.
+            let cb = inner.lock().unwrap().take_writable_callback();
+            if let Some(cb) = cb {
+                cb();
+                // What it wrote waits in the session until flushed.
+                ep.poke_handler();
+            }
+        })));
     }
 
     pub fn wants_close(&self) -> bool {
@@ -289,6 +301,10 @@ impl H1SessionInner {
     /// [`MAX_UNFLUSHED_BODY`]) without invoking it — the caller must run it
     /// only after releasing the lock on this struct, since the callback
     /// commonly calls straight back into `request_body_content`.
+    fn has_writable_callback(&self) -> bool {
+        self.writable_callback.is_some()
+    }
+
     fn take_writable_callback(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
         self.writable_callback.take()
     }
@@ -935,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    fn request_body_content_short_writes_past_cap_then_resumes_after_flush() {
+    fn request_body_content_short_writes_past_cap_then_has_room_after_flush() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let req_slot = Arc::new(Mutex::new(None));
@@ -968,13 +984,12 @@ mod tests {
         req.on_body_writable(Box::new(move || resumed2.store(true, Ordering::SeqCst)))
             .unwrap();
 
-        // A flush drains `out` back to empty, so the callback should fire.
+        // A flush drains `out` back to empty, which makes room for the
+        // remainder; the callback itself waits for the connection to drain
+        // (see `H1Endpoint`'s test of that).
         let flushed = codec.take_outbound();
         assert!(!flushed.is_empty());
-        assert!(
-            resumed.load(Ordering::SeqCst),
-            "writable callback should fire once buffered bytes are flushed"
-        );
+        assert!(!resumed.load(Ordering::SeqCst), "handing the bytes over is not draining them");
 
         // The remainder is now accepted in full.
         let remainder = &big[accepted..];

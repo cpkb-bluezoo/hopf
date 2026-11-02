@@ -52,6 +52,8 @@ pub struct Wire {
     jobs: Mutex<VecDeque<Job>>,
     timers: Mutex<Vec<Timer>>,
     poked: AtomicBool,
+    /// The callback the handler asked to run once its output is drained.
+    write_ready: Mutex<Option<crate::endpoint::WriteReadyCallback>>,
     paused: AtomicBool,
     closed: AtomicBool,
 }
@@ -65,6 +67,7 @@ impl Wire {
             jobs: Mutex::default(),
             timers: Mutex::default(),
             poked: AtomicBool::new(false),
+            write_ready: Mutex::new(None),
             paused: AtomicBool::new(false),
             closed: AtomicBool::new(false),
         }
@@ -179,7 +182,9 @@ impl Endpoint for TestEndpoint {
     fn resume_read(&mut self) {
         self.0.paused.store(false, Ordering::Relaxed);
     }
-    fn on_write_ready(&mut self, _callback: Option<crate::endpoint::WriteReadyCallback>) {}
+    fn on_write_ready(&mut self, callback: Option<crate::endpoint::WriteReadyCallback>) {
+        *self.0.write_ready.lock().unwrap() = callback;
+    }
     fn execute(&self, task: Box<dyn FnOnce() + Send>) {
         task();
     }
@@ -308,6 +313,18 @@ impl<H: ProtocolHandler> Peer<H> {
         self.input.extend_from_slice(bytes);
         self.stalled = false;
         self.handler.receive(&mut self.endpoint, &mut self.input);
+    }
+
+    /// The network takes everything the handler has sent: the callback it
+    /// registered with [`Endpoint::on_write_ready`], if any, runs, and whatever
+    /// that starts is seen through. Until this is called the output is taken to
+    /// be queued, as it is when the peer reads slowly.
+    pub fn drain(&mut self) {
+        let callback = self.wire.write_ready.lock().unwrap().take();
+        if let Some(callback) = callback {
+            callback(&mut self.endpoint);
+        }
+        self.pump();
     }
 
     /// The peer goes away: the handler is told, and whatever it starts in answer

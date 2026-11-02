@@ -2240,6 +2240,63 @@ fn gumdrop_h1_streamed_body_off_reactor_reaches_the_server_whole() {
     assert_eq!(cap.chunks.iter().map(|c| c.len()).sum::<usize>(), TOTAL);
 }
 
+/// A body several times the connection's 4 MiB outbound cap, streamed by a
+/// writer that goes again on every `on_body_writable`, to a peer that starts
+/// reading late and then reads slowly. The writer is only told to carry on
+/// once the connection has taken what it wrote, so the outbound buffer never
+/// overflows and the upload completes.
+#[test]
+fn h1_streamed_body_to_a_slow_reader_does_not_overflow_the_outbound_buffer() {
+    const TOTAL: usize = 16 * 1024 * 1024;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        // Let the client fill the kernel buffers before anything is read.
+        std::thread::sleep(Duration::from_millis(500));
+        let mut seen = Vec::new();
+        let mut chunk = vec![0u8; 64 * 1024];
+        let mut body_start = None;
+        let mut body_bytes = 0usize;
+        while body_start.is_none() || body_bytes < TOTAL {
+            let n = sock.read(&mut chunk).unwrap();
+            assert!(n > 0, "client closed before the body was complete");
+            if body_start.is_none() {
+                seen.extend_from_slice(&chunk[..n]);
+                if let Some(i) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+                    body_start = Some(i + 4);
+                    body_bytes = seen.len() - (i + 4);
+                }
+            } else {
+                body_bytes += n;
+            }
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").unwrap();
+        body_bytes
+    });
+
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let slot = Arc::new(Mutex::new(None));
+    HttpClient::new(addr.ip().to_string(), addr.port())
+        .connect(&rt, Box::new(HandOff { slot: Arc::clone(&slot) }))
+        .unwrap();
+    let mut session = wait_session(&slot);
+    let out = Arc::new(Mutex::new(GumdropOutcome::default()));
+    let mut req = session.put("/part");
+    req.header("content-length", TOTAL.to_string()).unwrap();
+    req.start_request_body(Box::new(RecordingResponseHandler { out: Arc::clone(&out) }))
+        .unwrap();
+    session.conn_handle().unwrap().poke();
+    stream_body_off_reactor(&session, &mut req, TOTAL);
+
+    assert!(wait_gumdrop_done(&out, Duration::from_secs(30)), "request never completed");
+    let g = out.lock().unwrap();
+    assert_eq!(g.failed, None);
+    assert_eq!(g.status, 200);
+    assert_eq!(server.join().unwrap(), TOTAL);
+}
+
 // ---------------------------------------------------------------------------
 // Large echoed response over HTTP/1.1 to the session API
 // ---------------------------------------------------------------------------

@@ -88,6 +88,8 @@ pub trait Endpoint: Send {
     fn resume_read(&mut self);
 
     /// One-shot callback when the outbound buffer has been fully drained.
+    /// If nothing is buffered when it is registered, it runs as soon as the
+    /// connection next can write.
     ///
     /// Replaces any previously registered callback. Pass `None` to clear.
     /// Runs on the reactor thread. Not cleared automatically after firing —

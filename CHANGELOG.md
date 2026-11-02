@@ -28,6 +28,15 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
   the connection closes now fails with an error, instead of its handler
   never being called.
 
+- **hopf-http:** the HTTP/1 client now runs a body writer's `on_body_writable`
+  callback when the connection has drained what was written, not when the
+  staging buffer is merely handed to the connection. A writer that carries on
+  at every callback no longer outruns a slow peer and overflows the 4 MiB
+  outbound buffer, which closed the connection.
+- **hopf-core:** `Endpoint::on_write_ready` now also runs when it is registered
+  with nothing buffered; before, no write event was requested for an empty
+  buffer, so the callback never ran.
+
 ### Changed
 
 - Unit tests (`cargo test --lib`) do no socket or file I/O and do not wait

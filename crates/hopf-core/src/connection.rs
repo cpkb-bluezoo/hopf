@@ -442,7 +442,7 @@ impl TcpConnection {
         // TlsRecordEngine pushes ciphertext straight into net_out as it's
         // produced (sink-based, unlike the old pull-based TlsSession::write_tls),
         // so net_out already reflects everything pending — no separate check needed.
-        self.connecting || !self.net_out.is_empty() || self.close_requested
+        self.connecting || !self.net_out.is_empty() || self.close_requested || self.write_ready.is_some()
     }
 
     /// Gives the plaintext ring a real size once TLS is on the connection.
@@ -1002,6 +1002,9 @@ impl Endpoint for TcpConnection {
 
     fn on_write_ready(&mut self, callback: Option<WriteReadyCallback>) {
         self.write_ready = callback;
+        // A registered callback needs a write event to run it, even when there
+        // is nothing buffered to provoke one.
+        self.interest_dirty = true;
     }
 
     fn execute(&self, task: Task) {
@@ -1161,5 +1164,44 @@ mod tests {
         let timeout = std::time::Duration::from_secs(5);
         assert_eq!(rx.recv_timeout(timeout).unwrap(), "error OutOfMemory");
         assert_eq!(rx.recv_timeout(timeout).unwrap(), "disconnected");
+    }
+
+    /// Hands its endpoint's handle to the test, then does nothing.
+    struct HandOut(std::sync::mpsc::Sender<crate::ConnHandle>);
+
+    impl crate::handler::ProtocolHandler for HandOut {
+        fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+            let _ = self.0.send(endpoint.handle());
+        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, _buf: &mut loopbuf::LoopBuf) {}
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
+    }
+
+    /// `on_write_ready` promises a call once the outbound buffer is drained.
+    /// Registered on an idle connection, whose buffer is already empty, that
+    /// is straight away; waiting for a write event that nothing will provoke
+    /// would leave the caller stalled.
+    #[test]
+    fn write_ready_fires_on_an_idle_connection_with_nothing_buffered() {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (handle_tx, handle_rx) = std::sync::mpsc::channel();
+        let rt = crate::Runtime::start(crate::RuntimeConfig::default()).unwrap();
+        rt.connect(crate::TcpConnectorConfig::new(addr, move || Box::new(HandOut(handle_tx.clone()))))
+            .unwrap();
+        let _peer = listener.accept().unwrap();
+        let timeout = std::time::Duration::from_secs(5);
+        let handle = handle_rx.recv_timeout(timeout).unwrap();
+        // Let the connect settle so nothing else is about to provoke a write.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let (fired_tx, fired_rx) = std::sync::mpsc::channel();
+        handle.with_endpoint(move |ep| {
+            ep.on_write_ready(Some(Box::new(move |_| {
+                let _ = fired_tx.send(());
+            })));
+        });
+        fired_rx.recv_timeout(timeout).expect("write-ready callback never ran");
     }
 }

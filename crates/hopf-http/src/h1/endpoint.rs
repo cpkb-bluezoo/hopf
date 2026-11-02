@@ -144,6 +144,7 @@ impl H1Endpoint {
             // on inbound progress (this flush follows a `receive()` that
             // fed the parser) alike — `touch_stage_timer` itself is a no-op
             // when no request is in flight.
+            codec.arm_writable(endpoint);
             codec.touch_stage_timer(endpoint);
             if codec.wants_close() {
                 endpoint.close();
@@ -165,6 +166,7 @@ impl H1Endpoint {
             if !out.is_empty() {
                 endpoint.send(&out);
             }
+            codec.arm_writable(endpoint);
             codec.touch_stage_timer(endpoint);
         }
     }
@@ -242,5 +244,78 @@ impl ProtocolHandler for H1Endpoint {
             codec.fail_transport(std::io::Error::new(err.kind(), err.to_string()));
         }
         endpoint.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use hopf_core::testing::Peer;
+
+    use super::*;
+    use crate::client::api::{
+        HttpClientSessionHandle, HttpConnectionHandler, HttpRequest, HttpResponseHandler,
+    };
+    use crate::h1::session_client_codec::H1SessionConfig;
+
+    struct Ignore;
+
+    impl HttpResponseHandler for Ignore {
+        fn ok(&mut self, _status: u16) {}
+        fn error(&mut self, _status: u16) {}
+        fn header(&mut self, _name: &str, _value: &str) {}
+        fn response_body_content(&mut self, _data: &[u8]) {}
+        fn close(&mut self) {}
+        fn failed(&mut self, _err: std::io::Error) {}
+    }
+
+    /// Opens an upload and keeps hold of the request and the connection handle.
+    struct Upload(Arc<Mutex<Option<(HttpRequest, hopf_core::ConnHandle)>>>);
+
+    impl HttpConnectionHandler for Upload {
+        fn on_connected(&mut self, session: &mut HttpClientSessionHandle) {
+            let mut req = session.post("/upload");
+            req.start_request_body(Box::new(Ignore)).unwrap();
+            *self.0.lock().unwrap() = Some((req, session.conn_handle().unwrap()));
+        }
+    }
+
+    /// A body writer that is told to carry on has to be told when the
+    /// connection has taken what it wrote, not when the bytes are merely
+    /// handed to the connection's buffer. Otherwise a writer that goes again
+    /// on every callback outruns a slow peer and overflows that buffer.
+    #[test]
+    fn body_writable_fires_when_the_output_is_drained_not_when_it_is_handed_over() {
+        let slot = Arc::new(Mutex::new(None));
+        let config = Arc::new(H1SessionConfig {
+            host: "ex.com".into(),
+            port: 80,
+            limits: HttpLimits::default(),
+            secure: false,
+            handler: Mutex::new(Some(Box::new(Upload(Arc::clone(&slot))))),
+            stage: Duration::ZERO,
+        });
+        let codec = H1SessionClientCodec::new(config);
+        let mut peer = Peer::connect(H1Endpoint::client_session(codec, HttpLimits::default(), false), |_| false);
+        let (mut req, handle) = slot.lock().unwrap().take().expect("connected");
+
+        let body = vec![b'x'; 300 * 1024];
+        let accepted = req.request_body_content(&body).unwrap();
+        assert!(accepted > 0 && accepted < body.len(), "a short write, got {accepted}");
+        let writable = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&writable);
+        req.on_body_writable(Box::new(move || flag.store(true, Ordering::SeqCst))).unwrap();
+
+        handle.poke();
+        let sent = peer.run("");
+        assert!(sent.len() >= accepted, "the body went out");
+        assert!(!writable.load(Ordering::SeqCst), "handed over, not yet drained");
+
+        peer.drain();
+        assert!(writable.load(Ordering::SeqCst), "told once the output drained");
+        assert_eq!(req.request_body_content(&body[accepted..]).unwrap().min(1), 1, "room again");
     }
 }
