@@ -13,6 +13,13 @@
 //! (a handler that waits for one reports itself busy, as it does for the
 //! storage pool, so the peer keeps pumping until it has gone off).
 //!
+//! [`Endpoint::fail`] behaves as it does on a real connection: the connection
+//! is closed, and when the failure comes from a callback posted with
+//! [`ConnHandle::with_endpoint`] (a timer, say) the handler's `error` is
+//! called with it. A failure raised from inside one of the handler's own
+//! callbacks closes the connection without calling `error`, as on a real
+//! connection, where the handler is busy at that point.
+//!
 //! ```ignore
 //! let mut peer = Peer::connect(handler, |h| h.is_busy());
 //! assert!(peer.take().starts_with("+OK"));
@@ -56,6 +63,8 @@ pub struct Wire {
     write_ready: Mutex<Option<crate::endpoint::WriteReadyCallback>>,
     paused: AtomicBool,
     closed: AtomicBool,
+    /// Errors passed to [`Endpoint::fail`] and not yet given to the handler.
+    failures: Mutex<Vec<io::Error>>,
 }
 
 impl Wire {
@@ -70,6 +79,7 @@ impl Wire {
             write_ready: Mutex::new(None),
             paused: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            failures: Mutex::default(),
         }
     }
 
@@ -196,6 +206,12 @@ impl Endpoint for TestEndpoint {
     }
     fn poke_handler(&mut self) {
         self.0.poked.store(true, Ordering::Relaxed);
+    }
+    /// As on a real connection: the connection is closed, and the error is
+    /// kept for the handler (see the module documentation).
+    fn fail(&mut self, err: io::Error) {
+        self.0.failures.lock().unwrap().push(err);
+        self.0.closed.store(true, Ordering::Relaxed);
     }
 }
 
@@ -368,7 +384,14 @@ impl<H: ProtocolHandler> Peer<H> {
                 match job {
                     Some(job) => {
                         self.stalled = false;
-                        job(&mut self.endpoint)
+                        // A failure raised while the handler was in one of its
+                        // own callbacks is not delivered to it.
+                        self.wire.failures.lock().unwrap().clear();
+                        job(&mut self.endpoint);
+                        let failures = std::mem::take(&mut *self.wire.failures.lock().unwrap());
+                        for err in failures {
+                            self.handler.error(&mut self.endpoint, &err);
+                        }
                     }
                     None => break,
                 }

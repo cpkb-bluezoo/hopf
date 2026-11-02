@@ -7,6 +7,8 @@
 //! so there's no need for a separate client-side codec.
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hopf_core::{Endpoint, LoopBuf, ProtocolHandler, SecurityInfo, SharedTlsConnector, TimerHandle};
@@ -18,15 +20,123 @@ use crate::codec::{encode, MqttError, Properties, ProtocolVersion};
 
 use super::handlers::{MqttClientControl, MqttClientDriver, MqttClientHandlerFactory};
 
-/// Marker text on a [`std::io::ErrorKind::TimedOut`] error delivered via
-/// [`Endpoint::fail`] that means "time to send a keepalive PINGREQ", as
-/// opposed to a genuine CONNACK / PINGRESP deadline (which fall through to
-/// [`MqttClientDriver::on_error`] instead). The scheduled-timer closure
-/// that fires this only has `&mut dyn Endpoint` (no access back to `self`),
-/// so re-arming the next keepalive tick and the PINGRESP deadline happens
-/// in `error()`, which does have `&mut self` — same pattern `hopf-pop3`
-/// uses for its stage timers.
-const KEEPALIVE_DUE: &str = "hopf-mqtt-keepalive-due";
+/// The client's keep-alive: a timer that sends a PINGREQ every keep-alive
+/// interval, and a deadline for the PINGRESP that answers each one.
+///
+/// The timers reach the connection only through its [`ConnHandle`], never
+/// through [`Endpoint::fail`] for a routine tick: `fail` force-closes the
+/// connection, so it is kept for the PINGRESP deadline, which is a real
+/// failure. Each tick schedules the next, so stopping has to end the whole
+/// chain, not just the timer that was first scheduled: `stopped` is checked
+/// before every send, and `timers` holds the pending ones so they are
+/// cancelled too rather than left to fire into nothing.
+///
+/// [`ConnHandle`]: hopf_core::ConnHandle
+struct KeepAlive {
+    interval: Duration,
+    pingresp_timeout: Duration,
+    stopped: AtomicBool,
+    timers: Mutex<KeepAliveTimers>,
+}
+
+#[derive(Default)]
+struct KeepAliveTimers {
+    ping: Option<TimerHandle>,
+    pingresp: Option<TimerHandle>,
+}
+
+impl KeepAlive {
+    /// Start pinging on `ep`'s connection, the first PINGREQ `interval` from
+    /// now.
+    fn start(ep: &dyn Endpoint, interval: Duration, pingresp_timeout: Duration) -> Arc<Self> {
+        let keep_alive = Arc::new(Self {
+            interval,
+            pingresp_timeout,
+            stopped: AtomicBool::new(false),
+            timers: Mutex::default(),
+        });
+        Self::schedule_ping(&keep_alive, ep);
+        keep_alive
+    }
+
+    fn schedule_ping(this: &Arc<Self>, ep: &dyn Endpoint) {
+        if this.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        let handle = ep.handle();
+        let next = Arc::clone(this);
+        let timer = ep.schedule_timer(
+            this.interval,
+            Box::new(move || {
+                if next.stopped.load(Ordering::Acquire) {
+                    return;
+                }
+                handle.with_endpoint(move |ep| {
+                    if next.stopped.load(Ordering::Acquire) || !ep.is_open() || ep.is_closing() {
+                        return;
+                    }
+                    ep.send(&encode::encode_pingreq());
+                    Self::schedule_pingresp(&next, ep);
+                    Self::schedule_ping(&next, ep);
+                });
+            }),
+        );
+        this.store(timer, |t| &mut t.ping);
+    }
+
+    fn schedule_pingresp(this: &Arc<Self>, ep: &dyn Endpoint) {
+        if this.pingresp_timeout.is_zero() || this.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        let handle = ep.handle();
+        let timer = ep.schedule_timer(
+            this.pingresp_timeout,
+            Box::new(move || {
+                handle.with_endpoint(|ep| {
+                    ep.fail(io::Error::new(io::ErrorKind::TimedOut, "MQTT PINGRESP timed out"));
+                });
+            }),
+        );
+        this.store(timer, |t| &mut t.pingresp);
+    }
+
+    /// Keep `timer` in the slot `slot` picks, cancelling the one it replaces.
+    fn store(&self, timer: TimerHandle, slot: fn(&mut KeepAliveTimers) -> &mut Option<TimerHandle>) {
+        let mut timers = self.timers.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(old) = slot(&mut timers).replace(timer) {
+            old.cancel();
+        }
+        // `stop` may have run on another thread since the caller checked; if
+        // so, it found nothing to cancel.
+        if self.stopped.load(Ordering::Acquire) {
+            Self::cancel(&mut timers);
+        }
+    }
+
+    /// The PINGRESP has arrived: its deadline no longer applies.
+    fn pingresp_received(&self) {
+        let pending = self.timers.lock().unwrap_or_else(|e| e.into_inner()).pingresp.take();
+        if let Some(t) = pending {
+            t.cancel();
+        }
+    }
+
+    #[cfg(test)]
+    fn pingresp_pending(&self) -> bool {
+        self.timers.lock().unwrap_or_else(|e| e.into_inner()).pingresp.is_some()
+    }
+
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        Self::cancel(&mut self.timers.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+
+    fn cancel(timers: &mut KeepAliveTimers) {
+        for t in [timers.ping.take(), timers.pingresp.take()].into_iter().flatten() {
+            t.cancel();
+        }
+    }
+}
 
 /// Builder input bundled by [`super::facade::MqttClient`] — one call site,
 /// avoids an eleven-plus-argument constructor. `Clone` because the
@@ -82,8 +192,9 @@ pub struct MqttClientEndpoint {
     connack_timeout: Duration,
     connack_timer: Option<TimerHandle>,
     pingresp_timeout: Duration,
-    pingresp_timer: Option<TimerHandle>,
-    keepalive_timer: Option<TimerHandle>,
+    /// Running from CONNACK until the connection ends; `None` before that
+    /// and when the keep-alive is zero.
+    keepalive: Option<Arc<KeepAlive>>,
     next_packet_id: u16,
     pending_publish_header: Option<PublishHeader>,
     /// AUTH challenge received while the driver was taken (re-delivered on
@@ -111,8 +222,7 @@ impl MqttClientEndpoint {
             connack_timeout: params.connack_timeout,
             connack_timer: None,
             pingresp_timeout: params.pingresp_timeout,
-            pingresp_timer: None,
-            keepalive_timer: None,
+            keepalive: None,
             next_packet_id: 1,
             pending_publish_header: None,
             pending_auth: None,
@@ -165,45 +275,22 @@ impl MqttClientEndpoint {
         ));
     }
 
-    fn arm_keepalive_timer(&mut self, ep: &mut dyn Endpoint) {
+    fn start_keepalive(&mut self, ep: &dyn Endpoint) {
         if self.keep_alive.is_zero() {
             return;
         }
-        let handle = ep.handle();
-        self.keepalive_timer = Some(ep.schedule_timer(
-            self.keep_alive,
-            Box::new(move || {
-                handle.with_endpoint(|ep2| {
-                    ep2.fail(io::Error::new(io::ErrorKind::TimedOut, KEEPALIVE_DUE));
-                });
-            }),
-        ));
-    }
-
-    fn arm_pingresp_timer(&mut self, ep: &mut dyn Endpoint) {
-        if self.pingresp_timeout.is_zero() {
-            return;
+        if let Some(old) = self.keepalive.take() {
+            old.stop();
         }
-        let handle = ep.handle();
-        self.pingresp_timer = Some(ep.schedule_timer(
-            self.pingresp_timeout,
-            Box::new(move || {
-                handle.with_endpoint(|ep2| {
-                    ep2.fail(io::Error::new(io::ErrorKind::TimedOut, "MQTT PINGRESP timed out"));
-                });
-            }),
-        ));
+        self.keepalive = Some(KeepAlive::start(ep, self.keep_alive, self.pingresp_timeout));
     }
 
     fn cancel_all_timers(&mut self) {
         if let Some(t) = self.connack_timer.take() {
             t.cancel();
         }
-        if let Some(t) = self.keepalive_timer.take() {
-            t.cancel();
-        }
-        if let Some(t) = self.pingresp_timer.take() {
-            t.cancel();
+        if let Some(k) = self.keepalive.take() {
+            k.stop();
         }
     }
 }
@@ -245,13 +332,7 @@ impl ProtocolHandler for MqttClientEndpoint {
         }
     }
 
-    fn error(&mut self, ep: &mut dyn Endpoint, err: &io::Error) {
-        if err.kind() == io::ErrorKind::TimedOut && err.to_string().contains(KEEPALIVE_DUE) {
-            ep.send(&encode::encode_pingreq());
-            self.arm_keepalive_timer(ep);
-            self.arm_pingresp_timer(ep);
-            return;
-        }
+    fn error(&mut self, _ep: &mut dyn Endpoint, err: &io::Error) {
         self.cancel_all_timers();
         self.closed = true;
         if let Some(mut driver) = self.driver.take() {
@@ -333,7 +414,7 @@ impl MqttFrameHandler for ClientCtx<'_, '_> {
         if let Some(t) = self.handler.connack_timer.take() {
             t.cancel();
         }
-        self.handler.arm_keepalive_timer(self.endpoint);
+        self.handler.start_keepalive(self.endpoint);
         if let Some(mut driver) = self.handler.driver.take() {
             driver.on_connack(self, session_present, reason_code, &properties);
             self.handler.driver = Some(driver);
@@ -433,8 +514,8 @@ impl MqttFrameHandler for ClientCtx<'_, '_> {
     }
 
     fn ping_resp(&mut self) {
-        if let Some(t) = self.handler.pingresp_timer.take() {
-            t.cancel();
+        if let Some(k) = &self.handler.keepalive {
+            k.pingresp_received();
         }
         if let Some(mut driver) = self.handler.driver.take() {
             driver.on_ping_resp(self);

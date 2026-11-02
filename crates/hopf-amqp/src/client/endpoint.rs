@@ -4,6 +4,8 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hopf_auth::{create_client, SaslClient, SaslClientStep, SaslMechanism};
@@ -34,8 +36,77 @@ use crate::codec::{AmqpError, BasicProperties};
 
 use super::handlers::{AmqpClientControl, AmqpClientDriver, AmqpClientHandlerFactory, BasicReturnInfo};
 
-/// Marker on TimedOut errors meaning "send a heartbeat".
-const HEARTBEAT_DUE: &str = "hopf-amqp-heartbeat-due";
+/// The client's outbound heartbeat: a timer that sends a heartbeat frame
+/// every negotiated interval and then schedules the next one.
+///
+/// The timer reaches the connection only through its [`ConnHandle`], never
+/// through [`Endpoint::fail`]: `fail` force-closes the connection, so it is
+/// kept for real failures (the receive-side heartbeat timeout). Each firing
+/// schedules a fresh timer, so cancelling has to stop the whole chain, not
+/// just the timer that was first scheduled: `stopped` is checked before
+/// every send, and `current` holds the pending timer so that it is
+/// cancelled too rather than left to fire into nothing.
+///
+/// [`ConnHandle`]: hopf_core::ConnHandle
+struct HeartbeatSender {
+    interval: Duration,
+    stopped: AtomicBool,
+    current: Mutex<Option<TimerHandle>>,
+}
+
+impl HeartbeatSender {
+    /// Start sending heartbeats on `endpoint`'s connection, the first one
+    /// `interval` from now. The returned handle stops them.
+    fn start(endpoint: &dyn Endpoint, interval: Duration) -> TimerHandle {
+        let sender = Arc::new(Self {
+            interval,
+            stopped: AtomicBool::new(false),
+            current: Mutex::new(None),
+        });
+        Self::schedule(&sender, endpoint);
+        TimerHandle::from_cancel(move || sender.stop())
+    }
+
+    fn schedule(sender: &Arc<Self>, endpoint: &dyn Endpoint) {
+        if sender.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        let handle = endpoint.handle();
+        let next = Arc::clone(sender);
+        let timer = endpoint.schedule_timer(
+            sender.interval,
+            Box::new(move || {
+                if next.stopped.load(Ordering::Acquire) {
+                    return;
+                }
+                handle.with_endpoint(move |ep| {
+                    if next.stopped.load(Ordering::Acquire) || !ep.is_open() || ep.is_closing() {
+                        return;
+                    }
+                    ep.send(&encode_heartbeat());
+                    Self::schedule(&next, ep);
+                });
+            }),
+        );
+        let mut current = sender.current.lock().unwrap_or_else(|e| e.into_inner());
+        *current = Some(timer);
+        // `stop` may have run on another thread between the check above and
+        // storing the timer; if so, it found nothing to cancel.
+        if sender.stopped.load(Ordering::Acquire) {
+            if let Some(t) = current.take() {
+                t.cancel();
+            }
+        }
+    }
+
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        let pending = self.current.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(t) = pending {
+            t.cancel();
+        }
+    }
+}
 
 /// Pending content after a content-bearing method (deliver / return / get-ok).
 enum PendingContent {
@@ -218,16 +289,23 @@ impl AmqpClientEndpoint {
         if let Some(t) = self.heartbeat_send_timer.take() {
             t.cancel();
         }
-        let handle = endpoint.handle();
         let interval = Duration::from_secs(u64::from(self.negotiated_heartbeat));
-        self.heartbeat_send_timer = Some(endpoint.schedule_timer(
-            interval,
-            Box::new(move || {
-                handle.with_endpoint(|ep2| {
-                    ep2.fail(io::Error::new(io::ErrorKind::TimedOut, HEARTBEAT_DUE));
-                });
-            }),
-        ));
+        self.heartbeat_send_timer = Some(HeartbeatSender::start(endpoint, interval));
+    }
+
+    /// Cancel every timer this connection still has pending, so none fires
+    /// after it has gone.
+    fn cancel_timers(&mut self) {
+        for t in [
+            self.handshake_timer.take(),
+            self.heartbeat_send_timer.take(),
+            self.heartbeat_recv_timer.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            t.cancel();
+        }
     }
 
     fn rearm_heartbeat_recv(&mut self, endpoint: &mut dyn Endpoint) {
@@ -1276,17 +1354,13 @@ impl ProtocolHandler for AmqpClientEndpoint {
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
+        self.cancel_timers();
         if let Some(ref mut d) = self.driver {
             d.on_disconnected();
         }
     }
 
-    fn error(&mut self, endpoint: &mut dyn Endpoint, err: &io::Error) {
-        if err.kind() == io::ErrorKind::TimedOut && err.to_string().contains(HEARTBEAT_DUE) {
-            endpoint.send(&encode_heartbeat());
-            self.rearm_heartbeat_send(endpoint);
-            return;
-        }
+    fn error(&mut self, _endpoint: &mut dyn Endpoint, err: &io::Error) {
         if let Some(ref mut d) = self.driver {
             d.on_error(err);
         }

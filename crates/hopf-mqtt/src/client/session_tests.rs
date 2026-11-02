@@ -490,25 +490,60 @@ fn suback_and_unsuback_carry_the_ids_and_codes() {
 
 // -- keepalive ---------------------------------------------------------------
 
-fn keepalive_due() -> io::Error {
-    io::Error::new(io::ErrorKind::TimedOut, KEEPALIVE_DUE)
+fn pingresp_pending(peer: &Peer<MqttClientEndpoint>) -> bool {
+    peer.handler.keepalive.as_ref().is_some_and(|k| k.pingresp_pending())
 }
 
 #[test]
 fn the_keepalive_timer_sends_a_pingreq_and_the_connection_stays_up() {
     let (mut peer, state) = up(V3);
-    peer.fail(&keepalive_due());
+    peer.advance(Duration::from_secs(30));
     assert_eq!(peer.take_bytes(), encode::encode_pingreq());
     assert!(events(&state).is_empty());
-    assert!(!peer.is_closed());
-    peer.fail(&keepalive_due());
-    assert_eq!(peer.take_bytes(), encode::encode_pingreq(), "and again on the next tick");
+    assert!(!peer.is_closed(), "sending a PINGREQ must not close the connection");
+}
+
+/// The client used to signal "keepalive due" through `Endpoint::fail`, which
+/// force-closes a real connection, so every connection with a keep-alive was
+/// closed one interval after CONNACK.
+#[test]
+fn pings_keep_the_connection_open_over_many_intervals() {
+    let (mut peer, state) = up(V3);
+    for i in 1..=4 {
+        peer.advance(Duration::from_secs(30));
+        assert_eq!(peer.take_bytes(), encode::encode_pingreq(), "interval {i}");
+        assert!(!peer.is_closed(), "closed after interval {i}");
+        peer.run_bytes(&encode::encode_pingresp());
+    }
+    assert!(peer.elapsed() >= Duration::from_secs(120));
+    assert_eq!(events(&state), ["pingresp"; 4]);
+}
+
+#[test]
+fn a_missing_pingresp_still_times_the_connection_out() {
+    let (mut peer, state) = up(V3);
+    peer.advance(Duration::from_secs(30));
+    assert_eq!(peer.take_bytes(), encode::encode_pingreq());
+    peer.advance(Duration::from_secs(10));
+    assert!(peer.is_closed(), "a missed PINGRESP must close the connection");
+    assert_eq!(events(&state), ["error TimedOut"]);
+    peer.take_bytes();
+    peer.advance(Duration::from_secs(90));
+    assert!(peer.take_bytes().is_empty(), "no PINGREQ after the connection closed");
+}
+
+#[test]
+fn pings_stop_when_the_connection_drops() {
+    let (mut peer, _) = up(V3);
+    peer.disconnect();
+    peer.advance(Duration::from_secs(90));
+    assert!(peer.take_bytes().is_empty(), "no PINGREQ after a disconnect");
 }
 
 #[test]
 fn pingresp_reaches_the_driver() {
     let (mut peer, state) = up(V3);
-    peer.fail(&keepalive_due());
+    peer.advance(Duration::from_secs(30));
     peer.run_bytes(&encode::encode_pingresp());
     assert_eq!(events(&state), ["pingresp"]);
 }
@@ -530,7 +565,7 @@ fn a_zero_keep_alive_never_arms_the_timer() {
     let (mut peer, state, _) = connect_with(p);
     peer.run_bytes(&encode::encode_connack(false, 0, &no_props(), V3));
     assert_eq!(events(&state), ["connack present=false code=0"]);
-    assert!(peer.handler.keepalive_timer.is_none());
+    assert!(peer.handler.keepalive.is_none());
     assert!(peer.handler.connack_timer.is_none(), "cancelled by CONNACK");
 }
 
@@ -541,8 +576,10 @@ fn zero_timeouts_arm_nothing() {
     p.pingresp_timeout = Duration::ZERO;
     let (mut peer, _, _) = connect_with(p);
     assert!(peer.handler.connack_timer.is_none());
-    peer.fail(&keepalive_due());
-    assert!(peer.handler.pingresp_timer.is_none());
+    peer.run_bytes(&encode::encode_connack(false, 0, &no_props(), V3));
+    peer.advance(Duration::from_secs(30));
+    assert_eq!(peer.take_bytes(), encode::encode_pingreq());
+    assert!(!pingresp_pending(&peer));
 }
 
 #[test]
@@ -551,11 +588,11 @@ fn timers_are_armed_by_connect_and_ping_and_cancelled_by_the_answers() {
     assert!(peer.handler.connack_timer.is_some());
     peer.run_bytes(&encode::encode_connack(false, 0, &no_props(), V3));
     assert!(peer.handler.connack_timer.is_none());
-    assert!(peer.handler.keepalive_timer.is_some());
-    peer.fail(&keepalive_due());
-    assert!(peer.handler.pingresp_timer.is_some());
+    assert!(peer.handler.keepalive.is_some());
+    peer.advance(Duration::from_secs(30));
+    assert!(pingresp_pending(&peer));
     peer.run_bytes(&encode::encode_pingresp());
-    assert!(peer.handler.pingresp_timer.is_none());
+    assert!(!pingresp_pending(&peer));
 }
 
 // -- disconnecting -----------------------------------------------------------

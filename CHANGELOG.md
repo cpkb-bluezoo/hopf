@@ -13,12 +13,28 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
   `connector_from_pem_bytes`, `connector_from_pem_bytes_with_tcp_version_policy`
   and `connector_from_pem_tls12_bytes`. The path-based builders read the file
   and use these.
+- **hopf-mqtt:** a client connection with a non-zero keep-alive no longer
+  closes when its first PINGREQ falls due. It had the same fault as
+  hopf-amqp: the keep-alive timer used `Endpoint::fail`, which force-closes a
+  real connection. PINGREQs are now sent directly from the timer, and the
+  keep-alive timers are cancelled when the connection drops. A broker that
+  does not answer with PINGRESP still times the connection out.
 - **hopf-core `testing`:** `Peer::connect_timed`, `Peer::elapsed` and
   `Peer::advance`. A handler that is waiting only for a timer it set no
   longer makes a test wait for the time to pass: the peer's clock skips ahead.
 
 ### Fixed
 
+- **hopf-amqp:** a client connection with heartbeats enabled no longer closes
+  when its first heartbeat falls due. The send timer used `Endpoint::fail` to
+  signal the handler, which on a real connection also force-closes it, so
+  every connection dropped after one heartbeat interval. Heartbeats are now
+  sent directly from the timer, and the handshake and heartbeat timers are
+  cancelled when the connection drops. A broker that stops sending still
+  times the connection out.
+- **hopf-core `testing`:** `Endpoint::fail` on the test endpoint now behaves as
+  on a real connection: it records the error, closes the endpoint and reports
+  the error to the handler, instead of doing nothing.
 - **hopf-core:** a connection closed because its outbound buffer overflowed
   (or a TLS send failed) now reports the error to the protocol handler
   before `disconnected`, instead of closing silently. A connection closed

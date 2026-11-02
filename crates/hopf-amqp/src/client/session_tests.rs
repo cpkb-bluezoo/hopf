@@ -839,18 +839,67 @@ fn a_broker_heartbeat_is_not_an_error() {
     assert!(seen(&events).is_empty());
 }
 
-#[test]
-fn a_heartbeat_timer_makes_the_client_send_a_heartbeat() {
+/// A connection opened with a heartbeat of `secs` negotiated, with what the
+/// client sent during the handshake taken.
+fn opened_with_heartbeat(secs: u16) -> (Client, Events) {
     let mut p = params();
-    p.heartbeat = 30;
+    p.heartbeat = secs;
     let (mut peer, events) = connect_with(p, Box::new(|_, _| {}));
     peer.run_bytes(&start("PLAIN"));
-    peer.run_bytes(&tune(2047, 131_072, 30));
+    peer.run_bytes(&tune(2047, 131_072, secs));
     peer.run_bytes(&open_ok());
     peer.take_bytes();
-    peer.fail(&io::Error::new(io::ErrorKind::TimedOut, "hopf-amqp-heartbeat-due"));
+    (peer, events)
+}
+
+#[test]
+fn a_heartbeat_timer_makes_the_client_send_a_heartbeat() {
+    let (mut peer, events) = opened_with_heartbeat(30);
+    peer.advance(Duration::from_secs(30));
     assert_eq!(decode(&peer.take_bytes()), [Out::Heartbeat]);
+    assert!(!peer.is_closed(), "sending a heartbeat must not close the connection");
     assert_eq!(seen(&events), ["open"], "a heartbeat is not an error");
+}
+
+/// The client used to signal "heartbeat due" through `Endpoint::fail`, which
+/// force-closes a real connection, so every connection with a heartbeat was
+/// closed one interval after it opened.
+#[test]
+fn heartbeats_keep_the_connection_open_over_many_intervals() {
+    let (mut peer, events) = opened_with_heartbeat(30);
+    for i in 1..=4 {
+        peer.advance(Duration::from_secs(30));
+        assert_eq!(decode(&peer.take_bytes()), [Out::Heartbeat], "interval {i}");
+        assert!(!peer.is_closed(), "closed after interval {i}");
+        // The broker's own heartbeat keeps the receive-side timeout away.
+        peer.run_bytes(&encode_heartbeat());
+    }
+    assert!(peer.elapsed() >= Duration::from_secs(120));
+    assert_eq!(seen(&events), ["open"]);
+}
+
+#[test]
+fn a_silent_broker_still_times_the_connection_out() {
+    let (mut peer, events) = opened_with_heartbeat(30);
+    peer.advance(Duration::from_secs(30));
+    assert_eq!(decode(&peer.take_bytes()), [Out::Heartbeat]);
+    assert!(!peer.is_closed());
+    // Nothing from the broker for two intervals.
+    peer.advance(Duration::from_secs(30));
+    assert!(peer.is_closed(), "a missed broker heartbeat must close the connection");
+    assert_eq!(seen(&events), ["open", "error:amqp heartbeat timeout"]);
+    peer.take_bytes();
+    peer.advance(Duration::from_secs(90));
+    assert!(decode(&peer.take_bytes()).is_empty(), "no heartbeats after the connection closed");
+}
+
+#[test]
+fn heartbeats_stop_when_the_connection_drops() {
+    let (mut peer, events) = opened_with_heartbeat(30);
+    peer.disconnect();
+    peer.advance(Duration::from_secs(90));
+    assert!(decode(&peer.take_bytes()).is_empty(), "no heartbeats after a disconnect");
+    assert_eq!(seen(&events), ["open", "disconnected"]);
 }
 
 #[test]
