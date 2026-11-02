@@ -70,6 +70,7 @@ mod tests {
         assert_eq!(back.default_ttl(), 300);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn write_zone_file_is_atomic_and_readable() {
         let dir = std::env::temp_dir().join(format!("hopf-zone-w-{}", std::process::id()));

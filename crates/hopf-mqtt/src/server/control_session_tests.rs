@@ -234,6 +234,7 @@ fn subscribed(b: &Arc<BrokerState>, version: ProtocolVersion, id: &str, f: &str)
 
 /// Send `wire` and gather everything that comes back for it: the reply and
 /// any deliveries it causes, which may arrive with the reply or after it.
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 fn run_and_collect(peer: &mut Server, wire: &[u8], want: usize) -> Vec<u8> {
     let mut out = peer.run_bytes(wire);
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -582,6 +583,7 @@ fn qos_is_downgraded_to_what_the_subscriber_asked_for() {
     assert_eq!(publish_of(&got[0], V3).2, 0);
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn a_qos1_subscriber_gets_a_qos1_delivery_it_can_acknowledge() {
     let b = broker();
@@ -730,6 +732,7 @@ fn bad_topic_aliases_end_the_connection_with_the_right_reason() {
 // -- retained messages -------------------------------------------------------
 
 /// Publish `topic` retained and wait for the broker to have stored it.
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 fn retain(b: &Arc<BrokerState>, version: ProtocolVersion, topic: &str) {
     let mut publisher = up_with(b, version, "retainer");
     publisher.run_bytes(&publish_wire(topic, b"kept", QoS::AtMostOnce, true, 0, version));
@@ -741,6 +744,7 @@ fn retain(b: &Arc<BrokerState>, version: ProtocolVersion, topic: &str) {
     assert!(!b.retained_matching(topic).is_empty(), "the retained message was stored");
 }
 
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 fn retain_then_subscribe(handling: u8, resubscribe: bool) -> usize {
     let b = broker();
     retain(&b, V5, "ret/t");
@@ -757,6 +761,7 @@ fn retain_then_subscribe(handling: u8, resubscribe: bool) -> usize {
     n
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn a_retained_message_is_sent_to_a_new_subscriber_according_to_retain_handling() {
     assert_eq!(retain_then_subscribe(0, false), 1, "0: always at subscribe time");
@@ -764,12 +769,14 @@ fn a_retained_message_is_sent_to_a_new_subscriber_according_to_retain_handling()
     assert_eq!(retain_then_subscribe(2, false), 0, "2: never");
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn retain_handling_1_does_not_resend_on_a_repeat_subscription_but_0_does() {
     assert_eq!(retain_then_subscribe(1, true), 1);
     assert_eq!(retain_then_subscribe(0, true), 2);
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn a_retained_delivery_has_the_retain_flag_set() {
     let b = broker();
@@ -858,6 +865,7 @@ fn a_new_connection_with_the_same_client_id_takes_over() {
     assert!(first.is_closed(), "the old connection is closed");
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn a_persistent_session_keeps_its_subscription_and_reports_session_present() {
     let b = broker();

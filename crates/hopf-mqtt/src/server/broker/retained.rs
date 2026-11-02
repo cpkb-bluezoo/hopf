@@ -159,7 +159,7 @@ fn matches_from(topic: &[&str], filter: &[&str]) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod tests {
     use super::*;
     use hopf_core::{ConnHandle, Runtime, RuntimeConfig};

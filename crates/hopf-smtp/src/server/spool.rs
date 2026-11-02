@@ -252,6 +252,7 @@ mod tests {
         assert!(!pipeline.is_pending(), "spool writes never drained within {max_ms}ms");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn writes_content_to_a_temp_file_in_order_and_cleans_up_on_reset() {
         let (rt, handle) = test_runtime_and_handle();

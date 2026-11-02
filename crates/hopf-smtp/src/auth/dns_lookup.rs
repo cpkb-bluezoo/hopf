@@ -198,11 +198,15 @@ mod tests {
 
     // The real resolver, against a stub name server ---------------------------
 
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use hopf_core::{Runtime, RuntimeConfig};
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::sync::mpsc;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::time::Duration;
 
     /// A UDP name server for a few fixed names.
+    #[cfg(feature = "integration")]
     fn stub() -> std::net::SocketAddr {
         let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = sock.local_addr().unwrap();
@@ -233,6 +237,7 @@ mod tests {
         addr
     }
 
+    #[cfg(feature = "integration")]
     fn resolver() -> (Arc<DnsResolver>, Arc<Runtime>) {
         let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
         let dns = Arc::new(DnsResolver::new(rt.pick_worker().clone()));
@@ -242,6 +247,7 @@ mod tests {
         (dns, rt)
     }
 
+    #[cfg(feature = "integration")]
     fn ask<T: Send + 'static>(f: impl FnOnce(Cb<T>)) -> Lookup<T> {
         let (tx, rx) = mpsc::channel();
         f(Box::new(move |l| {
@@ -250,6 +256,7 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(5)).expect("an answer")
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn the_resolver_answers_each_kind_of_question() {
         let (dns, _rt) = resolver();
@@ -276,6 +283,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn the_resolver_tells_nothing_there_from_no_such_name_from_a_failure() {
         let (dns, _rt) = resolver();
@@ -286,6 +294,7 @@ mod tests {
         assert_eq!(kind(&ask(|cb| dns.query_mx("other.example", cb))), "nodata");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn an_spf_check_runs_against_the_real_resolver() {
         let (dns, _rt) = resolver();

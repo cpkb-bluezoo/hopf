@@ -613,27 +613,34 @@ impl DtlsSocket {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "integration")]
     use std::sync::mpsc::{channel, Receiver, Sender};
 
     use super::*;
     use crate::crypto::kx_policy::KxPolicy;
     use crate::crypto::trust::TrustStore;
+    #[cfg(feature = "integration")]
     use crate::dtls12::Dtls12Config;
+    #[cfg(feature = "integration")]
     use crate::tls::tls12::engine::{Config as Tls12Config, Role as Tls12Role};
-    use crate::tls::{HandshakeConfig, HandshakeMode, HandshakeRole, ServerCredentials};
+    #[cfg(feature = "integration")]
+    use crate::tls::{HandshakeConfig, HandshakeMode, HandshakeRole};
+    use crate::tls::ServerCredentials;
+    #[cfg(feature = "integration")]
     use crate::Runtime;
 
+    #[cfg(feature = "integration")]
     #[derive(Debug)]
     enum Ev {
         Established(SocketAddr, Option<String>),
         Data(Vec<u8>),
-        // The peer address is only asserted by the integration-only test.
-        #[cfg_attr(not(feature = "integration"), allow(dead_code))]
         Closed(SocketAddr, Option<String>),
     }
 
+    #[cfg(feature = "integration")]
     struct Recorder(Sender<Ev>);
 
+    #[cfg(feature = "integration")]
     impl DtlsObserver for Recorder {
         fn established(&mut self, peer: SocketAddr, info: &SecurityInfo) {
             let _ = self.0.send(Ev::Established(peer, info.sni().map(str::to_owned)));
@@ -646,15 +653,18 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "integration")]
     fn observer() -> (Box<dyn DtlsObserver>, Receiver<Ev>) {
         let (tx, rx) = channel();
         (Box::new(Recorder(tx)), rx)
     }
 
+    #[cfg(feature = "integration")]
     fn next(rx: &Receiver<Ev>) -> Ev {
         rx.recv_timeout(Duration::from_secs(10)).expect("event within 10 s")
     }
 
+    #[cfg(feature = "integration")]
     fn creds() -> (ServerCredentials, TrustStore) {
         let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
         let cert = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap().self_signed(&kp).unwrap();
@@ -667,10 +677,12 @@ mod tests {
         (creds, trust)
     }
 
+    #[cfg(feature = "integration")]
     fn udp() -> UdpSocket {
         UdpSocket::bind("127.0.0.1:0").unwrap()
     }
 
+    #[cfg(feature = "integration")]
     fn server13(creds: &ServerCredentials) -> Arc<dyn DtlsAcceptor> {
         let creds = creds.clone();
         Arc::new(move |_peer: SocketAddr| {
@@ -684,6 +696,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "integration")]
     fn client13(trust: &TrustStore) -> DtlsEngine {
         DtlsEngine::V13(DtlsRecordEngine::new(HandshakeConfig {
             role: HandshakeRole::Client,
@@ -695,6 +708,7 @@ mod tests {
         }))
     }
 
+    #[cfg(feature = "integration")]
     fn expect_established(rx: &Receiver<Ev>) -> SocketAddr {
         match next(rx) {
             Ev::Established(peer, _) => peer,
@@ -703,6 +717,7 @@ mod tests {
     }
 
     /// Like [`expect_established`], also returning the SNI the session reports.
+    #[cfg(feature = "integration")]
     fn expect_established_sni(rx: &Receiver<Ev>) -> (SocketAddr, Option<String>) {
         match next(rx) {
             Ev::Established(peer, sni) => (peer, sni),
@@ -710,6 +725,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "integration")]
     fn expect_data(rx: &Receiver<Ev>, want: &[u8]) {
         match next(rx) {
             Ev::Data(got) => assert_eq!(got, want),
@@ -717,6 +733,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn dtls13_handshake_and_data_over_a_real_udp_socket() {
         let rt = Runtime::start(Default::default()).unwrap();
@@ -749,6 +766,7 @@ mod tests {
         rt.shutdown();
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn negotiating_acceptor_handles_dtls13_and_dtls12_clients() {
         let rt = Runtime::start(Default::default()).unwrap();
@@ -810,6 +828,7 @@ mod tests {
         rt.shutdown();
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn dtls12_over_udp_with_an_address_bound_cookie() {
         let rt = Runtime::start(Default::default()).unwrap();
@@ -850,6 +869,7 @@ mod tests {
 
     /// Forward datagrams between `client` and `server`, dropping the first
     /// `drop_server_to_client` the server sends. Returns the proxy's address.
+    #[cfg(feature = "integration")]
     fn lossy_proxy(server: SocketAddr, drop_server_to_client: usize, stop: Arc<AtomicBool>) -> SocketAddr {
         let sock = udp();
         sock.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
@@ -879,6 +899,7 @@ mod tests {
         addr
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn the_engines_retransmit_timers_recover_lost_datagrams() {
         // Nothing gets through from the server until its flight has been
@@ -937,6 +958,7 @@ mod tests {
         rt.shutdown();
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn unfinished_handshakes_are_swept_and_the_session_limit_holds() {
         let rt = Runtime::start(Default::default()).unwrap();
@@ -1027,6 +1049,7 @@ mod tests {
 
     /// A FIPS DTLS server and client establish a session (and move data) under
     /// every version policy: 1.3 only, 1.2 only, and negotiating.
+    #[cfg(feature = "integration")]
     #[test]
     fn fips_dtls_sessions_establish_under_every_version_policy() {
         use crate::dtls::{dtls_client_engine_fips, dtls_server_engine, DtlsVersionPolicy};

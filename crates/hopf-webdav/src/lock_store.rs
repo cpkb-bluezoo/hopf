@@ -574,7 +574,7 @@ fn parse_record(data: &str, store: &FileLockStore) -> Option<WebDavLock> {
 /// agree about them wherever they mount the content tree — exercised here
 /// through the public [`WebDavLockManager`] API, exactly as
 /// `crate::factory::WebDavFactory` wires it up.
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod tests {
     use super::*;
     use crate::constants::{DEPTH_0, DEPTH_INFINITY};

@@ -384,17 +384,22 @@ impl ServerWriter for InstrumentedWriter<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use super::*;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::sync::Mutex;
 
     use hopf_http::Headers;
 
+    #[cfg(feature = "integration")]
     struct Rec {
         seen_tp: Option<String>,
         status: u16,
     }
 
+    #[cfg(feature = "integration")]
     struct Hello;
+    #[cfg(feature = "integration")]
     impl ServerHandler for Hello {
         fn headers(&mut self, response: &mut dyn ServerWriter, _: &Headers) {
             let body = b"ok";
@@ -412,19 +417,23 @@ mod tests {
         fn request_complete(&mut self, _: &mut dyn ServerWriter) {}
     }
 
+    #[cfg(feature = "integration")]
     struct HelloFactory;
+    #[cfg(feature = "integration")]
     impl ServerHandlerFactory for HelloFactory {
         fn create_handler(&self) -> Box<dyn ServerHandler> {
             Box::new(Hello)
         }
     }
 
+    #[cfg(feature = "integration")]
     struct CapturingWriter {
         headers: Option<Headers>,
         body: Vec<u8>,
         rec: Arc<Mutex<Rec>>,
     }
 
+    #[cfg(feature = "integration")]
     impl ServerWriter for CapturingWriter {
         fn headers(&mut self, headers: Headers) {
             self.rec.lock().unwrap().status = headers.status_code();
@@ -453,6 +462,7 @@ mod tests {
         fn resume_request_body(&mut self) {}
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn instrumented_injects_response_traceparent_and_continues() {
         let traces = std::env::temp_dir().join(format!(
@@ -514,6 +524,7 @@ mod tests {
         let _ = std::fs::remove_file(&metrics);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn access_log_emits_one_clf_line_per_protocol_version() {
         for (version, path_part) in [

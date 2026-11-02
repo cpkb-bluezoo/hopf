@@ -151,13 +151,17 @@ impl LogSink for LogSinkInstance {
 mod tests {
     use super::*;
     use crate::config::OtelConfig;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::fs;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::path::PathBuf;
 
+    #[cfg(feature = "integration")]
     fn temp_jsonl(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("hopf-otel-{name}-{}.jsonl", std::process::id()))
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn disjoint_level_sets_route_to_separate_files() {
         let info_path = temp_jsonl("info-only");
@@ -190,6 +194,7 @@ mod tests {
         let _ = fs::remove_file(&err_path);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn an_otlp_sink_posts_the_batch_as_protobuf() {
         let (port, rx) = crate::otlp_http::tests::serve_once("HTTP/1.1 200 OK\r\n\r\n");
@@ -207,6 +212,7 @@ mod tests {
         assert!(req.windows(9).any(|w| w == b"otlp-test"), "and the service name");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_failing_export_does_not_keep_the_batch() {
         let (port, _rx) = crate::otlp_http::tests::serve_once("HTTP/1.1 503 Busy\r\n\r\n");
@@ -235,6 +241,7 @@ mod tests {
         assert!(batch.is_empty());
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn access_and_qlog_sinks_take_only_their_own_levels() {
         let dir = std::env::temp_dir().join(format!("hopf-otel-sinks-{}", std::process::id()));

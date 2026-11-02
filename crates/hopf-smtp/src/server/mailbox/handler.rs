@@ -684,6 +684,7 @@ mod tests {
         assert_eq!(visited, recipients);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn deliver_to_mailbox_streaming_round_trips_spooled_content() {
         use hopf_mailbox::MaildirFactory;
@@ -714,6 +715,7 @@ mod tests {
         assert_eq!(cb.0, b"From: a@b\r\n\r\nhello\r\n");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn extra_header_lines_are_prepended_ahead_of_spooled_content() {
         use hopf_mailbox::MaildirFactory;
@@ -761,7 +763,7 @@ mod tests {
 }
 
 /// The handler as a server runs it: SMTP in, a Maildir out.
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod session_tests {
     use super::*;
     use crate::server::control::SmtpControlHandler;

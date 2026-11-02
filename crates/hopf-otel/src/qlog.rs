@@ -39,6 +39,7 @@ impl QlogFileSink {
     }
 
     #[cfg(test)]
+    #[cfg_attr(not(feature = "integration"), allow(dead_code))]
     fn with_idle_after(mut self, idle: Duration) -> Self {
         self.idle_after = idle;
         self
@@ -331,6 +332,7 @@ pub fn qlog_event(
 }
 
 #[cfg(test)]
+#[cfg(feature = "integration")]
 pub(crate) fn parse_json_seq_records(bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut start: Option<usize> = None;
@@ -351,10 +353,13 @@ pub(crate) fn parse_json_seq_records(bytes: &[u8]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::fs;
 
+    #[cfg(feature = "integration")]
     const T0: u64 = 1_700_000_000_000_000_000;
 
+    #[cfg(feature = "integration")]
     fn event(
         time: u64,
         group: &str,
@@ -365,10 +370,12 @@ mod tests {
         qlog_event(name, group, vantage, QLOG_SCHEMA_QUIC, data).tap_time(time)
     }
 
+    #[cfg(feature = "integration")]
     trait TestLogRecord {
         fn tap_time(self, t: u64) -> Self;
     }
 
+    #[cfg(feature = "integration")]
     impl TestLogRecord for LogRecord {
         fn tap_time(mut self, t: u64) -> Self {
             self.time_unix_nano = t;
@@ -376,10 +383,12 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "integration")]
     fn temp_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("hopf-qlog-{name}-{}", std::process::id()))
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn two_connections_two_files() {
         let dir = temp_dir("two-conn");
@@ -399,6 +408,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn header_and_framing() {
         let dir = temp_dir("header");
@@ -416,6 +426,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn relative_times_and_data() {
         let dir = temp_dir("times");
@@ -441,6 +452,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn connection_closed_closes_file_and_reopen_appends() {
         let dir = temp_dir("closed");
@@ -467,6 +479,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn idle_close() {
         let dir = temp_dir("idle");
@@ -491,6 +504,7 @@ mod tests {
         assert_eq!(milliseconds(12_345_678_999), "12345.678");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn group_id_sanitized() {
         let dir = temp_dir("safe");

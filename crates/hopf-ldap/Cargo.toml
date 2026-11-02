@@ -14,6 +14,12 @@ readme = "README.md"
 keywords = ["ldap", "ber", "asn1", "auth", "sasl"]
 categories = ["network-programming", "authentication"]
 
+[features]
+default = []
+# Tests that use real files or sockets; excluded from CI
+# unit-test runs.
+integration = []
+
 [dependencies]
 hopf-core = { workspace = true }
 hopf-auth = { workspace = true }

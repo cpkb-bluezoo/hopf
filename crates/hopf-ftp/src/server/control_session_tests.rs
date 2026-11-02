@@ -1,9 +1,11 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
 //! In-process tests of [`FtpControlHandler`]: the test is the FTP client,
-//! over a [`Peer`], against the stock filesystem handler on a temporary
-//! root. Data connections are real loopback sockets.
+//! over a [`Peer`], against an in-memory file system. The tests that open a
+//! data connection use real loopback sockets, and run only with the
+//! `integration` feature.
 
+#[cfg_attr(not(feature = "integration"), allow(unused_imports))]
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -15,7 +17,8 @@ use hopf_core::{Runtime, RuntimeConfig};
 
 use super::*;
 use crate::server::fs::FtpFileSystem;
-use crate::server::handler::{FilesystemFtpHandler, FtpAuthResult, FtpConnectionHandler, FtpOperation};
+use crate::server::handler::{FtpAuthResult, FtpConnectionHandler, FtpOperation};
+use crate::server::memory_fs::{MemoryFtpFileSystem, MemoryFtpHandler};
 use crate::server::throttle::{LoginLimits, LoginThrottle};
 
 /// What the authorization hook was asked, and what it refuses.
@@ -27,7 +30,7 @@ struct Policy {
 
 /// The stock handler with a refusal rule and a log of what it was asked.
 struct PolicyHandler {
-    inner: FilesystemFtpHandler,
+    inner: MemoryFtpHandler,
     policy: Arc<Policy>,
 }
 
@@ -58,7 +61,7 @@ fn runtime() -> Arc<Runtime> {
 struct Session {
     peer: Peer<FtpControlHandler>,
     policy: Arc<Policy>,
-    root: tempfile::TempDir,
+    fs: MemoryFtpFileSystem,
     greeting: String,
 }
 
@@ -68,23 +71,21 @@ impl Session {
     }
 
     fn with(tweak: impl FnOnce(FtpConfig) -> FtpConfig) -> Self {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("pub.txt"), b"public text\n").unwrap();
-        std::fs::create_dir(root.path().join("docs")).unwrap();
-        std::fs::write(root.path().join("docs").join("a.txt"), b"in docs").unwrap();
-        std::fs::create_dir(root.path().join("secret")).unwrap();
-        std::fs::write(root.path().join("secret").join("plan.txt"), b"hidden").unwrap();
+        let fs = MemoryFtpFileSystem::new();
+        fs.put("/pub.txt", b"public text\n");
+        fs.put("/docs/a.txt", b"in docs");
+        fs.put("/secret/plan.txt", b"hidden");
         let tp = PasswordTrustPolicy::new().with_user("u", "p").shared();
         let policy = Arc::new(Policy::default());
         let app = PolicyHandler {
-            inner: FilesystemFtpHandler::new(root.path(), Arc::clone(&tp)).unwrap(),
+            inner: MemoryFtpHandler::new(fs.clone(), Arc::clone(&tp)),
             policy: Arc::clone(&policy),
         };
         let local: SocketAddr = "127.0.0.1:2121".parse().unwrap();
         // The tests that are not about the login limits should not wait out
         // the delay a real server puts after a failed login.
         let no_delay = LoginLimits { failure_delay: Duration::ZERO, ..LoginLimits::default() };
-        let config = tweak(FtpConfig::new(local, root.path(), tp).with_login_limits(no_delay));
+        let config = tweak(FtpConfig::new(local, "/", tp).with_login_limits(no_delay));
         let handler = FtpControlHandler::new(
             Box::new(app),
             runtime(),
@@ -93,11 +94,13 @@ impl Session {
             "127.0.0.1:50000".parse().unwrap(),
             local,
         );
-        let mut peer = Peer::connect(handler, |h| {
-            h.busy.load(std::sync::atomic::Ordering::Relaxed) || h.login_gate.load(std::sync::atomic::Ordering::Relaxed)
-        });
+        let mut peer = Peer::connect_timed(
+            handler,
+            |h| h.busy.load(std::sync::atomic::Ordering::Relaxed),
+            |h| h.login_gate.load(std::sync::atomic::Ordering::Relaxed),
+        );
         let greeting = peer.take();
-        Session { peer, policy, root, greeting }
+        Session { peer, policy, fs, greeting }
     }
 
     fn run(&mut self, line: &str) -> String {
@@ -124,6 +127,7 @@ impl Session {
     }
 
     /// PASV, connect to the port it names.
+    #[cfg_attr(not(feature = "integration"), allow(dead_code))]
     fn passive(&mut self) -> TcpStream {
         let r = self.run("PASV");
         assert!(r.starts_with("227 "), "{r}");
@@ -134,6 +138,7 @@ impl Session {
 
     /// Replies that arrive on the control connection after a command was
     /// sent: pumps until `done` holds of everything so far (or 5 s).
+    #[cfg_attr(not(feature = "integration"), allow(dead_code))]
     fn until(&mut self, mut acc: String, done: impl Fn(&str) -> bool) -> String {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !done(&acc) && Instant::now() < deadline {
@@ -146,6 +151,7 @@ impl Session {
 
     /// Run a transfer command over a passive connection; returns the control
     /// replies and the bytes that came over the data connection.
+    #[cfg_attr(not(feature = "integration"), allow(dead_code))]
     fn transfer(&mut self, cmd: &str) -> (String, Vec<u8>) {
         let mut data = self.passive();
         data.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -253,10 +259,11 @@ fn a_limit_of_zero_means_no_limit() {
 fn a_failed_login_is_answered_only_after_the_delay() {
     let mut s = Session::with(limits(|l| l.failure_delay = Duration::from_millis(250)));
     s.run("USER u");
-    let started = Instant::now();
+    let started = s.peer.elapsed();
     let reply = s.run("PASS wrong");
     assert!(reply.starts_with("530 "), "{reply}");
-    assert!(started.elapsed() >= Duration::from_millis(250), "answered after {:?}", started.elapsed());
+    let waited = s.peer.elapsed() - started;
+    assert!(waited >= Duration::from_millis(250), "answered after {waited:?}");
 }
 
 #[test]
@@ -264,9 +271,9 @@ fn commands_sent_behind_a_failed_login_wait_for_it_and_are_answered_in_order() {
     let mut s = Session::with(limits(|l| l.failure_delay = Duration::from_millis(150)));
     s.run("USER u");
     // a client that does not wait for the answer cannot get ahead of the delay
-    let started = Instant::now();
+    let started = s.peer.elapsed();
     let replies = s.peer.run("PASS wrong\r\nPASS p\r\nPWD\r\n");
-    assert!(started.elapsed() >= Duration::from_millis(150));
+    assert!(s.peer.elapsed() - started >= Duration::from_millis(150));
     let codes: Vec<&str> = replies.lines().map(|l| &l[..3]).collect();
     assert_eq!(codes, ["530", "230", "257"], "{replies}");
 }
@@ -274,9 +281,10 @@ fn commands_sent_behind_a_failed_login_wait_for_it_and_are_answered_in_order() {
 #[test]
 fn a_login_that_works_is_not_delayed() {
     let mut s = Session::with(limits(|l| l.failure_delay = Duration::from_secs(5)));
-    let started = Instant::now();
+    let started = s.peer.elapsed();
     s.login();
-    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    // nothing waited for the clock to be skipped to a timer
+    assert!(s.peer.elapsed() - started < Duration::from_secs(2), "{:?}", s.peer.elapsed() - started);
 }
 
 #[test]
@@ -298,7 +306,7 @@ fn failures_from_one_address_lock_it_out_across_connections() {
             let mut c = limits(|l| {
                 l.max_failures_per_connection = 3;
                 l.lockout_after = 5;
-                l.lockout_duration = Duration::from_millis(400);
+                l.lockout_duration = Duration::from_secs(600);
             })(c);
             c.throttle = shared;
             c
@@ -320,11 +328,7 @@ fn failures_from_one_address_lock_it_out_across_connections() {
     let third = session(&shared);
     assert!(third.greeting.starts_with("421 "), "{}", third.greeting);
     assert!(third.peer.is_closed());
-    // and it is let in again when the lockout ends
-    std::thread::sleep(Duration::from_millis(450));
-    let mut later = session(&shared);
-    assert!(later.greeting.starts_with("220 "), "{}", later.greeting);
-    later.login();
+    // (that the lockout ends is the throttle's own test: it takes the time it is asked at)
 }
 
 #[test]
@@ -379,7 +383,7 @@ fn rein_forgets_the_previous_user_entirely() {
     assert!(s.run("PWD").starts_with("530 "));
     s.login();
     assert!(s.run("RNTO stolen.txt").starts_with("503 "), "another user's RNFR must not carry over");
-    assert!(s.root.path().join("pub.txt").exists() && !s.root.path().join("stolen.txt").exists());
+    assert!(s.fs.exists("/pub.txt") && !s.fs.exists("/stolen.txt"));
     assert_eq!(s.peer.handler.transfer_type, TransferType::Image);
     assert_eq!(s.peer.handler.restart, 0);
 }
@@ -503,6 +507,13 @@ fn a_path_the_hook_refuses_is_refused_for_every_way_of_looking_at_it() {
         let r = s.run(cmd);
         assert!(r.starts_with("550 "), "{cmd}: {r}");
     }
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_path_the_hook_refuses_is_refused_for_a_listing_too() {
+    let mut s = Session::logged_in();
+    s.deny("secret");
     for cmd in ["LIST secret", "NLST secret", "MLSD secret"] {
         let _data = s.passive();
         let r = s.run(cmd);
@@ -522,7 +533,7 @@ fn a_refused_path_does_not_stop_the_others() {
     assert!(s.run("RMD secret").starts_with("550 "));
     assert!(s.run("MKD secret2").starts_with("550 "));
     assert!(s.run("RNFR secret/plan.txt").starts_with("550 "));
-    assert!(s.root.path().join("secret").join("plan.txt").exists());
+    assert!(s.fs.exists("/secret/plan.txt"));
 }
 
 #[test]
@@ -533,7 +544,7 @@ fn a_rename_into_a_refused_place_is_refused_and_can_be_retried() {
     assert!(s.run("RNTO secret/pub.txt").starts_with("550 "));
     *s.policy.deny_containing.lock().unwrap() = None;
     assert!(s.run("RNTO moved.txt").starts_with("250 "));
-    assert!(s.root.path().join("moved.txt").exists());
+    assert!(s.fs.exists("/moved.txt"));
 }
 
 // -- commands that name a path -----------------------------------------------
@@ -592,20 +603,20 @@ fn stat_with_a_path_lists_it_on_the_control_connection() {
 fn mkd_rmd_dele_and_rename() {
     let mut s = Session::logged_in();
     assert!(s.run("MKD fresh").starts_with("257 "));
-    assert!(s.root.path().join("fresh").is_dir());
+    assert!(s.fs.is_dir("/fresh"));
     assert!(s.run("MKD fresh").starts_with("550 "), "it exists");
     assert!(s.run("RMD fresh").starts_with("250 "));
-    assert!(!s.root.path().join("fresh").exists());
+    assert!(!s.fs.exists("/fresh"));
     assert!(s.run("RMD fresh").starts_with("550 "));
     assert!(s.run("RMD docs").starts_with("550 "), "not empty");
     assert!(s.run("DELE pub.txt").starts_with("250 "));
-    assert!(!s.root.path().join("pub.txt").exists());
+    assert!(!s.fs.exists("/pub.txt"));
     assert!(s.run("DELE pub.txt").starts_with("550 "));
     assert!(s.run("RNTO x").starts_with("503 "));
     assert!(s.run("RNFR nothing").starts_with("550 "));
     assert!(s.run("RNFR docs").starts_with("350 "));
     assert!(s.run("RNTO folder").starts_with("250 "));
-    assert!(s.root.path().join("folder").join("a.txt").exists());
+    assert!(s.fs.exists("/folder/a.txt"));
     assert!(s.run("RNTO again").starts_with("503 "), "the RNFR is used up");
 }
 
@@ -618,8 +629,7 @@ fn paths_cannot_leave_the_root() {
         assert!(r.starts_with("550 "), "{cmd}: {r}");
     }
     assert!(s.run("MKD ../escape").starts_with("257 \"/escape\""));
-    assert!(s.root.path().join("escape").is_dir());
-    assert!(!s.root.path().parent().unwrap().join("escape").exists(), "nothing created outside the root");
+    assert!(s.fs.is_dir("/escape"));
 }
 
 #[test]
@@ -641,6 +651,7 @@ fn a_transfer_needs_a_data_connection_first() {
     }
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn pasv_names_a_port_that_is_listening() {
     let mut s = Session::logged_in();
@@ -650,6 +661,7 @@ fn pasv_names_a_port_that_is_listening() {
     assert_eq!(s.peer.handler.metrics.pasv_binds.load(std::sync::atomic::Ordering::Relaxed), 2);
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn pasv_advertises_the_configured_address() {
     let mut s = Session::with(|mut c| {
@@ -661,6 +673,7 @@ fn pasv_advertises_the_configured_address() {
 }
 
 /// A session whose passive ports are confined to one free port, and that port.
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 fn one_port_session() -> (Session, u16) {
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = probe.local_addr().unwrap().port();
@@ -674,6 +687,7 @@ fn one_port_session() -> (Session, u16) {
     (s, port)
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn passive_ports_stay_inside_the_configured_range() {
     let (mut s, port) = one_port_session();
@@ -682,12 +696,14 @@ fn passive_ports_stay_inside_the_configured_range() {
     assert_eq!(nums[4] * 256 + nums[5], port, "{r}");
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn extended_passive_ports_stay_inside_the_configured_range_too() {
     let (mut s, port) = one_port_session();
     assert_eq!(s.run("EPSV"), format!("229 Entering Extended Passive Mode (|||{port}|)\r\n"));
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn epsv_variants() {
     let mut s = Session::logged_in();
@@ -738,6 +754,7 @@ fn require_tls_for_data_refuses_clear_data_connections() {
     assert!(s.run("LIST").starts_with("522 "), "checked again when the transfer is asked for");
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn list_nlst_and_mlsd_over_a_passive_connection() {
     let mut s = Session::logged_in();
@@ -760,6 +777,7 @@ fn list_nlst_and_mlsd_over_a_passive_connection() {
     assert!(text.contains("Type=file;Size=7;") && text.trim_end().ends_with(" a.txt"), "{text}");
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn list_ignores_ls_style_options() {
     // Clients send `LIST -la` out of habit; the options are not a pathname.
@@ -773,6 +791,7 @@ fn list_ignores_ls_style_options() {
     assert!(String::from_utf8_lossy(&data).contains("a.txt"));
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn list_of_a_missing_directory_is_refused() {
     let mut s = Session::logged_in();
@@ -780,6 +799,7 @@ fn list_of_a_missing_directory_is_refused() {
     assert!(s.run("LIST nowhere").starts_with("550 "));
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn retr_sends_the_file_and_stor_receives_it() {
     let mut s = Session::logged_in();
@@ -793,9 +813,10 @@ fn retr_sends_the_file_and_stor_receives_it() {
     drop(d);
     let replies = s.until(first, |r| r.contains("226 "));
     assert!(replies.starts_with("150 ") && replies.contains("226 "), "{replies}");
-    assert_eq!(std::fs::read(s.root.path().join("upload.bin")).unwrap(), b"uploaded bytes");
+    assert_eq!(s.fs.contents("/upload.bin").unwrap(), b"uploaded bytes");
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn restart_resumes_a_download_from_the_offset() {
     let mut s = Session::logged_in();
@@ -808,6 +829,7 @@ fn restart_resumes_a_download_from_the_offset() {
     assert_eq!(data, b"public text\n");
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn appe_appends_and_stou_makes_a_unique_name() {
     let mut s = Session::logged_in();
@@ -816,7 +838,7 @@ fn appe_appends_and_stou_makes_a_unique_name() {
     d.write_all(b"more\n").unwrap();
     drop(d);
     s.until(first, |r| r.contains("226 "));
-    assert_eq!(std::fs::read(s.root.path().join("pub.txt")).unwrap(), b"public text\nmore\n");
+    assert_eq!(s.fs.contents("/pub.txt").unwrap(), b"public text\nmore\n");
 
     let mut d = s.passive();
     let first = s.run("STOU");
@@ -826,6 +848,7 @@ fn appe_appends_and_stou_makes_a_unique_name() {
     s.until(first, |r| r.contains("226 "));
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn retr_of_a_missing_file_or_a_directory_is_refused() {
     let mut s = Session::logged_in();
@@ -835,6 +858,7 @@ fn retr_of_a_missing_file_or_a_directory_is_refused() {
     assert!(s.run("RETR docs").starts_with("550 "));
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn abor_always_answers() {
     let mut s = Session::logged_in();

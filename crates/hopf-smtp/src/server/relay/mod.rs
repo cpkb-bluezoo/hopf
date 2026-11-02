@@ -26,5 +26,5 @@ pub use handler::{SimpleRelayHandler, SimpleRelayHandlerFactory};
 pub use queue::{QueueScan, QueuedMessage, QueuedRecipient, RecipientStatus, RelayQueue};
 pub use service::SimpleRelayService;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod tests;

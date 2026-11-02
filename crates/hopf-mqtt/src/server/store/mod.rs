@@ -554,7 +554,7 @@ pub fn queued_message(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod file_backed_tests {
     use super::*;
 

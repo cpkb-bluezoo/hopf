@@ -8,6 +8,8 @@ mod control;
 mod data;
 mod fs;
 mod handler;
+#[cfg(test)]
+mod memory_fs;
 mod metrics;
 mod reply;
 mod service;

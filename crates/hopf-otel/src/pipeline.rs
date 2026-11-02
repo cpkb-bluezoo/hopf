@@ -240,6 +240,7 @@ impl Hook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use crate::config::LevelSet;
     use crate::event::log_record_from_event;
     use crate::log_record::LogRecord;
@@ -252,6 +253,7 @@ mod tests {
         pipeline.shutdown();
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn jsonl_appends_line() {
         let dir = std::env::temp_dir().join(format!(
@@ -285,6 +287,7 @@ mod tests {
         pipeline.shutdown();
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn flush_waits_for_in_memory_log_batch() {
         let dir = std::env::temp_dir().join(format!(
@@ -309,6 +312,7 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn flush_blocks_when_export_queue_is_full() {
         let dir = std::env::temp_dir().join(format!(
@@ -376,6 +380,7 @@ mod tests {
         assert_eq!(bytes[0] & 0x07, 2);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn disjoint_sinks_receive_only_matching_levels() {
         let info_path = std::env::temp_dir().join(format!(
@@ -410,6 +415,7 @@ mod tests {
         let _ = std::fs::remove_file(&access_path);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn qlog_sink_writes_sqlog_file() {
         let dir = std::env::temp_dir().join(format!("hopf-qlog-pipe-{}", std::process::id()));

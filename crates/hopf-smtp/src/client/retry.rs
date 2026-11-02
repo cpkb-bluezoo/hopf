@@ -139,9 +139,13 @@ impl Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::io::{BufRead, BufReader, Write};
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::net::TcpListener;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::sync::mpsc;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
@@ -166,6 +170,7 @@ mod tests {
 
     /// A loopback SMTP server that answers each connection's MAIL FROM with
     /// `mail_reply(attempt)`; everything else is accepted.
+    #[cfg(feature = "integration")]
     fn server(mail_reply: impl Fn(usize) -> &'static str + Send + Sync + 'static) -> (u16, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -220,6 +225,7 @@ mod tests {
         (port, attempts)
     }
 
+    #[cfg(feature = "integration")]
     fn quick_policy() -> RetryPolicy {
         RetryPolicy::exponential_backoff()
             .with_initial_delay(Duration::from_millis(20))
@@ -228,6 +234,7 @@ mod tests {
             .with_max_attempts(4)
     }
 
+    #[cfg(feature = "integration")]
     fn run(port: u16, policy: RetryPolicy) -> SmtpSendOutcome {
         let rt = Arc::new(Runtime::start(hopf_core::RuntimeConfig::default()).unwrap());
         let client = SmtpClient::from_addr(format!("127.0.0.1:{port}").parse().unwrap());
@@ -243,6 +250,7 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(10)).expect("a final outcome")
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_delivery_that_works_first_time_is_reported_once() {
         let (port, attempts) = server(|_| "250 ok\r\n");
@@ -250,6 +258,7 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_temporary_refusal_is_tried_again_until_it_works() {
         let (port, attempts) = server(|n| if n < 2 { "451 4.3.0 try later\r\n" } else { "250 ok\r\n" });
@@ -257,6 +266,7 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_permanent_refusal_is_not_tried_again() {
         let (port, attempts) = server(|_| "550 5.1.1 no\r\n");
@@ -264,6 +274,7 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_temporary_refusal_that_never_clears_is_given_up_on() {
         let (port, attempts) = server(|_| "451 4.3.0 try later\r\n");
@@ -272,6 +283,7 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 5);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_server_that_cannot_be_reached_is_a_failure_after_the_attempts_are_used() {
         let port = {

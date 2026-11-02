@@ -384,6 +384,7 @@ mod tests {
         (rt, handle)
     }
 
+    #[cfg(feature = "integration")]
     fn wait_for(pred: impl Fn() -> bool, max_ms: u64) -> bool {
         for _ in 0..(max_ms / 5).max(1) {
             if pred() {
@@ -394,6 +395,7 @@ mod tests {
         pred()
     }
 
+    #[cfg(feature = "integration")]
     fn retained_header(topic: &str, payload_len: u32) -> PublishHeader {
         PublishHeader {
             dup: false,
@@ -409,6 +411,7 @@ mod tests {
     /// Issue #187: many `feed()` calls, each offloaded independently, must
     /// still land on disk in submission order (mirrors the equivalent
     /// `hopf-smtp`/`hopf-imap` "many chunks in order" tests).
+    #[cfg(feature = "integration")]
     #[test]
     fn feed_chunks_land_in_order_despite_offloading() {
         let (rt, handle) = test_runtime_and_handle();

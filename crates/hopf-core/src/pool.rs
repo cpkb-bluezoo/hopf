@@ -324,6 +324,21 @@ mod tests {
     /// (pool bookkeeping only, not real I/O) shouldn't need to spin up.
     struct FakeBackend {
         open: Arc<AtomicBool>,
+        timers: Timers,
+    }
+
+    /// Timers the pool scheduled, kept until a test fires them: a test moves
+    /// time by calling [`fire_timers`], not by waiting for it.
+    type Timers = Arc<Mutex<Vec<(Task, Arc<AtomicBool>)>>>;
+
+    /// Run every timer that has not been cancelled.
+    fn fire_timers(timers: &Timers) {
+        let due = std::mem::take(&mut *timers.lock().unwrap());
+        for (callback, cancelled) in due {
+            if !cancelled.load(Ordering::SeqCst) {
+                callback();
+            }
+        }
     }
 
     impl ConnHandleBackend for FakeBackend {
@@ -337,25 +352,26 @@ mod tests {
         fn is_probably_open(&self) -> bool {
             self.open.load(Ordering::SeqCst)
         }
-        fn schedule_timer(&self, delay: Duration, callback: Task) -> TimerHandle {
+        fn schedule_timer(&self, _delay: Duration, callback: Task) -> TimerHandle {
             let cancelled = Arc::new(AtomicBool::new(false));
-            let flag = Arc::clone(&cancelled);
-            std::thread::spawn(move || {
-                std::thread::sleep(delay);
-                if !flag.load(Ordering::SeqCst) {
-                    callback();
-                }
-            });
+            self.timers.lock().unwrap().push((callback, Arc::clone(&cancelled)));
             TimerHandle::new(move || cancelled.store(true, Ordering::SeqCst))
         }
     }
 
     fn fake_handle() -> (ConnHandle, Arc<AtomicBool>) {
+        let (handle, open, _timers) = fake_handle_with_timers();
+        (handle, open)
+    }
+
+    fn fake_handle_with_timers() -> (ConnHandle, Arc<AtomicBool>, Timers) {
         let open = Arc::new(AtomicBool::new(true));
+        let timers = Timers::default();
         let backend = Arc::new(FakeBackend {
             open: Arc::clone(&open),
+            timers: Arc::clone(&timers),
         });
-        (ConnHandle::from_backend(backend), open)
+        (ConnHandle::from_backend(backend), open, timers)
     }
 
     #[test]
@@ -437,10 +453,10 @@ mod tests {
                 .idle_timeout(Some(Duration::from_millis(30)))
                 .max_idle_total(10),
         );
-        let (handle, _open) = fake_handle();
+        let (handle, _open, timers) = fake_handle_with_timers();
         drop(pool.adopt(1, handle));
         assert_eq!(pool.idle_count(&1), 1);
-        std::thread::sleep(Duration::from_millis(150));
+        fire_timers(&timers);
         assert_eq!(pool.idle_count(&1), 0, "idle entry should have been evicted");
     }
 
@@ -449,13 +465,13 @@ mod tests {
         let pool: Pool<u32> = Pool::new(
             PoolConfig::default().idle_timeout(Some(Duration::from_millis(30))),
         );
-        let (handle, _open) = fake_handle();
+        let (handle, _open, timers) = fake_handle_with_timers();
         drop(pool.adopt(1, handle));
         let pooled = pool.checkout(&1).unwrap();
         // Hold it checked out past the idle timeout — the timer that would
         // have evicted it must have been cancelled at checkout time, not
         // left free to fire against an entry that's no longer idle.
-        std::thread::sleep(Duration::from_millis(150));
+        fire_timers(&timers);
         drop(pooled);
         assert_eq!(
             pool.idle_count(&1),

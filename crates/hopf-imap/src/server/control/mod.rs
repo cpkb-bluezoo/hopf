@@ -2175,7 +2175,7 @@ fn unique_append_spool_path() -> std::path::PathBuf {
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod session_tests;
 
 #[cfg(test)]
@@ -2213,7 +2213,7 @@ mod tests {
 /// thread, and `finalize_pending_append`/the `Command` event that follows
 /// must not read `pending_append_path` until every queued chunk has
 /// actually landed, in order.
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod append_offload_tests {
     use super::*;
     use crate::server::handler::ImapHandlerFactory;
@@ -2383,7 +2383,7 @@ mod append_offload_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod telemetry_tests {
     use super::*;
     use hopf_auth::PasswordStore;

@@ -1180,7 +1180,7 @@ fn crate_civil(z: i64) -> (i32, u32, u32) {
     (y as i32, m as u32, d as u32)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod tests {
     use super::*;
     use crate::traits::{MailboxFactory, MessageReadCallback};

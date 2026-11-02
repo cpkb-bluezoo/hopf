@@ -14,9 +14,12 @@
 #   ./scripts/check-hermetic-tests.sh -p hopf-ftp     one crate (repeatable)
 #   ./scripts/check-hermetic-tests.sh -p hopf-ftp -- session_tests   filter
 #
-# Sandbox: macOS uses sandbox-exec; Linux uses an unshared network and mount
-# namespace (needs root, or unprivileged user namespaces) with / read-only.
-# Only /dev stays writable.
+# Sandbox: macOS uses sandbox-exec, which denies every socket (a bare bind
+# included) and every write. Linux unshares the network and mount namespaces
+# (as root, through unprivileged user namespaces, or through sudo) and makes /
+# read-only; the new network namespace has no usable interface, so a socket can
+# be created and bound but nothing can connect or send. Only /dev stays
+# writable.
 
 set -euo pipefail
 
@@ -62,14 +65,18 @@ EOF
         confine() { sandbox-exec -f "$scratch/deny.sb" "$@"; }
         ;;
     Linux)
-        confine() {
-            local run='mount --make-rprivate / && mount -o remount,ro,bind / / && exec "$@"'
-            if [ "$(id -u)" -eq 0 ]; then
-                unshare -m -n -- sh -c "$run" sh "$@"
-            else
-                unshare -r -m -n -- sh -c "$run" sh "$@"
-            fi
-        }
+        readonly_root='mount --make-rprivate / && mount -o remount,ro,bind / / && exec "$@"'
+        if [ "$(id -u)" -eq 0 ]; then
+            unshare_cmd=(unshare -m -n)
+        elif unshare -r -m -n true 2>/dev/null; then
+            unshare_cmd=(unshare -r -m -n)
+        elif sudo -n true 2>/dev/null; then
+            unshare_cmd=(sudo -n unshare -m -n)
+        else
+            echo "cannot create namespaces: need root, sudo or unprivileged user namespaces" >&2
+            exit 2
+        fi
+        confine() { "${unshare_cmd[@]}" -- sh -c "$readonly_root" sh "$@"; }
         ;;
     *) echo "unsupported platform: $(uname -s)" >&2; exit 2 ;;
 esac
@@ -78,7 +85,7 @@ failed=0
 while read -r binary dir; do
     name=$(basename "$binary")
     log="$scratch/$name.log"
-    if (cd "$dir" && CARGO_MANIFEST_DIR="$dir" confine "$binary" --test-threads=8 ${filter[@]+"${filter[@]}"} > "$log" 2>&1); then
+    if (cd "$dir" && confine env CARGO_MANIFEST_DIR="$dir" "$binary" --test-threads=8 ${filter[@]+"${filter[@]}"} > "$log" 2>&1); then
         echo "ok      ${dir#$ROOT/}"
     else
         echo "FAILED  ${dir#$ROOT/}"

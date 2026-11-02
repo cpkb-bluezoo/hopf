@@ -91,7 +91,9 @@ pub use telemetry::{
 };
 pub use tls::{
     acceptor_from_pem, acceptor_from_pem_tls12, acceptor_from_pem_tls12_with_client_auth,
-    acceptor_from_credentials, acceptor_from_credentials_with_client_auth,
+    acceptor_from_credentials, acceptor_from_credentials_tls12, acceptor_from_credentials_with_client_auth,
+    acceptor_from_credentials_with_sni, acceptor_from_pem_bytes, acceptor_from_pem_tls12_bytes,
+    connector_from_pem_bytes, connector_from_pem_bytes_with_tcp_version_policy, connector_from_pem_tls12_bytes,
     acceptor_from_pem_with_client_auth, acceptor_from_pem_with_sni,
     acceptor_from_pem_with_tcp_version_policy, acceptor_requiring_supported_versions, acceptor_with_alpn,
     acceptor_with_record_size_limit,

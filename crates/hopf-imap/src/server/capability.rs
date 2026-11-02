@@ -112,16 +112,15 @@ mod tests {
     use hopf_mailbox::MaildirFactory;
     use std::net::SocketAddr;
     use std::sync::Arc;
-    use tempfile::tempdir;
 
     fn test_config(enable_idle: bool) -> ImapConfig {
-        let dir = tempdir().unwrap();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let mut cfg = ImapConfig::new(
             addr,
             "localhost",
             Arc::new(PasswordStore::new()),
-            Arc::new(MaildirFactory::new(dir.path())),
+            // The factory is never asked for a mailbox, so this path is never touched.
+            Arc::new(MaildirFactory::new("/srv/mail")),
         );
         cfg.enable_idle = enable_idle;
         cfg.enable_quota = false;

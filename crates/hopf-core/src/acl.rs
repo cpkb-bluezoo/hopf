@@ -129,7 +129,12 @@ impl AcceptRateLimit {
 
     /// Try to consume one accept slot for `peer`. Returns false if limited.
     pub fn try_acquire(&self, peer: SocketAddr) -> bool {
-        let now = Instant::now();
+        self.try_acquire_at(peer, Instant::now())
+    }
+
+    /// [`Self::try_acquire`] as of `now`, so that a test can move time
+    /// instead of waiting for it.
+    pub(crate) fn try_acquire_at(&self, peer: SocketAddr, now: Instant) -> bool {
         let ip = peer.ip();
         let mut g = self.inner.lock().unwrap();
         if self.global > 0 {
@@ -252,17 +257,17 @@ mod tests {
     fn rate_limit_prunes_expired_sources_instead_of_growing_forever() {
         let window = Duration::from_millis(20);
         let lim = AcceptRateLimit::new(1, window, 0);
+        let t0 = Instant::now();
 
         for i in 0..50u8 {
-            assert!(lim.try_acquire(sa4([10, 0, 0, i], 1)));
+            assert!(lim.try_acquire_at(sa4([10, 0, 0, i], 1), t0));
         }
         assert_eq!(lim.inner.lock().unwrap().sources.len(), 50);
 
         // Let every tracked entry's window expire, then make one more call
         // (from a source not in the map) far enough past the last sweep to
         // trigger a new sweep.
-        std::thread::sleep(window * 2);
-        assert!(lim.try_acquire(sa4([10, 0, 1, 0], 1)));
+        assert!(lim.try_acquire_at(sa4([10, 0, 1, 0], 1), t0 + window * 2));
 
         // Only the source that triggered the sweep should remain — every
         // stale entry was pruned rather than sitting there indefinitely.

@@ -1356,7 +1356,7 @@ fn sync_pending_authorize(handler: &mut MqttControlHandler, endpoint: &mut dyn E
 #[path = "control_session_tests.rs"]
 mod session_tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod publish_finish_tests {
     use super::*;
     use crate::codec::encode;

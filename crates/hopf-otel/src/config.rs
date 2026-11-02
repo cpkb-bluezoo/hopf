@@ -327,6 +327,7 @@ impl OtelConfig {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "integration")]
     #[test]
     fn qlogdir_env_adds_sink_when_none_accepts_qlog() {
         let dir = std::env::temp_dir().join(format!("hopf-qlogdir-cfg-{}", std::process::id()));

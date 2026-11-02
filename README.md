@@ -59,6 +59,9 @@ every protocol crate.
 cargo check --workspace
 # Same unit-test command used by CI (does not enable integration features):
 cargo test --workspace --lib
+# The same tests with no network and a read-only filesystem, as CI also runs
+# them: a unit test that does socket or file I/O fails here.
+./scripts/check-hermetic-tests.sh
 # Opt-in I/O smoke suites, run locally per crate when needed:
 cargo test -p hopf-smtp --features integration
 cargo test -p hopf-imap --features integration

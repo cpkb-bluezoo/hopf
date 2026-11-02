@@ -828,9 +828,22 @@ mod tests {
         cancelled: bool,
     }
 
-    struct SyncTimerBackend;
+    /// Keeps the timers it is asked for, to be fired by the test.
+    #[derive(Default)]
+    struct ManualTimerBackend {
+        timers: Mutex<Vec<hopf_core::Task>>,
+    }
 
-    impl ConnHandleBackend for SyncTimerBackend {
+    impl ManualTimerBackend {
+        fn fire(&self) {
+            let due = std::mem::take(&mut *self.timers.lock().unwrap());
+            for callback in due {
+                callback();
+            }
+        }
+    }
+
+    impl ConnHandleBackend for ManualTimerBackend {
         fn with_endpoint(&self, _task: hopf_core::EndpointTask) {}
         fn execute(&self, task: hopf_core::Task) {
             task();
@@ -838,11 +851,8 @@ mod tests {
         fn is_probably_open(&self) -> bool {
             true
         }
-        fn schedule_timer(&self, delay: Duration, callback: hopf_core::Task) -> TimerHandle {
-            std::thread::spawn(move || {
-                std::thread::sleep(delay);
-                callback();
-            });
+        fn schedule_timer(&self, _delay: Duration, callback: hopf_core::Task) -> TimerHandle {
+            self.timers.lock().unwrap().push(callback);
             TimerHandle::from_cancel(|| {})
         }
     }
@@ -1101,13 +1111,15 @@ mod tests {
             )
             .with_options(opts);
         let mut handler = call.create_handler();
+        let timers = Arc::new(ManualTimerBackend::default());
         let mut req = MockRequest {
             sent: Arc::new(Mutex::new(Sent::default())),
-            conn: ConnHandle::from_backend(Arc::new(SyncTimerBackend)),
+            conn: ConnHandle::from_backend(Arc::clone(&timers) as Arc<dyn ConnHandleBackend>),
         };
         handler.start(&mut req);
         assert!(req.headers().unwrap().get("grpc-timeout").is_some());
-        std::thread::sleep(Duration::from_millis(40));
+        assert!(!req.sent.lock().unwrap().cancelled, "not before the deadline");
+        timers.fire();
         assert!(req.sent.lock().unwrap().cancelled);
         let got = events.take();
         assert!(

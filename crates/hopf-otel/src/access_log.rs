@@ -406,6 +406,7 @@ mod tests {
         assert!(line.ends_with(" 200 42"));
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn elff_new_file_gets_version_and_fields() {
         let path = std::env::temp_dir().join(format!(

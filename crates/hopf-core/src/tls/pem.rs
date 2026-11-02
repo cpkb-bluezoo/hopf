@@ -282,32 +282,42 @@ fn base_config(role: HandshakeRole, alpn: &[&[u8]]) -> HandshakeConfig {
     handshake_config_tcp_record_layer(role, alpn)
 }
 
-fn load_certs(path: &Path) -> io::Result<Vec<Bytes>> {
-    let pem = std::fs::read(path)?;
-    let certs = parse_certs(&pem);
+fn certs_from_pem(pem: &[u8], origin: &str) -> io::Result<Vec<Bytes>> {
+    let certs = parse_certs(pem);
     if certs.is_empty() {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            format!("no certificates in {}", path.display()),
-        ));
+        return Err(io::Error::new(ErrorKind::InvalidData, format!("no certificates in {origin}")));
     }
     Ok(certs.into_iter().map(Bytes::from).collect())
 }
 
-fn load_pkcs8_key(path: &Path) -> io::Result<Bytes> {
-    let pem = std::fs::read(path)?;
-    let mut keys = parse_pkcs8_keys(&pem);
+fn pkcs8_key_from_pem(pem: &[u8], origin: &str) -> io::Result<Bytes> {
+    let mut keys = parse_pkcs8_keys(pem);
     let Some(key) = keys.pop() else {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
             format!(
-                "{}: no PKCS#8 private key found (only `BEGIN PRIVATE KEY` PEM blocks are \
-                 supported today — re-encode PKCS#1/SEC1 keys with `openssl pkcs8 -topk8 -nocrypt`)",
-                path.display()
+                "{origin}: no PKCS#8 private key found (only `BEGIN PRIVATE KEY` PEM blocks are \
+                 supported today — re-encode PKCS#1/SEC1 keys with `openssl pkcs8 -topk8 -nocrypt`)"
             ),
         ));
     };
     Ok(Bytes::from(key))
+}
+
+fn load_certs(path: &Path) -> io::Result<Vec<Bytes>> {
+    certs_from_pem(&std::fs::read(path)?, &path.display().to_string())
+}
+
+fn load_pkcs8_key(path: &Path) -> io::Result<Bytes> {
+    pkcs8_key_from_pem(&std::fs::read(path)?, &path.display().to_string())
+}
+
+fn trust_store_from(certs: Vec<Bytes>) -> TrustStore {
+    let mut trust = TrustStore::new();
+    for cert in certs {
+        trust.add_anchor(cert);
+    }
+    trust
 }
 
 /// Load a PEM certificate chain and PKCS#8 private key into [`ServerCredentials`].
@@ -408,14 +418,25 @@ pub fn acceptor_from_pem_with_sni(
     alpn: &[&[u8]],
 ) -> io::Result<SharedTlsAcceptor> {
     let default = server_credentials_from_pem(default_cert_path, default_key_path)?;
-    Ok(Arc::new(SniAcceptor {
+    Ok(acceptor_from_credentials_with_sni(default, by_name, alpn))
+}
+
+/// [`acceptor_from_pem_with_sni`] for credentials already in memory (see
+/// [`server_credentials_from_pem_bytes`]): `default` backs an unmatched or
+/// absent SNI.
+pub fn acceptor_from_credentials_with_sni(
+    default: ServerCredentials,
+    by_name: impl IntoIterator<Item = (String, ServerCredentials)>,
+    alpn: &[&[u8]],
+) -> SharedTlsAcceptor {
+    Arc::new(SniAcceptor {
         by_name: Arc::new(by_name.into_iter().collect()),
         default,
         alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
         client_auth: ClientAuthPolicy::None,
         client_trust_store: None,
         version_policy: TcpTlsVersionPolicy::Negotiate,
-    }))
+    })
 }
 
 /// Build a mutual-TLS [`SharedTlsAcceptor`]: like [`acceptor_from_pem`], but
@@ -429,10 +450,7 @@ pub fn acceptor_from_pem_with_client_auth(
     client_ca_path: &Path,
 ) -> io::Result<SharedTlsAcceptor> {
     let creds = server_credentials_from_pem(cert_path, key_path)?;
-    let mut trust = TrustStore::new();
-    for cert in load_certs(client_ca_path)? {
-        trust.add_anchor(cert);
-    }
+    let trust = trust_store_from(load_certs(client_ca_path)?);
     Ok(Arc::new(PemAcceptor {
         creds,
         alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
@@ -446,21 +464,15 @@ pub fn acceptor_from_pem_with_client_auth(
 /// into [`ServerCredentials`] — for identities generated at run time (an
 /// ephemeral loopback CA, a test fixture) that never touch the file system.
 pub fn server_credentials_from_pem_bytes(cert_pem: &[u8], key_pem: &[u8]) -> io::Result<ServerCredentials> {
-    let certs = parse_certs(cert_pem);
-    if certs.is_empty() {
-        return Err(io::Error::new(ErrorKind::InvalidData, "no certificates in PEM"));
-    }
-    let mut keys = parse_pkcs8_keys(key_pem);
-    let Some(key) = keys.pop() else {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "no PKCS#8 private key found in PEM (only `BEGIN PRIVATE KEY` blocks are supported)",
-        ));
-    };
     Ok(ServerCredentials {
-        cert_chain: certs.into_iter().map(Bytes::from).collect(),
-        signing_key_pkcs8: Bytes::from(key),
+        cert_chain: certs_from_pem(cert_pem, "PEM")?,
+        signing_key_pkcs8: pkcs8_key_from_pem(key_pem, "PEM")?,
     })
+}
+
+/// [`acceptor_from_pem`] for PEM already in memory.
+pub fn acceptor_from_pem_bytes(cert_pem: &[u8], key_pem: &[u8], alpn: &[&[u8]]) -> io::Result<SharedTlsAcceptor> {
+    Ok(acceptor_from_credentials(server_credentials_from_pem_bytes(cert_pem, key_pem)?, alpn))
 }
 
 /// Build a [`SharedTlsAcceptor`] from credentials already in memory — the
@@ -595,17 +607,31 @@ pub fn connector_from_pem_with_tcp_version_policy(
     alpn: &[&[u8]],
     version_policy: TcpTlsVersionPolicy,
 ) -> io::Result<SharedTlsConnector> {
-    let mut trust = TrustStore::new();
-    for cert in load_certs(ca_path)? {
-        trust.add_anchor(cert);
-    }
-    Ok(trusted_connector(
+    Ok(connector_trusting(trust_store_from(load_certs(ca_path)?), alpn, version_policy))
+}
+
+fn connector_trusting(trust: TrustStore, alpn: &[&[u8]], version_policy: TcpTlsVersionPolicy) -> SharedTlsConnector {
+    trusted_connector(
         Some(trust),
         None,
         alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
         None,
         version_policy,
-    ))
+    )
+}
+
+/// [`connector_from_pem`] for a PEM CA / leaf certificate already in memory.
+pub fn connector_from_pem_bytes(ca_pem: &[u8], alpn: &[&[u8]]) -> io::Result<SharedTlsConnector> {
+    connector_from_pem_bytes_with_tcp_version_policy(ca_pem, alpn, TcpTlsVersionPolicy::Negotiate)
+}
+
+/// [`connector_from_pem_with_tcp_version_policy`] for PEM already in memory.
+pub fn connector_from_pem_bytes_with_tcp_version_policy(
+    ca_pem: &[u8],
+    alpn: &[&[u8]],
+    version_policy: TcpTlsVersionPolicy,
+) -> io::Result<SharedTlsConnector> {
+    Ok(connector_trusting(trust_store_from(certs_from_pem(ca_pem, "PEM")?), alpn, version_policy))
 }
 
 /// Build a mutual-TLS [`SharedTlsConnector`]: like [`connector_from_pem`], but
@@ -703,8 +729,17 @@ impl TlsAcceptor for PemAcceptorTls12 {
 /// Build a TLS 1.2 [`SharedTlsAcceptor`] from PEM cert-chain and PKCS#8 key
 /// files — RSA, ECDSA P-256/P-384 or Ed25519 keys (see `tls12::engine`'s module doc).
 pub fn acceptor_from_pem_tls12(cert_path: &Path, key_path: &Path) -> io::Result<SharedTlsAcceptor> {
-    let creds = server_credentials_from_pem(cert_path, key_path)?;
-    Ok(Arc::new(PemAcceptorTls12 { creds, client_auth: ClientAuthPolicy::None, client_trust_store: None }))
+    Ok(acceptor_from_credentials_tls12(server_credentials_from_pem(cert_path, key_path)?))
+}
+
+/// [`acceptor_from_pem_tls12`] for PEM already in memory.
+pub fn acceptor_from_pem_tls12_bytes(cert_pem: &[u8], key_pem: &[u8]) -> io::Result<SharedTlsAcceptor> {
+    Ok(acceptor_from_credentials_tls12(server_credentials_from_pem_bytes(cert_pem, key_pem)?))
+}
+
+/// TLS 1.2 counterpart of [`acceptor_from_credentials`].
+pub fn acceptor_from_credentials_tls12(creds: ServerCredentials) -> SharedTlsAcceptor {
+    Arc::new(PemAcceptorTls12 { creds, client_auth: ClientAuthPolicy::None, client_trust_store: None })
 }
 
 /// Build a mutual-TLS TLS 1.2 [`SharedTlsAcceptor`]: like
@@ -717,10 +752,7 @@ pub fn acceptor_from_pem_tls12_with_client_auth(
     client_ca_path: &Path,
 ) -> io::Result<SharedTlsAcceptor> {
     let creds = server_credentials_from_pem(cert_path, key_path)?;
-    let mut trust = TrustStore::new();
-    for cert in load_certs(client_ca_path)? {
-        trust.add_anchor(cert);
-    }
+    let trust = trust_store_from(load_certs(client_ca_path)?);
     Ok(Arc::new(PemAcceptorTls12 { creds, client_auth: policy, client_trust_store: Some(trust) }))
 }
 
@@ -748,10 +780,13 @@ impl TlsConnector for TrustedConnectorTls12 {
 /// Build a TLS 1.2 [`SharedTlsConnector`] that trusts the given PEM CA / leaf
 /// cert file.
 pub fn connector_from_pem_tls12(ca_path: &Path) -> io::Result<SharedTlsConnector> {
-    let mut trust = TrustStore::new();
-    for cert in load_certs(ca_path)? {
-        trust.add_anchor(cert);
-    }
+    let trust = trust_store_from(load_certs(ca_path)?);
+    Ok(Arc::new(TrustedConnectorTls12 { trust_store: Some(trust), client_credentials: None }))
+}
+
+/// [`connector_from_pem_tls12`] for a PEM CA / leaf certificate already in memory.
+pub fn connector_from_pem_tls12_bytes(ca_pem: &[u8]) -> io::Result<SharedTlsConnector> {
+    let trust = trust_store_from(certs_from_pem(ca_pem, "PEM")?);
     Ok(Arc::new(TrustedConnectorTls12 { trust_store: Some(trust), client_credentials: None }))
 }
 
@@ -782,14 +817,27 @@ pub fn insecure_connector_tls12() -> SharedTlsConnector {
 mod tests {
     use super::*;
 
-    fn write_temp_pem(key_pair: &rcgen::KeyPair) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
-        let dir = tempfile::Builder::new().prefix("hopf-core-tls-pem-").tempdir().unwrap();
+    /// A self-signed certificate for `localhost` and its key, as PEM.
+    struct Pem {
+        cert: Vec<u8>,
+        key: Vec<u8>,
+    }
+
+    fn pem_fixture(key_pair: &rcgen::KeyPair) -> Pem {
         let params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
         let cert = params.self_signed(key_pair).unwrap();
+        Pem { cert: cert.pem().into_bytes(), key: key_pair.serialize_pem().into_bytes() }
+    }
+
+    /// The same fixture in files, for the tests of the path-based builders.
+    #[cfg(feature = "integration")]
+    fn write_temp_pem(key_pair: &rcgen::KeyPair) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = tempfile::Builder::new().prefix("hopf-core-tls-pem-").tempdir().unwrap();
+        let pem = pem_fixture(key_pair);
         let cert_path = dir.path().join("cert.pem");
         let key_path = dir.path().join("key.pem");
-        std::fs::write(&cert_path, cert.pem()).unwrap();
-        std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
+        std::fs::write(&cert_path, &pem.cert).unwrap();
+        std::fs::write(&key_path, &pem.key).unwrap();
         (dir, cert_path, key_path)
     }
 
@@ -851,14 +899,14 @@ mod tests {
     /// other's limit while the data still arrives intact.
     #[test]
     fn the_wrappers_apply_the_limit_to_engines_from_the_ordinary_builders() {
-        use crate::tls::connector_from_pem;
+        use crate::tls::connector_from_pem_bytes;
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let (_dir, cert_path, key_path) = write_temp_pem(&key_pair);
+        let pem = pem_fixture(&key_pair);
         let acceptor = acceptor_with_record_size_limit(
-            acceptor_from_pem(&cert_path, &key_path, &[b"h2"]).unwrap(),
+            acceptor_from_pem_bytes(&pem.cert, &pem.key, &[b"h2"]).unwrap(),
             150,
         );
-        let connector = connector_with_record_size_limit(connector_from_pem(&cert_path, &[b"h2"]).unwrap(), 120);
+        let connector = connector_with_record_size_limit(connector_from_pem_bytes(&pem.cert, &[b"h2"]).unwrap(), 120);
 
         let (mut client, mut server) = (connector.connect("localhost").unwrap(), acceptor.accept());
         let (mut wc, mut ws) = (Wire::default(), Wire::default());
@@ -900,13 +948,13 @@ mod tests {
     /// Default PEM acceptor/connector negotiate TLS 1.2 vs 1.3 on one TCP endpoint.
     #[test]
     fn default_pem_negotiates_tls12_and_tls13_on_one_acceptor() {
-        use crate::tls::{connector_from_pem, connector_from_pem_tls12};
+        use crate::tls::{connector_from_pem_bytes, connector_from_pem_tls12_bytes};
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let (_dir, cert_path, key_path) = write_temp_pem(&key_pair);
-        let acceptor = acceptor_from_pem(&cert_path, &key_path, &[]).unwrap();
+        let pem = pem_fixture(&key_pair);
+        let acceptor = acceptor_from_pem_bytes(&pem.cert, &pem.key, &[]).unwrap();
         for (label, connector) in [
-            ("TLS 1.3 client", connector_from_pem(&cert_path, &[]).unwrap()),
-            ("TLS 1.2 client", connector_from_pem_tls12(&cert_path).unwrap()),
+            ("TLS 1.3 client", connector_from_pem_bytes(&pem.cert, &[]).unwrap()),
+            ("TLS 1.2 client", connector_from_pem_tls12_bytes(&pem.cert).unwrap()),
         ] {
             let (mut client, mut server) = (connector.connect("localhost").unwrap(), acceptor.accept());
             let (wc, ws) = handshake(&mut client, &mut server);
@@ -926,11 +974,11 @@ mod tests {
     /// Master Secret, the secure-renegotiation signal and ec_point_formats.
     #[test]
     fn negotiate_connector_falls_back_to_a_tls12_only_acceptor() {
-        use crate::tls::connector_from_pem;
+        use crate::tls::connector_from_pem_bytes;
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let (_dir, cert_path, key_path) = write_temp_pem(&key_pair);
-        let acceptor = acceptor_with_alpn(acceptor_from_pem_tls12(&cert_path, &key_path).unwrap(), &[b"h2", b"http/1.1"]);
-        let connector = connector_from_pem(&cert_path, &[b"h2", b"http/1.1"]).unwrap();
+        let pem = pem_fixture(&key_pair);
+        let acceptor = acceptor_with_alpn(acceptor_from_pem_tls12_bytes(&pem.cert, &pem.key).unwrap(), &[b"h2", b"http/1.1"]);
+        let connector = connector_from_pem_bytes(&pem.cert, &[b"h2", b"http/1.1"]).unwrap();
         let (mut client, mut server) = (connector.connect("localhost").unwrap(), acceptor.accept());
         let (mut wc, mut ws) = handshake(&mut client, &mut server);
         assert!(client.is_complete() && server.is_complete(), "{:?} {:?}", wc.errors, ws.errors);
@@ -950,18 +998,18 @@ mod tests {
     /// ALPN, and override the list a TLS 1.3 builder was given.
     #[test]
     fn alpn_wrappers_apply_to_both_tls_versions() {
-        use crate::tls::{connector_from_pem, connector_from_pem_tls12};
+        use crate::tls::{connector_from_pem_bytes, connector_from_pem_tls12_bytes};
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let (_dir, cert_path, key_path) = write_temp_pem(&key_pair);
+        let pem = pem_fixture(&key_pair);
 
         let tls12 = (
-            connector_with_alpn(connector_from_pem_tls12(&cert_path).unwrap(), &[b"http/1.1", b"h2"]),
-            acceptor_with_alpn(acceptor_from_pem_tls12(&cert_path, &key_path).unwrap(), &[b"h2", b"http/1.1"]),
+            connector_with_alpn(connector_from_pem_tls12_bytes(&pem.cert).unwrap(), &[b"http/1.1", b"h2"]),
+            acceptor_with_alpn(acceptor_from_pem_tls12_bytes(&pem.cert, &pem.key).unwrap(), &[b"h2", b"http/1.1"]),
         );
         // The TLS 1.3 builder is given a different list, which the wrapper replaces.
         let tls13 = (
-            connector_with_alpn(connector_from_pem(&cert_path, &[b"nope"]).unwrap(), &[b"http/1.1", b"h2"]),
-            acceptor_with_alpn(acceptor_from_pem(&cert_path, &key_path, &[b"nope"]).unwrap(), &[b"h2", b"http/1.1"]),
+            connector_with_alpn(connector_from_pem_bytes(&pem.cert, &[b"nope"]).unwrap(), &[b"http/1.1", b"h2"]),
+            acceptor_with_alpn(acceptor_from_pem_bytes(&pem.cert, &pem.key, &[b"nope"]).unwrap(), &[b"h2", b"http/1.1"]),
         );
         for (label, (connector, acceptor)) in [("TLS 1.2", tls12), ("TLS 1.3", tls13)] {
             let (mut client, mut server) = (connector.connect("localhost").unwrap(), acceptor.accept());
@@ -974,11 +1022,11 @@ mod tests {
 
     #[test]
     fn a_wrapped_acceptor_refuses_a_client_with_nothing_in_common() {
-        use crate::tls::connector_from_pem_tls12;
+        use crate::tls::connector_from_pem_tls12_bytes;
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let (_dir, cert_path, key_path) = write_temp_pem(&key_pair);
-        let connector = connector_with_alpn(connector_from_pem_tls12(&cert_path).unwrap(), &[b"h2"]);
-        let acceptor = acceptor_with_alpn(acceptor_from_pem_tls12(&cert_path, &key_path).unwrap(), &[b"smtp"]);
+        let pem = pem_fixture(&key_pair);
+        let connector = connector_with_alpn(connector_from_pem_tls12_bytes(&pem.cert).unwrap(), &[b"h2"]);
+        let acceptor = acceptor_with_alpn(acceptor_from_pem_tls12_bytes(&pem.cert, &pem.key).unwrap(), &[b"smtp"]);
         let (mut client, mut server) = (connector.connect("localhost").unwrap(), acceptor.accept());
         let (wc, ws) = handshake(&mut client, &mut server);
         assert!(!client.is_complete() && !server.is_complete());
@@ -988,10 +1036,10 @@ mod tests {
 
     #[test]
     fn alpn_cannot_be_changed_once_the_handshake_has_started() {
-        use crate::tls::connector_from_pem_tls12;
+        use crate::tls::connector_from_pem_tls12_bytes;
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let (_dir, cert_path, _key_path) = write_temp_pem(&key_pair);
-        let mut client = connector_from_pem_tls12(&cert_path).unwrap().connect("localhost").unwrap();
+        let pem = pem_fixture(&key_pair);
+        let mut client = connector_from_pem_tls12_bytes(&pem.cert).unwrap().connect("localhost").unwrap();
         assert!(client.set_alpn(&[b"h2"]));
         client.start(&mut Wire::default());
         assert!(!client.set_alpn(&[b"h3"]), "too late: the ClientHello is already out");
@@ -999,12 +1047,12 @@ mod tests {
 
     #[test]
     fn a_strict_acceptor_still_serves_a_client_that_sends_supported_versions() {
-        use crate::tls::connector_from_pem_tls12;
+        use crate::tls::connector_from_pem_tls12_bytes;
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let (_dir, cert_path, key_path) = write_temp_pem(&key_pair);
-        let acceptor = acceptor_requiring_supported_versions(acceptor_from_pem_tls12(&cert_path, &key_path).unwrap());
+        let pem = pem_fixture(&key_pair);
+        let acceptor = acceptor_requiring_supported_versions(acceptor_from_pem_tls12_bytes(&pem.cert, &pem.key).unwrap());
         let (mut client, mut server) =
-            (connector_from_pem_tls12(&cert_path).unwrap().connect("localhost").unwrap(), acceptor.accept());
+            (connector_from_pem_tls12_bytes(&pem.cert).unwrap().connect("localhost").unwrap(), acceptor.accept());
         let (wc, ws) = handshake(&mut client, &mut server);
         assert!(client.is_complete() && server.is_complete(), "{:?} {:?}", wc.errors, ws.errors);
     }
@@ -1012,22 +1060,22 @@ mod tests {
     #[test]
     fn requiring_supported_versions_is_a_tls12_matter_only() {
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let (_dir, cert_path, key_path) = write_temp_pem(&key_pair);
+        let pem = pem_fixture(&key_pair);
         let mut negotiating =
-            acceptor_requiring_supported_versions(acceptor_from_pem(&cert_path, &key_path, &[]).unwrap()).accept();
+            acceptor_requiring_supported_versions(acceptor_from_pem_bytes(&pem.cert, &pem.key, &[]).unwrap()).accept();
         assert!(
             negotiating.set_require_supported_versions(true),
             "stored for the TLS 1.2 leg of a negotiating acceptor"
         );
-        let mut v12 = acceptor_from_pem_tls12(&cert_path, &key_path).unwrap().accept();
+        let mut v12 = acceptor_from_pem_tls12_bytes(&pem.cert, &pem.key).unwrap().accept();
         assert!(v12.set_require_supported_versions(true));
     }
 
     #[test]
     fn a_wrapped_tls12_engine_is_left_alone() {
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let (_dir, cert_path, key_path) = write_temp_pem(&key_pair);
-        let acceptor = acceptor_with_record_size_limit(acceptor_from_pem_tls12(&cert_path, &key_path).unwrap(), 200);
+        let pem = pem_fixture(&key_pair);
+        let acceptor = acceptor_with_record_size_limit(acceptor_from_pem_tls12_bytes(&pem.cert, &pem.key).unwrap(), 200);
         let mut engine = acceptor.accept();
         assert!(matches!(engine, TlsVariant::V12(_)));
         assert!(!engine.set_record_size_limit(Some(200)), "TLS 1.2 does not implement the extension");
@@ -1036,13 +1084,50 @@ mod tests {
     #[test]
     fn the_limit_cannot_be_changed_once_the_handshake_has_started() {
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let (_dir, cert_path, _key_path) = write_temp_pem(&key_pair);
-        let mut client = crate::tls::connector_from_pem(&cert_path, &[]).unwrap().connect("localhost").unwrap();
+        let pem = pem_fixture(&key_pair);
+        let mut client = crate::tls::connector_from_pem_bytes(&pem.cert, &[]).unwrap().connect("localhost").unwrap();
         assert!(client.set_record_size_limit(Some(500)));
         client.start(&mut Wire::default());
         assert!(!client.set_record_size_limit(Some(600)), "too late: the ClientHello is already out");
     }
 
+    #[test]
+    fn acceptor_from_pem_bytes_loads_ed25519_key() {
+        let pem = pem_fixture(&rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap());
+        let _engine = acceptor_from_pem_bytes(&pem.cert, &pem.key, &[b"h2"]).unwrap().accept();
+    }
+
+    #[test]
+    fn acceptor_from_pem_bytes_loads_ecdsa_p256_key() {
+        let pem = pem_fixture(&rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap());
+        let _engine = acceptor_from_pem_bytes(&pem.cert, &pem.key, &[]).unwrap().accept();
+    }
+
+    #[test]
+    fn acceptor_from_credentials_with_sni_takes_default_and_named_credentials() {
+        let creds = |pem: Pem| server_credentials_from_pem_bytes(&pem.cert, &pem.key).unwrap();
+        let default = creds(pem_fixture(&rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap()));
+        let named = creds(pem_fixture(&rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap()));
+        let acceptor = acceptor_from_credentials_with_sni(default, [("b.example".to_string(), named)], &[b"h2"]);
+        let _engine = acceptor.accept();
+    }
+
+    #[test]
+    fn connector_from_pem_bytes_trusts_the_given_ca() {
+        let pem = pem_fixture(&rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap());
+        let _engine = connector_from_pem_bytes(&pem.cert, &[b"h2"]).unwrap().connect("localhost").unwrap();
+    }
+
+    #[test]
+    fn pem_without_a_certificate_or_key_is_refused() {
+        let pem = pem_fixture(&rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap());
+        assert!(acceptor_from_pem_bytes(b"", &pem.key, &[]).is_err());
+        assert!(acceptor_from_pem_bytes(&pem.cert, b"", &[]).is_err());
+        assert!(connector_from_pem_bytes(b"", &[]).is_err());
+        assert!(connector_from_pem_tls12_bytes(b"").is_err());
+    }
+
+    #[cfg(feature = "integration")]
     #[test]
     fn acceptor_from_pem_loads_ed25519_key() {
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
@@ -1051,6 +1136,7 @@ mod tests {
         let _engine = acceptor.accept();
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn acceptor_from_pem_loads_ecdsa_p256_key() {
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
@@ -1064,6 +1150,7 @@ mod tests {
     /// with the client's actual SNI, correct credentials selected) is
     /// covered by `tls::engine`'s `server_resolver_*` tests, which drive
     /// a full loopback handshake.
+    #[cfg(feature = "integration")]
     #[test]
     fn acceptor_from_pem_with_sni_loads_default_and_named_credentials() {
         let default_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
@@ -1082,6 +1169,7 @@ mod tests {
         let _engine = acceptor.accept();
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn connector_from_pem_trusts_the_given_ca() {
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
@@ -1147,8 +1235,8 @@ mod tests {
     #[test]
     fn verify_override_rejection_is_honoured_when_the_server_picks_tls12() {
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let (_dir, cert_path, key_path) = write_temp_pem(&key_pair);
-        let acceptor = acceptor_from_pem_tls12(&cert_path, &key_path).unwrap();
+        let pem = pem_fixture(&key_pair);
+        let acceptor = acceptor_from_pem_tls12_bytes(&pem.cert, &pem.key).unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = calls.clone();
         let connector = verify_override_connector_tls12(Arc::new(move |_chain, _name| {
@@ -1172,9 +1260,9 @@ mod tests {
     #[test]
     fn verify_override_acceptance_completes_a_tls12_handshake() {
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let (_dir, cert_path, key_path) = write_temp_pem(&key_pair);
-        let acceptor = acceptor_from_pem_tls12(&cert_path, &key_path).unwrap();
-        let expected_chain = load_certs(&cert_path).unwrap();
+        let pem = pem_fixture(&key_pair);
+        let acceptor = acceptor_from_pem_tls12_bytes(&pem.cert, &pem.key).unwrap();
+        let expected_chain = certs_from_pem(&pem.cert, "PEM").unwrap();
         let connector = verify_override_connector_tls12(Arc::new(move |chain, name| {
             chain == expected_chain.as_slice() && name == Some("localhost")
         }));
@@ -1185,19 +1273,19 @@ mod tests {
         assert!(client.is_complete() && server.is_complete(), "{:?} {:?}", wc.errors, ws.errors);
     }
 
-    fn fips_pems() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    fn fips_pems() -> Pem {
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        write_temp_pem(&key_pair)
+        pem_fixture(&key_pair)
     }
 
     /// FIPS wrappers over the ordinary builders: TLS 1.3 negotiates the profile
     /// (secp256r1, AES-128-GCM first), end to end through the negotiating engines.
     #[test]
     fn fips_wrappers_negotiate_tls13_on_the_profile() {
-        use crate::tls::connector_from_pem;
-        let (_dir, cert_path, key_path) = fips_pems();
-        let acceptor = acceptor_with_fips(acceptor_from_pem(&cert_path, &key_path, &[]).unwrap()).unwrap();
-        let connector = connector_with_fips(connector_from_pem(&cert_path, &[]).unwrap()).unwrap();
+        use crate::tls::connector_from_pem_bytes;
+        let pem = fips_pems();
+        let acceptor = acceptor_with_fips(acceptor_from_pem_bytes(&pem.cert, &pem.key, &[]).unwrap()).unwrap();
+        let connector = connector_with_fips(connector_from_pem_bytes(&pem.cert, &[]).unwrap()).unwrap();
         let (mut client, mut server) = (connector.connect("localhost").unwrap(), acceptor.accept());
         let (wc, ws) = handshake(&mut client, &mut server);
         assert!(client.is_complete() && server.is_complete(), "{:?} {:?}", wc.errors, ws.errors);
@@ -1209,10 +1297,10 @@ mod tests {
     /// with a profile suite (never ChaCha20-Poly1305).
     #[test]
     fn fips_connector_falls_back_to_tls12_on_the_profile() {
-        use crate::tls::connector_from_pem;
-        let (_dir, cert_path, key_path) = fips_pems();
-        let acceptor = acceptor_from_pem_tls12(&cert_path, &key_path).unwrap();
-        let connector = connector_with_fips(connector_from_pem(&cert_path, &[]).unwrap()).unwrap();
+        use crate::tls::connector_from_pem_bytes;
+        let pem = fips_pems();
+        let acceptor = acceptor_from_pem_tls12_bytes(&pem.cert, &pem.key).unwrap();
+        let connector = connector_with_fips(connector_from_pem_bytes(&pem.cert, &[]).unwrap()).unwrap();
         let (mut client, mut server) = (connector.connect("localhost").unwrap(), acceptor.accept());
         let (wc, ws) = handshake(&mut client, &mut server);
         assert!(client.is_complete() && server.is_complete(), "{:?} {:?}", wc.errors, ws.errors);
@@ -1227,10 +1315,10 @@ mod tests {
     /// no plain NIST group). Either way no handshake completes.
     #[test]
     fn fips_acceptor_refuses_an_ordinary_tls13_client() {
-        use crate::tls::connector_from_pem;
-        let (_dir, cert_path, key_path) = fips_pems();
-        let acceptor = acceptor_with_fips(acceptor_from_pem(&cert_path, &key_path, &[]).unwrap()).unwrap();
-        let connector = connector_from_pem(&cert_path, &[]).unwrap();
+        use crate::tls::connector_from_pem_bytes;
+        let pem = fips_pems();
+        let acceptor = acceptor_with_fips(acceptor_from_pem_bytes(&pem.cert, &pem.key, &[]).unwrap()).unwrap();
+        let connector = connector_from_pem_bytes(&pem.cert, &[]).unwrap();
         let (mut client, mut server) = (connector.connect("localhost").unwrap(), acceptor.accept());
         let (wc, ws) = handshake(&mut client, &mut server);
         assert!(!server.is_complete() && !client.is_complete());
@@ -1246,14 +1334,14 @@ mod tests {
     /// ECH layered on top of a FIPS connector is refused, not sent.
     #[test]
     fn fips_and_ech_do_not_mix() {
-        use crate::tls::connector_from_pem;
+        use crate::tls::connector_from_pem_bytes;
         use crate::tls::ech::EchClientConfig;
-        let (_dir, cert_path, _key_path) = fips_pems();
-        let inner = connector_with_ech(connector_from_pem(&cert_path, &[]).unwrap(), |_| Some(EchClientConfig::grease_only()));
+        let pem = fips_pems();
+        let inner = connector_with_ech(connector_from_pem_bytes(&pem.cert, &[]).unwrap(), |_| Some(EchClientConfig::grease_only()));
         let err = connector_with_fips(inner).err().expect("ECH inside FIPS is rejected at build time");
         assert!(err.to_string().contains("ech_client"), "{err}");
 
-        let fips_first = connector_with_fips(connector_from_pem(&cert_path, &[]).unwrap()).unwrap();
+        let fips_first = connector_with_fips(connector_from_pem_bytes(&pem.cert, &[]).unwrap()).unwrap();
         let layered = connector_with_ech(fips_first, |_| Some(EchClientConfig::grease_only()));
         let mut client = layered.connect("localhost").unwrap();
         let mut wc = Wire::default();
@@ -1265,9 +1353,9 @@ mod tests {
     /// FIPS mode has to be set before the handshake starts.
     #[test]
     fn fips_cannot_be_set_after_start() {
-        use crate::tls::connector_from_pem;
-        let (_dir, cert_path, _key_path) = fips_pems();
-        let connector = connector_from_pem(&cert_path, &[]).unwrap();
+        use crate::tls::connector_from_pem_bytes;
+        let pem = fips_pems();
+        let connector = connector_from_pem_bytes(&pem.cert, &[]).unwrap();
         let mut client = connector.connect("localhost").unwrap();
         client.start(&mut Wire::default());
         assert!(client.set_fips().is_err());

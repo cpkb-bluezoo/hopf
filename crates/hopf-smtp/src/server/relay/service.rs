@@ -131,7 +131,7 @@ impl SimpleRelayService {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod tests {
     use super::*;
     use hopf_core::{IpNet, PeerAcl, RuntimeConfig, TelemetryHook};

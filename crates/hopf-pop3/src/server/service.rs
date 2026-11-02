@@ -231,13 +231,18 @@ impl Pop3Service {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::io::{BufRead, BufReader, Write};
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::net::TcpStream;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::time::Instant;
 
     use hopf_core::RuntimeConfig;
 
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use crate::server::handler::{ClientConnected, ConnectedState, Pop3ConnectionMetadata};
 
     fn runtime() -> Arc<Runtime> {
@@ -252,26 +257,27 @@ mod tests {
         Pop3Config::new("127.0.0.1:0".parse().unwrap(), "mail.example", store, factory)
     }
 
-    fn acceptor(dir: &std::path::Path) -> SharedTlsAcceptor {
+    fn acceptor() -> SharedTlsAcceptor {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let (cert_path, key_path) = (dir.join("cert.pem"), dir.join("key.pem"));
-        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
-        hopf_core::acceptor_from_pem(&cert_path, &key_path, &[]).unwrap()
+        hopf_core::acceptor_from_pem_bytes(cert.cert.pem().as_bytes(), cert.key_pair.serialize_pem().as_bytes(), &[]).unwrap()
     }
 
     /// A blocking client over a real connection.
+    #[cfg(feature = "integration")]
     struct Client {
         reader: BufReader<TcpStream>,
     }
 
+    #[cfg(feature = "integration")]
     impl Client {
+        #[cfg(feature = "integration")]
         fn connect(addr: SocketAddr) -> Self {
             let stream = TcpStream::connect(addr).unwrap();
             stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             Self { reader: BufReader::new(stream) }
         }
 
+        #[cfg(feature = "integration")]
         fn line(&mut self) -> String {
             let mut line = String::new();
             self.reader.read_line(&mut line).unwrap_or(0);
@@ -280,6 +286,7 @@ mod tests {
 
         /// Send `cmd` and read the reply: the status line, and for a
         /// multi-line one (`multi`) up to the lone dot.
+        #[cfg(feature = "integration")]
         fn run(&mut self, cmd: &str, multi: bool) -> String {
             self.reader.get_mut().write_all(format!("{cmd}\r\n").as_bytes()).unwrap();
             let mut out = self.line();
@@ -299,17 +306,20 @@ mod tests {
             out
         }
 
+        #[cfg(feature = "integration")]
         fn login(&mut self, user: &str, pass: &str) -> String {
             let u = self.run(&format!("USER {user}"), false);
             assert!(u.starts_with("+OK"), "{u}");
             self.run(&format!("PASS {pass}"), false)
         }
 
+        #[cfg(feature = "integration")]
         fn at_eof(&mut self) -> bool {
             self.line().is_empty()
         }
     }
 
+    #[cfg(feature = "integration")]
     fn wait(pred: impl Fn() -> bool) -> bool {
         for _ in 0..500 {
             if pred() {
@@ -324,8 +334,9 @@ mod tests {
 
     #[test]
     fn a_new_config_has_the_documented_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        let c = config(dir.path());
+        // No file is touched: the root is only recorded in the configuration.
+        let dir = std::path::PathBuf::from("/srv/mail");
+        let c = config(&dir);
         assert_eq!(c.hostname, "mail.example");
         assert!(c.tls_acceptor.is_none() && !c.implicit_tls && c.greeting.is_empty());
         assert!(c.enable_utf8 && !c.enable_pipelining);
@@ -335,8 +346,9 @@ mod tests {
 
     #[test]
     fn the_builders_set_what_they_say() {
-        let dir = tempfile::tempdir().unwrap();
-        let c = config(dir.path()).with_tls(acceptor(dir.path())).implicit_tls().with_greeting("hello");
+        // No file is touched: the root is only recorded in the configuration.
+        let dir = std::path::PathBuf::from("/srv/mail");
+        let c = config(&dir).with_tls(acceptor()).implicit_tls().with_greeting("hello");
         assert!(c.tls_acceptor.is_some() && c.implicit_tls);
         assert_eq!(c.greeting, "hello");
     }
@@ -345,25 +357,28 @@ mod tests {
 
     #[test]
     fn the_listener_is_plain_stls_or_implicit_as_configured() {
-        let dir = tempfile::tempdir().unwrap();
+        // No file is touched: the root is only recorded in the configuration.
+        let dir = std::path::PathBuf::from("/srv/mail");
         let svc = |c: Pop3Config| Pop3Service::new(c, runtime()).control_listener();
-        let plain = svc(config(dir.path()));
+        let plain = svc(config(&dir));
         assert!(!plain.secure && plain.tls.is_none());
-        let stls = svc(config(dir.path()).with_tls(acceptor(dir.path())));
+        let stls = svc(config(&dir).with_tls(acceptor()));
         assert!(!stls.secure && stls.tls.is_some(), "STLS is offered, the handshake waits for it");
-        let implicit = svc(config(dir.path()).with_tls(acceptor(dir.path())).implicit_tls());
+        let implicit = svc(config(&dir).with_tls(acceptor()).implicit_tls());
         assert!(implicit.secure && implicit.tls.is_some(), "the handshake starts on accept");
     }
 
     #[test]
     fn implicit_tls_with_no_acceptor_is_refused_not_served_in_clear() {
-        let dir = tempfile::tempdir().unwrap();
-        let svc = Pop3Service::new(config(dir.path()).implicit_tls(), runtime());
+        // No file is touched: the root is only recorded in the configuration.
+        let dir = std::path::PathBuf::from("/srv/mail");
+        let svc = Pop3Service::new(config(&dir).implicit_tls(), runtime());
         let err = svc.start().unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
         assert!(svc.control_listener().secure, "composed by hand, every connection is refused");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_client_is_greeted_with_the_hostname_or_the_configured_greeting() {
         let dir = tempfile::tempdir().unwrap();
@@ -375,6 +390,7 @@ mod tests {
         assert!(greeting.contains("welcome to the test") && !greeting.contains("server ready"), "{greeting}");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn the_capability_switches_and_the_acceptor_reach_the_capa_list() {
         let dir = tempfile::tempdir().unwrap();
@@ -386,7 +402,7 @@ mod tests {
         };
         let plain = capa(config(dir.path()));
         assert!(plain.contains("UTF8") && !plain.contains("PIPELINING") && !plain.contains("EXPIRE") && !plain.contains("STLS"), "{plain}");
-        let mut c = config(dir.path()).with_tls(acceptor(dir.path()));
+        let mut c = config(dir.path()).with_tls(acceptor());
         c.enable_utf8 = false;
         c.enable_pipelining = true;
         c.expire_days = Some(30);
@@ -394,6 +410,7 @@ mod tests {
         assert!(tuned.contains("PIPELINING") && tuned.contains("EXPIRE 30") && tuned.contains("STLS") && !tuned.contains("UTF8"), "{tuned}");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_failed_login_holds_off_the_next_attempt_for_the_configured_time() {
         let dir = tempfile::tempdir().unwrap();
@@ -410,6 +427,7 @@ mod tests {
         assert!(later.starts_with("+OK"), "{later}");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn an_idle_session_is_ended_by_the_server_after_the_transaction_timeout() {
         let dir = tempfile::tempdir().unwrap();
@@ -427,6 +445,7 @@ mod tests {
         assert!(client.at_eof(), "the session was not closed");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_session_that_keeps_working_is_not_timed_out() {
         let dir = tempfile::tempdir().unwrap();
@@ -443,6 +462,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_connection_that_has_not_logged_in_is_not_subject_to_the_transaction_timeout() {
         let dir = tempfile::tempdir().unwrap();
@@ -457,17 +477,20 @@ mod tests {
 
     // -- a handler per connection ---------------------------------------------------
 
+    #[cfg(feature = "integration")]
     struct Counting {
         inner: DefaultPop3HandlerFactory,
         created: Arc<AtomicUsize>,
         ended: Arc<AtomicUsize>,
     }
 
+    #[cfg(feature = "integration")]
     struct CountedEnd {
         inner: Box<dyn ClientConnected>,
         ended: Arc<AtomicUsize>,
     }
 
+    #[cfg(feature = "integration")]
     impl ClientConnected for CountedEnd {
         fn connected(&mut self, state: &mut dyn ConnectedState, meta: &Pop3ConnectionMetadata) {
             self.inner.connected(state, meta);
@@ -478,6 +501,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "integration")]
     impl Pop3HandlerFactory for Counting {
         fn create(&self) -> Box<dyn ClientConnected> {
             self.created.fetch_add(1, Ordering::SeqCst);
@@ -485,6 +509,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn each_connection_gets_its_own_handler_and_its_end_is_reported() {
         let dir = tempfile::tempdir().unwrap();
@@ -510,6 +535,7 @@ mod tests {
 
     // -- storage and shutdown ----------------------------------------------------------
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_mailbox_that_cannot_be_opened_refuses_the_login_and_leaves_the_connection_usable() {
         // The Maildir root is a file, so a user's mailbox cannot be made there.
@@ -524,6 +550,7 @@ mod tests {
         assert!(c.run("NOOP", false).starts_with("-ERR") || c.run("QUIT", false).starts_with("+OK"), "the server hung after the storage failure");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_stopped_service_refuses_new_connections_but_lets_open_sessions_finish_and_the_runtime_shut_down() {
         let dir = tempfile::tempdir().unwrap();

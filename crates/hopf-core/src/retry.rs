@@ -141,10 +141,16 @@ impl RetryPolicy {
 
     /// Begin tracking a new operation's attempts against this policy.
     pub fn start(&self) -> RetryState {
+        self.start_at(Instant::now())
+    }
+
+    /// [`Self::start`] with the starting instant given, so that a test can
+    /// move time instead of waiting for it.
+    pub(crate) fn start_at(&self, started: Instant) -> RetryState {
         RetryState {
             policy: self.clone(),
             attempt: 0,
-            started: Instant::now(),
+            started,
         }
     }
 }
@@ -201,6 +207,12 @@ impl RetryState {
     /// `None` once the policy's bound (attempt count and/or elapsed time)
     /// has been reached, meaning the caller should give up.
     pub fn next_delay(&mut self) -> Option<Duration> {
+        self.next_delay_at(Instant::now())
+    }
+
+    /// [`Self::next_delay`] as of `now`.
+    pub(crate) fn next_delay_at(&mut self, now: Instant) -> Option<Duration> {
+        let elapsed = now.saturating_duration_since(self.started);
         let next_attempt = self.attempt + 1;
         let attempts_ok = match self.policy.bound {
             RetryBound::MaxAttempts(max) => next_attempt <= max,
@@ -211,8 +223,8 @@ impl RetryState {
             return None;
         }
         let elapsed_ok = match self.policy.bound {
-            RetryBound::MaxElapsed(max) => self.started.elapsed() < max,
-            RetryBound::Both { max_elapsed, .. } => self.started.elapsed() < max_elapsed,
+            RetryBound::MaxElapsed(max) => elapsed < max,
+            RetryBound::Both { max_elapsed, .. } => elapsed < max_elapsed,
             _ => true,
         };
         if !elapsed_ok {
@@ -296,11 +308,11 @@ mod tests {
         let p = RetryPolicy::exponential_backoff()
             .with_initial_delay(Duration::from_millis(1))
             .with_max_elapsed(Duration::from_millis(30));
-        let mut state = p.start();
-        assert!(state.next_delay().is_some(), "window just started");
-        std::thread::sleep(Duration::from_millis(50));
+        let t0 = Instant::now();
+        let mut state = p.start_at(t0);
+        assert!(state.next_delay_at(t0).is_some(), "window just started");
         assert!(
-            state.next_delay().is_none(),
+            state.next_delay_at(t0 + Duration::from_millis(50)).is_none(),
             "should give up once max_elapsed has passed"
         );
     }
@@ -311,11 +323,11 @@ mod tests {
             .with_initial_delay(Duration::from_millis(1))
             .with_max_attempts(100)
             .with_max_elapsed(Duration::from_millis(30));
-        let mut state = p.start();
-        assert!(state.next_delay().is_some());
-        std::thread::sleep(Duration::from_millis(50));
+        let t0 = Instant::now();
+        let mut state = p.start_at(t0);
+        assert!(state.next_delay_at(t0).is_some());
         assert!(
-            state.next_delay().is_none(),
+            state.next_delay_at(t0 + Duration::from_millis(50)).is_none(),
             "elapsed bound should win even though attempts is nowhere near 100"
         );
     }

@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use hopf_core::{Runtime, RuntimeConfig};
 
+#[cfg_attr(not(feature = "integration"), allow(unused_imports))]
 use super::tests::{decode, encode, plain, GOLDEN_BROTLI, GOLDEN_GZIP, GOLDEN_ZLIB};
 use super::*;
 use crate::{
@@ -24,6 +25,7 @@ use crate::stream::{ServerHandler, ServerHandlerFactory, ServerWriter};
 // Application under test
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 fn text_body() -> Vec<u8> {
     let mut v = Vec::new();
     for i in 0..8000u32 {
@@ -32,6 +34,7 @@ fn text_body() -> Vec<u8> {
     v
 }
 
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 struct App {
     path: String,
     method: String,
@@ -141,6 +144,7 @@ impl ServerHandler for App {
     }
 }
 
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 struct AppFactory;
 impl ServerHandlerFactory for AppFactory {
     fn create_handler(&self) -> Box<dyn ServerHandler> {
@@ -152,6 +156,7 @@ impl ServerHandlerFactory for AppFactory {
     }
 }
 
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 fn start_server(rt: &Arc<Runtime>, policy: ServerContentEncodingPolicy) -> SocketAddr {
     HttpServer::new()
         .content_encoding(policy)
@@ -165,6 +170,7 @@ fn start_server(rt: &Arc<Runtime>, policy: ServerContentEncodingPolicy) -> Socke
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 pub(crate) struct Outcome {
     pub(crate) version: Option<crate::version::HttpVersion>,
     pub(crate) status: u16,
@@ -175,6 +181,7 @@ pub(crate) struct Outcome {
 }
 
 impl Outcome {
+    #[cfg_attr(not(feature = "integration"), allow(dead_code))]
     pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -183,6 +190,7 @@ impl Outcome {
     }
 }
 
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 struct Rec(Arc<Mutex<Outcome>>);
 
 impl HttpResponseHandler for Rec {
@@ -206,8 +214,10 @@ impl HttpResponseHandler for Rec {
     }
 }
 
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 pub(crate) type Extra = Vec<(&'static str, &'static str)>;
 
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 pub(crate) enum Job {
     Get(&'static str),
     GetWith(&'static str, Extra),
@@ -216,6 +226,7 @@ pub(crate) enum Job {
     PostPumped { path: &'static str, body: Vec<u8> },
 }
 
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 struct Conn {
     job: Option<Job>,
     out: Arc<Mutex<Outcome>>,
@@ -273,6 +284,7 @@ impl HttpConnectionHandler for Conn {
     }
 }
 
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 struct Pump {
     req: crate::HttpRequest,
     body: Vec<u8>,
@@ -281,6 +293,7 @@ struct Pump {
 
 /// Feed `body` in 64 KiB pieces, resuming from `on_body_writable` after a
 /// short write - the documented way to stream a large request body.
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 fn pump(state: Arc<Mutex<Pump>>) {
     let mut g = state.lock().unwrap();
     loop {
@@ -303,12 +316,14 @@ fn pump(state: Arc<Mutex<Pump>>) {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 pub(crate) enum Proto {
     H1,
     H2,
 }
 
 /// Client for `proto`: `None` turns content coding off, `Some` supplies the policy.
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 pub(crate) fn client_for(addr: SocketAddr, proto: Proto, policy: Option<ContentEncodingPolicy>) -> HttpClient {
     let mut client = HttpClient::from_addr(addr);
     if let Proto::H2 = proto {
@@ -320,11 +335,13 @@ pub(crate) fn client_for(addr: SocketAddr, proto: Proto, policy: Option<ContentE
     }
 }
 
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 pub(crate) fn run(rt: &Arc<Runtime>, addr: SocketAddr, proto: Proto, policy: Option<ContentEncodingPolicy>, job: Job) -> Outcome {
     run_with(rt, &client_for(addr, proto, policy), job)
 }
 
 /// Run one job on `client` (reusing it shares its capability cache).
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 pub(crate) fn run_with(rt: &Arc<Runtime>, client: &HttpClient, job: Job) -> Outcome {
     let out = Arc::new(Mutex::new(Outcome::default()));
     client
@@ -345,23 +362,28 @@ pub(crate) fn run_with(rt: &Arc<Runtime>, client: &HttpClient, job: Job) -> Outc
     std::mem::take(&mut *g)
 }
 
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 pub(crate) fn rt() -> Arc<Runtime> {
     Arc::new(Runtime::start(RuntimeConfig::default()).unwrap())
 }
 
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 fn client_policy(codings: &[ContentCoding]) -> ContentEncodingPolicy {
     ContentEncodingPolicy::new(&HttpLimits::default()).accept(codings)
 }
 
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 fn server_policy() -> ServerContentEncodingPolicy {
     ServerContentEncodingPolicy::new(&HttpLimits::default())
 }
 
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 const CODED: [ContentCoding; 3] = [ContentCoding::Brotli, ContentCoding::Gzip, ContentCoding::Deflate];
 
 /// Read one complete HTTP/1.1 response off `s`, framed by its own headers
 /// (the server keeps the connection alive, so EOF cannot delimit it).
 /// `head_only` for HEAD. Returns (head, body-as-received).
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 pub(crate) fn read_response(s: &mut TcpStream, head_only: bool) -> (String, Vec<u8>) {
     let mut all = Vec::new();
     let mut buf = [0u8; 8192];
@@ -389,6 +411,7 @@ pub(crate) fn read_response(s: &mut TcpStream, head_only: bool) -> (String, Vec<
 }
 
 /// Raw HTTP/1.1 GET over a plain socket; returns (head, body-as-received).
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 fn raw_get(addr: SocketAddr, path: &str, accept_encoding: Option<&str>) -> (String, Vec<u8>) {
     let mut s = TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
@@ -399,6 +422,7 @@ fn raw_get(addr: SocketAddr, path: &str, accept_encoding: Option<&str>) -> (Stri
     read_response(&mut s, false)
 }
 
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 pub(crate) fn head_has(head: &str, name: &str, value: &str) -> bool {
     head.lines().any(|l| {
         l.split_once(':')
@@ -406,6 +430,7 @@ pub(crate) fn head_has(head: &str, name: &str, value: &str) -> bool {
     })
 }
 
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 pub(crate) fn head_lacks(head: &str, name: &str) -> bool {
     !head
         .lines()
@@ -413,6 +438,7 @@ pub(crate) fn head_lacks(head: &str, name: &str) -> bool {
 }
 
 /// De-chunk an HTTP/1.1 chunked body.
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 pub(crate) fn dechunk(mut b: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     loop {
@@ -431,6 +457,7 @@ pub(crate) fn dechunk(mut b: &[u8]) -> Vec<u8> {
 // Server compresses; client decodes; handler sees plain bytes
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "integration")]
 #[test]
 fn client_gets_decoded_body_for_every_coding_on_h1_and_h2() {
     let rt = rt();
@@ -457,6 +484,7 @@ fn client_gets_decoded_body_for_every_coding_on_h1_and_h2() {
     }
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn deferred_response_writes_go_through_the_encoder() {
     let rt = rt();
@@ -484,6 +512,7 @@ fn deferred_response_writes_go_through_the_encoder() {
     }
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn the_wire_really_is_compressed_and_only_when_accepted() {
     let rt = rt();
@@ -511,6 +540,7 @@ fn the_wire_really_is_compressed_and_only_when_accepted() {
     }
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn ineligible_responses_are_left_alone() {
     let rt = rt();
@@ -533,6 +563,7 @@ fn ineligible_responses_are_left_alone() {
     assert!(head_lacks(&head, "content-encoding"), "{head}");
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn client_with_content_encoding_disabled_sees_the_raw_wire_body() {
     let rt = rt();
@@ -544,6 +575,7 @@ fn client_with_content_encoding_disabled_sees_the_raw_wire_body() {
     assert!(o.header("content-encoding").is_none());
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn small_and_empty_responses_pass_through_the_decoding_client() {
     let rt = rt();
@@ -561,6 +593,7 @@ fn small_and_empty_responses_pass_through_the_decoding_client() {
 // Client request bodies decoded by the server
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "integration")]
 #[test]
 fn server_decodes_content_coded_request_bodies() {
     let rt = rt();
@@ -578,6 +611,7 @@ fn server_decodes_content_coded_request_bodies() {
     }
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn server_rejects_bad_request_bodies_fail_closed() {
     let rt = rt();
@@ -618,6 +652,7 @@ fn server_rejects_bad_request_bodies_fail_closed() {
 
 /// One-shot raw HTTP/1.1 server: replies to the first request with `head` +
 /// `body`, writing `chunk` bytes at a time.
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 fn raw_server(head: String, body: Vec<u8>, chunk: usize, pause: Duration) -> SocketAddr {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = l.local_addr().unwrap();
@@ -647,12 +682,14 @@ fn raw_server(head: String, body: Vec<u8>, chunk: usize, pause: Duration) -> Soc
     addr
 }
 
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 fn coded_head(coding: &str, len: usize) -> String {
     format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Encoding: {coding}\r\nContent-Length: {len}\r\n\r\n"
     )
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn one_byte_tcp_segments_decode_to_golden_output() {
     let rt = rt();
@@ -670,6 +707,7 @@ fn one_byte_tcp_segments_decode_to_golden_output() {
     }
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn unknown_response_coding_fails_the_request() {
     let rt = rt();
@@ -680,6 +718,7 @@ fn unknown_response_coding_fails_the_request() {
     assert!(o.body.is_empty(), "no undecoded bytes may leak to the handler");
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn response_bomb_over_the_limit_fails_closed() {
     let rt = rt();
@@ -692,6 +731,7 @@ fn response_bomb_over_the_limit_fails_closed() {
     assert!(o.body.len() <= 100_000, "delivered {} bytes past the cap", o.body.len());
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn corrupt_and_truncated_response_bodies_fail() {
     let rt = rt();
@@ -707,6 +747,7 @@ fn corrupt_and_truncated_response_bodies_fail() {
     assert!(o.failed.is_some(), "truncated brotli must fail");
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn stacked_response_codings_are_undone_in_reverse() {
     let rt = rt();
@@ -720,6 +761,7 @@ fn stacked_response_codings_are_undone_in_reverse() {
 
 /// HTTP/3: the same decorators over a real QUIC connection.
 #[cfg(feature = "h3")]
+#[cfg(feature = "integration")]
 #[test]
 fn h3_round_trip_decodes_and_server_decodes_requests() {
     use crate::client::h3_session::connect_h3_session;
@@ -795,6 +837,7 @@ fn h3_round_trip_decodes_and_server_decodes_requests() {
 // Activation: defaults, opt-outs and capability learning
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 fn default_server(rt: &Arc<Runtime>) -> SocketAddr {
     HttpServer::new()
         .bind(rt, "127.0.0.1:0".parse().unwrap(), Arc::new(AppFactory))
@@ -802,6 +845,7 @@ fn default_server(rt: &Arc<Runtime>) -> SocketAddr {
         .0
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn default_server_and_client_need_no_configuration() {
     let rt = rt();
@@ -827,6 +871,7 @@ fn default_server_and_client_need_no_configuration() {
     }
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn responses_advertise_the_codings_the_server_accepts_in_requests() {
     let rt = rt();
@@ -841,6 +886,7 @@ fn responses_advertise_the_codings_the_server_accepts_in_requests() {
     assert!(head_lacks(&head, "accept-encoding"), "{head}");
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn handler_opts_out_with_explicit_content_encoding_or_no_transform() {
     let rt = rt();
@@ -853,6 +899,7 @@ fn handler_opts_out_with_explicit_content_encoding_or_no_transform() {
     }
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn disabled_server_touches_nothing() {
     let rt = rt();
@@ -870,6 +917,7 @@ fn disabled_server_touches_nothing() {
 
 // --- a raw peer that records exactly what the client put on the wire -----------
 
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 struct Captured {
     head: String,
     /// Body with any chunked framing removed.
@@ -878,6 +926,7 @@ struct Captured {
 
 /// Serve one request per connection, recording each. `replies[i]` is the
 /// status and optional `Accept-Encoding` header for the i-th request.
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 fn capture_server(replies: Vec<(u16, Option<&'static str>)>) -> (SocketAddr, Arc<Mutex<Vec<Captured>>>) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = l.local_addr().unwrap();
@@ -896,6 +945,7 @@ fn capture_server(replies: Vec<(u16, Option<&'static str>)>) -> (SocketAddr, Arc
     (addr, seen)
 }
 
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 fn read_request(s: &mut TcpStream) -> Captured {
     let mut all = Vec::new();
     let mut buf = [0u8; 8192];
@@ -924,6 +974,7 @@ fn read_request(s: &mut TcpStream) -> Captured {
     }
 }
 
+#[cfg_attr(not(feature = "integration"), allow(dead_code))]
 fn post(rt: &Arc<Runtime>, client: &HttpClient, body: &[u8], extra: Extra) -> Outcome {
     run_with(
         rt,
@@ -932,6 +983,7 @@ fn post(rt: &Arc<Runtime>, client: &HttpClient, body: &[u8], extra: Extra) -> Ou
     )
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn request_bodies_are_compressed_only_once_the_origin_advertises_support() {
     let rt = rt();
@@ -966,6 +1018,7 @@ fn request_bodies_are_compressed_only_once_the_origin_advertises_support() {
     assert!(seen[3].body == body);
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn only_a_coding_the_origin_advertised_is_used_and_small_or_binary_bodies_are_left() {
     let rt = rt();
@@ -983,6 +1036,7 @@ fn only_a_coding_the_origin_advertised_is_used_and_small_or_binary_bodies_are_le
     assert!(head_lacks(&seen[3].head, "content-encoding"), "{}", seen[3].head);
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn a_415_teaches_a_capability_and_a_bare_415_unlearns_it() {
     let rt = rt();
@@ -1004,6 +1058,7 @@ fn a_415_teaches_a_capability_and_a_bare_415_unlearns_it() {
     assert!(head_lacks(&seen[3].head, "content-encoding"), "{}", seen[3].head);
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn a_seeded_cache_lets_the_first_request_compress() {
     let rt = rt();
@@ -1017,6 +1072,7 @@ fn a_seeded_cache_lets_the_first_request_compress() {
     assert!(head_has(&seen[0].head, "content-encoding", "gzip"), "{}", seen[0].head);
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn accept_encoding_is_not_sent_for_range_requests_or_by_a_disabled_client() {
     let rt = rt();
@@ -1030,6 +1086,7 @@ fn accept_encoding_is_not_sent_for_range_requests_or_by_a_disabled_client() {
     assert!(head_lacks(&seen[2].head, "accept-encoding"), "disabled: {}", seen[2].head);
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn a_large_request_body_streams_compressed_to_a_hopf_server() {
     let rt = rt();

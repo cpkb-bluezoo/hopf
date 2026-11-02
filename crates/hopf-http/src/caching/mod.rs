@@ -24,7 +24,7 @@ pub use cache_control::CacheControl;
 pub use entity_tag::{parse_entity_tag_list, EntityTag, EntityTagList};
 pub use precondition::{evaluate_preconditions, Precondition, Validators};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod e2e_tests;
 #[cfg(test)]
 mod tests;

@@ -9,6 +9,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "integration")]
 use std::time::Duration;
 
 use hopf_core::testing::Peer;
@@ -92,12 +93,14 @@ fn connect5(ip: [u8; 4], port: u16) -> Vec<u8> {
     r
 }
 
+#[cfg(feature = "integration")]
 /// A port nothing is listening on.
 fn closed_port() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     l.local_addr().unwrap().port()
 }
 
+#[cfg(feature = "integration")]
 /// Waits for the reply to something that completes on another thread.
 fn wait_bytes(p: &mut Peer<Boxed>) -> Vec<u8> {
     for _ in 0..250 {
@@ -193,6 +196,7 @@ fn a_connect_to_a_target_the_policy_forbids_is_refused() {
     assert_eq!(count(&s.metrics.connect_requests), 1);
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn a_connect_to_a_port_nothing_listens_on_is_reported_as_refused() {
     let mut s = server(true, false);
@@ -284,6 +288,7 @@ fn a_socks4_connect_to_a_forbidden_target_is_rejected() {
     assert!(s.peer.is_closed());
 }
 
+#[cfg(feature = "integration")]
 #[test]
 fn a_socks4_connect_to_a_port_nothing_listens_on_is_rejected() {
     let mut s = server(true, false);

@@ -421,7 +421,7 @@ fn mailbox_dirs(root: &Path) -> MailboxResult<Vec<(PathBuf, String)>> {
     Ok(out)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod tests {
     use super::*;
     use tempfile::tempdir;

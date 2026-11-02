@@ -1260,7 +1260,7 @@ impl SmtpClientDriver for SmtpSendDriver {
 /// (`from_execute`), this makes the storage callback's `with_endpoint`
 /// (and the offloaded op's own `ConnHandle::send`) actually reach the mock,
 /// which is what these tests need to observe.
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod tests {
     use super::*;
     use crate::client::endpoint::SmtpClientEndpoint;

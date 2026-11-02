@@ -584,6 +584,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "integration")]
     fn write_content(dir: &Path, name: &str, body: &str) -> PathBuf {
         let p = dir.join(name);
         fs::write(&p, body).unwrap();
@@ -653,6 +654,7 @@ mod tests {
         assert_eq!(parse_envelope(&text, &m.id).unwrap(), m, "{text}");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_message_put_in_the_queue_is_found_by_a_scan_with_its_content_moved_in() {
         let tmp = tempfile::tempdir().unwrap();
@@ -667,6 +669,7 @@ mod tests {
         assert!(scan.unreadable.is_empty() && scan.orphans.is_empty());
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_message_whose_content_is_missing_is_not_queued() {
         let tmp = tempfile::tempdir().unwrap();
@@ -676,6 +679,7 @@ mod tests {
         assert!(q.scan().unwrap().messages.is_empty());
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn an_update_replaces_the_state_and_a_removal_deletes_both_files() {
         let tmp = tempfile::tempdir().unwrap();
@@ -695,6 +699,7 @@ mod tests {
         q.remove(&m.id).unwrap(); // removing twice is not an error
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn updating_a_message_that_is_not_queued_is_an_error_not_a_resurrection() {
         let tmp = tempfile::tempdir().unwrap();
@@ -704,6 +709,7 @@ mod tests {
         assert!(q.scan().unwrap().messages.is_empty());
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_scan_lists_messages_in_the_order_they_arrived() {
         let tmp = tempfile::tempdir().unwrap();
@@ -717,6 +723,7 @@ mod tests {
         assert_eq!(ids, ["cccc", "aaaa", "bbbb"]);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_torn_or_foreign_envelope_is_reported_and_does_not_stop_the_scan() {
         let tmp = tempfile::tempdir().unwrap();
@@ -741,6 +748,7 @@ mod tests {
         assert!(q.dir().join("bbbb.env").exists(), "damaged files are left for an operator");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn content_with_no_envelope_is_an_orphan_and_stray_files_are_ignored() {
         let tmp = tempfile::tempdir().unwrap();
@@ -754,6 +762,7 @@ mod tests {
         assert_eq!(scan.orphans, [q.dir().join("abcd.msg")]);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn an_id_cannot_name_a_file_outside_the_queue() {
         let tmp = tempfile::tempdir().unwrap();

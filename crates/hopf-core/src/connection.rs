@@ -1051,7 +1051,7 @@ impl Endpoint for TcpConnection {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod tests {
     use super::*;
     use crate::handler::NopHandler;

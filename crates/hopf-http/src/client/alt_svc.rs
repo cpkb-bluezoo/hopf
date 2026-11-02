@@ -390,7 +390,7 @@ mod tests {
             443,
             &AltSvcH3Entry { host: None, port: 8443, max_age: Duration::from_secs(0) },
         );
-        std::thread::sleep(Duration::from_millis(5));
+        // A zero lifetime is over the moment it is cached.
         assert_eq!(cache.get("expired.test", 443), None);
     }
 

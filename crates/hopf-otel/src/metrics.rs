@@ -649,7 +649,7 @@ impl RequestTimer {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod tests {
     use super::*;
     use crate::batch::spawn_worker;

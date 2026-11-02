@@ -12,6 +12,12 @@ readme = "README.md"
 keywords = ["mailbox", "maildir", "mbox", "imap", "email"]
 categories = ["email", "filesystem"]
 
+[features]
+default = []
+# Tests that read and write real mailbox files; excluded from CI
+# unit-test runs.
+integration = []
+
 [dependencies]
 hopf-core = { workspace = true }
 rmimeparser = { workspace = true }

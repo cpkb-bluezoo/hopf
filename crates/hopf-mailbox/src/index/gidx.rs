@@ -362,7 +362,7 @@ fn update_crc_u64(crc: &mut crc32fast::Hasher, v: u64) {
     ]);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod tests {
     use super::*;
     use std::collections::BTreeSet;

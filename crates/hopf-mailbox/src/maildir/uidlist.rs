@@ -218,7 +218,7 @@ fn parse_modseq_and_base(rest: &str) -> (u64, String) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod tests {
     use super::*;
 

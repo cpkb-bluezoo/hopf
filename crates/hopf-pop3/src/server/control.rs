@@ -24,6 +24,7 @@ use crate::server::handler::{
     RetrieveState, TopState, TransactionHandler, UidlState, UidlWriter, UpdateState,
 };
 #[cfg(test)]
+#[cfg_attr(not(feature = "integration"), allow(unused_imports))]
 use crate::server::handler::DefaultPop3HandlerFactory;
 use crate::server::metrics::Pop3ServerMetrics;
 use crate::server::reply;
@@ -1942,10 +1943,10 @@ fn message_has_non_ascii(mb: &mut dyn Mailbox, message_number: u32) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod session_tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod top_streaming_tests {
     use std::collections::BTreeSet;
 
@@ -2045,7 +2046,7 @@ mod top_streaming_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod utf8_scan_tests {
     use std::collections::BTreeSet;
 
@@ -2079,7 +2080,7 @@ mod utf8_scan_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod telemetry_tests {
     use super::*;
     use hopf_auth::PasswordStore;

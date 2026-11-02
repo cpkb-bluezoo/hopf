@@ -98,8 +98,11 @@ pub fn post_protobuf(endpoint: &HttpEndpoint, body: &[u8]) -> Result<u16, String
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::net::TcpListener;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::sync::mpsc;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::thread;
 
     #[test]
@@ -141,6 +144,7 @@ pub(crate) mod tests {
 
     /// Serves one connection: reads a whole request, answers with `reply`,
     /// and hands the request bytes back.
+    #[cfg(feature = "integration")]
     pub(crate) fn serve_once(reply: &'static str) -> (u16, mpsc::Receiver<Vec<u8>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -173,10 +177,12 @@ pub(crate) mod tests {
         (port, rx)
     }
 
+    #[cfg(feature = "integration")]
     fn endpoint(port: u16) -> HttpEndpoint {
         HttpEndpoint { host: "127.0.0.1".into(), port, path: "/v1/logs".into() }
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_post_sends_the_protobuf_body_with_its_headers() {
         let (port, rx) = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
@@ -191,6 +197,7 @@ pub(crate) mod tests {
         assert!(req.ends_with(b"\r\n\r\n\x0a\x00body"));
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn the_host_header_names_a_non_default_port() {
         let (port, rx) = serve_once("HTTP/1.1 200 OK\r\n\r\n");
@@ -199,12 +206,14 @@ pub(crate) mod tests {
         assert!(text.contains(&format!("Host: 127.0.0.1:{port}\r\n")), "{text}");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn any_2xx_is_success() {
         let (port, _rx) = serve_once("HTTP/1.1 202 Accepted\r\n\r\n");
         assert_eq!(post_protobuf(&endpoint(port), b"x").unwrap(), 202);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn other_statuses_are_errors_that_quote_the_start_of_the_reply() {
         let (port, _rx) = serve_once("HTTP/1.1 503 Service Unavailable\r\n\r\nbusy");
@@ -214,12 +223,14 @@ pub(crate) mod tests {
         assert!(post_protobuf(&endpoint(port), b"x").unwrap_err().contains("301"));
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_reply_that_is_not_http_is_an_error() {
         let (port, _rx) = serve_once("garbage");
         assert!(post_protobuf(&endpoint(port), b"x").unwrap_err().contains("status 0"));
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_closed_port_is_an_error() {
         let port = {

@@ -14,5 +14,5 @@ pub use content_encoding::{ContentEncodingServerFactory, ServerContentEncodingPo
 pub use facade::HttpServer;
 pub use hsts::{HstsPolicy, HstsServerFactory};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod hsts_e2e_tests;

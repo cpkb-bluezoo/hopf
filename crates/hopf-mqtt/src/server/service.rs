@@ -129,17 +129,24 @@ impl MqttService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::io::{Read, Write};
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::net::TcpStream;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::time::{Duration, Instant};
 
     use hopf_auth::PasswordStore;
     use hopf_core::RuntimeConfig;
 
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use crate::codec::packet::{ConnectPacket, ProtocolVersion};
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use crate::codec::{encode, Properties, QoS};
     use crate::server::broker::BrokerState;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use crate::server::handler::{ConnectDecision, ConnectHandler, MqttConnectionMetadata};
 
     fn runtime() -> Arc<Runtime> {
@@ -150,6 +157,7 @@ mod tests {
         MqttConfig::new("127.0.0.1:0".parse().unwrap(), Arc::new(BrokerState::new()))
     }
 
+    #[cfg(feature = "integration")]
     fn connect(id: &str, user: Option<(&str, &str)>) -> Vec<u8> {
         encode::encode_connect(&ConnectPacket {
             version: ProtocolVersion::V311,
@@ -163,6 +171,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "integration")]
     fn publish(topic: &str, payload: &[u8]) -> Vec<u8> {
         encode::encode_publish(
             &encode::PublishFields {
@@ -178,6 +187,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "integration")]
     fn client(addr: SocketAddr) -> TcpStream {
         let stream = TcpStream::connect(addr).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -185,6 +195,7 @@ mod tests {
     }
 
     /// Send CONNECT and return the CONNACK return code (MQTT 3.1.1).
+    #[cfg(feature = "integration")]
     fn connack(stream: &mut TcpStream, packet: &[u8]) -> u8 {
         stream.write_all(packet).unwrap();
         let mut ack = [0u8; 4];
@@ -194,11 +205,13 @@ mod tests {
     }
 
     /// The server has closed the connection (read gives EOF or a reset).
+    #[cfg(feature = "integration")]
     fn closed(stream: &mut TcpStream) -> bool {
         let mut b = [0u8; 16];
         matches!(stream.read(&mut b), Ok(0) | Err(_))
     }
 
+    #[cfg(feature = "integration")]
     fn wait(pred: impl Fn() -> bool) -> bool {
         for _ in 0..500 {
             if pred() {
@@ -240,6 +253,7 @@ mod tests {
 
     // -- who may connect ----------------------------------------------------------------
 
+    #[cfg(feature = "integration")]
     #[test]
     fn an_anonymous_connect_is_refused_unless_the_config_allows_it() {
         let addr = MqttService::new(config()).start(runtime()).unwrap();
@@ -251,6 +265,7 @@ mod tests {
         assert_eq!(connack(&mut client(addr), &connect("anon", None)), 0);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn credentials_in_the_config_are_checked_at_connect() {
         let store = Arc::new(PasswordStore::new().with_user("u", "p"));
@@ -262,6 +277,7 @@ mod tests {
 
     // -- limits --------------------------------------------------------------------------
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_packet_over_the_size_limit_ends_the_connection() {
         let addr = MqttService::new(config().allow_anonymous().with_max_packet_size(64)).start(runtime()).unwrap();
@@ -271,6 +287,7 @@ mod tests {
         assert!(closed(&mut c), "an over-long packet was not refused");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_publish_over_the_payload_limit_drops_the_publisher_and_is_never_delivered() {
         let addr = MqttService::new(config().allow_anonymous().with_max_publish_payload(32)).start(runtime()).unwrap();
@@ -302,6 +319,7 @@ mod tests {
         assert!(!buf[..n].windows(4).any(|w| w == [1, 1, 1, 1]), "the over-size payload was delivered");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_connection_that_never_sends_connect_is_closed_after_the_connect_timeout() {
         let addr = MqttService::new(config().allow_anonymous().with_connect_timeout(Duration::from_millis(300)))
@@ -315,18 +333,22 @@ mod tests {
 
     // -- a handler per connection ---------------------------------------------------
 
+    #[cfg(feature = "integration")]
     struct Counting {
         created: Arc<AtomicUsize>,
     }
 
+    #[cfg(feature = "integration")]
     struct AcceptAll;
 
+    #[cfg(feature = "integration")]
     impl ConnectHandler for AcceptAll {
         fn authorize(&mut self, _p: &ConnectPacket, _m: &MqttConnectionMetadata) -> ConnectDecision {
             ConnectDecision::Accept
         }
     }
 
+    #[cfg(feature = "integration")]
     impl MqttHandlerFactory for Counting {
         fn create(&self) -> Box<dyn ConnectHandler> {
             self.created.fetch_add(1, Ordering::SeqCst);
@@ -334,6 +356,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn each_connection_gets_its_own_handlers_and_the_factory_decides_who_may_connect() {
         let created = Arc::new(AtomicUsize::new(0));
@@ -349,6 +372,7 @@ mod tests {
 
     // -- shutdown ---------------------------------------------------------------------
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_stopped_service_refuses_new_connections_but_lets_open_sessions_finish_and_the_runtime_shut_down() {
         let rt = runtime();

@@ -385,6 +385,7 @@ txt TXT \"hello world\" \"two\"
         assert!(parse_zone("e.org", "www A 1.1.1.1\n").is_err(), "no SOA");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn include_reads_relative_files_and_restores_origin() {
         let dir = std::env::temp_dir().join(format!("hopf-zone-inc-{}", std::process::id()));

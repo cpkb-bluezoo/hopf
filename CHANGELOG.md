@@ -3,6 +3,28 @@
 All notable changes to hopf are recorded here. The workspace crates are
 versioned together. Changes before 0.7.0 are in the git history and tags.
 
+## Unreleased
+
+### Added
+
+- **hopf-core:** in-memory counterparts of the PEM builders, for identities
+  generated at run time: `acceptor_from_pem_bytes`, `acceptor_from_pem_tls12_bytes`,
+  `acceptor_from_credentials_tls12`, `acceptor_from_credentials_with_sni`,
+  `connector_from_pem_bytes`, `connector_from_pem_bytes_with_tcp_version_policy`
+  and `connector_from_pem_tls12_bytes`. The path-based builders read the file
+  and use these.
+- **hopf-core `testing`:** `Peer::connect_timed`, `Peer::elapsed` and
+  `Peer::advance`. A handler that is waiting only for a timer it set no
+  longer makes a test wait for the time to pass: the peer's clock skips ahead.
+
+### Changed
+
+- Unit tests (`cargo test --lib`) do no socket or file I/O and do not wait
+  for the clock. Those that do are behind each crate's `integration` feature.
+  `scripts/check-hermetic-tests.sh` runs the unit tests with no network and a
+  read-only filesystem, and CI runs it. `hopf-mailbox`, `hopf-ldap` and
+  `hopf-otel` have gained an `integration` feature for this.
+
 ## 0.7.0 - 2026-11-01
 
 ### Breaking changes

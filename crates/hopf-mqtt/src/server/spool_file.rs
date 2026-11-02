@@ -82,6 +82,7 @@ mod tests {
         (rt, handle)
     }
 
+    #[cfg(feature = "integration")]
     fn wait_for(pred: impl Fn() -> bool, max_ms: u64) -> bool {
         for _ in 0..(max_ms / 5).max(1) {
             if pred() {
@@ -92,6 +93,7 @@ mod tests {
         pred()
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn deletes_file_only_once_the_last_clone_drops() {
         let (rt, handle) = test_runtime_and_handle();

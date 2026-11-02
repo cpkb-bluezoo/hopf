@@ -888,6 +888,7 @@ mod tests {
     /// 20 distinct chunks and checking the resulting file byte-for-byte,
     /// not just "eventually all bytes arrived" (which alone wouldn't catch
     /// a reordering bug).
+    #[cfg(feature = "integration")]
     #[test]
     fn stor_writes_land_off_thread_in_order_across_many_chunks() {
         let bridge = test_bridge();

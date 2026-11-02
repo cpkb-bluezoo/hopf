@@ -1000,6 +1000,7 @@ mod tests {
         assert!(sel.starts_with(b"Subject: b\r\n"));
     }
 
+    #[cfg(feature = "integration")]
     fn mailbox_with(msg: &[u8]) -> (tempfile::TempDir, Box<dyn Mailbox>) {
         use hopf_mailbox::{AppendGuard, MailboxFactory};
         let dir = tempfile::tempdir().unwrap();
@@ -1013,6 +1014,7 @@ mod tests {
         (dir, mb)
     }
 
+    #[cfg(feature = "integration")]
     fn push_collect(mb: &mut dyn Mailbox, items: &[FetchItem], size: u64) -> Vec<u8> {
         let flags = BTreeSet::new();
         let keywords = BTreeSet::new();
@@ -1028,6 +1030,7 @@ mod tests {
     /// heuristic always picks literal syntax (its threshold is 1024 bytes)
     /// — so the streaming and whole-buffer paths are byte-for-byte
     /// comparable here, not just semantically equivalent.
+    #[cfg(feature = "integration")]
     fn large_message() -> Vec<u8> {
         let mut msg = b"From: a@b\r\nTo: c@d\r\nSubject: streaming fetch\r\n\r\n".to_vec();
         for i in 0..100 {
@@ -1036,6 +1039,7 @@ mod tests {
         msg
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn push_fetch_attrs_matches_format_fetch_attrs_for_rfc822_and_body_full() {
         let msg = large_message();
@@ -1067,6 +1071,7 @@ mod tests {
         assert_eq!(streamed, whole);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn push_fetch_attrs_matches_format_fetch_attrs_for_header_and_text() {
         let msg = large_message();
@@ -1104,6 +1109,7 @@ mod tests {
         assert_eq!(streamed, whole);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn push_fetch_attrs_matches_format_fetch_attrs_for_header_fields() {
         let msg = large_message();
@@ -1131,6 +1137,7 @@ mod tests {
         assert_eq!(streamed, whole);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn push_fetch_attrs_declared_literal_length_matches_pushed_byte_count() {
         // Verifies the {n}\r\n length prefix for a content item is exactly
@@ -1152,6 +1159,7 @@ mod tests {
         assert_eq!(content, message_text(&msg));
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn push_fetch_attrs_uses_the_real_streaming_mailbox_read_regardless_of_chunk_size() {
         // The maildir backend already reads in 8KB chunks; use a message
@@ -1209,6 +1217,7 @@ mod tests {
         assert_eq!(attrs, b"(EMAILID (E1234.a) THREADID NIL)");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn push_emailid_and_threadid_matches_format() {
         let msg = b"From: a@b\r\n\r\nbody\r\n".to_vec();
@@ -1287,6 +1296,7 @@ mod tests {
         assert!(parse_fetch_items("BODY[]<0.0>").is_err());
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn push_fetch_attrs_partial_body_matches_format_fetch_attrs() {
         let msg = large_message();
@@ -1320,6 +1330,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn push_fetch_attrs_partial_body_start_beyond_end_is_empty_not_error() {
         let msg = b"From: a@b\r\n\r\nshort\r\n".to_vec();
@@ -1336,6 +1347,7 @@ mod tests {
         assert!(s.contains("{0}\r\n"), "got: {s}");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn push_fetch_attrs_partial_text_matches_format_fetch_attrs() {
         let msg = large_message();
@@ -1363,6 +1375,7 @@ mod tests {
         assert_eq!(streamed, whole);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn push_fetch_attrs_envelope_matches_format_fetch_attrs() {
         let msg = b"From: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nSubject: Hi\r\n\r\nbody\r\n".to_vec();
@@ -1388,6 +1401,7 @@ mod tests {
         assert!(s.contains("\"Hi\""), "got: {s}");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn push_fetch_attrs_bodystructure_matches_format_fetch_attrs() {
         let msg = b"Content-Type: multipart/mixed; boundary=X\r\n\r\n\
@@ -1417,6 +1431,7 @@ mod tests {
         assert!(s.contains("\"a.pdf\""), "got: {s}");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn push_fetch_attrs_envelope_and_bodystructure_together_match_whole_buffer() {
         // Both items in the same FETCH — exercises the header_scan +

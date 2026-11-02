@@ -912,7 +912,7 @@ pub(crate) fn resolve_mailbox_dir(user_root: &Path, name: &str) -> MailboxResult
     Ok(user_root.join(format!(".{encoded}")))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod tests {
     use super::*;
     use crate::traits::MailboxFactory;

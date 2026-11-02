@@ -47,7 +47,7 @@ mod error;
 mod facade;
 mod handlers;
 mod session;
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod tests;
 mod timeout;
 

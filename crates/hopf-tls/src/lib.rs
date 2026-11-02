@@ -100,7 +100,7 @@ pub fn public_trust_connector(alpn: &[&[u8]]) -> io::Result<SharedTlsConnector> 
     Ok(hopf_core::public_trust_connector(alpn))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 // These tests exist to exercise the deprecated hopf-tls wrappers themselves.
 #[allow(deprecated)]
 mod tests {
@@ -133,6 +133,7 @@ mod tests {
         let _ = connector_from_pem(&cert_path, &[b"h2"]).unwrap();
     }
 
+    // Loads the operating system's certificate store: slow and host-dependent.
     #[test]
     fn public_trust_connector_builds() {
         public_trust_connector(&[]).unwrap();

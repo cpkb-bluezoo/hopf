@@ -42,8 +42,12 @@ struct Timer {
 }
 
 /// What the connection has seen, shared by the endpoint and its handle.
-#[derive(Default)]
 pub struct Wire {
+    /// When the connection was made, for [`Peer::elapsed`].
+    created: Instant,
+    /// Time the test has skipped: the connection's clock is the real one plus
+    /// this, so a timer can be reached without waiting for it.
+    warp: Mutex<Duration>,
     out: Mutex<Vec<u8>>,
     jobs: Mutex<VecDeque<Job>>,
     timers: Mutex<Vec<Timer>>,
@@ -53,10 +57,43 @@ pub struct Wire {
 }
 
 impl Wire {
+    fn new() -> Self {
+        Self {
+            created: Instant::now(),
+            warp: Mutex::new(Duration::ZERO),
+            out: Mutex::default(),
+            jobs: Mutex::default(),
+            timers: Mutex::default(),
+            poked: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn now(&self) -> Instant {
+        Instant::now() + *self.warp.lock().unwrap()
+    }
+
+    /// Skips ahead to the earliest timer that has not been cancelled; false
+    /// if there is none.
+    fn skip_to_next_timer(&self) -> bool {
+        let next = {
+            let mut timers = self.timers.lock().unwrap();
+            timers.retain(|t| !t.cancelled.load(Ordering::Relaxed));
+            timers.iter().map(|t| t.due).min()
+        };
+        let Some(due) = next else { return false };
+        let now = self.now();
+        if due > now {
+            *self.warp.lock().unwrap() += due - now;
+        }
+        true
+    }
+
     fn add_timer(&self, delay: Duration, callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
         let cancelled = Arc::new(AtomicBool::new(false));
         self.timers.lock().unwrap().push(Timer {
-            due: Instant::now() + delay,
+            due: self.now() + delay,
             cancelled: Arc::clone(&cancelled),
             callback,
         });
@@ -65,7 +102,7 @@ impl Wire {
 
     /// Run the timers that are due, oldest first; a cancelled one is dropped.
     fn fire_due_timers(&self) {
-        let now = Instant::now();
+        let now = self.now();
         let mut due = Vec::new();
         {
             let mut timers = self.timers.lock().unwrap();
@@ -167,6 +204,9 @@ pub struct Peer<H: ProtocolHandler> {
     /// Is the handler waiting for something it started (a storage operation,
     /// a queued command)? The peer keeps playing the reactor until it is not.
     busy: fn(&H) -> bool,
+    /// Is the handler waiting only for a timer it set? If so, and nothing
+    /// else is going on, the peer skips ahead to the timer instead of waiting.
+    timed: fn(&H) -> bool,
     /// The last `receive` consumed nothing: the handler is waiting for more
     /// bytes (a partial line it leaves in the ring), so it is not run again
     /// until some arrive, it is poked, or a job has run.
@@ -177,18 +217,42 @@ impl<H: ProtocolHandler> Peer<H> {
     /// Connects `handler` (its `connected` runs, and whatever it starts is
     /// seen through). `busy` says whether it is still working.
     pub fn connect(handler: H, busy: fn(&H) -> bool) -> Self {
-        let wire = Arc::new(Wire::default());
+        Self::connect_timed(handler, busy, |_| false)
+    }
+
+    /// As [`Self::connect`], for a handler that can also be waiting for a timer
+    /// (`timed`): `busy` says whether it is waiting for something that happens
+    /// on its own, such as a storage operation, which the peer waits for; when
+    /// only `timed` holds, the peer skips the clock ahead to the next timer, so
+    /// that a test does not wait out a delay. [`Self::elapsed`] says how far
+    /// the clock was moved.
+    pub fn connect_timed(handler: H, busy: fn(&H) -> bool, timed: fn(&H) -> bool) -> Self {
+        let wire = Arc::new(Wire::new());
         let mut peer = Self {
             handler,
             endpoint: TestEndpoint(Arc::clone(&wire)),
             wire,
             input: LoopBuf::with_capacity(1 << 20),
             busy,
+            timed,
             stalled: false,
         };
         peer.handler.connected(&mut peer.endpoint);
         peer.pump();
         peer
+    }
+
+    /// How long the connection has been up by its own clock: the real time
+    /// that has passed plus the time skipped to reach a timer.
+    pub fn elapsed(&self) -> Duration {
+        self.wire.now() - self.wire.created
+    }
+
+    /// Moves the clock on by `by`, runs the timers that fall due, and sees
+    /// through what they start.
+    pub fn advance(&mut self, by: Duration) {
+        *self.wire.warp.lock().unwrap() += by;
+        self.pump();
     }
 
     /// Everything the handler has written since the last call.
@@ -302,6 +366,9 @@ impl<H: ProtocolHandler> Peer<H> {
             }
             let working = (self.busy)(&self.handler) || !self.wire.jobs.lock().unwrap().is_empty();
             if !working {
+                if (self.timed)(&self.handler) && self.wire.skip_to_next_timer() {
+                    continue;
+                }
                 return;
             }
             assert!(Instant::now() < deadline, "the handler never went idle; output so far: {:?}", self.take());

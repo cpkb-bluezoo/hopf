@@ -467,7 +467,7 @@ fn normalize_nvfs(path: &str) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod tests {
     use super::*;
     use crate::server::handler::FtpConnectionMetadata;

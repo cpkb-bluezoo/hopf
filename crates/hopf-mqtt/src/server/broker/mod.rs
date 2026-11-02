@@ -911,6 +911,7 @@ mod tests {
     /// doesn't land in the offline queue synchronously. `take_offline` is
     /// destructive (no peek API), so poll by taking-and-re-enqueueing until
     /// something shows up, rather than a fixed sleep.
+    #[cfg(feature = "integration")]
     fn wait_for_offline_message(broker: &BrokerState, id: SubscriberId, max_ms: u64) -> bool {
         for _ in 0..(max_ms / 5).max(1) {
             let msgs = broker.store.take_offline(id);
@@ -1064,6 +1065,7 @@ mod tests {
         fanout.feed(b"x");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn orphaned_qos1_is_queued_and_drained_on_resume() {
         let broker = Arc::new(BrokerState::new());

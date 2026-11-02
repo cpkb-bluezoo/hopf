@@ -71,9 +71,13 @@ struct State {
     last_error: Option<(io::ErrorKind, String)>,
 }
 
+/// Runs a task after a delay: a runtime's timer in service, a list a test
+/// empties by hand under test.
+type Schedule = Arc<dyn Fn(Duration, Box<dyn FnOnce() + Send>) + Send + Sync>;
+
 /// One connection race over a list of addresses.
 pub(crate) struct Race {
-    rt: Arc<Runtime>,
+    schedule: Schedule,
     addrs: Vec<SocketAddr>,
     delay: Duration,
     dial: Dial,
@@ -97,13 +101,21 @@ impl Attempt {
 /// connection's handler with the dial's `make`. See the module documentation.
 /// `on_failure` is called, once, if there are no addresses or none connects.
 pub(crate) fn connect_any(rt: &Arc<Runtime>, addrs: Vec<SocketAddr>, delay: Duration, dial: Dial, on_failure: Failure) {
+    let rt = Arc::clone(rt);
+    let schedule: Schedule = Arc::new(move |delay, task| {
+        rt.pick_worker().schedule_timer(delay, task);
+    });
+    connect_any_scheduled(schedule, addrs, delay, dial, on_failure);
+}
+
+fn connect_any_scheduled(schedule: Schedule, addrs: Vec<SocketAddr>, delay: Duration, dial: Dial, on_failure: Failure) {
     let addrs = order(addrs);
     if addrs.is_empty() {
         on_failure(io::Error::new(io::ErrorKind::NotFound, "no address to connect to"));
         return;
     }
     let race = Arc::new(Race {
-        rt: Arc::clone(rt),
+        schedule,
         addrs,
         delay,
         dial,
@@ -135,7 +147,7 @@ impl Race {
         };
         if index + 1 < self.addrs.len() {
             let race = Arc::clone(self);
-            self.rt.pick_worker().schedule_timer(self.delay, Box::new(move || race.launch(index + 1)));
+            (self.schedule)(self.delay, Box::new(move || race.launch(index + 1)));
         }
         if let Err(e) = (self.dial)(addr, Attempt(Arc::clone(self))) {
             self.attempt_failed(&e);
@@ -286,9 +298,9 @@ impl ProtocolHandler for Gated {
 mod tests {
     use super::*;
     use hopf_core::testing::Peer;
-    use hopf_core::{NopHandler, RuntimeConfig};
+    use hopf_core::NopHandler;
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Instant;
 
     fn a(s: &str) -> SocketAddr {
         s.parse().unwrap()
@@ -306,28 +318,37 @@ mod tests {
         assert_eq!(order(vec![v4(1)]), [v4(1)]);
     }
 
+    /// The timers a race asks for, run by hand: a test moves time by firing
+    /// them, never by waiting.
+    type Timers = Arc<Mutex<VecDeque<(Duration, Box<dyn FnOnce() + Send>)>>>;
+
+    fn manual_schedule(timers: &Timers) -> Schedule {
+        let timers = Arc::clone(timers);
+        Arc::new(move |delay, task| timers.lock().unwrap().push_back((delay, task)))
+    }
+
     /// A race over `n` addresses whose dial only records the attempt, with the
     /// handlers it gets kept to be driven by the test.
     struct Rig {
-        rt: Arc<Runtime>,
-        launched: Arc<Mutex<Vec<(SocketAddr, Instant)>>>,
+        launched: Arc<Mutex<Vec<SocketAddr>>>,
         handlers: Arc<Mutex<Vec<Arc<Mutex<Box<dyn ProtocolHandler>>>>>>,
         made: Arc<AtomicUsize>,
         failures: Arc<Mutex<Vec<io::Error>>>,
+        timers: Timers,
     }
 
     impl Rig {
         fn start(n: u8, delay: Duration) -> Self {
             let rig = Self {
-                rt: Arc::new(Runtime::start(RuntimeConfig::default()).unwrap()),
                 launched: Arc::default(),
                 handlers: Arc::default(),
                 made: Arc::default(),
                 failures: Arc::default(),
+                timers: Arc::default(),
             };
             let (launched, handlers, made) = (Arc::clone(&rig.launched), Arc::clone(&rig.handlers), Arc::clone(&rig.made));
             let dial: Dial = Arc::new(move |addr, attempt| {
-                launched.lock().unwrap().push((addr, Instant::now()));
+                launched.lock().unwrap().push(addr);
                 let made = Arc::clone(&made);
                 let make: MakeHandler = Arc::new(move || {
                     made.fetch_add(1, Ordering::SeqCst);
@@ -338,7 +359,7 @@ mod tests {
             });
             let failures = Arc::clone(&rig.failures);
             let addrs = (1..=n).map(|i| a(&format!("192.0.2.{i}:80"))).collect();
-            connect_any(&rig.rt, addrs, delay, dial, Box::new(move |e| failures.lock().unwrap().push(e)));
+            connect_any_scheduled(manual_schedule(&rig.timers), addrs, delay, dial, Box::new(move |e| failures.lock().unwrap().push(e)));
             rig
         }
 
@@ -346,9 +367,21 @@ mod tests {
             self.launched.lock().unwrap().len()
         }
 
-        /// Wait up to `ms` for `n` attempts to have been started.
-        fn wait_launched(&self, n: usize, ms: u64) -> bool {
-            wait(|| self.launched() >= n, ms)
+        /// The delays of the timers waiting to fire.
+        fn pending(&self) -> Vec<Duration> {
+            self.timers.lock().unwrap().iter().map(|(d, _)| *d).collect()
+        }
+
+        /// Fire the oldest timer; false if there is none.
+        fn fire(&self) -> bool {
+            let next = self.timers.lock().unwrap().pop_front();
+            match next {
+                Some((_, task)) => {
+                    task();
+                    true
+                }
+                None => false,
+            }
         }
 
         /// Run `f` on attempt `i`'s handler with a fresh endpoint.
@@ -366,25 +399,17 @@ mod tests {
         }
     }
 
-    fn wait(pred: impl Fn() -> bool, ms: u64) -> bool {
-        let end = Instant::now() + Duration::from_millis(ms);
-        while Instant::now() < end {
-            if pred() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        pred()
-    }
-
     #[test]
     fn the_next_address_is_started_when_the_previous_has_not_connected_after_the_delay() {
         let rig = Rig::start(3, Duration::from_millis(60));
         assert_eq!(rig.launched(), 1, "one at a time at first");
-        assert!(rig.wait_launched(3, 2000));
-        let times: Vec<Instant> = rig.launched.lock().unwrap().iter().map(|(_, t)| *t).collect();
-        assert!(times[1] - times[0] >= Duration::from_millis(55), "{:?}", times[1] - times[0]);
-        assert!(times[2] - times[1] >= Duration::from_millis(55), "{:?}", times[2] - times[1]);
+        assert_eq!(rig.pending(), [Duration::from_millis(60)], "the next waits for the delay");
+        assert!(rig.fire());
+        assert_eq!(rig.launched(), 2);
+        assert_eq!(rig.pending(), [Duration::from_millis(60)]);
+        assert!(rig.fire());
+        assert_eq!(rig.launched(), 3);
+        assert!(rig.pending().is_empty(), "no address is left to wait for");
         assert!(rig.failures.lock().unwrap().is_empty(), "attempts under way are not a failure");
     }
 
@@ -393,14 +418,15 @@ mod tests {
         let rig = Rig::start(2, Duration::from_secs(30));
         assert_eq!(rig.launched(), 1);
         rig.fail(0, io::ErrorKind::ConnectionRefused);
-        assert!(rig.wait_launched(2, 1000), "the second address was not tried until the delay ended");
+        assert_eq!(rig.launched(), 2, "the second address was not tried until the delay ended");
         assert!(rig.failures.lock().unwrap().is_empty());
     }
 
     #[test]
     fn the_first_to_connect_wins_and_the_others_are_closed_and_never_hear_of_it() {
         let rig = Rig::start(2, Duration::from_millis(20));
-        assert!(rig.wait_launched(2, 1000));
+        assert!(rig.fire());
+        assert_eq!(rig.launched(), 2);
         let (_, closed) = rig.drive(1, |h, ep| h.connected(ep));
         assert!(!closed, "the winner is kept");
         assert_eq!(rig.made.load(Ordering::SeqCst), 1, "its handler is made");
@@ -417,7 +443,7 @@ mod tests {
     fn a_win_stops_the_addresses_not_yet_started() {
         let rig = Rig::start(3, Duration::from_millis(80));
         rig.drive(0, |h, ep| h.connected(ep));
-        std::thread::sleep(Duration::from_millis(300));
+        while rig.fire() {}
         assert_eq!(rig.launched(), 1, "the timers found the race over");
     }
 
@@ -433,9 +459,9 @@ mod tests {
     fn when_every_address_fails_the_caller_is_told_once_with_the_last_error() {
         let rig = Rig::start(3, Duration::from_secs(30));
         rig.fail(0, io::ErrorKind::TimedOut);
-        assert!(rig.wait_launched(2, 1000));
+        assert_eq!(rig.launched(), 2);
         rig.fail(1, io::ErrorKind::ConnectionReset);
-        assert!(rig.wait_launched(3, 1000));
+        assert_eq!(rig.launched(), 3);
         assert!(rig.failures.lock().unwrap().is_empty(), "one address is left");
         rig.fail(2, io::ErrorKind::ConnectionRefused);
         let failures = rig.failures.lock().unwrap();
@@ -456,17 +482,17 @@ mod tests {
 
     #[test]
     fn no_addresses_is_a_failure_at_once() {
-        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        let timers = Timers::default();
         let failures: Arc<Mutex<Vec<io::Error>>> = Arc::default();
         let f2 = Arc::clone(&failures);
         let dial: Dial = Arc::new(|_, _| unreachable!("there is nothing to dial"));
-        connect_any(&rt, vec![], Duration::from_millis(10), dial, Box::new(move |e| f2.lock().unwrap().push(e)));
+        connect_any_scheduled(manual_schedule(&timers), vec![], Duration::from_millis(10), dial, Box::new(move |e| f2.lock().unwrap().push(e)));
         assert_eq!(failures.lock().unwrap()[0].kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
     fn a_dial_that_cannot_even_start_counts_as_a_failure_and_the_next_is_tried() {
-        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        let timers = Timers::default();
         let launched: Arc<Mutex<Vec<SocketAddr>>> = Arc::default();
         let failures: Arc<Mutex<Vec<io::Error>>> = Arc::default();
         let (l2, f2) = (Arc::clone(&launched), Arc::clone(&failures));
@@ -474,8 +500,8 @@ mod tests {
             l2.lock().unwrap().push(addr);
             Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "no route to host"))
         });
-        connect_any(&rt, vec![a("[::1]:80"), a("127.0.0.1:80")], Duration::from_secs(30), dial, Box::new(move |e| f2.lock().unwrap().push(e)));
-        assert!(wait(|| failures.lock().unwrap().len() == 1, 1000), "both were tried, without waiting for the delay");
+        connect_any_scheduled(manual_schedule(&timers), vec![a("[::1]:80"), a("127.0.0.1:80")], Duration::from_secs(30), dial, Box::new(move |e| f2.lock().unwrap().push(e)));
+        assert_eq!(failures.lock().unwrap().len(), 1, "both were tried, without waiting for the delay");
         assert_eq!(*launched.lock().unwrap(), [a("[::1]:80"), a("127.0.0.1:80")]);
         assert_eq!(failures.lock().unwrap()[0].kind(), io::ErrorKind::AddrNotAvailable);
     }
@@ -506,7 +532,7 @@ mod tests {
                 self.0.lock().unwrap().push("error");
             }
         }
-        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        let timers = Timers::default();
         let seen: Arc<Mutex<Vec<&'static str>>> = Arc::default();
         let gates: Arc<Mutex<Vec<Box<dyn ProtocolHandler>>>> = Arc::default();
         let (g2, s2) = (Arc::clone(&gates), Arc::clone(&seen));
@@ -515,7 +541,7 @@ mod tests {
             g2.lock().unwrap().push(attempt.gate(Arc::new(move || Box::new(Count(Arc::clone(&s))) as Box<dyn ProtocolHandler>)));
             Ok(())
         });
-        connect_any(&rt, vec![a("192.0.2.1:80")], Duration::from_millis(10), dial, Box::new(|_| {}));
+        connect_any_scheduled(manual_schedule(&timers), vec![a("192.0.2.1:80")], Duration::from_millis(10), dial, Box::new(|_| {}));
         let mut peer = Peer::connect(NopHandler, |_| false);
         let mut ring = LoopBuf::with_capacity(16);
         let mut gates = gates.lock().unwrap();

@@ -2168,6 +2168,7 @@ mod tests {
     /// exposed anywhere for a caller to make. A server whose discovery
     /// response says it doesn't understand the SVCB qtype at all must end
     /// up confirmed-absent in the capability cache.
+    #[cfg(feature = "integration")]
     #[test]
     fn a_real_query_triggers_ddr_discovery_which_records_confirmed_absent() {
         let fake = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -2236,6 +2237,7 @@ mod tests {
     /// DoT target must see a connection, and the original plain-UDP
     /// address must never be queried.
     #[cfg(feature = "dot")]
+    #[cfg(feature = "integration")]
     #[test]
     fn a_confirmed_dot_capability_is_dialed_dynamically_instead_of_plain_udp() {
         let dot_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2825,6 +2827,7 @@ mod tests {
     /// unchanged) rather than advancing to the next configured one — a
     /// second, distinctly-observable server proves it's never touched.
     #[cfg(feature = "dot")]
+    #[cfg(feature = "integration")]
     #[test]
     fn intra_server_fallback_never_advances_to_a_different_configured_server() {
         let rt = hopf_core::Runtime::start(Default::default()).unwrap();
@@ -2883,6 +2886,7 @@ mod tests {
     /// has only the one transport it was told to use, so there's nothing
     /// "next-best" within it to retry.
     #[cfg(feature = "dot")]
+    #[cfg(feature = "integration")]
     #[test]
     fn pinned_server_transport_failure_still_advances_to_the_next_server() {
         let rt = hopf_core::Runtime::start(Default::default()).unwrap();

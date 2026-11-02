@@ -1736,7 +1736,7 @@ fn _binding_ty(_: BindingId) {}
 #[path = "control_session_tests.rs"]
 mod session_tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod open_offload_tests {
     use super::*;
     use crate::server::fs::BasicFtpFileSystem;
@@ -2090,7 +2090,7 @@ mod open_offload_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod telemetry_tests {
     use super::*;
     use crate::server::handler::FilesystemFtpHandler;

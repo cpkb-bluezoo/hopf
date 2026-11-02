@@ -346,13 +346,17 @@ impl ImapService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::io::{BufRead, BufReader, Write};
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::net::TcpStream;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use hopf_core::RuntimeConfig;
 
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use crate::server::handler::{ClientConnected, ConnectedState, ImapConnectionMetadata};
 
     fn runtime() -> Arc<Runtime> {
@@ -369,26 +373,27 @@ mod tests {
 
     /// A TLS acceptor for the wiring tests (the handshakes themselves are
     /// exercised by the integration tests).
-    fn acceptor(dir: &std::path::Path) -> SharedTlsAcceptor {
+    fn acceptor() -> SharedTlsAcceptor {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let (cert_path, key_path) = (dir.join("cert.pem"), dir.join("key.pem"));
-        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
-        hopf_core::acceptor_from_pem(&cert_path, &key_path, &[]).unwrap()
+        hopf_core::acceptor_from_pem_bytes(cert.cert.pem().as_bytes(), cert.key_pair.serialize_pem().as_bytes(), &[]).unwrap()
     }
 
     /// A blocking client over a real connection.
+    #[cfg(feature = "integration")]
     struct Client {
         reader: BufReader<TcpStream>,
     }
 
+    #[cfg(feature = "integration")]
     impl Client {
+        #[cfg(feature = "integration")]
         fn connect(addr: SocketAddr) -> Self {
             let stream = TcpStream::connect(addr).unwrap();
             stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             Self { reader: BufReader::new(stream) }
         }
 
+        #[cfg(feature = "integration")]
         fn line(&mut self) -> String {
             let mut line = String::new();
             self.reader.read_line(&mut line).unwrap_or(0);
@@ -396,6 +401,7 @@ mod tests {
         }
 
         /// Send `cmd` and read up to and including the tagged answer.
+        #[cfg(feature = "integration")]
         fn run(&mut self, tag: &str, cmd: &str) -> String {
             self.reader.get_mut().write_all(format!("{tag} {cmd}\r\n").as_bytes()).unwrap();
             let mut out = String::new();
@@ -413,6 +419,7 @@ mod tests {
         }
 
         /// The server has closed the connection.
+        #[cfg(feature = "integration")]
         fn at_eof(&mut self) -> bool {
             self.line().is_empty()
         }
@@ -422,8 +429,9 @@ mod tests {
 
     #[test]
     fn a_new_config_has_the_documented_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        let c = config(dir.path());
+        // No file is touched: the root is only recorded in the configuration.
+        let dir = std::path::PathBuf::from("/srv/mail");
+        let c = config(&dir);
         assert_eq!(c.hostname, "mail.example");
         assert!(c.tls_acceptor.is_none() && !c.implicit_tls && c.greeting.is_empty() && c.preauth_username.is_none());
         assert_eq!(c.max_line, DEFAULT_MAX_LINE);
@@ -453,12 +461,13 @@ mod tests {
 
     #[test]
     fn the_builders_set_what_they_say() {
-        let dir = tempfile::tempdir().unwrap();
+        // No file is touched: the root is only recorded in the configuration.
+        let dir = std::path::PathBuf::from("/srv/mail");
         let ns = vec![NamespaceDesc::new("#shared/", '/')];
         let mut id = BTreeMap::new();
         id.insert("name".to_string(), "hopf".to_string());
-        let c = config(dir.path())
-            .with_tls(acceptor(dir.path()))
+        let c = config(&dir)
+            .with_tls(acceptor())
             .implicit_tls()
             .with_greeting("hello")
             .with_preauth("u")
@@ -477,13 +486,14 @@ mod tests {
 
     #[test]
     fn the_listener_is_plain_starttls_or_implicit_as_configured() {
-        let dir = tempfile::tempdir().unwrap();
+        // No file is touched: the root is only recorded in the configuration.
+        let dir = std::path::PathBuf::from("/srv/mail");
         let svc = |c: ImapConfig| ImapService::new(c, runtime()).control_listener();
-        let plain = svc(config(dir.path()));
+        let plain = svc(config(&dir));
         assert!(!plain.secure && plain.tls.is_none(), "no acceptor: plain");
-        let starttls = svc(config(dir.path()).with_tls(acceptor(dir.path())));
+        let starttls = svc(config(&dir).with_tls(acceptor()));
         assert!(!starttls.secure && starttls.tls.is_some(), "an acceptor: STARTTLS is offered, the handshake waits for it");
-        let implicit = svc(config(dir.path()).with_tls(acceptor(dir.path())).implicit_tls());
+        let implicit = svc(config(&dir).with_tls(acceptor()).implicit_tls());
         assert!(implicit.secure && implicit.tls.is_some(), "implicit: the handshake starts on accept");
     }
 
@@ -491,13 +501,15 @@ mod tests {
     fn implicit_tls_with_no_acceptor_is_refused_not_served_in_clear() {
         // IMAPS asked for, and nothing to do TLS with: the port must not quietly
         // become a cleartext one.
-        let dir = tempfile::tempdir().unwrap();
-        let svc = ImapService::new(config(dir.path()).implicit_tls(), runtime());
+        // No file is touched: the root is only recorded in the configuration.
+        let dir = std::path::PathBuf::from("/srv/mail");
+        let svc = ImapService::new(config(&dir).implicit_tls(), runtime());
         let err = svc.start().unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
         assert!(svc.control_listener().secure, "composed by hand, every connection is refused");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_connected_client_is_greeted_with_the_hostname() {
         let dir = tempfile::tempdir().unwrap();
@@ -508,6 +520,7 @@ mod tests {
         assert!(greeting.contains("mail.example IMAP4rev2 server ready"), "{greeting}");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_configured_greeting_replaces_the_built_in_one() {
         let dir = tempfile::tempdir().unwrap();
@@ -516,6 +529,7 @@ mod tests {
         assert!(greeting.contains("welcome to the test") && !greeting.contains("server ready"), "{greeting}");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_preauth_config_greets_with_preauth_and_the_users_store_is_open() {
         let dir = tempfile::tempdir().unwrap();
@@ -527,6 +541,7 @@ mod tests {
         assert!(list.contains("INBOX") && list.contains("a1 OK"), "no LOGIN needed: {list}");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn the_extension_switches_reach_the_capability_list() {
         let dir = tempfile::tempdir().unwrap();
@@ -551,6 +566,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn starttls_is_advertised_only_when_there_is_an_acceptor_to_use() {
         let dir = tempfile::tempdir().unwrap();
@@ -561,9 +577,10 @@ mod tests {
             client.run("c1", "CAPABILITY")
         };
         assert!(!caps(config(dir.path())).contains("STARTTLS"));
-        assert!(caps(config(dir.path()).with_tls(acceptor(dir.path()))).contains("STARTTLS"));
+        assert!(caps(config(dir.path()).with_tls(acceptor())).contains("STARTTLS"));
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn an_idle_that_runs_past_the_configured_time_is_ended_by_the_server() {
         let dir = tempfile::tempdir().unwrap();
@@ -592,6 +609,7 @@ mod tests {
         assert!(client.run("n1", "NOOP").contains("n1 OK"), "the session should go on");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_command_line_longer_than_the_limit_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -608,17 +626,20 @@ mod tests {
     // -- a handler per connection ---------------------------------------------------
 
     /// The stock handler, counting how many it is asked for and how many end.
+    #[cfg(feature = "integration")]
     struct Counting {
         inner: DefaultImapHandlerFactory,
         created: Arc<AtomicUsize>,
         ended: Arc<AtomicUsize>,
     }
 
+    #[cfg(feature = "integration")]
     struct CountedEnd {
         inner: Box<dyn ClientConnected>,
         ended: Arc<AtomicUsize>,
     }
 
+    #[cfg(feature = "integration")]
     impl ClientConnected for CountedEnd {
         fn connected(&mut self, state: &mut dyn ConnectedState, meta: &ImapConnectionMetadata) {
             self.inner.connected(state, meta);
@@ -629,6 +650,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "integration")]
     impl ImapHandlerFactory for Counting {
         fn create(&self) -> Box<dyn ClientConnected> {
             self.created.fetch_add(1, Ordering::SeqCst);
@@ -636,6 +658,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "integration")]
     fn wait(pred: impl Fn() -> bool) -> bool {
         for _ in 0..500 {
             if pred() {
@@ -646,6 +669,7 @@ mod tests {
         pred()
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn each_connection_gets_its_own_handler_and_its_end_is_reported() {
         let dir = tempfile::tempdir().unwrap();
@@ -673,6 +697,7 @@ mod tests {
 
     // -- storage and shutdown ----------------------------------------------------------
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_mailbox_store_that_cannot_be_opened_refuses_the_login_and_leaves_the_connection_usable() {
         // The Maildir root is a file, so a user's store cannot be made there.
@@ -690,6 +715,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_stopped_service_refuses_new_connections_but_lets_open_sessions_finish_and_the_runtime_shut_down() {
         let dir = tempfile::tempdir().unwrap();

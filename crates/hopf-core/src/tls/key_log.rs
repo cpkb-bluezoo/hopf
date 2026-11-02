@@ -84,14 +84,20 @@ impl KeyLogFile {
     }
 }
 
+/// One NSS key log line (without the newline) for `secret`.
+fn nss_line(label: &str, client_random: &[u8; 32], secret: &[u8]) -> String {
+    let mut line = String::with_capacity(label.len() + 2 * (32 + secret.len()) + 3);
+    line.push_str(label);
+    line.push(' ');
+    append_hex(&mut line, client_random);
+    line.push(' ');
+    append_hex(&mut line, secret);
+    line
+}
+
 impl KeyLog for KeyLogFile {
     fn log(&self, label: &str, client_random: &[u8; 32], secret: &[u8]) {
-        let mut line = String::with_capacity(label.len() + 2 * (32 + secret.len()) + 3);
-        line.push_str(label);
-        line.push(' ');
-        append_hex(&mut line, client_random);
-        line.push(' ');
-        append_hex(&mut line, secret);
+        let mut line = nss_line(label, client_random, secret);
         line.push('\n');
         if let Ok(mut w) = self.writer.lock() {
             if w.write_all(line.as_bytes()).is_ok() {
@@ -112,20 +118,29 @@ fn append_hex(out: &mut String, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
+    #[test]
+    fn a_line_is_the_label_the_client_random_and_the_secret_in_hex() {
+        let line = nss_line(labels::CLIENT_HANDSHAKE_TRAFFIC_SECRET, &[0x11; 32], &[0x22; 4]);
+        assert_eq!(
+            line,
+            format!("CLIENT_HANDSHAKE_TRAFFIC_SECRET {} 22222222", "11".repeat(32))
+        );
+    }
+
+    #[cfg(feature = "integration")]
     #[test]
     fn file_key_log_appends_nss_lines() {
         let dir = std::env::temp_dir().join(format!("hopf-keylog-{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("keys.log");
         let log = KeyLogFile::open(&path).unwrap();
         let random = [0x11u8; 32];
         let secret = [0x22u8; 32];
         log.log(labels::CLIENT_HANDSHAKE_TRAFFIC_SECRET, &random, &secret);
-        let text = fs::read_to_string(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("CLIENT_HANDSHAKE_TRAFFIC_SECRET "));
         assert!(text.contains("1111111111111111"));
-        let _ = fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

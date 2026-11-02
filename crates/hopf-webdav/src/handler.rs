@@ -1777,6 +1777,7 @@ fn parse_timeout_header(raw: Option<&str>) -> i64 {
 mod tests {
     use super::*;
     use hopf_http::parse_http_date;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use crate::dead_props::DeadPropMode;
     use std::time::Duration;
 
@@ -1786,6 +1787,7 @@ mod tests {
         assert_eq!(iso8601_date(t), "2024-01-01T00:00:00Z");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn delete_recursive_removes_tree() {
         let dir = tempfile::tempdir().unwrap();

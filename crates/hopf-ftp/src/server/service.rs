@@ -295,15 +295,21 @@ impl FtpService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::io::{BufRead, BufReader, Write};
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::net::TcpStream;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::time::Duration;
 
     use hopf_auth::PasswordTrustPolicy;
     use hopf_core::RuntimeConfig;
 
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use crate::server::fs::FtpFileSystem;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use crate::server::handler::{
         FilesystemFtpHandler, FtpAuthResult, FtpConnectionHandler, FtpConnectionMetadata, FtpOperation,
     };
@@ -319,20 +325,20 @@ mod tests {
         FtpConfig::new("127.0.0.1:0".parse().unwrap(), root, policy)
     }
 
-    fn acceptor(dir: &std::path::Path) -> hopf_core::tls::SharedTlsAcceptor {
+    fn acceptor() -> hopf_core::tls::SharedTlsAcceptor {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let (cert_path, key_path) = (dir.join("cert.pem"), dir.join("key.pem"));
-        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
-        hopf_core::acceptor_from_pem(&cert_path, &key_path, &[]).unwrap()
+        hopf_core::acceptor_from_pem_bytes(cert.cert.pem().as_bytes(), cert.key_pair.serialize_pem().as_bytes(), &[]).unwrap()
     }
 
     /// A blocking client over a real connection.
+    #[cfg(feature = "integration")]
     struct Client {
         reader: BufReader<TcpStream>,
     }
 
+    #[cfg(feature = "integration")]
     impl Client {
+        #[cfg(feature = "integration")]
         fn connect(addr: SocketAddr) -> Self {
             let stream = TcpStream::connect(addr).unwrap();
             stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -340,6 +346,7 @@ mod tests {
         }
 
         /// One reply: its lines, up to the one with the code and a space.
+        #[cfg(feature = "integration")]
         fn reply(&mut self) -> String {
             let mut out = String::new();
             loop {
@@ -355,22 +362,26 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "integration")]
         fn run(&mut self, cmd: &str) -> String {
             self.reader.get_mut().write_all(format!("{cmd}\r\n").as_bytes()).unwrap();
             self.reply()
         }
 
+        #[cfg(feature = "integration")]
         fn login(&mut self) {
             assert!(self.run("USER u").starts_with("331"));
             assert!(self.run("PASS p").starts_with("230"));
         }
 
+        #[cfg(feature = "integration")]
         fn at_eof(&mut self) -> bool {
             self.reply().is_empty()
         }
     }
 
     /// The port a `227` reply names.
+    #[cfg(feature = "integration")]
     fn pasv_port(reply: &str) -> u16 {
         let nums: Vec<u16> = reply[reply.find('(').unwrap() + 1..reply.find(')').unwrap()].split(',').map(|n| n.parse().unwrap()).collect();
         nums[4] * 256 + nums[5]
@@ -379,12 +390,14 @@ mod tests {
     /// The first of `n` adjacent ports that can all be bound now, searched
     /// from below the range the system hands out ephemeral ports from, so
     /// that tests running side by side do not take them in the meantime.
+    #[cfg(feature = "integration")]
     fn free_ports(n: u16) -> u16 {
         (21_000u16..22_000)
             .find(|&p| (p..p + n).all(|q| std::net::TcpListener::bind(("127.0.0.1", q)).is_ok()))
             .expect("four adjacent free ports")
     }
 
+    #[cfg(feature = "integration")]
     fn wait(pred: impl Fn() -> bool) -> bool {
         for _ in 0..500 {
             if pred() {
@@ -399,9 +412,10 @@ mod tests {
 
     #[test]
     fn a_new_config_has_the_documented_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        let c = config(dir.path());
-        assert_eq!(c.root, dir.path());
+        // No file is touched: the root is only recorded in the configuration.
+        let dir = std::path::PathBuf::from("/srv/ftp");
+        let c = config(&dir);
+        assert_eq!(c.root, dir);
         assert!(c.tls_acceptor.is_none() && c.data_tls_connector.is_none() && c.data_tls_server_name.is_none());
         assert!(!c.implicit_tls && !c.require_tls_for_data && !c.allow_active_bounce && !c.read_only);
         assert!(c.pasv_advertised.is_none() && c.pasv_port_min.is_none() && c.pasv_port_max.is_none());
@@ -410,10 +424,11 @@ mod tests {
 
     #[test]
     fn the_builders_set_what_they_say() {
-        let dir = tempfile::tempdir().unwrap();
+        // No file is touched: the root is only recorded in the configuration.
+        let dir = std::path::PathBuf::from("/srv/ftp");
         let connector = hopf_core::insecure_connector(&[]);
-        let c = config(dir.path())
-            .with_tls(acceptor(dir.path()))
+        let c = config(&dir)
+            .with_tls(acceptor())
             .implicit_ftps()
             .require_data_tls()
             .with_data_tls_connector(connector, "ftp.example")
@@ -428,25 +443,40 @@ mod tests {
 
     #[test]
     fn the_listener_is_plain_explicit_or_implicit_as_configured() {
-        let dir = tempfile::tempdir().unwrap();
+        // No file is touched: the root is only recorded in the configuration.
+        let dir = std::path::PathBuf::from("/srv/ftp");
         let listener = |c: FtpConfig| FtpService::new(c).control_listener(runtime());
-        let plain = listener(config(dir.path()));
+        let plain = listener(config(&dir));
         assert!(!plain.secure && plain.tls.is_none());
-        let explicit = listener(config(dir.path()).with_tls(acceptor(dir.path())));
+        let explicit = listener(config(&dir).with_tls(acceptor()));
         assert!(!explicit.secure && explicit.tls.is_some(), "AUTH TLS is offered, the handshake waits for it");
-        let implicit = listener(config(dir.path()).with_tls(acceptor(dir.path())).implicit_ftps());
+        let implicit = listener(config(&dir).with_tls(acceptor()).implicit_ftps());
         assert!(implicit.secure && implicit.tls.is_some(), "the handshake starts on accept");
+    }
+
+    struct MemoryFactory;
+
+    impl FtpConnectionHandlerFactory for MemoryFactory {
+        fn create(&self) -> Box<dyn crate::server::handler::FtpConnectionHandler> {
+            let policy = PasswordTrustPolicy::new().shared();
+            Box::new(crate::server::memory_fs::MemoryFtpHandler::new(
+                crate::server::memory_fs::MemoryFtpFileSystem::new(),
+                policy,
+            ))
+        }
     }
 
     #[test]
     fn implicit_ftps_with_no_acceptor_is_refused_not_served_in_clear() {
-        let dir = tempfile::tempdir().unwrap();
-        let svc = FtpService::new(config(dir.path()).implicit_ftps());
+        // No file is touched: the root is only recorded in the configuration.
+        let dir = std::path::PathBuf::from("/srv/ftp");
+        let svc = FtpService::with_handler_factory(config(&dir).implicit_ftps(), Arc::new(MemoryFactory));
         let err = svc.start(runtime()).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
         assert!(svc.control_listener(runtime()).secure, "composed by hand, every connection is refused");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_client_is_greeted_and_can_log_in() {
         let dir = tempfile::tempdir().unwrap();
@@ -460,6 +490,7 @@ mod tests {
         assert!(c.run("PWD").starts_with("257"));
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_read_only_config_refuses_changes_to_the_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -479,6 +510,7 @@ mod tests {
         assert!(dir.path().join("made").is_dir());
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn passive_ports_come_from_the_configured_range_and_the_advertised_address_is_used() {
         let dir = tempfile::tempdir().unwrap();
@@ -529,6 +561,7 @@ mod tests {
     //     drop(held);
     // }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_range_with_no_free_port_is_refused_cleanly() {
         let dir = tempfile::tempdir().unwrap();
@@ -547,6 +580,7 @@ mod tests {
     // -- a handler per connection ---------------------------------------------------
 
     /// The stock handler, counting how many it is asked for and how many end.
+    #[cfg(feature = "integration")]
     struct Counting {
         policy: Arc<dyn TrustPolicy>,
         root: std::path::PathBuf,
@@ -554,11 +588,13 @@ mod tests {
         ended: Arc<AtomicUsize>,
     }
 
+    #[cfg(feature = "integration")]
     struct Counted {
         inner: FilesystemFtpHandler,
         ended: Arc<AtomicUsize>,
     }
 
+    #[cfg(feature = "integration")]
     impl FtpConnectionHandler for Counted {
         fn authenticate(&mut self, u: &str, p: Option<&str>, a: Option<&str>, m: &FtpConnectionMetadata) -> FtpAuthResult {
             self.inner.authenticate(u, p, a, m)
@@ -577,6 +613,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "integration")]
     impl FtpConnectionHandlerFactory for Counting {
         fn create(&self) -> Box<dyn FtpConnectionHandler> {
             self.created.fetch_add(1, Ordering::SeqCst);
@@ -587,6 +624,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn each_connection_gets_its_own_handler_and_its_end_is_reported() {
         let dir = tempfile::tempdir().unwrap();
@@ -614,6 +652,7 @@ mod tests {
 
     // -- storage and shutdown ----------------------------------------------------------
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_root_that_is_not_there_is_refused_at_start() {
         let dir = tempfile::tempdir().unwrap();
@@ -621,6 +660,7 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_root_that_goes_away_costs_the_connection_a_421_and_not_the_listener() {
         // The handler is made on the accept thread: a panic there would stop
@@ -650,6 +690,7 @@ mod tests {
         assert!(Client::connect(other).reply().starts_with("220"), "a second service on the same runtime stopped accepting");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_stopped_service_refuses_new_connections_but_lets_open_sessions_finish_and_the_runtime_shut_down() {
         let dir = tempfile::tempdir().unwrap();

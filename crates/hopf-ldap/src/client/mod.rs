@@ -15,7 +15,7 @@ mod session;
 #[cfg(test)]
 pub(crate) mod session_tests;
 mod sync;
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod sync_tests;
 mod types;
 mod url;

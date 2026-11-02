@@ -573,6 +573,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    #[cfg(feature = "integration")]
     #[test]
     fn bind_udp_ephemeral_ipv4() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -586,6 +587,7 @@ mod tests {
     /// kernel clamps the request (rmem_max / wmem_max), so the check is
     /// against what it grants a plain socket for the same request, never
     /// against the requested size itself.
+    #[cfg(feature = "integration")]
     #[test]
     fn bind_udp_requests_larger_socket_buffers() {
         let plain = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
@@ -699,6 +701,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "integration")]
     #[test]
     fn ipv4_dont_fragment_is_set_when_supported() {
         use std::os::raw::c_int;

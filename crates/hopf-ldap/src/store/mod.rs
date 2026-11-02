@@ -528,21 +528,29 @@ mod tests {
     // Search-then-bind against a scripted LDAP server
     // -----------------------------------------------------------------
 
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::io::{Read, Write};
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::net::TcpListener;
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use std::thread;
 
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use crate::client::session_tests::{bind_response, done, entry};
+    #[cfg_attr(not(feature = "integration"), allow(unused_imports))]
     use crate::{Asn1Element, Asn1Type, BerDecoder};
 
     /// Answers each request with the messages `handler` returns.
+    #[cfg(feature = "integration")]
     type Handler = Arc<dyn Fn(&Asn1Element) -> Vec<Vec<u8>> + Send + Sync>;
 
+    #[cfg(feature = "integration")]
     struct Directory {
         port: u16,
         requests: Arc<Mutex<Vec<Asn1Element>>>,
     }
 
+    #[cfg(feature = "integration")]
     fn serve(handler: Handler) -> Directory {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -585,15 +593,18 @@ mod tests {
         Directory { port, requests }
     }
 
+    #[cfg(feature = "integration")]
     fn id(m: &Asn1Element) -> i32 {
         m.child(0).as_i32().unwrap()
     }
 
+    #[cfg(feature = "integration")]
     fn op(m: &Asn1Element) -> u8 {
         Asn1Type::tag_number(m.child(1).tag())
     }
 
     /// A directory with one user, `alice`, whose password is `secret`.
+    #[cfg(feature = "integration")]
     fn alice() -> Handler {
         Arc::new(|m| match op(m) {
             0 => {
@@ -616,6 +627,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "integration")]
     fn store(port: u16) -> LdapCredentialStore {
         let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
         LdapCredentialStore::new(
@@ -625,6 +637,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn the_right_password_matches() {
         let dir = serve(alice());
@@ -632,12 +645,14 @@ mod tests {
         assert!(s.password_match("alice", "secret"));
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn the_wrong_password_does_not() {
         let dir = serve(alice());
         assert!(!store(dir.port).password_match("alice", "nope"));
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn an_unknown_user_or_an_empty_name_does_not() {
         let dir = serve(alice());
@@ -646,6 +661,7 @@ mod tests {
         assert!(!s.password_match("", "secret"));
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn the_search_asks_for_the_user_with_the_configured_filter() {
         let dir = serve(alice());
@@ -658,6 +674,7 @@ mod tests {
         assert_eq!(op.child(3).as_i32().unwrap(), 1, "one entry is enough");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_name_with_filter_characters_is_searched_for_literally() {
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -674,6 +691,7 @@ mod tests {
         assert_eq!(seen.lock().unwrap().as_slice(), [b"a*(b)\\c".to_vec()]);
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_service_account_is_bound_before_the_search() {
         let dir = serve(alice());
@@ -690,6 +708,7 @@ mod tests {
         assert_eq!(&ops[..2], [0, 3], "bind then search: {ops:?}");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_refused_service_account_matches_nobody() {
         let dir = serve(alice());
@@ -703,6 +722,7 @@ mod tests {
         assert!(!s.password_match("alice", "secret"));
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_failed_search_matches_nobody() {
         let dir = serve(Arc::new(|m| match op(m) {
@@ -712,6 +732,7 @@ mod tests {
         assert!(!store(dir.port).password_match("alice", "secret"));
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_server_that_never_answers_times_out_to_no_match() {
         let dir = serve(Arc::new(|_| vec![]));
@@ -724,6 +745,7 @@ mod tests {
         assert!(!s.password_match("alice", "secret"));
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn nothing_listening_matches_nobody() {
         let port = {
@@ -733,6 +755,7 @@ mod tests {
         assert!(!store(port).password_match("alice", "secret"));
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn a_referral_is_chased_to_the_directory_that_has_the_user() {
         let real = serve(alice());
@@ -758,6 +781,7 @@ mod tests {
         assert!(!not_chasing.password_match("alice", "secret"));
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn referral_chasing_stops_at_the_hop_limit() {
         // A directory that always refers to a fresh URL on itself.

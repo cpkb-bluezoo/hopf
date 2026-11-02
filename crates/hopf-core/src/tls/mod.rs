@@ -120,6 +120,8 @@ pub use pem::{
     connector_from_pem_with_client_cert, connector_with_alpn, connector_with_record_size_limit,
     acceptor_with_fips, connector_with_fips, connector_with_verify_override, acceptor_requiring_supported_versions, acceptor_with_alpn, acceptor_with_record_size_limit, acceptor_with_ech, connector_with_ech, insecure_connector,
     acceptor_from_pem_with_tcp_version_policy, connector_from_pem_with_tcp_version_policy,
+    acceptor_from_credentials_tls12, acceptor_from_credentials_with_sni, acceptor_from_pem_bytes, acceptor_from_pem_tls12_bytes,
+    connector_from_pem_bytes, connector_from_pem_bytes_with_tcp_version_policy, connector_from_pem_tls12_bytes,
     insecure_connector_tls12, public_trust_connector, server_credentials_from_pem, SharedTlsAcceptor,
     SharedTlsConnector, TlsAcceptor, TlsConnector,
 };

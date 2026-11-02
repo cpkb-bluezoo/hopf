@@ -134,7 +134,7 @@ fn dotlock_path(mbox_path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod tests {
     use super::*;
 

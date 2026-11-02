@@ -16,8 +16,11 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo check --workspace
-      # Every library's default-feature unit tests. Network/filesystem smoke
-      # suites are gated by each crate's opt-in `integration` feature and must
+      # Every library's default-feature unit tests. Tests that do socket or
+      # file I/O are gated by each crate's opt-in `integration` feature and must
       # never be enabled in this workflow.
       - run: cargo test --workspace --lib
+      # The same tests again, in a sandbox with no network and a read-only
+      # filesystem, so a unit test that starts doing I/O fails here.
+      - run: ./scripts/check-hermetic-tests.sh
       - run: cargo doc --workspace --no-deps

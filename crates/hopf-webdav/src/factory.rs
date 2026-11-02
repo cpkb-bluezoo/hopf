@@ -354,7 +354,7 @@ impl PathAbsolute for PathBuf {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "integration"))]
 mod tests {
     use super::*;
     use hopf_core::storage::{StorageConfig, StorageExecutor};
