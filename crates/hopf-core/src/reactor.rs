@@ -276,7 +276,11 @@ impl Reactor {
         conn.interest = interest;
         conn.registered = true;
         if !connecting {
-            conn.call_connected();
+            // On a PROXY listener `connected` is deferred until the header
+            // has been parsed (see `TcpConnection::process_proxy_protocol`).
+            if !conn.is_proxy_protocol_pending() {
+                conn.call_connected();
+            }
         } else {
             // Any TLS output from an eager client connector (e.g. ClientHello)
             // is already in net_out — TcpConnection::new pumps engine.start()

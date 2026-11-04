@@ -72,6 +72,7 @@ pub use listener::{
     DEFAULT_MAX_NET_IN, DEFAULT_MAX_NET_OUT,
 };
 pub use peer_addr::PeerAddr;
+pub use proxy_protocol::ProxyTlv;
 pub use peer_cred::{PeerCredAllowlist, PeerCredentials};
 pub use pool::{Pool, PoolConfig, PooledConn};
 pub use quota::{
@@ -189,6 +190,32 @@ mod tests {
                 endpoint.send(addr.as_bytes());
         });
     }
+
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
+    }
+
+    /// Reports both addresses and any AWS VPC endpoint ID as text the
+    /// moment `connected()` fires, then ignores everything else. Lets a
+    /// test observe what a server-speaks-first handler (SMTP, say) would
+    /// snapshot in `connected()`.
+    struct AddrsOnConnected;
+
+    impl ProtocolHandler for AddrsOnConnected {
+        fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+            let msg = format!(
+                "{} {} {}",
+                endpoint.remote_addr().unwrap(),
+                endpoint.local_addr().unwrap(),
+                crate::ProxyTlv::aws_vpce_id(endpoint.proxy_tlvs()).unwrap_or("-"),
+            );
+            endpoint.send(msg.as_bytes());
+        }
+
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut crate::LoopBuf) {
+            crate::with_slice(buf, |data| *data = &[]);
+        }
 
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
@@ -570,6 +597,86 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = c.read(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"203.0.113.9:56325");
+
+        rt.shutdown();
+    }
+
+    /// Regression test for issue #523: `connected()` must not fire on a
+    /// PROXY listener until the header has been parsed, so a
+    /// server-speaks-first handler sees the proxied source *and*
+    /// destination addresses rather than the relay's socket addresses.
+    #[test]
+    fn tcp_listener_proxy_protocol_addresses_visible_in_connected() {
+        let rt = Runtime::start(RuntimeConfig {
+            worker_threads: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        let (addr, _) = rt
+            .add_tcp_listener(
+                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), || {
+                    Box::new(AddrsOnConnected) as Box<dyn ProtocolHandler>
+                })
+                .with_proxy_protocol(),
+            )
+            .unwrap();
+
+        let mut c = wait_connect(addr);
+        // Give a premature connected() every chance to run before the header.
+        std::thread::sleep(Duration::from_millis(100));
+        c.write_all(b"PROXY TCP4 203.0.113.7 198.51.100.1 56324 25\r\n")
+            .unwrap();
+
+        let mut buf = [0u8; 128];
+        let n = c.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"203.0.113.7:56324 198.51.100.1:25 -");
+
+        rt.shutdown();
+    }
+
+    /// Issue #523: v2 destination address and TLVs reach the handler.
+    #[test]
+    fn tcp_listener_proxy_protocol_v2_destination_and_tlvs_visible_in_connected() {
+        let rt = Runtime::start(RuntimeConfig {
+            worker_threads: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        let (addr, _) = rt
+            .add_tcp_listener(
+                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), || {
+                    Box::new(AddrsOnConnected) as Box<dyn ProtocolHandler>
+                })
+                .with_proxy_protocol(),
+            )
+            .unwrap();
+
+        let vpce = b"vpce-0123456789abcdef0";
+        let mut tlv = vec![crate::ProxyTlv::AWS];
+        tlv.extend_from_slice(&((vpce.len() + 1) as u16).to_be_bytes());
+        tlv.push(crate::ProxyTlv::AWS_SUBTYPE_VPCE_ID);
+        tlv.extend_from_slice(vpce);
+        let mut header: Vec<u8> = vec![
+            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, // sig
+            0x21, // version 2, command PROXY
+            0x11, // AF_INET, STREAM
+        ];
+        header.extend_from_slice(&(12 + tlv.len() as u16).to_be_bytes());
+        header.extend_from_slice(&[203, 0, 113, 9]);
+        header.extend_from_slice(&[198, 51, 100, 1]);
+        header.extend_from_slice(&56325u16.to_be_bytes());
+        header.extend_from_slice(&25u16.to_be_bytes());
+        header.extend_from_slice(&tlv);
+
+        let mut c = wait_connect(addr);
+        c.write_all(&header).unwrap();
+
+        let mut buf = [0u8; 128];
+        let n = c.read(&mut buf).unwrap();
+        assert_eq!(
+            &buf[..n],
+            b"203.0.113.9:56325 198.51.100.1:25 vpce-0123456789abcdef0"
+        );
 
         rt.shutdown();
     }

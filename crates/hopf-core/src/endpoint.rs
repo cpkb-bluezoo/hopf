@@ -8,6 +8,7 @@ use std::time::Duration;
 use crate::error::StartTlsError;
 use crate::handle::{ConnHandle, Task};
 use crate::peer_addr::PeerAddr;
+use crate::proxy_protocol::ProxyTlv;
 use crate::security::SecurityInfo;
 
 /// Cancels a scheduled timer callback.
@@ -52,10 +53,27 @@ pub trait Endpoint: Send {
     fn close(&mut self);
 
     /// Local address — TCP/IP or a UNIX domain socket path.
+    ///
+    /// On a listener with PROXY protocol enabled this is the destination
+    /// address the PROXY header reports (the relay or load-balancer
+    /// address the client actually connected to), when the header carries
+    /// one; otherwise it is the socket's own local address.
     fn local_addr(&self) -> io::Result<PeerAddr>;
 
     /// Remote address — TCP/IP or a UNIX domain socket path.
+    ///
+    /// On a listener with PROXY protocol enabled this is the source
+    /// address the PROXY header reports, when the header carries one.
     fn remote_addr(&self) -> io::Result<PeerAddr>;
+
+    /// The TLVs from a PROXY protocol v2 header, in wire order.
+    ///
+    /// Empty unless the connection arrived on a PROXY protocol listener
+    /// and the header carried TLVs. See [`ProxyTlv`] for the helpers that
+    /// look up common ones.
+    fn proxy_tlvs(&self) -> &[ProxyTlv] {
+        &[]
+    }
 
     /// Whether a security layer is active.
     fn is_secure(&self) -> bool {

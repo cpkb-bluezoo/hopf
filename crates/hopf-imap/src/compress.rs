@@ -173,6 +173,10 @@ impl Endpoint for CompressingEndpoint<'_> {
         self.inner.remote_addr()
     }
 
+    fn proxy_tlvs(&self) -> &[hopf_core::ProxyTlv] {
+        self.inner.proxy_tlvs()
+    }
+
     fn security_info(&self) -> &SecurityInfo {
         self.inner.security_info()
     }

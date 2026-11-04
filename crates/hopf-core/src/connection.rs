@@ -22,7 +22,7 @@ use crate::handle::{ConnHandle, Task};
 use crate::handler::ProtocolHandler;
 use crate::listener::DEFAULT_BUFFER_SIZE;
 use crate::peer_addr::PeerAddr;
-use crate::proxy_protocol::{self, ProxyHeaderOutcome};
+use crate::proxy_protocol::{self, ProxyHeaderOutcome, ProxyTlv};
 use crate::security::SecurityInfo;
 use crate::telemetry::{emit_connection_log, LogLevel, LogRecord, TelemetryHook};
 use crate::tls::{SharedTlsAcceptor, TlsProtocolError, TlsRecordSink, TlsVariant, VerifyRequest, VerifyResult};
@@ -166,6 +166,8 @@ pub(crate) struct TcpConnection {
     /// of `net_in` and `remote` rewritten from it. While true, no bytes in
     /// `net_in` are handed to TLS or the protocol handler.
     proxy_protocol_pending: bool,
+    /// TLVs from the PROXY protocol v2 header, once parsed.
+    proxy_tlvs: Vec<ProxyTlv>,
     security: SecurityInfo,
     security_notified: bool,
     tls: Option<TlsVariant>,
@@ -330,6 +332,7 @@ impl TcpConnection {
             local,
             remote,
             proxy_protocol_pending: params.expect_proxy_protocol,
+            proxy_tlvs: Vec::new(),
             security: SecurityInfo::plaintext(),
             security_notified: false,
             tls,
@@ -499,6 +502,12 @@ impl TcpConnection {
                 self.interest_dirty = true;
                 return;
             }
+            if !self.open || self.closing {
+                // The handler closed the connection from the deferred
+                // `connected`; the bytes behind the header are not wanted.
+                self.interest_dirty = true;
+                return;
+            }
         }
         if self.tls.is_some() {
             if let Err(e) = self.process_tls_inbound() {
@@ -521,8 +530,9 @@ impl TcpConnection {
 
     /// Try to consume a PROXY protocol header off the front of `net_in`.
     /// Leaves `proxy_protocol_pending` set (and `net_in` untouched) if the
-    /// header hasn't fully arrived yet; clears it and rewrites `remote`
-    /// once one has. Runs strictly before any TLS/plaintext processing, so
+    /// header hasn't fully arrived yet; clears it, rewrites `remote` and
+    /// `local`, records the TLVs and fires the deferred `connected` once
+    /// one has. Runs strictly before any TLS/plaintext processing, so
     /// this must never look at or consume bytes belonging to the
     /// connection's real traffic.
     fn process_proxy_protocol(&mut self) -> io::Result<()> {
@@ -530,12 +540,24 @@ impl TcpConnection {
         let (header, _) = self.net_in.readable_spans();
         match proxy_protocol::try_parse_proxy_header(header)? {
             ProxyHeaderOutcome::Incomplete => Ok(()),
-            ProxyHeaderOutcome::Parsed { consumed, peer } => {
+            ProxyHeaderOutcome::Parsed {
+                consumed,
+                peer,
+                local,
+                tlvs,
+            } => {
                 self.net_in.advance(consumed);
                 if let Some(peer) = peer {
                     self.remote = peer;
                 }
+                if let Some(local) = local {
+                    self.local = local;
+                }
+                self.proxy_tlvs = tlvs;
                 self.proxy_protocol_pending = false;
+                // `connected` was held back until now so the handler sees
+                // the proxied addresses from its first callback.
+                self.call_connected();
                 Ok(())
             }
         }
@@ -731,6 +753,12 @@ impl TcpConnection {
         }
         self.interest_dirty = true;
         Ok(WriteOutcome::Drained)
+    }
+
+    /// Whether a PROXY protocol header is still awaited, i.e. `connected`
+    /// has not yet been delivered because the addresses are not final.
+    pub fn is_proxy_protocol_pending(&self) -> bool {
+        self.proxy_protocol_pending
     }
 
     pub fn call_connected(&mut self) {
@@ -946,6 +974,10 @@ impl Endpoint for TcpConnection {
 
     fn remote_addr(&self) -> io::Result<PeerAddr> {
         Ok(self.remote.clone())
+    }
+
+    fn proxy_tlvs(&self) -> &[ProxyTlv] {
+        &self.proxy_tlvs
     }
 
     fn security_info(&self) -> &SecurityInfo {
