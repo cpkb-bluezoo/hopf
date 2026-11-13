@@ -28,8 +28,19 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
   acknowledgements and push kinds it does not know to a `SubscriberHandler`;
   `RedisClient::publish` and `spublish` publish, and `set_push_handler`
   receives the RESP3 pushes (key invalidations, for one) a command connection
-  gets. A command connection refuses `SUBSCRIBE` and its relatives. Cluster
-  mode follows. Tested against Redis 7.4 and Valkey 8.1.
+  gets. A command connection refuses `SUBSCRIBE` and its relatives.
+  `RedisCluster` is the cluster client: it learns the layout from `CLUSTER
+  SHARDS` (or `CLUSTER SLOTS`), keeps one connection per master, sends each
+  command to the master of the slot its key hashes to (CRC16 with hash tags,
+  with a table of where each command's keys are), fails commands with keys in
+  several slots with `CROSSSLOT` before they reach the network, follows `MOVED`
+  and `ASK` (with `ASKING` written in the same batch), refreshes the layout when
+  a node cannot be reached or a slot moves (one fetch at a time, rate-limited),
+  and never sends again a command that was already sent when its connection was
+  lost. Transactions run on the owner of their slot, `send_to_key` routes a
+  command by an explicit key, and `ClusterConfig::node_config` gives every node
+  connection its password, TLS and timeouts. Tested against Redis 7.4 and
+  Valkey 8.1, including slot migration and master failover.
 - **hopf-core:** readiness and graceful shutdown (#530).
   `Runtime::is_ready()`, `is_draining()`, `bind_failures()` and
   `open_connections()`; `Runtime::start_drain()` stops accepting and tells every

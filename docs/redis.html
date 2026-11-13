@@ -88,6 +88,7 @@
 <li><a href="#pipelining-and-failure">Pipelining and failure</a></li>
 <li><a href="#transactions-and-scripts">Transactions and scripts</a></li>
 <li><a href="#pubsub">Publish/subscribe and pushes</a></li>
+<li><a href="#cluster">Cluster</a></li>
 <li><a href="#tls">TLS</a></li>
 <li><a href="#resp">The RESP codec</a></li>
 <li><a href="#testing">Testing</a></li>
@@ -169,6 +170,26 @@ let sub = RedisSubscriber::connect(reactor, config, |m: Message| println!("{m:?}
 <li><strong>Nothing is dropped.</strong> Out-of-band data of a kind the crate does not interpret reaches <code>on_push</code> as a <code>Push { kind, data }</code>.</li>
 </ul>
 <p><code>RedisClient::set_push_handler</code> receives the RESP3 pushes a <em>command</em> connection gets: key invalidations after <code>CLIENT TRACKING on</code> (<code>Push::invalidation()</code> says which keys, or everything after a flush), and anything else a server pushes, of any kind. Replies stay matched to their commands around a push. With no handler set, pushes are discarded.</p>
+<h2 id="cluster">Cluster</h2>
+<p><code>RedisCluster</code> is the same client for a Redis Cluster or Valkey Cluster. Give it one or more seed nodes; it asks them for the layout (<code>CLUSTER SHARDS</code>, or <code>CLUSTER SLOTS</code> for a server without it), keeps a pipelined connection to each master, and sends every command to the master that owns the slot its key hashes to. Every typed helper of <code>RedisClient</code> is there, with <code>command</code>, <code>send</code> and <code>transaction</code>, and callbacks run on the reactor it is bound to.</p>
+<pre class="rust,ignore"><code>use hopf_redis::{ClusterConfig, RedisCluster};
+
+let cluster = RedisCluster::connect(
+    rt.pick_worker(),
+    ClusterConfig::new([("10.0.0.1", 7000), ("10.0.0.2", 7000)])
+        .node_config(|c| c.password("secret")),   // every node connection
+);
+cluster.set("user:42", "ada", |r| assert!(r.is_ok()));
+cluster.get("user:42", |r| println!("{r:?}"));</code></pre>
+<ul>
+<li><strong>Routing.</strong> The slot is CRC16 of the key (or of the part inside the first <code>{hash tag}</code>) modulo 16384. The key positions of a command come from a table covering the commands Redis and Valkey define, including <code>EVAL</code>'s <code>numkeys</code>, <code>XREAD ... STREAMS</code> and <code>SPUBLISH</code>'s shard channel. For one it does not know, <code>send_to_key</code> names the key. A command with no key goes to any master in turn.</li>
+<li><strong>Several keys.</strong> They must share a slot, so use hash tags (<code>{user:42}:profile</code>, <code>{user:42}:cart</code>). Otherwise the command fails at once with <code>CROSSSLOT</code>, as the server would, without touching the network. <code>transaction</code> takes the same rule and runs on the owner of its slot; <code>eval</code> and <code>evalsha</code> use the keys they are given. <code>send_to_key(routing_key, command, callback)</code> picks the node by an explicit key, for a command the table does not know or one that must run where a particular key lives.</li>
+<li><strong>Redirections.</strong> <code>MOVED</code> updates the slot and refreshes the whole layout, and the command is sent again to the new owner. <code>ASK</code> sends that one command, preceded by <code>ASKING</code> in the same write, to the node the slot is moving to, and leaves the layout alone. Each hop spends one of <code>max_redirects</code> (default 5).</li>
+<li><strong>Failover.</strong> A node that cannot be connected to is dropped, the layout is fetched again and a command that was never sent is tried where its slot now lives. A command that was sent when its connection failed is <em>not</em> sent again; it fails with <code>ConnectionLost</code> and the layout is refreshed. <code>CLUSTERDOWN</code> and <code>TRYAGAIN</code> are returned to the caller, and the former refreshes the layout too. A node that stops being a master is let go of once the commands already sent to it are answered.</li>
+<li><strong>Refreshing.</strong> One at a time, and at most one in <code>min_refresh_interval</code> (default 500 ms) however many commands ask. <code>refresh()</code> asks for one, <code>refresh_count()</code> says how many have been made, and <code>owner_of(slot)</code>, <code>masters()</code> and <code>slot_of(key)</code> expose the layout.</li>
+<li><strong>Per-node settings.</strong> <code>node_config</code> takes the <code>RedisConfig</code> template for every node connection: password and user, TLS connector, timeouts, RESP version. <code>tls_server_name</code> names the certificate to verify when the nodes are reached by address.</li>
+</ul>
+<p>Publish/subscribe does not go through <code>RedisCluster</code>: it refuses <code>SUBSCRIBE</code> and its relatives like a command connection. A <code>RedisSubscriber</code> pointed at one node receives that node's classic messages (which a cluster broadcasts to every node), and <code>spublish</code> on the cluster is routed by the shard channel's slot.</p>
 <h2 id="tls">TLS</h2>
 <pre class="rust,ignore"><code>use hopf_core::ClientTlsBuilder;
 
@@ -192,15 +213,17 @@ let redis = RedisClient::connect(rt.pick_worker(), RedisConfig::new("redis.examp
 </table>
 <p>A violation is an error and the connection is closed. <code>encode_command</code> writes a command as an array of bulk strings.</p>
 <h2 id="testing">Testing</h2>
-<p>The codec and the connection logic have unit tests with no I/O, including every reply type split at every byte boundary. <code>--features integration</code> adds two suites with real sockets. <code>scripted</code> runs the client against a scripted RESP server inside the test: an old server without <code>HELLO</code>, a wrong password, a drop mid-pipeline, a stray reply, a slow handshake, a timed-out command with another behind it, a server that appears later, TLS, an unknown push kind, a silently dead subscriber connection and a subscriber that is dropped and must subscribe again. <code>redis_server</code> runs it against a real server named by <code>HOPF_TEST_REDIS</code> (and <code>HOPF_TEST_REDIS_AUTH</code>, a server started with <code>--requirepass hunter2</code>); a test with no server named is skipped. It has been run against Redis 7.4 and Valkey 8.1:</p>
+<p>The codec, the key table and the layout parsers have unit tests with no I/O, including every reply type split at every byte boundary. <code>--features integration</code> adds suites with real sockets. <code>scripted</code> runs the client against a scripted RESP server inside the test: an old server without <code>HELLO</code>, a wrong password, a drop mid-pipeline, a stray reply, a slow handshake, a timed-out command with another behind it, a server that appears later, TLS, an unknown push kind, a silently dead subscriber connection and a subscriber that is dropped and must subscribe again. <code>cluster_scripted</code> does the same for scripted cluster nodes. <code>redis_server</code> and <code>pubsub_server</code> run against a real server named by <code>HOPF_TEST_REDIS</code> (and <code>HOPF_TEST_REDIS_AUTH</code>, a server started with <code>--requirepass hunter2</code>), and <code>cluster_server</code> against a cluster named by <code>HOPF_TEST_CLUSTER</code> (one node's <code>host:port</code>; three masters, nodes announcing addresses the test can reach). A test with no server named is skipped. They have been run against Redis 7.4 and Valkey 8.1:</p>
 <pre><code>podman run -d --rm -p 127.0.0.1:16379:6379 docker.io/library/redis:7
 podman run -d --rm -p 127.0.0.1:16380:6379 docker.io/library/redis:7 redis-server --requirepass hunter2
 HOPF_TEST_REDIS=127.0.0.1:16379 HOPF_TEST_REDIS_AUTH=127.0.0.1:16380 \
     cargo test -p hopf-redis --features integration</code></pre>
+<p>The cluster tests move empty slots between masters (and put them back) to provoke <code>MOVED</code> and <code>ASK</code>. One more fails a master over to its replica with <code>CLUSTER FAILOVER</code> and back; it changes the cluster's roles for a few seconds, so it runs only when <code>HOPF_TEST_CLUSTER_FAILOVER</code> is also set and every master has a replica.</p>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li>Cluster mode is not in this client yet. Sharded pub/sub works against a single server; in a cluster a shard-channel subscriber would have to connect to the node that owns the slot.</li>
-<li>One connection per client. Spread load by creating clients on several reactors; there is no pool.</li>
+<li>Publish/subscribe has no cluster mode: a <code>RedisSubscriber</code> connects to one node, so a shard-channel subscriber has to be pointed at the node that owns the channel's slot, and does not follow it if the slot moves.</li>
+<li>Commands are sent to masters only; there is no reading from replicas (<code>READONLY</code>).</li>
+<li>One connection per client, and one per master in a cluster. Spread load by creating clients on several reactors; there is no pool.</li>
 <li>A command that was sent when a connection was lost is not retried.</li>
 <li>No URL form of the configuration (<code>redis://</code>, <code>rediss://</code>).</li>
 </ul>

@@ -7,128 +7,18 @@
 
 mod common;
 
-use std::net::SocketAddr;
+use common::scripted_server::*;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, Runtime, TcpListenerConfig};
-use hopf_redis::{RedisClient, RedisConfig, RedisError, RespParser, Value};
+use hopf_core::Runtime;
+use hopf_redis::{RedisClient, RedisConfig, RedisError, Value};
 
 use common::*;
-
-/// What a script sees of one command and its connection.
-struct Session<'a> {
-    endpoint: &'a mut dyn Endpoint,
-    /// Which connection this is, from 0.
-    conn: usize,
-    /// The 0-based index of this command on its connection.
-    seq: usize,
-    /// Commands held back by the script so far on this connection.
-    held: &'a mut Vec<Vec<Vec<u8>>>,
-}
-
-impl Session<'_> {
-    fn reply(&mut self, bytes: impl AsRef<[u8]>) {
-        self.endpoint.send(bytes.as_ref());
-    }
-    fn reply_after(&self, wait: Duration, bytes: impl AsRef<[u8]> + Send + 'static) {
-        let handle: ConnHandle = self.endpoint.handle();
-        thread::spawn(move || {
-            thread::sleep(wait);
-            handle.with_endpoint(move |ep| ep.send(bytes.as_ref()));
-        });
-    }
-    fn close(&mut self) {
-        self.endpoint.close();
-    }
-}
-
-type Script = dyn Fn(&mut Session, &[Vec<u8>]) + Send + Sync;
-
-struct Scripted {
-    script: Arc<Script>,
-    conn: usize,
-    parser: RespParser,
-    seq: usize,
-    held: Vec<Vec<Vec<u8>>>,
-}
-
-impl ProtocolHandler for Scripted {
-    fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
-        let mut commands = Vec::new();
-        hopf_core::with_slice(buf, |data| {
-            self.parser
-                .feed(data, &mut |v| {
-                    if let Value::Array(words) = v {
-                        commands.push(words.iter().map(|w| w.as_bytes().unwrap().to_vec()).collect::<Vec<_>>());
-                    }
-                })
-                .unwrap();
-        });
-        for words in commands {
-            let mut session = Session {
-                endpoint,
-                conn: self.conn,
-                seq: self.seq,
-                held: &mut self.held,
-            };
-            self.seq += 1;
-            (self.script)(&mut session, &words);
-        }
-    }
-    fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
-    fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
-}
-
-struct Server {
-    rt: Runtime,
-    addr: SocketAddr,
-    connections: Arc<AtomicUsize>,
-}
-
-fn serve(script: impl Fn(&mut Session, &[Vec<u8>]) + Send + Sync + 'static) -> Server {
-    serve_on("127.0.0.1:0".parse().unwrap(), None, script)
-}
-
-fn serve_on(
-    addr: SocketAddr,
-    tls: Option<hopf_core::SharedTlsAcceptor>,
-    script: impl Fn(&mut Session, &[Vec<u8>]) + Send + Sync + 'static,
-) -> Server {
-    let script: Arc<Script> = Arc::new(script);
-    let connections = Arc::new(AtomicUsize::new(0));
-    let rt = runtime();
-    let (sc, cn) = (Arc::clone(&script), Arc::clone(&connections));
-    let mut listener = TcpListenerConfig::new(addr, move || {
-        Box::new(Scripted {
-            script: Arc::clone(&sc),
-            conn: cn.fetch_add(1, Ordering::SeqCst),
-            parser: RespParser::new(),
-            seq: 0,
-            held: Vec::new(),
-        }) as Box<dyn ProtocolHandler>
-    });
-    if let Some(acceptor) = tls {
-        listener = listener.with_tls(acceptor);
-    }
-    let (addr, _) = rt.add_tcp_listener(listener).unwrap();
-    Server { rt, addr, connections }
-}
-
-fn name_of(words: &[Vec<u8>]) -> String {
-    String::from_utf8_lossy(&words[0]).to_ascii_uppercase()
-}
-
-fn arg(words: &[Vec<u8>], i: usize) -> String {
-    String::from_utf8_lossy(&words[i]).into_owned()
-}
-
-/// A RESP3 reply to `HELLO 3`.
-const HELLO_OK: &str = "%2\r\n$6\r\nserver\r\n$5\r\nredis\r\n$5\r\nproto\r\n:3\r\n";
 
 fn client(server: &Server, config: impl FnOnce(RedisConfig) -> RedisConfig) -> (Runtime, RedisClient) {
     let rt = runtime();

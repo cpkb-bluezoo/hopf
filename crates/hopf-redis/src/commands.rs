@@ -171,27 +171,385 @@ fn keyed(name: &str, keys: &[impl AsRef<[u8]>]) -> Command {
     Command::new(name).args(keys)
 }
 
+/// The typed helpers, written once and expanded in both [`RedisClient`] and
+/// [`RedisCluster`](crate::RedisCluster): each is [`send`](RedisClient::send)
+/// of the command with the reply read as the type it returns.
+macro_rules! typed_commands {
+    () => {
+        // ---- connection ----
+
+        /// `PING`.
+        pub fn ping(&self, callback: impl FnOnce(Result<(), RedisError>) + Send + 'static) {
+            self.typed(Command::new("PING"), |v| match &v {
+                Value::Simple(s) if s == "PONG" => Ok(()),
+                Value::Bulk(_) => Ok(()),
+                other => unexpected("PONG", other),
+            }, callback);
+        }
+
+
+
+
+        // ---- strings ----
+
+        /// `GET`: the value, or `None` for a missing key.
+        pub fn get(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<Option<Bytes>, RedisError>) + Send + 'static) {
+            self.typed(Command::new("GET").arg(key), opt_bytes, callback);
+        }
+
+        /// `SET key value`.
+        pub fn set(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>, callback: impl FnOnce(Result<(), RedisError>) + Send + 'static) {
+            self.typed(Command::new("SET").arg(key).arg(value), ok, callback);
+        }
+
+        /// `SET` with options: whether it took effect (`false` when an `NX` or
+        /// `XX` condition was not met).
+        pub fn set_with(
+            &self,
+            key: impl AsRef<[u8]>,
+            value: impl AsRef<[u8]>,
+            options: &SetOptions,
+            callback: impl FnOnce(Result<bool, RedisError>) + Send + 'static,
+        ) {
+            let cmd = options.append(Command::new("SET").arg(key).arg(value));
+            self.typed(
+                cmd,
+                |v| match v {
+                    Value::Null => Ok(false),
+                    other => ok(other).map(|()| true),
+                },
+                callback,
+            );
+        }
+
+        /// `SETNX`: whether the key was set.
+        pub fn setnx(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>, callback: impl FnOnce(Result<bool, RedisError>) + Send + 'static) {
+            self.typed(Command::new("SETNX").arg(key).arg(value), boolean, callback);
+        }
+
+        /// `GETDEL`.
+        pub fn getdel(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<Option<Bytes>, RedisError>) + Send + 'static) {
+            self.typed(Command::new("GETDEL").arg(key), opt_bytes, callback);
+        }
+
+        /// `MGET`.
+        pub fn mget(&self, keys: &[impl AsRef<[u8]>], callback: impl FnOnce(Result<Vec<Option<Bytes>>, RedisError>) + Send + 'static) {
+            self.typed(keyed("MGET", keys), opt_bytes_vec, callback);
+        }
+
+        /// `MSET`.
+        pub fn mset<K: AsRef<[u8]>, V: AsRef<[u8]>>(&self, pairs: &[(K, V)], callback: impl FnOnce(Result<(), RedisError>) + Send + 'static) {
+            let mut cmd = Command::new("MSET");
+            for (k, v) in pairs {
+                cmd = cmd.arg(k).arg(v);
+            }
+            self.typed(cmd, ok, callback);
+        }
+
+        /// `INCR`: the new value.
+        pub fn incr(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            self.typed(Command::new("INCR").arg(key), int, callback);
+        }
+
+        /// `INCRBY`.
+        pub fn incrby(&self, key: impl AsRef<[u8]>, by: i64, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            self.typed(Command::new("INCRBY").arg(key).arg(by.to_string()), int, callback);
+        }
+
+        /// `DECR`.
+        pub fn decr(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            self.typed(Command::new("DECR").arg(key), int, callback);
+        }
+
+        /// `DECRBY`.
+        pub fn decrby(&self, key: impl AsRef<[u8]>, by: i64, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            self.typed(Command::new("DECRBY").arg(key).arg(by.to_string()), int, callback);
+        }
+
+        /// `APPEND`: the new length.
+        pub fn append(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            self.typed(Command::new("APPEND").arg(key).arg(value), int, callback);
+        }
+
+        /// `STRLEN`.
+        pub fn strlen(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            self.typed(Command::new("STRLEN").arg(key), int, callback);
+        }
+
+        // ---- keys ----
+
+        /// `DEL`: how many keys were removed.
+        pub fn del(&self, keys: &[impl AsRef<[u8]>], callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            self.typed(keyed("DEL", keys), int, callback);
+        }
+
+        /// `EXISTS`: how many of the keys exist.
+        pub fn exists(&self, keys: &[impl AsRef<[u8]>], callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            self.typed(keyed("EXISTS", keys), int, callback);
+        }
+
+        /// `EXPIRE`: whether the key exists and got a timeout.
+        pub fn expire(&self, key: impl AsRef<[u8]>, seconds: u64, callback: impl FnOnce(Result<bool, RedisError>) + Send + 'static) {
+            self.typed(Command::new("EXPIRE").arg(key).arg(seconds.to_string()), boolean, callback);
+        }
+
+        /// `PEXPIRE`.
+        pub fn pexpire(&self, key: impl AsRef<[u8]>, millis: u64, callback: impl FnOnce(Result<bool, RedisError>) + Send + 'static) {
+            self.typed(Command::new("PEXPIRE").arg(key).arg(millis.to_string()), boolean, callback);
+        }
+
+        /// `TTL`: seconds left, `-1` for no timeout, `-2` for a missing key.
+        pub fn ttl(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            self.typed(Command::new("TTL").arg(key), int, callback);
+        }
+
+        /// `PTTL`.
+        pub fn pttl(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            self.typed(Command::new("PTTL").arg(key), int, callback);
+        }
+
+        /// `PERSIST`: whether a timeout was removed.
+        pub fn persist(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<bool, RedisError>) + Send + 'static) {
+            self.typed(Command::new("PERSIST").arg(key), boolean, callback);
+        }
+
+        // ---- hashes ----
+
+        /// `HSET`: how many fields were added.
+        pub fn hset<F: AsRef<[u8]>, V: AsRef<[u8]>>(
+            &self,
+            key: impl AsRef<[u8]>,
+            fields: &[(F, V)],
+            callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static,
+        ) {
+            let mut cmd = Command::new("HSET").arg(key);
+            for (f, v) in fields {
+                cmd = cmd.arg(f).arg(v);
+            }
+            self.typed(cmd, int, callback);
+        }
+
+        /// `HGET`.
+        pub fn hget(&self, key: impl AsRef<[u8]>, field: impl AsRef<[u8]>, callback: impl FnOnce(Result<Option<Bytes>, RedisError>) + Send + 'static) {
+            self.typed(Command::new("HGET").arg(key).arg(field), opt_bytes, callback);
+        }
+
+        /// `HMGET`.
+        pub fn hmget(
+            &self,
+            key: impl AsRef<[u8]>,
+            fields: &[impl AsRef<[u8]>],
+            callback: impl FnOnce(Result<Vec<Option<Bytes>>, RedisError>) + Send + 'static,
+        ) {
+            self.typed(Command::new("HMGET").arg(key).args(fields), opt_bytes_vec, callback);
+        }
+
+        /// `HGETALL`, in the order the server sent.
+        pub fn hgetall(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<Vec<(Bytes, Bytes)>, RedisError>) + Send + 'static) {
+            self.typed(Command::new("HGETALL").arg(key), pairs, callback);
+        }
+
+        /// `HDEL`: how many fields were removed.
+        pub fn hdel(&self, key: impl AsRef<[u8]>, fields: &[impl AsRef<[u8]>], callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            self.typed(Command::new("HDEL").arg(key).args(fields), int, callback);
+        }
+
+        /// `HEXISTS`.
+        pub fn hexists(&self, key: impl AsRef<[u8]>, field: impl AsRef<[u8]>, callback: impl FnOnce(Result<bool, RedisError>) + Send + 'static) {
+            self.typed(Command::new("HEXISTS").arg(key).arg(field), boolean, callback);
+        }
+
+        /// `HINCRBY`.
+        pub fn hincrby(&self, key: impl AsRef<[u8]>, field: impl AsRef<[u8]>, by: i64, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            self.typed(Command::new("HINCRBY").arg(key).arg(field).arg(by.to_string()), int, callback);
+        }
+
+        /// `HLEN`.
+        pub fn hlen(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            self.typed(Command::new("HLEN").arg(key), int, callback);
+        }
+
+        // ---- lists ----
+
+        /// `LPUSH`: the list's new length.
+        pub fn lpush(&self, key: impl AsRef<[u8]>, values: &[impl AsRef<[u8]>], callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            self.typed(Command::new("LPUSH").arg(key).args(values), int, callback);
+        }
+
+        /// `RPUSH`.
+        pub fn rpush(&self, key: impl AsRef<[u8]>, values: &[impl AsRef<[u8]>], callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            self.typed(Command::new("RPUSH").arg(key).args(values), int, callback);
+        }
+
+        /// `LPOP`.
+        pub fn lpop(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<Option<Bytes>, RedisError>) + Send + 'static) {
+            self.typed(Command::new("LPOP").arg(key), opt_bytes, callback);
+        }
+
+        /// `RPOP`.
+        pub fn rpop(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<Option<Bytes>, RedisError>) + Send + 'static) {
+            self.typed(Command::new("RPOP").arg(key), opt_bytes, callback);
+        }
+
+        /// `LLEN`.
+        pub fn llen(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            self.typed(Command::new("LLEN").arg(key), int, callback);
+        }
+
+        /// `LRANGE`.
+        pub fn lrange(&self, key: impl AsRef<[u8]>, start: i64, stop: i64, callback: impl FnOnce(Result<Vec<Bytes>, RedisError>) + Send + 'static) {
+            self.typed(Command::new("LRANGE").arg(key).arg(start.to_string()).arg(stop.to_string()), bytes_vec, callback);
+        }
+
+        /// `LINDEX`.
+        pub fn lindex(&self, key: impl AsRef<[u8]>, index: i64, callback: impl FnOnce(Result<Option<Bytes>, RedisError>) + Send + 'static) {
+            self.typed(Command::new("LINDEX").arg(key).arg(index.to_string()), opt_bytes, callback);
+        }
+
+        // ---- sets ----
+
+        /// `SADD`: how many members were added.
+        pub fn sadd(&self, key: impl AsRef<[u8]>, members: &[impl AsRef<[u8]>], callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            self.typed(Command::new("SADD").arg(key).args(members), int, callback);
+        }
+
+        /// `SREM`.
+        pub fn srem(&self, key: impl AsRef<[u8]>, members: &[impl AsRef<[u8]>], callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            self.typed(Command::new("SREM").arg(key).args(members), int, callback);
+        }
+
+        /// `SMEMBERS`.
+        pub fn smembers(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<Vec<Bytes>, RedisError>) + Send + 'static) {
+            self.typed(Command::new("SMEMBERS").arg(key), bytes_vec, callback);
+        }
+
+        /// `SISMEMBER`.
+        pub fn sismember(&self, key: impl AsRef<[u8]>, member: impl AsRef<[u8]>, callback: impl FnOnce(Result<bool, RedisError>) + Send + 'static) {
+            self.typed(Command::new("SISMEMBER").arg(key).arg(member), boolean, callback);
+        }
+
+        /// `SCARD`.
+        pub fn scard(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            self.typed(Command::new("SCARD").arg(key), int, callback);
+        }
+
+        // ---- sorted sets ----
+
+        /// `ZADD`: how many members were added.
+        pub fn zadd<M: AsRef<[u8]>>(&self, key: impl AsRef<[u8]>, members: &[(f64, M)], callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            let mut cmd = Command::new("ZADD").arg(key);
+            for (score, member) in members {
+                cmd = cmd.arg(score.to_string()).arg(member);
+            }
+            self.typed(cmd, int, callback);
+        }
+
+        /// `ZREM`.
+        pub fn zrem(&self, key: impl AsRef<[u8]>, members: &[impl AsRef<[u8]>], callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            self.typed(Command::new("ZREM").arg(key).args(members), int, callback);
+        }
+
+        /// `ZRANGE start stop`: members by rank.
+        pub fn zrange(&self, key: impl AsRef<[u8]>, start: i64, stop: i64, callback: impl FnOnce(Result<Vec<Bytes>, RedisError>) + Send + 'static) {
+            self.typed(Command::new("ZRANGE").arg(key).arg(start.to_string()).arg(stop.to_string()), bytes_vec, callback);
+        }
+
+        /// `ZRANGE start stop WITHSCORES`.
+        pub fn zrange_withscores(
+            &self,
+            key: impl AsRef<[u8]>,
+            start: i64,
+            stop: i64,
+            callback: impl FnOnce(Result<Vec<(Bytes, f64)>, RedisError>) + Send + 'static,
+        ) {
+            self.typed(
+                Command::new("ZRANGE").arg(key).arg(start.to_string()).arg(stop.to_string()).arg("WITHSCORES"),
+                scored,
+                callback,
+            );
+        }
+
+        /// `ZSCORE`.
+        pub fn zscore(&self, key: impl AsRef<[u8]>, member: impl AsRef<[u8]>, callback: impl FnOnce(Result<Option<f64>, RedisError>) + Send + 'static) {
+            self.typed(Command::new("ZSCORE").arg(key).arg(member), opt_f64, callback);
+        }
+
+        /// `ZINCRBY`: the member's new score.
+        pub fn zincrby(&self, key: impl AsRef<[u8]>, by: f64, member: impl AsRef<[u8]>, callback: impl FnOnce(Result<f64, RedisError>) + Send + 'static) {
+            self.typed(Command::new("ZINCRBY").arg(key).arg(by.to_string()).arg(member), float, callback);
+        }
+
+        /// `ZCARD`.
+        pub fn zcard(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            self.typed(Command::new("ZCARD").arg(key), int, callback);
+        }
+
+        // ---- publish ----
+
+        /// `PUBLISH`: how many subscribers received the message. Subscribing is
+        /// done with a [`RedisSubscriber`](crate::RedisSubscriber).
+        pub fn publish(&self, channel: impl AsRef<[u8]>, message: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            self.typed(Command::new("PUBLISH").arg(channel).arg(message), int, callback);
+        }
+
+        /// `SPUBLISH` (Redis 7): publish to a shard channel.
+        pub fn spublish(&self, channel: impl AsRef<[u8]>, message: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+            self.typed(Command::new("SPUBLISH").arg(channel).arg(message), int, callback);
+        }
+
+        // ---- scripts ----
+
+        /// `EVAL script numkeys key... arg...`: the script's result, as sent.
+        pub fn eval(
+            &self,
+            script: impl AsRef<[u8]>,
+            keys: &[impl AsRef<[u8]>],
+            args: &[impl AsRef<[u8]>],
+            callback: impl FnOnce(Result<Value, RedisError>) + Send + 'static,
+        ) {
+            let cmd = Command::new("EVAL").arg(script).arg(keys.len().to_string()).args(keys).args(args);
+            self.send(&cmd, callback);
+        }
+
+        /// `EVALSHA sha1 numkeys key... arg...`. A server that has not seen the
+        /// script answers a `NOSCRIPT` error: load it with [`script_load`](Self::script_load)
+        /// and try again.
+        pub fn evalsha(
+            &self,
+            sha1: impl AsRef<[u8]>,
+            keys: &[impl AsRef<[u8]>],
+            args: &[impl AsRef<[u8]>],
+            callback: impl FnOnce(Result<Value, RedisError>) + Send + 'static,
+        ) {
+            let cmd = Command::new("EVALSHA").arg(sha1).arg(keys.len().to_string()).args(keys).args(args);
+            self.send(&cmd, callback);
+        }
+
+        /// `SCRIPT LOAD`: the script's SHA-1, as hex.
+        pub fn script_load(&self, script: impl AsRef<[u8]>, callback: impl FnOnce(Result<String, RedisError>) + Send + 'static) {
+            self.typed(Command::new("SCRIPT").arg("LOAD").arg(script), text, callback);
+        }
+
+    };
+}
+
+macro_rules! typed_fn {
+    () => {
+        /// Send `cmd` and read its reply with `read`.
+        pub(crate) fn typed<T: Send + 'static>(
+            &self,
+            cmd: Command,
+            read: fn(Value) -> Result<T, RedisError>,
+            callback: impl FnOnce(Result<T, RedisError>) + Send + 'static,
+        ) {
+            self.send(&cmd, move |reply| callback(reply.and_then(read)));
+        }
+    };
+}
+
 impl RedisClient {
-    /// Send `cmd` and read its reply with `read`.
-    fn typed<T: Send + 'static>(
-        &self,
-        cmd: Command,
-        read: fn(Value) -> Result<T, RedisError>,
-        callback: impl FnOnce(Result<T, RedisError>) + Send + 'static,
-    ) {
-        self.send(&cmd, move |reply| callback(reply.and_then(read)));
-    }
-
-    // ---- connection ----
-
-    /// `PING`.
-    pub fn ping(&self, callback: impl FnOnce(Result<(), RedisError>) + Send + 'static) {
-        self.typed(Command::new("PING"), |v| match &v {
-            Value::Simple(s) if s == "PONG" => Ok(()),
-            Value::Bulk(_) => Ok(()),
-            other => unexpected("PONG", other),
-        }, callback);
-    }
+    typed_fn!();
+    typed_commands!();
 
     /// `AUTH password`, on the current connection. A client configured with a
     /// password authenticates by itself every time it connects.
@@ -216,346 +574,6 @@ impl RedisClient {
         self.typed(Command::new("SELECT").arg(db.to_string()), ok, callback);
     }
 
-    // ---- strings ----
-
-    /// `GET`: the value, or `None` for a missing key.
-    pub fn get(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<Option<Bytes>, RedisError>) + Send + 'static) {
-        self.typed(Command::new("GET").arg(key), opt_bytes, callback);
-    }
-
-    /// `SET key value`.
-    pub fn set(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>, callback: impl FnOnce(Result<(), RedisError>) + Send + 'static) {
-        self.typed(Command::new("SET").arg(key).arg(value), ok, callback);
-    }
-
-    /// `SET` with options: whether it took effect (`false` when an `NX` or
-    /// `XX` condition was not met).
-    pub fn set_with(
-        &self,
-        key: impl AsRef<[u8]>,
-        value: impl AsRef<[u8]>,
-        options: &SetOptions,
-        callback: impl FnOnce(Result<bool, RedisError>) + Send + 'static,
-    ) {
-        let cmd = options.append(Command::new("SET").arg(key).arg(value));
-        self.typed(
-            cmd,
-            |v| match v {
-                Value::Null => Ok(false),
-                other => ok(other).map(|()| true),
-            },
-            callback,
-        );
-    }
-
-    /// `SETNX`: whether the key was set.
-    pub fn setnx(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>, callback: impl FnOnce(Result<bool, RedisError>) + Send + 'static) {
-        self.typed(Command::new("SETNX").arg(key).arg(value), boolean, callback);
-    }
-
-    /// `GETDEL`.
-    pub fn getdel(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<Option<Bytes>, RedisError>) + Send + 'static) {
-        self.typed(Command::new("GETDEL").arg(key), opt_bytes, callback);
-    }
-
-    /// `MGET`.
-    pub fn mget(&self, keys: &[impl AsRef<[u8]>], callback: impl FnOnce(Result<Vec<Option<Bytes>>, RedisError>) + Send + 'static) {
-        self.typed(keyed("MGET", keys), opt_bytes_vec, callback);
-    }
-
-    /// `MSET`.
-    pub fn mset<K: AsRef<[u8]>, V: AsRef<[u8]>>(&self, pairs: &[(K, V)], callback: impl FnOnce(Result<(), RedisError>) + Send + 'static) {
-        let mut cmd = Command::new("MSET");
-        for (k, v) in pairs {
-            cmd = cmd.arg(k).arg(v);
-        }
-        self.typed(cmd, ok, callback);
-    }
-
-    /// `INCR`: the new value.
-    pub fn incr(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        self.typed(Command::new("INCR").arg(key), int, callback);
-    }
-
-    /// `INCRBY`.
-    pub fn incrby(&self, key: impl AsRef<[u8]>, by: i64, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        self.typed(Command::new("INCRBY").arg(key).arg(by.to_string()), int, callback);
-    }
-
-    /// `DECR`.
-    pub fn decr(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        self.typed(Command::new("DECR").arg(key), int, callback);
-    }
-
-    /// `DECRBY`.
-    pub fn decrby(&self, key: impl AsRef<[u8]>, by: i64, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        self.typed(Command::new("DECRBY").arg(key).arg(by.to_string()), int, callback);
-    }
-
-    /// `APPEND`: the new length.
-    pub fn append(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        self.typed(Command::new("APPEND").arg(key).arg(value), int, callback);
-    }
-
-    /// `STRLEN`.
-    pub fn strlen(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        self.typed(Command::new("STRLEN").arg(key), int, callback);
-    }
-
-    // ---- keys ----
-
-    /// `DEL`: how many keys were removed.
-    pub fn del(&self, keys: &[impl AsRef<[u8]>], callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        self.typed(keyed("DEL", keys), int, callback);
-    }
-
-    /// `EXISTS`: how many of the keys exist.
-    pub fn exists(&self, keys: &[impl AsRef<[u8]>], callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        self.typed(keyed("EXISTS", keys), int, callback);
-    }
-
-    /// `EXPIRE`: whether the key exists and got a timeout.
-    pub fn expire(&self, key: impl AsRef<[u8]>, seconds: u64, callback: impl FnOnce(Result<bool, RedisError>) + Send + 'static) {
-        self.typed(Command::new("EXPIRE").arg(key).arg(seconds.to_string()), boolean, callback);
-    }
-
-    /// `PEXPIRE`.
-    pub fn pexpire(&self, key: impl AsRef<[u8]>, millis: u64, callback: impl FnOnce(Result<bool, RedisError>) + Send + 'static) {
-        self.typed(Command::new("PEXPIRE").arg(key).arg(millis.to_string()), boolean, callback);
-    }
-
-    /// `TTL`: seconds left, `-1` for no timeout, `-2` for a missing key.
-    pub fn ttl(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        self.typed(Command::new("TTL").arg(key), int, callback);
-    }
-
-    /// `PTTL`.
-    pub fn pttl(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        self.typed(Command::new("PTTL").arg(key), int, callback);
-    }
-
-    /// `PERSIST`: whether a timeout was removed.
-    pub fn persist(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<bool, RedisError>) + Send + 'static) {
-        self.typed(Command::new("PERSIST").arg(key), boolean, callback);
-    }
-
-    // ---- hashes ----
-
-    /// `HSET`: how many fields were added.
-    pub fn hset<F: AsRef<[u8]>, V: AsRef<[u8]>>(
-        &self,
-        key: impl AsRef<[u8]>,
-        fields: &[(F, V)],
-        callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static,
-    ) {
-        let mut cmd = Command::new("HSET").arg(key);
-        for (f, v) in fields {
-            cmd = cmd.arg(f).arg(v);
-        }
-        self.typed(cmd, int, callback);
-    }
-
-    /// `HGET`.
-    pub fn hget(&self, key: impl AsRef<[u8]>, field: impl AsRef<[u8]>, callback: impl FnOnce(Result<Option<Bytes>, RedisError>) + Send + 'static) {
-        self.typed(Command::new("HGET").arg(key).arg(field), opt_bytes, callback);
-    }
-
-    /// `HMGET`.
-    pub fn hmget(
-        &self,
-        key: impl AsRef<[u8]>,
-        fields: &[impl AsRef<[u8]>],
-        callback: impl FnOnce(Result<Vec<Option<Bytes>>, RedisError>) + Send + 'static,
-    ) {
-        self.typed(Command::new("HMGET").arg(key).args(fields), opt_bytes_vec, callback);
-    }
-
-    /// `HGETALL`, in the order the server sent.
-    pub fn hgetall(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<Vec<(Bytes, Bytes)>, RedisError>) + Send + 'static) {
-        self.typed(Command::new("HGETALL").arg(key), pairs, callback);
-    }
-
-    /// `HDEL`: how many fields were removed.
-    pub fn hdel(&self, key: impl AsRef<[u8]>, fields: &[impl AsRef<[u8]>], callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        self.typed(Command::new("HDEL").arg(key).args(fields), int, callback);
-    }
-
-    /// `HEXISTS`.
-    pub fn hexists(&self, key: impl AsRef<[u8]>, field: impl AsRef<[u8]>, callback: impl FnOnce(Result<bool, RedisError>) + Send + 'static) {
-        self.typed(Command::new("HEXISTS").arg(key).arg(field), boolean, callback);
-    }
-
-    /// `HINCRBY`.
-    pub fn hincrby(&self, key: impl AsRef<[u8]>, field: impl AsRef<[u8]>, by: i64, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        self.typed(Command::new("HINCRBY").arg(key).arg(field).arg(by.to_string()), int, callback);
-    }
-
-    /// `HLEN`.
-    pub fn hlen(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        self.typed(Command::new("HLEN").arg(key), int, callback);
-    }
-
-    // ---- lists ----
-
-    /// `LPUSH`: the list's new length.
-    pub fn lpush(&self, key: impl AsRef<[u8]>, values: &[impl AsRef<[u8]>], callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        self.typed(Command::new("LPUSH").arg(key).args(values), int, callback);
-    }
-
-    /// `RPUSH`.
-    pub fn rpush(&self, key: impl AsRef<[u8]>, values: &[impl AsRef<[u8]>], callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        self.typed(Command::new("RPUSH").arg(key).args(values), int, callback);
-    }
-
-    /// `LPOP`.
-    pub fn lpop(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<Option<Bytes>, RedisError>) + Send + 'static) {
-        self.typed(Command::new("LPOP").arg(key), opt_bytes, callback);
-    }
-
-    /// `RPOP`.
-    pub fn rpop(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<Option<Bytes>, RedisError>) + Send + 'static) {
-        self.typed(Command::new("RPOP").arg(key), opt_bytes, callback);
-    }
-
-    /// `LLEN`.
-    pub fn llen(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        self.typed(Command::new("LLEN").arg(key), int, callback);
-    }
-
-    /// `LRANGE`.
-    pub fn lrange(&self, key: impl AsRef<[u8]>, start: i64, stop: i64, callback: impl FnOnce(Result<Vec<Bytes>, RedisError>) + Send + 'static) {
-        self.typed(Command::new("LRANGE").arg(key).arg(start.to_string()).arg(stop.to_string()), bytes_vec, callback);
-    }
-
-    /// `LINDEX`.
-    pub fn lindex(&self, key: impl AsRef<[u8]>, index: i64, callback: impl FnOnce(Result<Option<Bytes>, RedisError>) + Send + 'static) {
-        self.typed(Command::new("LINDEX").arg(key).arg(index.to_string()), opt_bytes, callback);
-    }
-
-    // ---- sets ----
-
-    /// `SADD`: how many members were added.
-    pub fn sadd(&self, key: impl AsRef<[u8]>, members: &[impl AsRef<[u8]>], callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        self.typed(Command::new("SADD").arg(key).args(members), int, callback);
-    }
-
-    /// `SREM`.
-    pub fn srem(&self, key: impl AsRef<[u8]>, members: &[impl AsRef<[u8]>], callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        self.typed(Command::new("SREM").arg(key).args(members), int, callback);
-    }
-
-    /// `SMEMBERS`.
-    pub fn smembers(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<Vec<Bytes>, RedisError>) + Send + 'static) {
-        self.typed(Command::new("SMEMBERS").arg(key), bytes_vec, callback);
-    }
-
-    /// `SISMEMBER`.
-    pub fn sismember(&self, key: impl AsRef<[u8]>, member: impl AsRef<[u8]>, callback: impl FnOnce(Result<bool, RedisError>) + Send + 'static) {
-        self.typed(Command::new("SISMEMBER").arg(key).arg(member), boolean, callback);
-    }
-
-    /// `SCARD`.
-    pub fn scard(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        self.typed(Command::new("SCARD").arg(key), int, callback);
-    }
-
-    // ---- sorted sets ----
-
-    /// `ZADD`: how many members were added.
-    pub fn zadd<M: AsRef<[u8]>>(&self, key: impl AsRef<[u8]>, members: &[(f64, M)], callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        let mut cmd = Command::new("ZADD").arg(key);
-        for (score, member) in members {
-            cmd = cmd.arg(score.to_string()).arg(member);
-        }
-        self.typed(cmd, int, callback);
-    }
-
-    /// `ZREM`.
-    pub fn zrem(&self, key: impl AsRef<[u8]>, members: &[impl AsRef<[u8]>], callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        self.typed(Command::new("ZREM").arg(key).args(members), int, callback);
-    }
-
-    /// `ZRANGE start stop`: members by rank.
-    pub fn zrange(&self, key: impl AsRef<[u8]>, start: i64, stop: i64, callback: impl FnOnce(Result<Vec<Bytes>, RedisError>) + Send + 'static) {
-        self.typed(Command::new("ZRANGE").arg(key).arg(start.to_string()).arg(stop.to_string()), bytes_vec, callback);
-    }
-
-    /// `ZRANGE start stop WITHSCORES`.
-    pub fn zrange_withscores(
-        &self,
-        key: impl AsRef<[u8]>,
-        start: i64,
-        stop: i64,
-        callback: impl FnOnce(Result<Vec<(Bytes, f64)>, RedisError>) + Send + 'static,
-    ) {
-        self.typed(
-            Command::new("ZRANGE").arg(key).arg(start.to_string()).arg(stop.to_string()).arg("WITHSCORES"),
-            scored,
-            callback,
-        );
-    }
-
-    /// `ZSCORE`.
-    pub fn zscore(&self, key: impl AsRef<[u8]>, member: impl AsRef<[u8]>, callback: impl FnOnce(Result<Option<f64>, RedisError>) + Send + 'static) {
-        self.typed(Command::new("ZSCORE").arg(key).arg(member), opt_f64, callback);
-    }
-
-    /// `ZINCRBY`: the member's new score.
-    pub fn zincrby(&self, key: impl AsRef<[u8]>, by: f64, member: impl AsRef<[u8]>, callback: impl FnOnce(Result<f64, RedisError>) + Send + 'static) {
-        self.typed(Command::new("ZINCRBY").arg(key).arg(by.to_string()).arg(member), float, callback);
-    }
-
-    /// `ZCARD`.
-    pub fn zcard(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        self.typed(Command::new("ZCARD").arg(key), int, callback);
-    }
-
-    // ---- publish ----
-
-    /// `PUBLISH`: how many subscribers received the message. Subscribing is
-    /// done with a [`RedisSubscriber`](crate::RedisSubscriber).
-    pub fn publish(&self, channel: impl AsRef<[u8]>, message: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        self.typed(Command::new("PUBLISH").arg(channel).arg(message), int, callback);
-    }
-
-    /// `SPUBLISH` (Redis 7): publish to a shard channel.
-    pub fn spublish(&self, channel: impl AsRef<[u8]>, message: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
-        self.typed(Command::new("SPUBLISH").arg(channel).arg(message), int, callback);
-    }
-
-    // ---- scripts ----
-
-    /// `EVAL script numkeys key... arg...`: the script's result, as sent.
-    pub fn eval(
-        &self,
-        script: impl AsRef<[u8]>,
-        keys: &[impl AsRef<[u8]>],
-        args: &[impl AsRef<[u8]>],
-        callback: impl FnOnce(Result<Value, RedisError>) + Send + 'static,
-    ) {
-        let cmd = Command::new("EVAL").arg(script).arg(keys.len().to_string()).args(keys).args(args);
-        self.send(&cmd, callback);
-    }
-
-    /// `EVALSHA sha1 numkeys key... arg...`. A server that has not seen the
-    /// script answers a `NOSCRIPT` error: load it with [`script_load`](Self::script_load)
-    /// and try again.
-    pub fn evalsha(
-        &self,
-        sha1: impl AsRef<[u8]>,
-        keys: &[impl AsRef<[u8]>],
-        args: &[impl AsRef<[u8]>],
-        callback: impl FnOnce(Result<Value, RedisError>) + Send + 'static,
-    ) {
-        let cmd = Command::new("EVALSHA").arg(sha1).arg(keys.len().to_string()).args(keys).args(args);
-        self.send(&cmd, callback);
-    }
-
-    /// `SCRIPT LOAD`: the script's SHA-1, as hex.
-    pub fn script_load(&self, script: impl AsRef<[u8]>, callback: impl FnOnce(Result<String, RedisError>) + Send + 'static) {
-        self.typed(Command::new("SCRIPT").arg("LOAD").arg(script), text, callback);
-    }
-
     // ---- transactions ----
 
     /// Run `commands` as one transaction: `MULTI`, the commands, `EXEC`, written
@@ -567,6 +585,17 @@ impl RedisClient {
     /// error.
     pub fn transaction(
         &self,
+        commands: Vec<Command>,
+        callback: impl FnOnce(Result<Option<Vec<Value>>, RedisError>) + Send + 'static,
+    ) {
+        self.transaction_asking(false, commands, callback);
+    }
+
+    /// [`transaction`](Self::transaction), led by an `ASKING` when `asking`: a
+    /// cluster sending it to the node a slot is being migrated to.
+    pub(crate) fn transaction_asking(
+        &self,
+        asking: bool,
         commands: Vec<Command>,
         callback: impl FnOnce(Result<Option<Vec<Value>>, RedisError>) + Send + 'static,
     ) {
@@ -582,7 +611,10 @@ impl RedisClient {
                 }
             }) as Callback
         };
-        let mut batch: Vec<(Command, Callback)> = Vec::with_capacity(commands.len() + 2);
+        let mut batch: Vec<(Command, Callback)> = Vec::with_capacity(commands.len() + 3);
+        if asking {
+            batch.push((Command::new("ASKING"), Box::new(|_| {})));
+        }
         batch.push((Command::new("MULTI"), note(&first_error)));
         for c in commands {
             batch.push((c, note(&first_error)));
@@ -644,6 +676,11 @@ impl RedisClient {
     pub fn discard(&self, callback: impl FnOnce(Result<(), RedisError>) + Send + 'static) {
         self.typed(Command::new("DISCARD"), ok, callback);
     }
+}
+
+impl crate::cluster::RedisCluster {
+    typed_fn!();
+    typed_commands!();
 }
 
 #[cfg(test)]

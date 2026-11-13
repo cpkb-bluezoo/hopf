@@ -23,6 +23,11 @@ speaking RESP2 and RESP3.
   shard channels), notices a dead connection with a keepalive, and delivers
   messages, acknowledgements and unknown push kinds to a handler. A command
   connection takes a push handler for RESP3 pushes such as key invalidations.
+- **Cluster:** `RedisCluster` learns the layout from `CLUSTER SHARDS` (or
+  `CLUSTER SLOTS`), sends each command to the master of its key's slot, follows
+  `MOVED` and `ASK`, refreshes the layout when nodes fail or slots move, and
+  fails multi-slot commands with `CROSSSLOT` without touching the network.
+  Works with Redis Cluster and Valkey Cluster.
 - **A push RESP parser** (`hopf_redis::resp`) that holds none of the stream,
   reads every RESP2 and RESP3 type in any split, and checks every size a server
   announces against configurable limits before reserving memory.
@@ -37,5 +42,6 @@ redis.set("greeting", "hello", |r| assert!(r.is_ok()));
 redis.get("greeting", |r| println!("{r:?}"));
 ```
 
-Tested against Redis 7.4 and Valkey 8.1 as well as a scripted server; see
+Tested against Redis 7.4 and Valkey 8.1 (single node and cluster) as well as
+scripted servers; see
 [docs/redis.html](../../docs/redis.html).

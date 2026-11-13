@@ -166,6 +166,9 @@ pub(crate) struct Inner {
     pub(crate) config: RedisConfig,
     pub(crate) state: Mutex<State>,
     pub(crate) closed: AtomicBool,
+    /// No new commands are taken; the connection closes once those it has are
+    /// answered.
+    retiring: AtomicBool,
     next_qid: AtomicU64,
     resolver: Mutex<Option<Arc<DnsResolver>>>,
     /// Where RESP3 pushes go on a command connection.
@@ -199,6 +202,7 @@ pub(crate) fn start(reactor: &ReactorHandle, config: RedisConfig, sub: Option<Bo
             last_rx: Instant::now(),
         }),
         closed: AtomicBool::new(false),
+        retiring: AtomicBool::new(false),
         next_qid: AtomicU64::new(0),
         resolver: Mutex::new(None),
         push: Mutex::new(None),
@@ -268,6 +272,29 @@ pub(crate) fn close(inner: &Arc<Inner>) {
         if let Kind::User(Some(cb)) = s.kind {
             finish(inner, cb, Err(RedisError::Closed));
         }
+    }
+}
+
+/// Stop taking commands, and close once the ones already taken are answered
+/// (at once if there are none). What a caller sent before is not failed, and
+/// what it sends after fails with [`RedisError::Closed`] without having been
+/// sent, so it is safe to send elsewhere.
+pub(crate) fn retire(inner: &Arc<Inner>) {
+    inner.retiring.store(true, Ordering::SeqCst);
+    close_if_drained(inner);
+}
+
+/// Close a retiring connection that has nothing left to answer.
+fn close_if_drained(inner: &Arc<Inner>) {
+    if !inner.retiring.load(Ordering::SeqCst) {
+        return;
+    }
+    let drained = {
+        let st = inner.state.lock().unwrap();
+        st.waiting.is_empty() && !st.pending.iter().any(|s| matches!(s.kind, Kind::User(_)))
+    };
+    if drained {
+        close(inner);
     }
 }
 
@@ -347,6 +374,11 @@ impl RedisClient {
     /// [`RedisError::Closed`]. Later commands fail the same way.
     pub fn close(&self) {
         close(&self.inner);
+    }
+
+    /// Have the cluster layer let go of this client: see [`retire`].
+    pub(crate) fn retire(&self) {
+        retire(&self.inner);
     }
 }
 
@@ -465,7 +497,7 @@ fn begin_dial(st: &mut State) -> Option<u64> {
 /// Accept commands from a caller: send them, queue them for the connection, or
 /// fail them.
 fn submit(inner: &Arc<Inner>, items: Vec<(Vec<u8>, Callback)>) {
-    if inner.closed.load(Ordering::SeqCst) {
+    if inner.closed.load(Ordering::SeqCst) || inner.retiring.load(Ordering::SeqCst) {
         for (_, cb) in items {
             finish(inner, cb, Err(RedisError::Closed));
         }
@@ -910,6 +942,7 @@ impl Conn {
             Kind::User(None) => {} // timed out: the reply is discarded
             Kind::Internal(step) => self.on_handshake_reply(endpoint, step, value),
         }
+        close_if_drained(&inner);
     }
 
     fn on_handshake_reply(&mut self, endpoint: &mut dyn Endpoint, step: Step, value: Value) {

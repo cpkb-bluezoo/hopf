@@ -44,3 +44,13 @@ required-features = ["integration"]
 name = "pubsub_server"
 path = "tests/pubsub_server.rs"
 required-features = ["integration"]
+
+[[test]]
+name = "cluster_server"
+path = "tests/cluster_server.rs"
+required-features = ["integration"]
+
+[[test]]
+name = "cluster_scripted"
+path = "tests/cluster_scripted.rs"
+required-features = ["integration"]

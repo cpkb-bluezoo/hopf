@@ -9,6 +9,9 @@
 //! selects a database, resolves host names through `hopf-dns` and speaks TLS
 //! through a `hopf-core` connector. [`RedisSubscriber`] is a connection for
 //! publish/subscribe that reconnects and subscribes again by itself.
+//! [`RedisCluster`] sends each command to the master of a Redis Cluster or
+//! Valkey Cluster that owns its key's slot, and follows the cluster as slots
+//! move and nodes fail over.
 //!
 //! ```no_run
 //! use hopf_core::{Runtime, RuntimeConfig};
@@ -21,16 +24,22 @@
 //! ```
 
 mod client;
+mod cluster;
 mod commands;
 mod config;
 mod error;
+mod keys;
 mod pubsub;
 pub mod resp;
+mod topology;
 
 pub use client::{Callback, Command, RedisClient, Reply};
+pub use cluster::{ClusterConfig, RedisCluster};
 pub use commands::SetOptions;
 pub use config::RedisConfig;
 pub use error::RedisError;
+pub use keys::{command_slot, crc16, key_indexes, key_slot, CrossSlot, SLOTS};
+pub use topology::NodeAddr;
 pub use pubsub::{
     Invalidation, Message, Push, RedisSubscriber, SubscriberHandler, SubscriptionChange, SubscriptionKind,
 };
