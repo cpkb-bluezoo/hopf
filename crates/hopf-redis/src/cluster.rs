@@ -16,7 +16,7 @@
 //! the command fails at once with a `CROSSSLOT` error, without touching the
 //! network. Use `{hash tags}` to put related keys in one slot. A command with
 //! no key goes to any master. A key the table does not know can be named with
-//! [`send_to_key`](RedisCluster::send_to_key).
+//! [`command_for_key`](RedisCluster::command_for_key).
 //!
 //! # Redirections and failure
 //!
@@ -27,8 +27,12 @@
 //! [`max_redirects`](ClusterConfig::max_redirects). A node that cannot be
 //! reached makes the client refresh its map and, since the command was never
 //! sent, try again where the map now says it lives. A command that was sent
-//! when its connection failed is not sent again. `TRYAGAIN` and `CLUSTERDOWN`
-//! are handed to the caller; the latter also refreshes the map.
+//! when its connection failed is not sent again. `CLUSTERDOWN` and `TRYAGAIN`
+//! mean the command did not run, because the slot has no master for the moment
+//! or is being migrated: the map is fetched again and the command tried once
+//! more, as many times as it has redirections left, and then the error is the
+//! caller's. (`WAIT` is never sent again: see
+//! [`wait_replicas`](RedisCluster::wait_replicas).)
 //!
 //! Refreshes are one at a time and at most one in
 //! [`min_refresh_interval`](ClusterConfig::min_refresh_interval), however many
@@ -37,13 +41,16 @@
 //! as it goes, never having been sent, is sent again to the owner.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hopf_core::ReactorHandle;
 
-use crate::client::{Callback, Command, RedisClient, Reply};
+use crate::client::{Callback, Command, Deadline, RedisClient, Reply};
+use crate::commands::{
+    aof_counts, is_connection_scoped, server_timeout_ms, wait_command, wait_count, wait_deadline, waitaof_command,
+};
 use crate::config::RedisConfig;
 use crate::error::RedisError;
 use crate::keys::{command_slot, key_slot, SLOTS};
@@ -143,6 +150,8 @@ struct Job {
     /// Redirections and retries left.
     budget: u32,
     callback: Callback,
+    /// What a `WAIT` for this command's slot is bound to while it is unanswered.
+    track: Option<Arc<Track>>,
 }
 
 /// Work that cannot go anywhere until the layout is known.
@@ -179,6 +188,8 @@ struct State {
     parked: Vec<(Parked, Option<RedisError>)>,
     /// Turns keyless commands over the masters.
     next_keyless: usize,
+    /// The last command submitted for each slot, until it is answered.
+    last: HashMap<u16, Arc<Track>>,
 }
 
 struct Inner {
@@ -187,6 +198,8 @@ struct Inner {
     state: Mutex<State>,
     closed: AtomicBool,
     refreshes: AtomicUsize,
+    /// Numbers each sending of a `WAIT`.
+    wait_sends: AtomicU64,
 }
 
 /// A Redis Cluster client. Cheap to clone; clones share the connections. See
@@ -209,9 +222,11 @@ impl RedisCluster {
                 refresh: Refresh::default(),
                 parked: Vec::new(),
                 next_keyless: 0,
+                last: HashMap::new(),
             }),
             closed: AtomicBool::new(false),
             refreshes: AtomicUsize::new(0),
+            wait_sends: AtomicU64::new(0),
         });
         request_refresh(&inner);
         Self { inner }
@@ -233,11 +248,15 @@ impl RedisCluster {
 
     /// [`send`](Self::send) to the master that owns `routing_key`'s slot,
     /// whatever the command's own keys are: for a command the key table does
-    /// not know, or a keyless one that has to run on a particular node (such
-    /// as `WAIT`, after the write whose replication it asks about). If the
+    /// not know, or a keyless one that has to run on a particular node. If the
     /// command names keys of its own they must be in that slot, or it fails
-    /// with `CROSSSLOT`.
-    pub fn send_to_key(&self, routing_key: impl AsRef<[u8]>, command: &Command, callback: impl FnOnce(Reply) + Send + 'static) {
+    /// with `CROSSSLOT`. An ordinary command follows `MOVED` and `ASK`.
+    ///
+    /// `WAIT` and `WAITAOF` mean something only on the connection that carried
+    /// the writes they ask about, so they are never redirected or sent again,
+    /// and one sent here behaves as [`wait_replicas`](Self::wait_replicas)
+    /// does: it is bound to the last command submitted for the key's slot.
+    pub fn command_for_key(&self, routing_key: impl AsRef<[u8]>, command: &Command, callback: impl FnOnce(Reply) + Send + 'static) {
         self.submit(command, Some(key_slot(routing_key.as_ref())), Box::new(callback));
     }
 
@@ -255,10 +274,32 @@ impl RedisCluster {
                 )),
             );
         }
+        if command.words().first().is_some_and(|w| is_connection_scoped(w)) {
+            return match routed {
+                Some(slot) => {
+                    let deadline = wait_deadline(server_timeout_ms(command.words()));
+                    self.bound(slot, command.clone(), deadline, callback)
+                }
+                None => finish(
+                    inner,
+                    callback,
+                    Err(RedisError::Unexpected(
+                        "WAIT and WAITAOF act on the connection that carried the writes: use wait_replicas or wait_aof, \
+                         or command_for_key with the key of the write"
+                            .into(),
+                    )),
+                ),
+            };
+        }
         let slot = match (command_slot(command.words()), routed) {
             (Err(_), _) => return finish(inner, callback, Err(crossslot())),
             (Ok(own), Some(r)) if own.is_some_and(|s| s != r) => return finish(inner, callback, Err(crossslot())),
             (Ok(own), r) => r.or(own),
+        };
+        let track = slot.map(|s| register(inner, s));
+        let callback = match &track {
+            Some(t) => on_completion(inner, t, callback),
+            None => callback,
         };
         dispatch(
             inner,
@@ -268,9 +309,98 @@ impl RedisCluster {
                 target: Target::Owner,
                 budget: inner.config.max_redirects,
                 callback,
+                track,
             },
             true,
         );
+    }
+
+    /// `WAIT num_replicas timeout_ms`, for the writes just made to the slot of
+    /// `slot_key`: it blocks until `num_replicas` replicas of that slot's
+    /// master have acknowledged every write made on the connection to it, or
+    /// `timeout_ms` passes, and calls back with how many did. Fewer than asked
+    /// for is `Ok(n)`, not an error.
+    ///
+    /// A replica count means something only on the connection that carried the
+    /// write, so the `WAIT` is bound to the last command submitted for the
+    /// slot. If that command is still unanswered, the `WAIT` goes on the
+    /// connection it was sent on, right behind it; if it is redirected
+    /// (`MOVED`, `ASK`), the `WAIT` goes with it, and the first node's answer
+    /// to it is thrown away. If nothing is in flight for the slot it goes to
+    /// the connection that serves the slot now. It is never sent again on
+    /// another connection: if the connection is lost, or the node leaves the
+    /// layout, before the reply, the callback gets the error; so does
+    /// `CLUSTERDOWN`. `slot_key` is a key of the write, or a hash tag shared
+    /// with it.
+    ///
+    /// The server holds the reply for up to `timeout_ms`, so the client's
+    /// deadline is its command timeout plus `timeout_ms`; with `timeout_ms` 0
+    /// the server waits for ever and there is no client deadline, so pass a
+    /// positive value. A cluster has no connection-wide `MULTI`:
+    /// [`transaction`](Self::transaction) is one batch, so `WAIT` cannot fall
+    /// inside it.
+    pub fn wait_replicas(
+        &self,
+        slot_key: impl AsRef<[u8]>,
+        num_replicas: u32,
+        timeout_ms: u64,
+        callback: impl FnOnce(Result<u32, RedisError>) + Send + 'static,
+    ) {
+        let slot = key_slot(slot_key.as_ref());
+        let command = wait_command(num_replicas, timeout_ms);
+        self.bound(slot, command, wait_deadline(timeout_ms), Box::new(move |r| callback(r.and_then(wait_count))));
+    }
+
+    /// `WAITAOF num_local num_replicas timeout_ms`, bound to the slot of
+    /// `slot_key` exactly as [`wait_replicas`](Self::wait_replicas) is. The
+    /// callback gets `(local, replicas)`: how many of the master's own append-only
+    /// file and its replicas' files have the writes fsynced.
+    pub fn wait_aof(
+        &self,
+        slot_key: impl AsRef<[u8]>,
+        num_local: u32,
+        num_replicas: u32,
+        timeout_ms: u64,
+        callback: impl FnOnce(Result<(u32, u32), RedisError>) + Send + 'static,
+    ) {
+        let slot = key_slot(slot_key.as_ref());
+        let command = waitaof_command(num_local, num_replicas, timeout_ms);
+        self.bound(slot, command, wait_deadline(timeout_ms), Box::new(move |r| callback(r.and_then(aof_counts))));
+    }
+
+    /// Send a connection-scoped `command` for `slot`: behind the command in
+    /// flight for it, on its connection, or to the slot's owner if there is
+    /// none.
+    fn bound(&self, slot: u16, command: Command, deadline: Deadline, callback: Callback) {
+        let inner = &self.inner;
+        if inner.closed.load(Ordering::SeqCst) {
+            return finish(inner, callback, Err(RedisError::Closed));
+        }
+        let track = inner.state.lock().unwrap().last.get(&slot).cloned();
+        if let Some(track) = track {
+            let mut ts = track.st.lock().unwrap();
+            if !ts.finished {
+                let wait = Arc::new(Wait {
+                    command,
+                    deadline,
+                    sent: AtomicU64::new(0),
+                    callback: Mutex::new(Some(callback)),
+                });
+                ts.waits.push(Arc::clone(&wait));
+                if let Some(client) = ts.client.clone() {
+                    send_wait(inner, &track, &wait, &client);
+                }
+                return;
+            }
+        }
+        // Nothing in flight for the slot: the connection that serves it now.
+        match route(inner, &Target::Owner, Some(slot)) {
+            None => finish(inner, callback, Err(unserved())),
+            Some((client, _, _)) => {
+                let inner2 = Arc::clone(inner);
+                client.send_with_deadline(&command, deadline, move |reply| callback(unsent_closed(&inner2, reply)));
+            }
+        }
     }
 
     /// Run `commands` as one transaction on the master that owns their slot:
@@ -297,6 +427,17 @@ impl RedisCluster {
         if inner.closed.load(Ordering::SeqCst) {
             return finish_tx(inner, Box::new(callback), Err(RedisError::Closed));
         }
+        let track = slot.map(|s| register(inner, s));
+        let callback: TxCallback = match &track {
+            Some(t) => {
+                let (inner2, track2) = (Arc::clone(inner), Arc::clone(t));
+                Box::new(move |result| {
+                    complete(&inner2, &track2, result.as_ref().err());
+                    callback(result)
+                })
+            }
+            None => Box::new(callback),
+        };
         dispatch_tx(
             inner,
             TxJob {
@@ -304,7 +445,8 @@ impl RedisCluster {
                 slot,
                 target: Target::Owner,
                 budget: inner.config.max_redirects,
-                callback: Box::new(callback),
+                callback,
+                track,
             },
             true,
         );
@@ -439,15 +581,26 @@ fn unserved() -> RedisError {
 /// the layout was last fetched: if its node is unknown, a fresh job waits for a
 /// layout, and one that has had its layout fails, since fetching it again would
 /// only find the slot unserved again.
-fn dispatch(inner: &Arc<Inner>, job: Job, fresh: bool) {
+fn dispatch(inner: &Arc<Inner>, mut job: Job, fresh: bool) {
+    // A `WAIT` bound to this command must not be answered by where it was
+    // before; it is sent again behind the command wherever it goes now.
+    if let Some(t) = &job.track {
+        detach(t);
+    }
     let Some((client, addr, asking)) = route(inner, &job.target, job.slot) else {
         return if fresh {
             park(inner, Parked::Command(job), None)
+        } else if job.budget > 0 {
+            // The layout just fetched has no master for the slot: a failover
+            // is probably under way. Wait for the next layout.
+            job.budget -= 1;
+            park(inner, Parked::Command(job), Some(unserved()))
         } else {
             finish(inner, job.callback, Err(unserved()))
         };
     };
     let sent = job.command.clone();
+    let track = job.track.clone();
     let inner2 = Arc::clone(inner);
     let reply = move |reply: Reply| on_reply(&inner2, job, addr, reply);
     if asking {
@@ -456,6 +609,9 @@ fn dispatch(inner: &Arc<Inner>, job: Job, fresh: bool) {
         client.send_batch(vec![(Command::new("ASKING"), Box::new(|_: Reply| {})), (sent, Box::new(reply))]);
     } else {
         client.send(&sent, reply);
+    }
+    if let Some(t) = track {
+        attach(inner, &t, &client);
     }
 }
 
@@ -480,6 +636,13 @@ fn on_reply(inner: &Arc<Inner>, mut job: Job, from: NodeAddr, reply: Reply) {
                 }
                 return dispatch(inner, job, true);
             }
+        }
+        // Nothing ran: the cluster, or this slot of it, is between masters (a
+        // failover, say). Look at the layout again, and try then.
+        RedisError::Server(e) if (e.code == "CLUSTERDOWN" || e.code == "TRYAGAIN") && job.budget > 0 => {
+            job.budget -= 1;
+            job.target = Target::Owner;
+            return park(inner, Parked::Command(job), Some(error));
         }
         RedisError::Server(e) if e.code == "CLUSTERDOWN" => request_refresh(inner),
         // Nothing was sent: the node is unreachable. Find out where the slot
@@ -520,19 +683,30 @@ struct TxJob {
     target: Target,
     budget: u32,
     callback: TxCallback,
+    track: Option<Arc<Track>>,
 }
 
-fn dispatch_tx(inner: &Arc<Inner>, job: TxJob, fresh: bool) {
+fn dispatch_tx(inner: &Arc<Inner>, mut job: TxJob, fresh: bool) {
+    if let Some(t) = &job.track {
+        detach(t);
+    }
     let Some((client, addr, asking)) = route(inner, &job.target, job.slot) else {
         return if fresh {
             park(inner, Parked::Tx(job), None)
+        } else if job.budget > 0 {
+            job.budget -= 1;
+            park(inner, Parked::Tx(job), Some(unserved()))
         } else {
             finish_tx(inner, job.callback, Err(unserved()))
         };
     };
     let inner2 = Arc::clone(inner);
     let commands = job.commands.clone();
+    let track = job.track.clone();
     client.transaction_asking(asking, commands, move |result| on_tx_reply(&inner2, job, addr, result));
+    if let Some(t) = track {
+        attach(inner, &t, &client);
+    }
 }
 
 fn on_tx_reply(inner: &Arc<Inner>, mut job: TxJob, from: NodeAddr, result: Result<Option<Vec<Value>>, RedisError>) {
@@ -554,6 +728,11 @@ fn on_tx_reply(inner: &Arc<Inner>, mut job: TxJob, from: NodeAddr, result: Resul
                 return dispatch_tx(inner, job, true);
             }
         }
+        RedisError::Server(e) if (e.code == "CLUSTERDOWN" || e.code == "TRYAGAIN") && job.budget > 0 => {
+            job.budget -= 1;
+            job.target = Target::Owner;
+            return park(inner, Parked::Tx(job), Some(error));
+        }
         RedisError::Server(e) if e.code == "CLUSTERDOWN" => request_refresh(inner),
         RedisError::Connect(_) if job.budget > 0 => {
             job.budget -= 1;
@@ -570,6 +749,134 @@ fn on_tx_reply(inner: &Arc<Inner>, mut job: TxJob, from: NodeAddr, result: Resul
         _ => {}
     }
     (job.callback)(Err(error));
+}
+
+// ---- commands bound to the connection of a write ----
+
+/// The last command submitted for a slot, while it is unanswered: what a `WAIT`
+/// for the slot is bound to.
+struct Track {
+    slot: u16,
+    st: Mutex<TrackState>,
+}
+
+#[derive(Default)]
+struct TrackState {
+    /// The connection the command is on now; `None` until it is dispatched, and
+    /// while it is being redirected.
+    client: Option<RedisClient>,
+    /// The `WAIT`s that have not been answered.
+    waits: Vec<Arc<Wait>>,
+    /// The command has been answered.
+    finished: bool,
+}
+
+struct Wait {
+    command: Command,
+    deadline: Deadline,
+    /// The sending of this `WAIT` whose reply counts, or 0 when it is not
+    /// sent: an answer to an earlier sending, from before the command was
+    /// redirected, is not an answer.
+    sent: AtomicU64,
+    callback: Mutex<Option<Callback>>,
+}
+
+/// Make `slot`'s new last command.
+fn register(inner: &Arc<Inner>, slot: u16) -> Arc<Track> {
+    let track = Arc::new(Track {
+        slot,
+        st: Mutex::new(TrackState::default()),
+    });
+    inner.state.lock().unwrap().last.insert(slot, Arc::clone(&track));
+    track
+}
+
+/// `callback`, preceded by the end of `track`: a `WAIT` made from `callback`
+/// finds nothing in flight.
+fn on_completion(inner: &Arc<Inner>, track: &Arc<Track>, callback: Callback) -> Callback {
+    let (inner, track) = (Arc::clone(inner), Arc::clone(track));
+    Box::new(move |reply| {
+        complete(&inner, &track, reply.as_ref().err());
+        callback(reply)
+    })
+}
+
+/// The command has its answer. A `WAIT` that was never sent fails with its
+/// error; one that was has its own reply coming.
+fn complete(inner: &Arc<Inner>, track: &Arc<Track>, error: Option<&RedisError>) {
+    let unsent: Vec<Arc<Wait>> = {
+        let mut ts = track.st.lock().unwrap();
+        ts.finished = true;
+        ts.client = None;
+        let (unsent, sent): (Vec<_>, Vec<_>) = ts.waits.drain(..).partition(|w| w.sent.load(Ordering::SeqCst) == 0);
+        ts.waits = sent;
+        unsent
+    };
+    {
+        let mut st = inner.state.lock().unwrap();
+        if st.last.get(&track.slot).is_some_and(|t| Arc::ptr_eq(t, track)) {
+            st.last.remove(&track.slot);
+        }
+    }
+    for w in unsent {
+        let why = error
+            .cloned()
+            .unwrap_or_else(|| RedisError::Unexpected("the command the WAIT was bound to was never sent".into()));
+        if let Some(cb) = w.callback.lock().unwrap().take() {
+            finish(inner, cb, Err(why));
+        }
+    }
+}
+
+/// The command is being sent again: what was sent behind it where it was no
+/// longer counts.
+fn detach(track: &Arc<Track>) {
+    let mut ts = track.st.lock().unwrap();
+    ts.client = None;
+    for w in &ts.waits {
+        w.sent.store(0, Ordering::SeqCst);
+    }
+}
+
+/// The command has been written to `client`: send the `WAIT`s behind it.
+fn attach(inner: &Arc<Inner>, track: &Arc<Track>, client: &RedisClient) {
+    let mut ts = track.st.lock().unwrap();
+    if ts.finished {
+        // Answered before this thread got here.
+        return;
+    }
+    ts.client = Some(client.clone());
+    for w in ts.waits.clone() {
+        send_wait(inner, track, &w, client);
+    }
+}
+
+fn send_wait(inner: &Arc<Inner>, track: &Arc<Track>, wait: &Arc<Wait>, client: &RedisClient) {
+    let id = inner.wait_sends.fetch_add(1, Ordering::SeqCst) + 1;
+    wait.sent.store(id, Ordering::SeqCst);
+    let (inner2, track2, wait2) = (Arc::clone(inner), Arc::clone(track), Arc::clone(wait));
+    client.send_with_deadline(&wait.command, wait.deadline, move |reply| {
+        // Not this sending's reply: the command was redirected since, and the
+        // `WAIT` has been sent again where it went.
+        if wait2.sent.load(Ordering::SeqCst) != id {
+            return;
+        }
+        track2.st.lock().unwrap().waits.retain(|w| !Arc::ptr_eq(w, &wait2));
+        if let Some(cb) = wait2.callback.lock().unwrap().take() {
+            cb(unsent_closed(&inner2, reply));
+        }
+    });
+}
+
+/// A node's client that refuses a command because it is being let go of has
+/// not sent it, but a `WAIT` cannot go anywhere else: say that, not `Closed`.
+fn unsent_closed(inner: &Inner, reply: Reply) -> Reply {
+    match reply {
+        Err(RedisError::Closed) if !inner.closed.load(Ordering::SeqCst) => Err(RedisError::ConnectionLost(
+            "the node left the cluster layout before the command was sent".into(),
+        )),
+        other => other,
+    }
 }
 
 // ---- the layout ----

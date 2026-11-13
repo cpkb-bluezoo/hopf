@@ -159,6 +159,9 @@ pub(crate) struct State {
     pub(crate) desired: Desired,
     /// When anything last arrived on the connection (a subscriber's health).
     pub(crate) last_rx: Instant,
+    /// A `MULTI` has been sent on the connection and not yet an `EXEC` or
+    /// `DISCARD`.
+    in_multi: bool,
 }
 
 pub(crate) struct Inner {
@@ -200,6 +203,7 @@ pub(crate) fn start(reactor: &ReactorHandle, config: RedisConfig, sub: Option<Bo
             last_error: None,
             desired: Desired::default(),
             last_rx: Instant::now(),
+            in_multi: false,
         }),
         closed: AtomicBool::new(false),
         retiring: AtomicBool::new(false),
@@ -256,6 +260,7 @@ pub(crate) fn close(inner: &Arc<Inner>) {
     let (handle, waiting, pending) = {
         let mut st = inner.state.lock().unwrap();
         st.phase = Phase::Idle;
+        st.in_multi = false;
         st.conn_id += 1;
         st.outbox.clear();
         (st.handle.take(), std::mem::take(&mut st.waiting), std::mem::take(&mut st.pending))
@@ -376,6 +381,18 @@ impl RedisClient {
         close(&self.inner);
     }
 
+    /// Send `command` with a deadline of its own, for one the server holds for
+    /// a time of its own.
+    pub(crate) fn send_with_deadline(&self, command: &Command, deadline: Deadline, callback: impl FnOnce(Reply) + Send + 'static) {
+        submit_timed(&self.inner, vec![(command.encode(), Box::new(callback))], deadline);
+    }
+
+    /// Whether a `MULTI` is open on the connection: it was sent, and no `EXEC`
+    /// or `DISCARD` since.
+    pub(crate) fn in_multi(&self) -> bool {
+        self.inner.state.lock().unwrap().in_multi
+    }
+
     /// Have the cluster layer let go of this client: see [`retire`].
     pub(crate) fn retire(&self) {
         retire(&self.inner);
@@ -494,9 +511,48 @@ fn begin_dial(st: &mut State) -> Option<u64> {
     Some(st.conn_id)
 }
 
+/// How long a command may go unanswered.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Deadline {
+    /// The configured command timeout.
+    Default,
+    /// The configured command timeout and this much more: for a command that
+    /// the server itself holds for a time, such as `WAIT`.
+    Extra(Duration),
+    /// No limit.
+    Never,
+}
+
+/// The name of the command in `encoded` (an array of bulk strings), in upper
+/// case.
+fn command_name(encoded: &[u8]) -> Option<Vec<u8>> {
+    // *<n>\r\n$<len>\r\n<name>\r\n
+    let first = encoded.windows(2).position(|w| w == b"\r\n")? + 2;
+    let rest = encoded.get(first..)?;
+    let len_end = rest.windows(2).position(|w| w == b"\r\n")?;
+    let len: usize = std::str::from_utf8(rest.get(1..len_end)?).ok()?.parse().ok()?;
+    let name = rest.get(len_end + 2..len_end + 2 + len)?;
+    Some(name.to_ascii_uppercase())
+}
+
+/// Track whether the connection is inside a transaction, from what is sent.
+fn note_transaction_state(st: &mut State, batch: &[Waiting]) {
+    for w in batch {
+        match command_name(&w.bytes).as_deref() {
+            Some(b"MULTI") => st.in_multi = true,
+            Some(b"EXEC") | Some(b"DISCARD") => st.in_multi = false,
+            _ => {}
+        }
+    }
+}
+
 /// Accept commands from a caller: send them, queue them for the connection, or
 /// fail them.
 fn submit(inner: &Arc<Inner>, items: Vec<(Vec<u8>, Callback)>) {
+    submit_timed(inner, items, Deadline::Default);
+}
+
+fn submit_timed(inner: &Arc<Inner>, items: Vec<(Vec<u8>, Callback)>, deadline: Deadline) {
     if inner.closed.load(Ordering::SeqCst) || inner.retiring.load(Ordering::SeqCst) {
         for (_, cb) in items {
             finish(inner, cb, Err(RedisError::Closed));
@@ -507,7 +563,12 @@ fn submit(inner: &Arc<Inner>, items: Vec<(Vec<u8>, Callback)>) {
     let mut prepared = Vec::with_capacity(items.len());
     for (bytes, callback) in items {
         let qid = inner.next_qid.fetch_add(1, Ordering::Relaxed);
-        let cancel = inner.config.command_timeout.map(|timeout| {
+        let limit = match deadline {
+            Deadline::Default => inner.config.command_timeout,
+            Deadline::Extra(more) => inner.config.command_timeout.map(|t| t + more),
+            Deadline::Never => None,
+        };
+        let cancel = limit.map(|timeout| {
             let weak = Arc::downgrade(inner);
             inner.reactor.schedule_timer(
                 timeout,
@@ -535,10 +596,15 @@ fn submit(inner: &Arc<Inner>, items: Vec<(Vec<u8>, Callback)>) {
     let next = {
         let mut st = inner.state.lock().unwrap();
         let max = inner.config.max_pending;
-        let in_hand = st.pending.len() + st.waiting.len();
+        // What the connection sends for itself while it handshakes is not the
+        // callers' to count: only their commands use up the room.
+        let in_hand = if st.phase == Phase::Handshaking { 0 } else { st.pending.len() } + st.waiting.len();
         if max > 0 && in_hand + prepared.len() > max {
             Next::Fail(prepared, RedisError::Overloaded)
         } else {
+            if st.phase != Phase::Idle || st.retry_at.is_none_or(|at| at <= Instant::now()) {
+                note_transaction_state(&mut st, &prepared);
+            }
             match st.phase {
                 Phase::Ready => {
                     for w in prepared {
@@ -745,6 +811,7 @@ fn connect_failed(inner: &Arc<Inner>, conn_id: u64, error: RedisError) {
             return;
         }
         st.phase = Phase::Idle;
+        st.in_multi = false;
         st.handle = None;
         st.outbox.clear();
         st.flush_scheduled = false;
@@ -777,6 +844,7 @@ pub(crate) fn lost(inner: &Arc<Inner>, conn_id: u64, reason: &str) {
             (VecDeque::new(), VecDeque::new(), false, true)
         } else {
             st.phase = Phase::Idle;
+            st.in_multi = false;
             st.handle = None;
             st.outbox.clear();
             st.flush_scheduled = false;
@@ -1050,6 +1118,14 @@ impl ProtocolHandler for Conn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_command_name_is_read_from_the_encoding() {
+        assert_eq!(command_name(&Command::new("multi").encode()).as_deref(), Some(&b"MULTI"[..]));
+        assert_eq!(command_name(&Command::new("GET").arg("k").encode()).as_deref(), Some(&b"GET"[..]));
+        assert_eq!(command_name(b"garbage"), None);
+        assert_eq!(command_name(b""), None);
+    }
 
     #[test]
     fn backoff_doubles_to_a_ceiling() {

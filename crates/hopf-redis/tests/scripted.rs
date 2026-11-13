@@ -562,3 +562,110 @@ fn a_closed_subscriber_stops_dialling() {
     rt.shutdown();
     server.rt.shutdown();
 }
+
+#[test]
+fn wait_and_waitaof_on_a_single_server_are_plain_commands_whatever_the_slot_key() {
+    let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+    let log = Arc::clone(&seen);
+    let server = serve(move |s, w| {
+        log.lock().unwrap().push(w.iter().map(|x| String::from_utf8_lossy(x).into_owned()).collect());
+        match name_of(w).as_str() {
+            "HELLO" => s.reply(HELLO_OK),
+            "WAIT" => s.reply(":3\r\n"),
+            "WAITAOF" => s.reply("*2\r\n:1\r\n:2\r\n"),
+            other => panic!("unexpected {other}"),
+        }
+    });
+    let (rt, c) = client(&server, |c| c);
+    assert_eq!(call!(|cb| c.wait_replicas("ignored", 2, 150, cb)).unwrap(), 3);
+    assert_eq!(call!(|cb| c.wait_aof("also ignored", 1, 2, 150, cb)).unwrap(), (1, 2));
+    let sent: Vec<String> = seen.lock().unwrap().iter().skip(1).map(|w| w.join(" ")).collect();
+    assert_eq!(sent, vec!["WAIT 2 150", "WAITAOF 1 2 150"]);
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn wait_inside_multi_fails_at_once_and_is_not_queued() {
+    let waits = Arc::new(AtomicUsize::new(0));
+    let w2 = Arc::clone(&waits);
+    let server = serve(move |s, w| match name_of(w).as_str() {
+        "HELLO" => s.reply(HELLO_OK),
+        "MULTI" | "DISCARD" => s.reply("+OK\r\n"),
+        "WAIT" => {
+            w2.fetch_add(1, Ordering::SeqCst);
+            s.reply(":1\r\n");
+        }
+        other => panic!("unexpected {other}"),
+    });
+    let (rt, c) = client(&server, |c| c);
+    call!(|cb| c.multi(cb)).unwrap();
+    let started = Instant::now();
+    let err = call!(|cb| c.wait_replicas("k", 1, 1000, cb)).unwrap_err();
+    assert!(matches!(err, RedisError::Unexpected(_)), "{err:?}");
+    assert!(err.to_string().contains("MULTI"), "{err}");
+    let err = call!(|cb| c.wait_aof("k", 0, 1, 1000, cb)).unwrap_err();
+    assert!(matches!(err, RedisError::Unexpected(_)), "{err:?}");
+    assert!(started.elapsed() < Duration::from_millis(500), "it failed without waiting for the server");
+    assert_eq!(waits.load(Ordering::SeqCst), 0, "nothing was sent to be queued");
+    // Once the transaction is over it is an ordinary command again.
+    call!(|cb| c.discard(cb)).unwrap();
+    assert_eq!(call!(|cb| c.wait_replicas("k", 1, 100, cb)).unwrap(), 1);
+    assert_eq!(waits.load(Ordering::SeqCst), 1);
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_wait_has_the_server_timeout_on_top_of_the_command_timeout_and_zero_means_no_deadline() {
+    let server = serve(move |s, w| match name_of(w).as_str() {
+        "HELLO" => s.reply(HELLO_OK),
+        // Answered after 350 ms: longer than the 100 ms command timeout.
+        "WAIT" if arg(w, 2) == "300" => s.reply_after(Duration::from_millis(350), ":1\r\n"),
+        "WAIT" if arg(w, 2) == "0" => s.reply_after(Duration::from_millis(350), ":4\r\n"),
+        "WAIT" => {} // never answered
+        other => panic!("unexpected {other}"),
+    });
+    let (rt, c) = client(&server, |c| c.command_timeout(Some(Duration::from_millis(100))));
+    // 100 + 300 ms allows an answer that takes 350.
+    assert_eq!(call!(|cb| c.wait_replicas("k", 1, 300, cb)).unwrap(), 1);
+    // No server timeout, no client deadline either.
+    assert_eq!(call!(|cb| c.wait_replicas("k", 1, 0, cb)).unwrap(), 4);
+    // An answer that never comes ends at the command timeout plus the server's.
+    let started = Instant::now();
+    let err = call!(|cb| c.wait_replicas("k", 1, 200, cb)).unwrap_err();
+    assert!(matches!(err, RedisError::Timeout), "{err:?}");
+    let took = started.elapsed();
+    assert!(took >= Duration::from_millis(280) && took < Duration::from_secs(2), "{took:?}");
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn the_handshake_does_not_use_up_the_room_max_pending_gives_the_callers_commands() {
+    let server = serve(move |s, w| match name_of(w).as_str() {
+        // The handshake is still in flight while the commands arrive.
+        "HELLO" => s.reply_after(Duration::from_millis(300), HELLO_OK),
+        "PING" => s.reply("+PONG\r\n"),
+        other => panic!("unexpected {other}"),
+    });
+    let (rt, c) = client(&server, |c| c.max_pending(2));
+    std::thread::sleep(Duration::from_millis(100)); // HELLO has been sent, and not answered
+    let (tx, rx) = mpsc::channel();
+    for _ in 0..2 {
+        let tx = tx.clone();
+        c.ping(move |r| tx.send(r).unwrap());
+    }
+    // Room for two commands means room for two, whatever the connection is
+    // doing for itself meanwhile; a third is over the limit.
+    assert_eq!(call!(|cb| c.ping(cb)).unwrap_err(), RedisError::Overloaded);
+    for _ in 0..2 {
+        rx.recv_timeout(Duration::from_secs(5)).unwrap().expect("accepted and answered");
+    }
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}

@@ -509,15 +509,48 @@ fn too_many_waiting_commands_are_refused() {
     );
     let blocker = unique("max");
     let (tx, rx) = mpsc::channel();
-    for _ in 0..2 {
-        let tx = tx.clone();
-        c.command(&[b"BLPOP", blocker.as_bytes(), b"0"], move |r| {
-            let _ = tx.send(r);
-        });
-    }
+    // Both at once: sent one after the other, the connection's own handshake
+    // could be counted between them and refuse the second, leaving room for the
+    // PING to be accepted behind a command that never returns.
+    let blocking = |tx: mpsc::Sender<_>| -> (Command, hopf_redis::Callback) {
+        (
+            Command::new("BLPOP").arg(&blocker).arg("0"),
+            Box::new(move |r| {
+                let _ = tx.send(r);
+            }),
+        )
+    };
+    c.send_batch(vec![blocking(tx.clone()), blocking(tx.clone())]);
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(call!(|cb| c.ping(cb)).unwrap_err(), RedisError::Overloaded);
     c.close();
     drop(rx);
+    rt.shutdown();
+}
+
+#[test]
+fn wait_on_a_server_with_no_replicas_reports_none_after_its_timeout_and_is_refused_inside_multi() {
+    let (host, port) = server_or_skip!(real_server());
+    let rt = runtime();
+    let c = client(&rt, &host, port);
+    let k = unique("wait");
+    call!(|cb| c.set(&k, "v", cb)).unwrap();
+    // Nothing to replicate to: asking for none is answered at once, asking for
+    // one is answered with 0 when the server's timeout passes.
+    assert_eq!(call!(|cb| c.wait_replicas(&k, 0, 100, cb)).unwrap(), 0);
+    let started = Instant::now();
+    assert_eq!(call!(|cb| c.wait_replicas(&k, 1, 150, cb)).unwrap(), 0);
+    assert!(started.elapsed() >= Duration::from_millis(140), "{:?}", started.elapsed());
+    // Not an error that there were fewer than asked for; and WAITAOF has the
+    // same shape (no append-only file here, so nothing local to wait for).
+    let (local, replicas) = call!(|cb| c.wait_aof(&k, 0, 0, 100, cb)).unwrap();
+    assert_eq!((local, replicas), (0, 0));
+
+    // Inside MULTI the server would queue it: the client refuses instead.
+    call!(|cb| c.multi(cb)).unwrap();
+    let err = call!(|cb| c.wait_replicas(&k, 1, 100, cb)).unwrap_err();
+    assert!(matches!(err, RedisError::Unexpected(_)), "{err:?}");
+    call!(|cb| c.discard(cb)).unwrap();
+    call!(|cb| c.del(&[&k], cb)).unwrap();
     rt.shutdown();
 }

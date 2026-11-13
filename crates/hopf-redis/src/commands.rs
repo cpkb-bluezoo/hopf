@@ -10,7 +10,7 @@
 
 use hopf_core::Bytes;
 
-use crate::client::{Callback, Command, RedisClient};
+use crate::client::{Callback, Command, Deadline, RedisClient};
 use crate::error::RedisError;
 use crate::resp::Value;
 
@@ -683,6 +683,129 @@ impl crate::cluster::RedisCluster {
     typed_commands!();
 }
 
+// ---- WAIT and WAITAOF ----
+
+/// `WAIT numreplicas timeout`.
+pub(crate) fn wait_command(num_replicas: u32, timeout_ms: u64) -> Command {
+    Command::new("WAIT").arg(num_replicas.to_string()).arg(timeout_ms.to_string())
+}
+
+/// `WAITAOF numlocal numreplicas timeout`.
+pub(crate) fn waitaof_command(num_local: u32, num_replicas: u32, timeout_ms: u64) -> Command {
+    Command::new("WAITAOF")
+        .arg(num_local.to_string())
+        .arg(num_replicas.to_string())
+        .arg(timeout_ms.to_string())
+}
+
+/// How long the client waits for a `WAIT` the server holds for `timeout_ms`:
+/// its own command timeout on top of that, and no limit for a server that is
+/// asked to wait for ever.
+pub(crate) fn wait_deadline(timeout_ms: u64) -> Deadline {
+    if timeout_ms == 0 {
+        Deadline::Never
+    } else {
+        Deadline::Extra(std::time::Duration::from_millis(timeout_ms))
+    }
+}
+
+/// Whether `name` is a command whose meaning is bound to the connection it runs
+/// on.
+pub(crate) fn is_connection_scoped(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(b"WAIT") || name.eq_ignore_ascii_case(b"WAITAOF")
+}
+
+/// The server-side timeout of a `WAIT` or `WAITAOF` written out in `words`.
+pub(crate) fn server_timeout_ms(words: &[Vec<u8>]) -> u64 {
+    let at = if words.first().is_some_and(|w| w.eq_ignore_ascii_case(b"WAITAOF")) { 3 } else { 2 };
+    words
+        .get(at)
+        .and_then(|w| std::str::from_utf8(w).ok())
+        .and_then(|w| w.parse().ok())
+        .unwrap_or(0)
+}
+
+pub(crate) fn wait_count(v: Value) -> Result<u32, RedisError> {
+    let n = int(v)?;
+    u32::try_from(n).map_err(|_| RedisError::Unexpected(format!("{n} is not a replica count")))
+}
+
+pub(crate) fn aof_counts(v: Value) -> Result<(u32, u32), RedisError> {
+    let items = array(v)?;
+    match items.as_slice() {
+        [local, replicas] => Ok((wait_count(local.clone())?, wait_count(replicas.clone())?)),
+        _ => Err(RedisError::Unexpected(format!("WAITAOF answered {} elements, not 2", items.len()))),
+    }
+}
+
+/// The error for `WAIT` run where it cannot mean anything.
+pub(crate) fn wait_in_multi() -> RedisError {
+    RedisError::Unexpected(
+        "WAIT or WAITAOF inside MULTI is queued, not run, so it would confirm nothing: send it after EXEC".into(),
+    )
+}
+
+impl RedisClient {
+    /// `WAIT numreplicas timeout_ms`: block until `num_replicas` replicas have
+    /// acknowledged every write made on **this connection**, or `timeout_ms`
+    /// passes, and call back with how many did. Fewer than asked for is
+    /// `Ok(n)`, not an error. `slot_key` says nothing on a single server and is
+    /// ignored: the parameter is there so code can be written once for this and
+    /// for [`RedisCluster::wait_replicas`](crate::RedisCluster::wait_replicas).
+    ///
+    /// The server holds the reply for up to `timeout_ms`, so the client's
+    /// deadline is its command timeout plus `timeout_ms`; with `timeout_ms` 0
+    /// the server waits for ever and there is no client deadline, so pass a
+    /// positive value. The connection is shared by every user of this client, so
+    /// the writes confirmed are all of theirs before the `WAIT`, which is more
+    /// than yours and never fewer.
+    ///
+    /// Fails at once, without sending anything, if a `MULTI` is open on the
+    /// connection: the server would queue the `WAIT` instead of running it.
+    pub fn wait_replicas(
+        &self,
+        slot_key: impl AsRef<[u8]>,
+        num_replicas: u32,
+        timeout_ms: u64,
+        callback: impl FnOnce(Result<u32, RedisError>) + Send + 'static,
+    ) {
+        let _ = slot_key;
+        self.wait_typed(wait_command(num_replicas, timeout_ms), timeout_ms, wait_count, callback);
+    }
+
+    /// `WAITAOF numlocal numreplicas timeout_ms`: block until this connection's
+    /// writes are fsynced to the local append-only file (`num_local` 0 or 1) and
+    /// to `num_replicas` replicas' files, or `timeout_ms` passes. The callback
+    /// gets `(local, replicas)` acknowledged. Everything said of
+    /// [`wait_replicas`](Self::wait_replicas) applies. A server answers an
+    /// error if `num_local` is 1 and it is not running with `appendonly yes`.
+    pub fn wait_aof(
+        &self,
+        slot_key: impl AsRef<[u8]>,
+        num_local: u32,
+        num_replicas: u32,
+        timeout_ms: u64,
+        callback: impl FnOnce(Result<(u32, u32), RedisError>) + Send + 'static,
+    ) {
+        let _ = slot_key;
+        self.wait_typed(waitaof_command(num_local, num_replicas, timeout_ms), timeout_ms, aof_counts, callback);
+    }
+
+    fn wait_typed<T: Send + 'static>(
+        &self,
+        command: Command,
+        timeout_ms: u64,
+        read: fn(Value) -> Result<T, RedisError>,
+        callback: impl FnOnce(Result<T, RedisError>) + Send + 'static,
+    ) {
+        if self.in_multi() {
+            self.inner.reactor.execute(Box::new(move || callback(Err(wait_in_multi()))));
+            return;
+        }
+        self.send_with_deadline(&command, wait_deadline(timeout_ms), move |reply| callback(reply.and_then(read)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -748,5 +871,25 @@ mod tests {
         .append(Command::new("SET").arg("k").arg("v"));
         let words: Vec<String> = cmd.words().iter().map(|w| String::from_utf8_lossy(w).into_owned()).collect();
         assert_eq!(words, ["SET", "k", "v", "XX", "PX", "5", "KEEPTTL"]);
+    }
+
+    #[test]
+    fn wait_replies_are_counts_and_nothing_else() {
+        assert_eq!(wait_count(Value::Int(2)).unwrap(), 2);
+        assert!(wait_count(Value::Int(-1)).is_err());
+        assert!(wait_count(Value::Null).is_err());
+        assert_eq!(aof_counts(Value::Array(vec![Value::Int(1), Value::Int(0)])).unwrap(), (1, 0));
+        assert!(aof_counts(Value::Array(vec![Value::Int(1)])).is_err());
+        assert!(aof_counts(Value::Int(1)).is_err());
+    }
+
+    #[test]
+    fn the_server_timeout_is_read_from_where_each_command_keeps_it() {
+        let words = |s: &str| s.split(' ').map(|w| w.as_bytes().to_vec()).collect::<Vec<_>>();
+        assert_eq!(server_timeout_ms(&words("WAIT 1 250")), 250);
+        assert_eq!(server_timeout_ms(&words("waitaof 0 1 75")), 75);
+        assert_eq!(server_timeout_ms(&words("WAIT 1")), 0);
+        assert!(is_connection_scoped(b"wait") && is_connection_scoped(b"WAITAOF") && !is_connection_scoped(b"GET"));
+        assert_eq!(wait_command(2, 100).words().iter().map(|w| w.as_slice()).collect::<Vec<_>>(), [&b"WAIT"[..], b"2", b"100"]);
     }
 }

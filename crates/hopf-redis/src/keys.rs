@@ -109,7 +109,7 @@ fn layout(name: &str) -> Option<Layout> {
 /// This is a table of the commands applications use, not the server's own
 /// knowledge of every command, and a command it does not list is taken to have
 /// one key, its first argument. For anything else, name the key yourself with
-/// [`RedisCluster::send_to_key`](crate::RedisCluster::send_to_key).
+/// [`RedisCluster::command_for_key`](crate::RedisCluster::command_for_key).
 pub fn key_indexes(words: &[Vec<u8>]) -> Vec<usize> {
     let Some(name) = words.first() else {
         return Vec::new();

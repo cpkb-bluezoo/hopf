@@ -37,10 +37,26 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
   and `ASK` (with `ASKING` written in the same batch), refreshes the layout when
   a node cannot be reached or a slot moves (one fetch at a time, rate-limited),
   and never sends again a command that was already sent when its connection was
-  lost. Transactions run on the owner of their slot, `send_to_key` routes a
+  lost. Transactions run on the owner of their slot, `command_for_key` routes a
   command by an explicit key, and `ClusterConfig::node_config` gives every node
   connection its password, TLS and timeouts. Tested against Redis 7.4 and
   Valkey 8.1, including slot migration and master failover.
+- **hopf-redis:** `WAIT` and `WAITAOF` bound to the connection of the write
+  (#532). `RedisCluster::wait_replicas(slot_key, n, timeout_ms, cb)` and
+  `wait_aof(...)` send the command behind the last command submitted for the
+  slot, on the connection that carried it (or to the slot's master when nothing
+  is in flight); a write that is redirected takes its `WAIT` with it and the
+  first node's answer is discarded; a lost connection fails the callback and
+  the `WAIT` is never sent again. The client's deadline is its command timeout
+  plus `timeout_ms` (none for 0). `RedisClient::wait_replicas` and `wait_aof`
+  are the same calls on one server, and fail at once inside `MULTI`.
+  `RedisCluster::command_for_key` routes any command by a key; `WAIT` through
+  `command` or `send` with no key is refused rather than sent to any master.
+  `CLUSTERDOWN` and `TRYAGAIN` for an ordinary command are now retried against
+  a fresh layout, as many times as it has redirections left, so a failover is
+  not seen by callers; and a command whose slot the layout just fetched leaves
+  unserved waits for the next layout instead of failing. `max_pending` no
+  longer counts the commands the connection sends for its own handshake.
 - **hopf-core:** readiness and graceful shutdown (#530).
   `Runtime::is_ready()`, `is_draining()`, `bind_failures()` and
   `open_connections()`; `Runtime::start_drain()` stops accepting and tells every

@@ -27,7 +27,9 @@ speaking RESP2 and RESP3.
   `CLUSTER SLOTS`), sends each command to the master of its key's slot, follows
   `MOVED` and `ASK`, refreshes the layout when nodes fail or slots move, and
   fails multi-slot commands with `CROSSSLOT` without touching the network.
-  Works with Redis Cluster and Valkey Cluster.
+  `wait_replicas` and `wait_aof` run `WAIT` and `WAITAOF` on the connection
+  that carried the write they confirm. Works with Redis Cluster and Valkey
+  Cluster.
 - **A push RESP parser** (`hopf_redis::resp`) that holds none of the stream,
   reads every RESP2 and RESP3 type in any split, and checks every size a server
   announces against configurable limits before reserving memory.
