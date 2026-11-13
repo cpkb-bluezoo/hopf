@@ -276,9 +276,9 @@ fn dot_without_a_client_certificate_reports_no_chain_when_it_is_only_requested()
 #[test]
 fn doq_with_mtls_gives_the_handler_the_client_chain_sni_and_local_address() {
     use hopf_core::crypto::TrustStore;
-    use hopf_core::{ClientAuthPolicy, HandshakeConfig, HandshakeMode, HandshakeRole};
+    use hopf_core::{ClientAuthPolicy, HandshakeConfig, HandshakeMode, HandshakeRole, ServerTlsBuilder};
     use hopf_dns::server::listen_dns_doq;
-    use hopf_quic::{QuicClientConfig, QuicServerConfig};
+    use hopf_quic::QuicClientConfig;
 
     let server = identity("localhost");
     let client = identity("client.example");
@@ -289,15 +289,14 @@ fn doq_with_mtls_gives_the_handler_the_client_chain_sni_and_local_address() {
 
     let mut client_ca = TrustStore::new();
     client_ca.add_anchor(client.der.clone());
-    let server_config = Arc::new(QuicServerConfig::from_handshake(HandshakeConfig {
-        role: HandshakeRole::Server,
-        mode: HandshakeMode::Quic,
-        alpn: vec![Bytes::from_static(b"doq")],
-        server: Some(server_creds),
-        client_auth: ClientAuthPolicy::Require,
-        client_trust_store: Some(client_ca),
-        ..Default::default()
-    }));
+    let server_config = hopf_quic::server_config_from_tls_builder(
+        &ServerTlsBuilder::new()
+            .credentials(server_creds)
+            .alpn(&[b"doq"])
+            .client_auth(ClientAuthPolicy::Require)
+            .client_trust_store(client_ca),
+    )
+    .unwrap();
 
     let mut server_ca = TrustStore::new();
     server_ca.add_anchor(server.der.clone());
@@ -331,6 +330,94 @@ fn doq_with_mtls_gives_the_handler_the_client_chain_sni_and_local_address() {
         Some(&[client.der.clone()][..]),
         "the handler sees exactly the client's certificate"
     );
+    rt.shutdown();
+    driver.shutdown();
+}
+
+/// A DoQ server's client trust is fetched for every handshake: after the
+/// anchors are swapped, a new connection from the old client is refused and
+/// its query never reaches the handler, with no restart.
+#[cfg(all(feature = "doq", feature = "server"))]
+#[test]
+fn doq_client_trust_can_be_swapped_without_a_restart() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use hopf_core::crypto::TrustStore;
+    use hopf_core::{ClientAuthPolicy, HandshakeConfig, HandshakeMode, HandshakeRole, ServerTlsBuilder};
+    use hopf_dns::server::listen_dns_doq;
+    use hopf_quic::QuicClientConfig;
+
+    let server = identity("localhost");
+    let client = identity("client.example");
+    let other = identity("other.example");
+    let server_creds =
+        hopf_core::server_credentials_from_pem_bytes(server.cert_pem.as_bytes(), server.key_pem.as_bytes()).unwrap();
+    let client_creds =
+        hopf_core::server_credentials_from_pem_bytes(client.cert_pem.as_bytes(), client.key_pem.as_bytes()).unwrap();
+
+    let trusted = Arc::new(Mutex::new({
+        let mut t = TrustStore::new();
+        t.add_anchor(client.der.clone());
+        t
+    }));
+    let handshakes = Arc::new(AtomicUsize::new(0));
+    let (source, counter) = (Arc::clone(&trusted), Arc::clone(&handshakes));
+    let server_config = hopf_quic::server_config_from_tls_builder(
+        &ServerTlsBuilder::new()
+            .credentials(server_creds)
+            .alpn(&[b"doq"])
+            .client_auth(ClientAuthPolicy::Require)
+            .client_trust(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                source.lock().unwrap().clone()
+            }),
+    )
+    .unwrap();
+
+    let mut server_ca = TrustStore::new();
+    server_ca.add_anchor(server.der.clone());
+    let client_config = Arc::new(QuicClientConfig::from_handshake(HandshakeConfig {
+        role: HandshakeRole::Client,
+        mode: HandshakeMode::Quic,
+        alpn: vec![Bytes::from_static(b"doq")],
+        trust_store: Some(server_ca),
+        client_credentials: Some(client_creds),
+        ..Default::default()
+    }));
+
+    let recorder = Recorder::default();
+    let handle = DnsServiceHandle::new(DnsService::with_handler(recorder.clone()));
+    let driver = listen_dns_doq("127.0.0.1:0".parse().unwrap(), server_config, handle).unwrap();
+    let addr = driver.local_addr;
+    let rt = hopf_core::Runtime::start(Default::default()).unwrap();
+    let connect = || {
+        let resolver = hopf_dns::DnsResolver::new(rt.pick_worker().clone());
+        resolver.add_server_doq(addr, "localhost", Arc::clone(&client_config));
+        resolver.open().unwrap();
+        resolver
+    };
+
+    ask(&connect(), "before.test").expect("a client of the trusted anchor is answered");
+    assert_eq!(recorder.0.lock().unwrap().len(), 1);
+
+    // Swap the anchors for ones the client's certificate does not chain to.
+    let mut replacement = TrustStore::new();
+    replacement.add_anchor(other.der.clone());
+    *trusted.lock().unwrap() = replacement;
+
+    // The same client on a new connection is judged by the new anchors. The
+    // query is asked without waiting for an answer that will not come.
+    let refused = connect();
+    refused.query_a("after.test", Box::new(|_| {}));
+    for _ in 0..100 {
+        if handshakes.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(handshakes.load(Ordering::SeqCst), 2, "the trust source ran for each handshake");
+    assert_eq!(recorder.0.lock().unwrap().len(), 1, "the refused client's query never reached the handler");
     rt.shutdown();
     driver.shutdown();
 }

@@ -7,6 +7,22 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
 
 ### Added
 
+- **hopf-core:** `ServerTlsBuilder` (#528), a public server TLS configuration
+  that combines what the fixed acceptor helpers each offer one of: client
+  authentication (`client_auth`), a credentials resolver consulted on every
+  handshake (`server_resolver`), ALPN and the TCP version policy, and client
+  trust that is consulted on every handshake too, so it can change without a
+  restart. Client trust is a fixed `client_trust_store`, a `client_trust`
+  callback returning the current `TrustStore`, or a `client_verify`
+  `ClientVerifyOverride` that decides from the client's chain. `build()` gives
+  a `SharedTlsAcceptor`; `apply_to(&mut HandshakeConfig)` sets the same
+  configuration on any handshake config. It refuses contradictory settings
+  (no credentials, client authentication with nothing to trust, trust with no
+  client authentication). Both the TLS 1.3 and TLS 1.2 engines honour it.
+- **hopf-quic:** `server_config_from_tls_builder` (and `_with`) builds a
+  `QuicServerConfig` from a `ServerTlsBuilder`, so a QUIC listener (DoQ,
+  HTTP/3) has the same credentials, resolver and client-trust behaviour as a
+  TCP one.
 - **hopf-dns:** `DnsService` answers RFC 10029 multiple-QTYPE queries
   (#531). `DnsService::set_max_multi_qtypes(n)` allows up to `n` extra types
   per query; the default, `0`, leaves the mechanism off. A query that names

@@ -36,7 +36,7 @@ pub use config::{
     client_config_for_pem_bytes, client_config_for_pem_bytes_hopf,
     client_config_for_pem_bytes_with, client_config_for_pem_bytes_with_hopf, client_config_from_pem,
     client_config_from_pem_with, client_config_public_trust, client_config_public_trust_with,
-    server_config_from_pem, server_config_from_pem_with,
+    server_config_from_pem, server_config_from_pem_with, server_config_from_tls_builder, server_config_from_tls_builder_with,
     server_config_self_signed, server_config_self_signed_hopf, server_config_self_signed_with,
     server_config_self_signed_with_hopf, QuicClientConfig, QuicConnectConfig,
     QuicListenConfig, QuicListenHardening, QuicListenHooksConfig, QuicServerConfig, QuicTlsOptions, QuicVersion,

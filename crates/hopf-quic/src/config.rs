@@ -13,7 +13,7 @@ use hopf_core::crypto::kx_policy::KxPolicy;
 use hopf_core::crypto::trust::TrustStore;
 use hopf_core::pem::{parse_certs, parse_pkcs8_keys};
 use hopf_core::tls::{HandshakeConfig, HandshakeMode, HandshakeRole, ServerCredentials};
-use hopf_core::HandlerFactory;
+use hopf_core::{HandlerFactory, ServerTlsBuilder};
 
 use crate::transport::recovery::CongestionAlgorithm;
 use crate::crypto::{try_hopf_client_config, try_hopf_server_config, HopfTlsBuildParams};
@@ -590,6 +590,25 @@ pub fn server_config_from_pem_with(
     )
     .with_tls(tls);
     Ok(try_hopf_server_config(params)?)
+}
+
+/// Build a QUIC server config from a [`ServerTlsBuilder`]: the same
+/// credentials (fixed or per-handshake resolver), ALPN protocols and
+/// client-certificate policy, including a client trust store that is swapped
+/// while the server runs or a verifier of your own, as for a TCP listener
+/// built with [`ServerTlsBuilder::build`]. The builder's TCP version policy
+/// does not apply: QUIC is always TLS 1.3.
+pub fn server_config_from_tls_builder(builder: &ServerTlsBuilder) -> io::Result<Arc<QuicServerConfig>> {
+    server_config_from_tls_builder_with(builder, QuicTlsOptions::default())
+}
+
+/// [`server_config_from_tls_builder`] with explicit TLS options.
+pub fn server_config_from_tls_builder_with(
+    builder: &ServerTlsBuilder,
+    tls: QuicTlsOptions,
+) -> io::Result<Arc<QuicServerConfig>> {
+    let params = HopfTlsBuildParams::server_without_credentials(Vec::new()).with_tls(tls);
+    crate::crypto::try_hopf_server_config_from_builder(params, builder)
 }
 
 /// Client config trusting CA PEM.

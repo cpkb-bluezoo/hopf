@@ -343,6 +343,8 @@ impl TlsAcceptor for PemAcceptor {
             alpn: self.alpn.clone(),
             client_auth: self.client_auth,
             client_trust_store: self.client_trust_store.clone(),
+            client_trust_source: None,
+            client_verify_override: None,
             server_resolver: None,
             version_policy: self.version_policy,
         }
@@ -398,6 +400,8 @@ impl TlsAcceptor for SniAcceptor {
             alpn: self.alpn.clone(),
             client_auth: self.client_auth,
             client_trust_store: self.client_trust_store.clone(),
+            client_trust_source: None,
+            client_verify_override: None,
             server_resolver: Some(server_resolver),
             version_policy: self.version_policy,
         }

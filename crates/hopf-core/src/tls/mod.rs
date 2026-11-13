@@ -13,6 +13,7 @@ mod handshake;
 mod key_log;
 mod pem;
 mod record;
+mod server_tls;
 mod sink;
 mod ticket_keys;
 // `pub(crate)`, not private: `hopf-core::dtls12` (DTLS 1.2) wraps
@@ -98,7 +99,7 @@ impl NegotiatingTls {
 }
 
 pub use engine::{
-    ClientAuthPolicy, HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole,
+    ClientAuthPolicy, ClientTrustSource, ClientVerifyOverride, HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole,
     ServerCredentials, ServerCredentialsResolver, Tls13Aead, VerifyOverride, AES_128_GCM_SHA256,
     AES_256_GCM_SHA384, CHACHA20_POLY1305_SHA256, SUPPORTED_CIPHER_SUITES,
 };
@@ -125,6 +126,7 @@ pub use pem::{
     insecure_connector_tls12, public_trust_connector, server_credentials_from_pem, SharedTlsAcceptor,
     SharedTlsConnector, TlsAcceptor, TlsConnector,
 };
+pub use server_tls::ServerTlsBuilder;
 pub use record::{NopTlsRecordSink, TlsRecordEngine, TlsRecordSink};
 pub use sink::{
     AlertDescription, KeyUpdateDirection, NopTlsEventSink, QuicSecrets, RecordSizeLimits, TlsEventSink, TlsProtocolError, TlsTimerKind,

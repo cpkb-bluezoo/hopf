@@ -225,6 +225,12 @@ pub struct Config {
     /// [`ClientAuthPolicy::None`]. `None` gates on
     /// [`Tls12EventSink::verification_requested`] instead.
     pub client_trust_store: Option<TrustStore>,
+    /// Client trust store fetched for each handshake (server role), taking
+    /// the place of [`Self::client_trust_store`].
+    pub client_trust_source: Option<crate::tls::engine::ClientTrustSource>,
+    /// Decides whether a client's chain is trusted (server role), instead of
+    /// any trust store.
+    pub client_verify_override: Option<crate::tls::engine::ClientVerifyOverride>,
     /// Certificate + key to present when the server sends
     /// `CertificateRequest` (client role). `None` responds with an empty
     /// certificate list (RFC 5246 §7.4.6 permits this) — the handshake
@@ -326,6 +332,8 @@ impl Default for Config {
             client_ticket_store: None,
             client_auth: ClientAuthPolicy::None,
             client_trust_store: None,
+            client_trust_source: None,
+            client_verify_override: None,
             client_credentials: None,
             dtls: false,
             cookie: Bytes::new(),
@@ -1504,8 +1512,12 @@ impl Tls12Engine {
             peer_chain: self.peer_certs.clone(),
             server_name: None,
         });
-        if let Some(store) = &self.config.client_trust_store {
-            let ok = store.verify_server_chain(&self.peer_certs, None).is_ok();
+        if let Some(ok) = crate::tls::engine::check_client_chain(
+            self.config.client_verify_override.as_ref(),
+            self.config.client_trust_source.as_ref(),
+            self.config.client_trust_store.as_ref(),
+            &self.peer_certs,
+        ) {
             self.verify_pending = false;
             if !ok {
                 self.fail(sink, AlertDescription::BadCertificate, "client certificate verification failed");
@@ -3343,6 +3355,8 @@ mod tests {
             client_ticket_store: None,
             client_auth: policy,
             client_trust_store: Some(trust),
+            client_trust_source: None,
+            client_verify_override: None,
             client_credentials: None,
             dtls: false,
             cookie: Bytes::new(),

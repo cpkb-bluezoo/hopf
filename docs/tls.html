@@ -200,6 +200,27 @@ let acceptor = acceptor_from_pem_with_sni(
 )?;
 // A hostname with no matching entry (or no SNI at all) falls back to the
 // default credentials rather than failing the handshake.</code></pre>
+<h3 id="server-tls-builder">ServerTlsBuilder: rotation and your own client trust</h3>
+<p>The helpers above each fix one combination: a fixed client trust store, or a fixed hostname map, never both. <code>ServerTlsBuilder</code> combines them and keeps the parts that change while the server runs out of the build:</p>
+<pre class="rust,ignore"><code>use hopf_core::{ClientAuthPolicy, ClientVerifyOverride, ServerCredentialsResolver, ServerTlsBuilder};
+
+let acceptor = ServerTlsBuilder::new()
+    // Called for every handshake with the client's SNI: rotated certificates,
+    // one per hostname. None falls back to .credentials(..) if set.
+    .server_resolver(ServerCredentialsResolver(resolver))
+    .alpn(&[b"h2", b"http/1.1"])
+    .client_auth(ClientAuthPolicy::Require)
+    // Trust anchors fetched afresh for every handshake, so swapping what this
+    // returns takes effect on the next connection with no restart ...
+    .client_trust(move || current_client_roots())
+    // ... or decide from the chain yourself (allow-list, revocation, directory);
+    // the verdict replaces any trust store:
+    // .client_verify(ClientVerifyOverride::new(|chain| allowed(chain)))
+    .build()?;                                 // SharedTlsAcceptor, for TCP
+
+// QUIC (DoQ, HTTP/3, MASQUE): the same builder, the same behaviour.
+let server_config = hopf_quic::server_config_from_tls_builder(&builder)?;</code></pre>
+<p>It checks for contradictions when it builds: no credentials and no resolver, a client certificate asked for with nothing to trust it, or trust configured with <code>ClientAuthPolicy::None</code> are <code>InvalidInput</code> errors instead of a server that silently skips the check. A handshake already under way when trust is swapped is judged by the store it fetched. <code>builder.apply_to(&amp;mut HandshakeConfig)</code> sets the same configuration on a <code>HandshakeConfig</code> directly, for a DTLS or other custom engine. Like the other TLS 1.3 settings, <code>tcp_version_policy</code> applies to TCP only; QUIC is always TLS 1.3. <code>ClientVerifyOverride</code> is the server-side counterpart of the client's <code>VerifyOverride</code>.</p>
 <table>
 <colgroup>
 <col style="width: 38%" />
@@ -233,6 +254,11 @@ let acceptor = acceptor_from_pem_with_sni(
 <td><code>acceptor_from_pem_with_sni</code></td>
 <td><code>SharedTlsAcceptor</code></td>
 <td>Default + hostname-keyed credential map; virtual hosting</td>
+</tr>
+<tr>
+<td><code>ServerTlsBuilder::build</code></td>
+<td><code>SharedTlsAcceptor</code></td>
+<td>Everything above combined, with per-handshake credentials and client trust (see below)</td>
 </tr>
 <tr>
 <td><code>acceptor_from_pem_with_client_auth</code></td>

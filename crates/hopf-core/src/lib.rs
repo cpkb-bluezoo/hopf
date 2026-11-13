@@ -103,7 +103,7 @@ pub use tls::{
     connector_from_pem_with_client_cert, connector_with_alpn, connector_with_record_size_limit, connector_with_verify_override, insecure_connector, insecure_connector_tls12,
     public_trust_connector, server_credentials_from_pem, server_credentials_from_pem_bytes, ClientAuthPolicy, HandshakeConfig,
     HandshakeEngine, HandshakeMode, HandshakeRole, NopTlsEventSink, QuicSecrets, RecordSizeLimits,
-    ServerCredentials, ServerCredentialsResolver, SharedTlsAcceptor, SharedTlsConnector, StoredTls12Ticket, TicketKeys,
+    ClientTrustSource, ClientVerifyOverride, ServerCredentials, ServerCredentialsResolver, ServerTlsBuilder, SharedTlsAcceptor, SharedTlsConnector, StoredTls12Ticket, TicketKeys,
     Tls12ClientTicketStore, Tls12Config, Tls12Role,
     TlsAcceptor, TlsConnector, TlsEventSink, TcpTlsVersionPolicy, TlsProtocolError, TlsTimerKind, TlsVariant,
     VerifyOverride, VerifyRequest, VerifyResult, TLS12_SUPPORTED_CIPHER_SUITES,

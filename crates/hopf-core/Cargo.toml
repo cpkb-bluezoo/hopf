@@ -50,3 +50,8 @@ fips = ["aws-lc-rs/fips"]
 [target.'cfg(unix)'.dependencies]
 # UNIX domain socket peer credentials (SO_PEERCRED / getpeereid).
 libc = "0.2"
+
+[[test]]
+name = "server_tls_builder"
+path = "tests/server_tls_builder.rs"
+required-features = ["integration"]

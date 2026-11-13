@@ -83,6 +83,17 @@ impl HopfTlsBuildParams {
 
     /// Server parameters with credentials.
     pub fn server(creds: ServerCredentials, alpn: Vec<Bytes>) -> Self {
+        Self::server_with(Some(creds), alpn)
+    }
+
+    /// Server parameters whose credentials come from elsewhere (a
+    /// [`ServerTlsBuilder`](hopf_core::ServerTlsBuilder)'s fixed credentials
+    /// or resolver).
+    pub fn server_without_credentials(alpn: Vec<Bytes>) -> Self {
+        Self::server_with(None, alpn)
+    }
+
+    fn server_with(creds: Option<ServerCredentials>, alpn: Vec<Bytes>) -> Self {
         let mut ticket_key = [0u8; 32];
         let _ = SystemRandom::new().fill(&mut ticket_key);
         Self {
@@ -90,7 +101,7 @@ impl HopfTlsBuildParams {
             kx_policy: KxPolicy::classical_only(),
             server_name: None,
             trust_store: None,
-            server: Some(creds),
+            server: creds,
             local_transport_parameters: None,
             tls: QuicTlsOptions::default(),
             ticket_store: None,
@@ -185,6 +196,19 @@ pub fn hopf_client_config(params: HopfTlsBuildParams) -> Arc<QuicClientConfig> {
 pub fn try_hopf_client_config(params: HopfTlsBuildParams) -> Result<Arc<QuicClientConfig>, FipsProfileError> {
     let hs = params.into_handshake(HandshakeRole::Client)?;
     Ok(Arc::new(QuicClientConfig::from_handshake(hs)))
+}
+
+/// Build a QUIC server config from `params` with the credentials, ALPN and
+/// client-certificate policy of `tls` (a
+/// [`ServerTlsBuilder`](hopf_core::ServerTlsBuilder)), so a QUIC listener
+/// behaves like a TCP one built from the same builder.
+pub fn try_hopf_server_config_from_builder(
+    params: HopfTlsBuildParams,
+    tls: &hopf_core::ServerTlsBuilder,
+) -> std::io::Result<Arc<QuicServerConfig>> {
+    let mut handshake = params.into_handshake(HandshakeRole::Server)?;
+    tls.apply_to(&mut handshake)?;
+    Ok(Arc::new(QuicServerConfig::from_handshake(handshake)))
 }
 
 /// Build a QUIC server config using the in-tree handshake engine.

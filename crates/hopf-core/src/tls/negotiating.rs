@@ -24,6 +24,8 @@ pub(crate) struct ServerTlsMaterial {
     pub alpn: Vec<Bytes>,
     pub client_auth: ClientAuthPolicy,
     pub client_trust_store: Option<crate::crypto::trust::TrustStore>,
+    pub client_trust_source: Option<super::engine::ClientTrustSource>,
+    pub client_verify_override: Option<super::engine::ClientVerifyOverride>,
     pub server_resolver: Option<ServerCredentialsResolver>,
     pub version_policy: TcpTlsVersionPolicy,
 }
@@ -63,6 +65,8 @@ impl ServerTlsMaterial {
                 config.server_resolver = self.server_resolver.clone();
                 config.client_auth = self.client_auth;
                 config.client_trust_store = self.client_trust_store.clone();
+                config.client_trust_source = self.client_trust_source.clone();
+                config.client_verify_override = self.client_verify_override.clone();
                 config.record_size_limit = extras.record_size_limit;
                 config.ech_server = extras.ech_server.clone();
                 if extras.fips {
@@ -77,6 +81,8 @@ impl ServerTlsMaterial {
                     alpn,
                     client_auth: self.client_auth,
                     client_trust_store: self.client_trust_store.clone(),
+                    client_trust_source: self.client_trust_source.clone(),
+                    client_verify_override: self.client_verify_override.clone(),
                     require_supported_versions: extras.require_supported_versions,
                     ..Default::default()
                 };

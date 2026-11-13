@@ -199,6 +199,74 @@ impl std::fmt::Debug for VerifyOverride {
     }
 }
 
+/// Signature of a [`ClientVerifyOverride`] callback.
+pub type ClientVerifyFn = Arc<dyn Fn(&[Bytes]) -> bool + Send + Sync>;
+
+/// Custom client-chain verification callback (server role): the client's
+/// certificate chain (DER, leaf first) in, trusted-or-not out. The server
+/// counterpart of [`VerifyOverride`], for a caller with its own trust model
+/// (an allow-list of subjects, a revocation check, a directory lookup).
+/// Consulted on every handshake that presents a client certificate; when set
+/// it decides instead of any trust store.
+#[derive(Clone)]
+pub struct ClientVerifyOverride(pub ClientVerifyFn);
+
+impl ClientVerifyOverride {
+    /// Wrap `f`.
+    pub fn new(f: impl Fn(&[Bytes]) -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for ClientVerifyOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClientVerifyOverride(..)")
+    }
+}
+
+/// Signature of a [`ClientTrustSource`] callback.
+pub type ClientTrustFn = Arc<dyn Fn() -> crate::crypto::trust::TrustStore + Send + Sync>;
+
+/// A client trust store fetched anew for every handshake (server role), so
+/// the trust anchors can be swapped while the server runs: the callback
+/// returns whatever is current, for example the contents of a
+/// reloadable directory. A handshake that began before a swap is verified
+/// against the store it fetched.
+#[derive(Clone)]
+pub struct ClientTrustSource(pub ClientTrustFn);
+
+impl ClientTrustSource {
+    /// Wrap `f`.
+    pub fn new(f: impl Fn() -> crate::crypto::trust::TrustStore + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for ClientTrustSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClientTrustSource(..)")
+    }
+}
+
+/// Decide whether a client's chain is trusted, from the configured
+/// verifier: the override first, then the per-handshake source, then the
+/// fixed store. `None` means none is configured and the caller gates the
+/// handshake on [`super::sink::TlsEventSink::verification_requested`].
+pub(crate) fn check_client_chain(
+    verify_override: Option<&ClientVerifyOverride>,
+    source: Option<&ClientTrustSource>,
+    store: Option<&crate::crypto::trust::TrustStore>,
+    chain: &[Bytes],
+) -> Option<bool> {
+    if let Some(o) = verify_override {
+        return Some((o.0)(chain));
+    }
+    if let Some(src) = source {
+        return Some((src.0)().verify_server_chain(chain, None).is_ok());
+    }
+    store.map(|s| s.verify_server_chain(chain, None).is_ok())
+}
+
 /// Signature of a [`ServerCredentialsResolver`] callback.
 pub type ServerCredentialsFn = Arc<dyn Fn(Option<&str>) -> Option<ServerCredentials> + Send + Sync>;
 
@@ -305,6 +373,13 @@ pub struct HandshakeConfig {
     /// [`super::sink::TlsEventSink::verification_requested`] instead,
     /// exactly like [`Self::trust_store`] does for the client role.
     pub client_trust_store: Option<TrustStore>,
+    /// Client trust store fetched for each handshake (server role), taking
+    /// the place of [`Self::client_trust_store`] so trust anchors can be
+    /// swapped without a restart.
+    pub client_trust_source: Option<ClientTrustSource>,
+    /// Decides whether a client's chain is trusted (server role), instead of
+    /// any trust store.
+    pub client_verify_override: Option<ClientVerifyOverride>,
     /// Certificate + key to present when the server sends
     /// `CertificateRequest` (client role). `None` responds with an empty
     /// certificate list (RFC 8446 §4.4.2 permits this) — the handshake
@@ -431,6 +506,8 @@ impl Default for HandshakeConfig {
             anti_replay: None,
             client_auth: ClientAuthPolicy::None,
             client_trust_store: None,
+            client_trust_source: None,
+            client_verify_override: None,
             client_credentials: None,
             record_size_limit: None,
             ech_client: None,
@@ -1882,8 +1959,12 @@ impl HandshakeEngine {
             peer_chain: self.peer_certs.clone(),
             server_name: None,
         });
-        if let Some(store) = &self.config.client_trust_store {
-            let ok = store.verify_server_chain(&self.peer_certs, None).is_ok();
+        if let Some(ok) = check_client_chain(
+            self.config.client_verify_override.as_ref(),
+            self.config.client_trust_source.as_ref(),
+            self.config.client_trust_store.as_ref(),
+            &self.peer_certs,
+        ) {
             self.verify_pending = false;
             if !ok {
                 self.fail(sink, AlertDescription::BadCertificate, "client certificate verification failed");
