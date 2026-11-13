@@ -97,6 +97,29 @@ impl ReactorHandle {
         self.send(ReactorCmd::Task(task));
     }
 
+    /// Dial `config.addr` and register the connection on **this** reactor,
+    /// so its handler's callbacks and timers all run on the reactor that
+    /// scheduled them. [`Runtime::connect`](crate::Runtime::connect) is the
+    /// same dial on a worker of its choosing; use this when the caller owns a
+    /// reactor (a client bound to it) and wants its connections to live there.
+    ///
+    /// An error is the immediate failure to start the connect (a bad address
+    /// family, no socket); a refused or timed-out connection is reported to the
+    /// handler, as for [`Runtime::connect`](crate::Runtime::connect).
+    pub fn connect(&self, config: crate::connector::TcpConnectorConfig) -> std::io::Result<()> {
+        let stream = mio::net::TcpStream::connect(config.addr)?;
+        let handler = config.create_handler();
+        let params = config.conn_params();
+        self.send(ReactorCmd::Register {
+            stream: stream.into(),
+            handler,
+            params,
+            connecting: true,
+            telemetry: None,
+        });
+        Ok(())
+    }
+
     /// Schedule a timer; returns a cancel flag (`true` = cancelled).
     pub fn schedule_timer(
         &self,

@@ -88,3 +88,10 @@ required-features = ["integration", "server"]
 name = "multi_qtype_server"
 path = "tests/multi_qtype_server.rs"
 required-features = ["integration", "server"]
+
+[[test]]
+name = "upstream_client"
+path = "tests/upstream_client.rs"
+required-features = ["integration", "server", "dot"]
+
+

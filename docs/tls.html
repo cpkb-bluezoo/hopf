@@ -200,6 +200,8 @@ let acceptor = acceptor_from_pem_with_sni(
 )?;
 // A hostname with no matching entry (or no SNI at all) falls back to the
 // default credentials rather than failing the handshake.</code></pre>
+<h3 id="client-tls-builder">ClientTlsBuilder: trust, a client certificate and your own verifier</h3>
+<p>The connector helpers likewise each fix one combination. <code>ClientTlsBuilder</code> combines them: public WebPKI trust (the default), your own anchors (<code>trust_store</code>, <code>trust_anchors</code>), a client certificate for mutual TLS (<code>client_credentials</code>), a verifier of your own (<code>verify</code>, which replaces the trust check: use it for a pinned public key or DANE, and call <code>TrustStore::verify_server_chain</code> in it if you want the chain check as well), ALPN and the TCP version policy. <code>build()</code> returns a <code>SharedTlsConnector</code>. <code>hopf-dns</code>'s <code>UpstreamTls</code> is built on it.</p>
 <h3 id="server-tls-builder">ServerTlsBuilder: rotation and your own client trust</h3>
 <p>The helpers above each fix one combination: a fixed client trust store, or a fixed hostname map, never both. <code>ServerTlsBuilder</code> combines them and keeps the parts that change while the server runs out of the build:</p>
 <pre class="rust,ignore"><code>use hopf_core::{ClientAuthPolicy, ClientVerifyOverride, ServerCredentialsResolver, ServerTlsBuilder};

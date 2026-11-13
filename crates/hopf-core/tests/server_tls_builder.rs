@@ -319,3 +319,54 @@ fn a_credentials_resolver_and_client_auth_work_together_and_rotate() {
     assert!(s.dial(&connector, "two.test").echoed, "and two.test's new, trusted one");
     s.stop();
 }
+
+/// `ClientTlsBuilder`: trust anchors and a client certificate together, and a
+/// verifier of the caller's own that sees the name being verified.
+#[test]
+fn client_tls_builder_combines_anchors_a_client_certificate_and_a_verifier() {
+    use hopf_core::ClientTlsBuilder;
+
+    let server_ca = ca();
+    let server = issue(&server_ca, &["localhost"]);
+    let client_ca = ca();
+    let client = issue(&client_ca, &[]);
+    let s = Server::start(
+        ServerTlsBuilder::new()
+            .credentials(server.credentials())
+            .client_auth(ClientAuthPolicy::Require)
+            .client_trust_store(trust_of(&[&client_ca])),
+    );
+
+    // Anchors and a certificate: admitted.
+    let good = ClientTlsBuilder::new()
+        .trust_anchors([server_ca.der()])
+        .client_credentials(client.credentials())
+        .build();
+    assert!(s.dial(&good, "localhost").echoed);
+
+    // The same anchors with no certificate: the server refuses.
+    let anonymous = ClientTlsBuilder::new().trust_anchors([server_ca.der()]).build();
+    assert!(!s.dial(&anonymous, "localhost").echoed);
+
+    // Anchors that do not include the server's CA: the client refuses.
+    let wrong = ClientTlsBuilder::new()
+        .trust_anchors([client_ca.der()])
+        .client_credentials(client.credentials())
+        .build();
+    assert!(!s.dial(&wrong, "localhost").echoed);
+
+    // A verifier replaces the trust check, and is told the name.
+    let names = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&names);
+    let leaf = server.der();
+    let by_leaf = ClientTlsBuilder::new()
+        .verify(Arc::new(move |chain: &[Bytes], name: Option<&str>| {
+            seen.lock().unwrap().push(name.map(str::to_owned));
+            chain.first() == Some(&leaf)
+        }))
+        .client_credentials(client.credentials())
+        .build();
+    assert!(s.dial(&by_leaf, "localhost").echoed, "no anchors needed when the verifier accepts the leaf");
+    assert_eq!(names.lock().unwrap().as_slice(), [Some("localhost".to_string())]);
+    s.stop();
+}

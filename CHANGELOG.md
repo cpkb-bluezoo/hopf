@@ -23,6 +23,25 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
   `QuicServerConfig` from a `ServerTlsBuilder`, so a QUIC listener (DoQ,
   HTTP/3) has the same credentials, resolver and client-trust behaviour as a
   TCP one.
+- **hopf-dns:** `UpstreamClient` (#526), a callback-shaped client for one
+  encrypted upstream resolver, over DoT (feature `dot`) or DoQ (feature
+  `doq`). `query(message, callback)` returns at once and the callback runs
+  once on the client's reactor, never inline, with the answer or an
+  `UpstreamError`. DoT queries are pipelined on a pooled connection and
+  matched by message ID, so answers may arrive out of order; the connection
+  is opened by the first query, closed after `idle_timeout`, and reopened by
+  the next. A query waiting on a lost connection is sent again on a fresh one
+  (`retries`), a per-query timeout fails it once, and a late answer is
+  discarded. `UpstreamTls::builder` sets the trust anchors, a client
+  certificate for mutual TLS and SPKI pins. `UpstreamClient::metrics()` gives
+  queries, answers, timeouts, retries, reconnects, pool size, in flight and
+  latency. `DnsResolver::add_server_upstream` takes a client you built, and
+  `dot_upstream_metrics` reports the ones the resolver opened.
+- **hopf-core:** `ClientTlsBuilder`, the client counterpart of
+  `ServerTlsBuilder`: trust anchors or the public WebPKI, a client
+  certificate, a verifier of your own, ALPN and the TCP version policy, in one
+  builder. `ReactorHandle::connect` dials on a given reactor, so a client's
+  connections live on the reactor that owns it.
 - **hopf-dns:** `DnsService` answers RFC 10029 multiple-QTYPE queries
   (#531). `DnsService::set_max_multi_qtypes(n)` allows up to `n` extra types
   per query; the default, `0`, leaves the mechanism off. A query that names
@@ -51,6 +70,12 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
 
 ### Fixed
 
+- **hopf-dns:** `DnsResolver::add_server_dot` (and an auto-selected DoT
+  upstream) no longer runs each query on its own thread against a blocking
+  connection that serves one query at a time. DoT queries now go through
+  `UpstreamClient`: pipelined, non-blocking, and with the `MQTYPE-Query`
+  option and the EDNS OPT record attached like the other transports. A
+  forwarder over DoT is no longer held up by one slow upstream answer.
 - **hopf-dns:** a response that carries both a DNS Cookie and another EDNS
   option now has one OPT record, not two (RFC 6891 section 6.1.1).
 - **hopf-amqp:** a client connection with heartbeats enabled no longer closes

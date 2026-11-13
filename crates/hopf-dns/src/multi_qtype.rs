@@ -14,7 +14,9 @@
 //! opportunistic-attach / per-server-capability-cache / standalone-fallback
 //! behavior on top of it.
 
-use crate::wire::{DnsMessage, DnsResourceRecord, DnsType, OPT_UDP_PAYLOAD};
+#[cfg(feature = "server")]
+use crate::wire::{DnsMessage, DnsResourceRecord, OPT_UDP_PAYLOAD};
+use crate::wire::DnsType;
 
 /// EDNS option code for MQTYPE-Query: additional RRTYPEs a client wants
 /// alongside the primary question.
@@ -90,6 +92,7 @@ pub fn find_mqtype_option(opt_rdata: &[u8], code: u16) -> Option<Vec<DnsType>> {
 /// `opt_rdata` with every option coded `code` removed. An option that is
 /// cut short ends the walk: what follows it cannot be told apart from its
 /// payload, so it is kept as it came.
+#[cfg(feature = "server")]
 pub(crate) fn without_option(opt_rdata: &[u8], code: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(opt_rdata.len());
     let mut i = 0;
@@ -112,6 +115,7 @@ pub(crate) fn without_option(opt_rdata: &[u8], code: u16) -> Vec<u8> {
 /// record, creating the record if the message has none. A message carries at
 /// most one OPT record (RFC 6891 section 6.1.1), so every server-added option
 /// (a cookie, an MQTYPE-Response) goes through here.
+#[cfg(feature = "server")]
 pub(crate) fn add_edns_option(message: &mut DnsMessage, option: &[u8]) {
     match message
         .additionals
@@ -165,6 +169,7 @@ mod tests {
         assert_eq!(types, vec![DnsType::Aaaa]);
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn without_option_drops_only_the_named_option() {
         let mut blob = vec![0u8, 10, 0, 2, 9, 9]; // cookie-ish option
@@ -175,6 +180,7 @@ mod tests {
         assert_eq!(find_mqtype_option(&kept, EDNS_OPTION_MQTYPE_QUERY), None);
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn add_edns_option_extends_the_one_opt_record() {
         let mut m = DnsMessage::query(1, crate::wire::DnsQuestion::in_class("a.test", DnsType::A), false);

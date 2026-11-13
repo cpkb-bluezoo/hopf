@@ -11,6 +11,8 @@ mod udp;
 
 #[cfg(feature = "doq")]
 pub mod doq;
+#[cfg(any(feature = "dot", feature = "doq"))]
+pub mod upstream;
 #[cfg(feature = "doh")]
 mod doh;
 
@@ -20,6 +22,10 @@ pub use udp::UdpDnsClientTransport;
 
 #[cfg(feature = "doq")]
 pub use doq::{DoqClientTransport, DoqConnectionPool};
+#[cfg(any(feature = "dot", feature = "doq"))]
+pub use upstream::{UpstreamClient, UpstreamConfig, UpstreamError, UpstreamMetrics, UpstreamResult};
+#[cfg(feature = "dot")]
+pub use upstream::{UpstreamTls, UpstreamTlsBuilder};
 #[cfg(feature = "doh")]
 pub use doh::DohClientTransport;
 
@@ -95,14 +101,21 @@ enum ServerTransport {
     /// and the only transport available without the `dot`/`doq`/`doh`
     /// features).
     UdpTcp,
-    /// DNS-over-TLS (RFC 7858). `query_dot` is synchronous, so each query
-    /// runs on a dedicated spawned thread (mirroring the existing
-    /// UDP-truncation TCP-fallback pattern) rather than blocking the
-    /// caller.
+    /// DNS-over-TLS (RFC 7858), through an [`upstream::UpstreamClient`] the
+    /// resolver builds for the address on first use: queries are pipelined
+    /// on a pooled connection and answered by callback, never blocking a
+    /// thread.
     #[cfg(feature = "dot")]
     Dot {
         server_name: String,
         connector: hopf_core::SharedTlsConnector,
+    },
+    /// A caller-built [`upstream::UpstreamClient`] (DoT or DoQ), with its own
+    /// TLS settings, pins and tuning ([`DnsResolver::add_server_upstream`]).
+    #[cfg(any(feature = "dot", feature = "doq"))]
+    Upstream {
+        client: upstream::UpstreamClient,
+        transport: EncryptedTransport,
     },
     /// DNS-over-QUIC (RFC 9250), via [`DoqClientTransport`].
     #[cfg(feature = "doq")]
@@ -133,6 +146,8 @@ impl ServerTransport {
             ServerTransport::UdpTcp => None,
             #[cfg(feature = "dot")]
             ServerTransport::Dot { .. } => Some(EncryptedTransport::Dot),
+            #[cfg(any(feature = "dot", feature = "doq"))]
+            ServerTransport::Upstream { transport, .. } => Some(*transport),
             #[cfg(feature = "doq")]
             ServerTransport::Doq { .. } => Some(EncryptedTransport::Doq),
             #[cfg(feature = "doh")]
@@ -335,7 +350,7 @@ fn retry_or_fail(inner: &Arc<Mutex<ResolverInner>>, id: u16) {
 /// different configured server — a dead/unreachable *server* (plain UDP
 /// already failed, or a pinned server's only transport failed) is the
 /// only case that still falls through to [`retry_or_fail_impl`].
-#[cfg(all(test, any(feature = "dot", feature = "doq", feature = "doh")))]
+#[cfg(all(test, feature = "dot"))]
 fn retry_after_transport_error(inner: &Arc<Mutex<ResolverInner>>, id: u16, err: io::Error) {
     retry_after_transport_error_from(inner, id, None, err);
 }
@@ -724,6 +739,11 @@ struct ResolverInner {
     /// [`public_trust_dot_connector`].
     #[cfg(feature = "dot")]
     public_trust_dot_connector: Option<hopf_core::SharedTlsConnector>,
+    /// The DoT upstream client for each address dialled over DoT (pinned or
+    /// auto-selected), with the name and connector it was built for, so a
+    /// reconfigured server gets a new one.
+    #[cfg(feature = "dot")]
+    dot_upstreams: HashMap<SocketAddr, (String, hopf_core::SharedTlsConnector, upstream::UpstreamClient)>,
     /// As `public_trust_dot_connector`, for DoQ — see
     /// [`public_trust_doq_config`].
     #[cfg(feature = "doq")]
@@ -859,6 +879,8 @@ impl DnsResolver {
                 doq_pool: doq::DoqConnectionPool::new(),
                 #[cfg(feature = "dot")]
                 public_trust_dot_connector: None,
+            #[cfg(feature = "dot")]
+            dot_upstreams: HashMap::new(),
                 #[cfg(feature = "doq")]
                 public_trust_doq_config: None,
                 #[cfg(feature = "dnssec")]
@@ -945,6 +967,34 @@ impl DnsResolver {
             auto: false,
             well_known: None,
         });
+    }
+
+    /// Add an upstream reached through a client you built, with its own TLS
+    /// settings (a client certificate, a pinned key), connection pool and
+    /// timeouts: [`upstream::UpstreamClient::dot`] or
+    /// [`upstream::UpstreamClient::doq`]. Like the other `add_server_*`
+    /// methods this pins the server to that transport; the resolver's caching,
+    /// DNSSEC validation, failover to the next server and CNAME chasing all
+    /// work unchanged on top of it. Build the client on this resolver's own
+    /// reactor if you want its connections and callbacks there.
+    #[cfg(any(feature = "dot", feature = "doq"))]
+    pub fn add_server_upstream(&self, client: upstream::UpstreamClient) {
+        let transport = client.encrypted_transport();
+        self.inner.lock().unwrap().servers.push(ConfiguredServer {
+            addr: client.addr(),
+            transport: ServerTransport::Upstream { client, transport },
+            auto: false,
+            well_known: None,
+        });
+    }
+
+    /// Counters of the DoT upstream clients this resolver has opened, by
+    /// address: queries, answers, timeouts, reconnects, in-flight and
+    /// latency. Empty until a query has gone out over DoT.
+    #[cfg(feature = "dot")]
+    pub fn dot_upstream_metrics(&self) -> Vec<(SocketAddr, upstream::UpstreamMetrics)> {
+        let g = self.inner.lock().unwrap();
+        g.dot_upstreams.iter().map(|(a, (_, _, c))| (*a, c.metrics())).collect()
     }
 
     /// Add a DNS-over-QUIC (RFC 9250) upstream: every query/retry/CNAME
@@ -1211,6 +1261,7 @@ impl DnsResolver {
     /// Run `task` on this resolver's reactor after `delay`. Returns the flag
     /// that cancels it. For callers (the forwarder) that must bound how long
     /// they wait on a query without blocking a thread.
+    #[cfg(feature = "server")]
     pub(crate) fn schedule_timer(
         &self,
         delay: Duration,
@@ -1647,16 +1698,14 @@ fn send_query_to_server(
         }
         #[cfg(feature = "dot")]
         ServerTransport::Dot { server_name, connector } => {
-            // DoT dispatches through `TcpDnsConnectionPool::query_dot`
-            // rather than `build_query_message`, so a batched query's
-            // `MQTYPE-Query` option isn't attached here — the server simply
-            // never sees it, answers normally, and `query_batch`'s
-            // coverage-check falls back to standalone per-type queries
-            // exactly as it would for any other RFC-10029-unsupporting
-            // server. No correctness impact, just no optimization on DoT
-            // upstreams yet.
-            spawn_dot_query(inner, id, question.clone(), server.addr, server_name, connector);
+            let client = dot_upstream(g, server.addr, &server_name, &connector);
+            send_via_upstream(inner, g, id, question, server.addr, &client, extra_edns_options)?;
             Ok((None, Some(EncryptedTransport::Dot)))
+        }
+        #[cfg(any(feature = "dot", feature = "doq"))]
+        ServerTransport::Upstream { client, transport } => {
+            send_via_upstream(inner, g, id, question, server.addr, &client, extra_edns_options)?;
+            Ok((None, Some(transport)))
         }
         #[cfg(feature = "doq")]
         ServerTransport::Doq { server_name, client_config } => {
@@ -1742,8 +1791,8 @@ fn dispatch_auto_transport(
         #[cfg(feature = "dot")]
         EncryptedTransport::Dot => {
             let connector = public_trust_dot_connector(g)?;
-            spawn_dot_query(inner, id, question.clone(), details.target, details.sni.clone(), connector);
-            Some(Ok(None))
+            let client = dot_upstream(g, details.target, &details.sni, &connector);
+            Some(send_via_upstream(inner, g, id, question, details.target, &client, extra_edns_options).map(|()| None))
         }
         #[cfg(feature = "doq")]
         EncryptedTransport::Doq => {
@@ -1795,54 +1844,95 @@ fn public_trust_doq_config(g: &mut ResolverInner) -> Option<Arc<hopf_quic::QuicC
     g.public_trust_doq_config.clone()
 }
 
-/// Drive one DoT query on a dedicated thread ([`TcpDnsConnectionPool::query_dot`]
-/// is synchronous) — mirrors the existing UDP-truncation TCP-fallback
-/// thread exactly, down to reusing [`complete_response`]/[`questions_match`]
-/// for the success path and [`retry_or_fail`]'s next-server failover for
-/// the error path (a dead/unreachable DoT server should fail over just
-/// like a dead UDP one, not just time out silently).
+/// The [`upstream::UpstreamClient`] for `addr` over DoT, built on first use
+/// (it dials nothing until a query is sent) and kept: its connection is what
+/// the next query to `addr` pipelines onto. A different name or connector for
+/// the same address replaces it.
 #[cfg(feature = "dot")]
-fn spawn_dot_query(
-    inner: &Arc<Mutex<ResolverInner>>,
-    id: u16,
-    question: DnsQuestion,
+fn dot_upstream(
+    g: &mut ResolverInner,
     addr: SocketAddr,
-    server_name: String,
-    connector: hopf_core::SharedTlsConnector,
-) {
+    server_name: &str,
+    connector: &hopf_core::SharedTlsConnector,
+) -> upstream::UpstreamClient {
+    if let Some((name, existing, client)) = g.dot_upstreams.get(&addr) {
+        if name == server_name && Arc::ptr_eq(existing, connector) {
+            return client.clone();
+        }
+    }
+    let client = upstream::UpstreamClient::dot(
+        g.reactor.clone(),
+        addr,
+        upstream::UpstreamTls::new(server_name, Arc::clone(connector)),
+        upstream::UpstreamConfig::default(),
+    );
+    g.dot_upstreams
+        .insert(addr, (server_name.to_string(), Arc::clone(connector), client.clone()));
+    client
+}
+
+/// Send one attempt of query `id` through `client`; its answer or failure
+/// comes back to [`upstream_result`] on the reactor.
+///
+/// The client's own timeout is set a little past the resolver's, so the
+/// resolver's timer is the one that fails over to the next server, and the
+/// client only tidies up behind it.
+#[cfg(any(feature = "dot", feature = "doq"))]
+fn send_via_upstream(
+    inner: &Arc<Mutex<ResolverInner>>,
+    g: &mut ResolverInner,
+    id: u16,
+    question: &DnsQuestion,
+    addr: SocketAddr,
+    client: &upstream::UpstreamClient,
+    extra_edns_options: &[u8],
+) -> io::Result<()> {
+    let msg = build_query_message(g, id, question, None, extra_edns_options);
+    let within = g.timeout + Duration::from_millis(500);
     let inner = Arc::clone(inner);
-    std::thread::Builder::new()
-        .name("hopf-dns-dot".into())
-        .spawn(move || {
-            let result = {
+    client.query_within(msg, within, move |result| upstream_result(&inner, id, addr, result));
+    Ok(())
+}
+
+/// An [`upstream::UpstreamClient`] finished one attempt of query `id` against
+/// `addr`.
+///
+/// An answer, or a failure that is not a timeout, counts only if `addr` is
+/// still the server the query is waiting on: a late result for an attempt the
+/// resolver has already moved past must not disturb the attempt that replaced
+/// it. A timeout is the resolver's to declare, from its own timer.
+#[cfg(any(feature = "dot", feature = "doq"))]
+fn upstream_result(inner: &Arc<Mutex<ResolverInner>>, id: u16, addr: SocketAddr, result: upstream::UpstreamResult) {
+    let current = |g: &ResolverInner| g.pending.get(&id).is_some_and(|p| p.server == addr || p.alt_server == Some(addr));
+    match result {
+        Ok(msg) => {
+            let pending = {
                 let mut g = inner.lock().unwrap();
-                g.tcp_pool.query_dot(addr, &server_name, &connector, &question, id)
-            };
-            match result {
-                Ok(msg) => {
-                    let pending = {
-                        let mut g = inner.lock().unwrap();
-                        let Some(p) = g.pending.remove(&id) else {
-                            return;
-                        };
-                        if let Some(c) = &p.cancel {
-                            c.store(true, std::sync::atomic::Ordering::SeqCst);
-                        }
-                        p
-                    };
-                    if !msg.questions.first().is_some_and(|q| questions_match(q, &pending.question)) {
-                        (pending.callback)(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "DNS response question mismatch",
-                        )));
-                        return;
-                    }
-                    complete_response(&inner, pending, msg, addr);
+                if !current(&g) {
+                    return;
                 }
-                Err(e) => retry_after_transport_error_from(&inner, id, Some(addr), e),
+                let p = g.pending.remove(&id).expect("checked above");
+                if let Some(c) = &p.cancel {
+                    c.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                p
+            };
+            if !msg.questions.first().is_some_and(|q| questions_match(q, &pending.question)) {
+                (pending.callback)(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "DNS response question mismatch",
+                )));
+                return;
             }
-        })
-        .ok();
+            complete_response(inner, pending, msg, addr);
+        }
+        Err(upstream::UpstreamError::Timeout) => {}
+        Err(e) => {
+            if current(&inner.lock().unwrap()) {
+                retry_after_transport_error_from(inner, id, Some(addr), e.into());
+            }
+        }
+    }
 }
 
 /// Adapts a [`DnsClientTransport`] (DoQ/DoH)'s callback shape onto the
@@ -2353,6 +2443,8 @@ mod tests {
             doq_pool: doq::DoqConnectionPool::new(),
             #[cfg(feature = "dot")]
             public_trust_dot_connector: None,
+            #[cfg(feature = "dot")]
+            dot_upstreams: HashMap::new(),
             #[cfg(feature = "doq")]
             public_trust_doq_config: None,
             #[cfg(feature = "dnssec")]
@@ -2446,6 +2538,8 @@ mod tests {
             doq_pool: doq::DoqConnectionPool::new(),
             #[cfg(feature = "dot")]
             public_trust_dot_connector: None,
+            #[cfg(feature = "dot")]
+            dot_upstreams: HashMap::new(),
             #[cfg(feature = "doq")]
             public_trust_doq_config: None,
             #[cfg(feature = "dnssec")]
@@ -2679,6 +2773,8 @@ mod tests {
             doq_pool: doq::DoqConnectionPool::new(),
             #[cfg(feature = "dot")]
             public_trust_dot_connector: None,
+            #[cfg(feature = "dot")]
+            dot_upstreams: HashMap::new(),
             #[cfg(feature = "doq")]
             public_trust_doq_config: None,
             #[cfg(feature = "dnssec")]
@@ -3038,6 +3134,8 @@ mod tests {
             doq_pool: doq::DoqConnectionPool::new(),
             #[cfg(feature = "dot")]
             public_trust_dot_connector: None,
+            #[cfg(feature = "dot")]
+            dot_upstreams: HashMap::new(),
             #[cfg(feature = "doq")]
             public_trust_doq_config: None,
             dnssec_enabled: true,

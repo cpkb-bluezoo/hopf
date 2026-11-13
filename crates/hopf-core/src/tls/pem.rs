@@ -567,7 +567,7 @@ impl TlsConnector for TrustedConnector {
     }
 }
 
-fn trusted_connector(
+pub(super) fn trusted_connector(
     trust_store: Option<TrustStore>,
     verify_override: Option<VerifyOverride>,
     alpn: Vec<Bytes>,

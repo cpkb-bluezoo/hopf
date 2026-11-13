@@ -12,6 +12,7 @@ pub mod fips;
 mod handshake;
 mod key_log;
 mod pem;
+mod client_tls;
 mod record;
 mod server_tls;
 mod sink;
@@ -126,6 +127,7 @@ pub use pem::{
     insecure_connector_tls12, public_trust_connector, server_credentials_from_pem, SharedTlsAcceptor,
     SharedTlsConnector, TlsAcceptor, TlsConnector,
 };
+pub use client_tls::ClientTlsBuilder;
 pub use server_tls::ServerTlsBuilder;
 pub use record::{NopTlsRecordSink, TlsRecordEngine, TlsRecordSink};
 pub use sink::{
