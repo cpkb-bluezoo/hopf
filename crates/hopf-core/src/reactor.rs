@@ -40,12 +40,18 @@ pub(crate) struct Reactor {
     next_token: usize,
     timers: TimerQueue,
     active: Arc<AtomicBool>,
+    /// Connections open on all reactors, kept by each as it registers and
+    /// closes them: what a graceful shutdown waits on.
+    open: Arc<std::sync::atomic::AtomicUsize>,
+    /// A drain has begun: handlers are told as they register.
+    draining: bool,
 }
 
 impl Reactor {
     pub fn spawn(
         id: usize,
         active: Arc<AtomicBool>,
+        open: Arc<std::sync::atomic::AtomicUsize>,
     ) -> io::Result<(ReactorHandle, JoinHandle<()>)> {
         let poll = Poll::new()?;
         let waker = Arc::new(Waker::new(poll.registry(), WAKER_TOKEN)?);
@@ -71,6 +77,8 @@ impl Reactor {
                     next_token: FIRST_CONN_TOKEN,
                     timers: TimerQueue::new(),
                     active,
+                    open,
+                    draining: false,
                 };
                 if let Err(e) = reactor.run() {
                     crate::telemetry::subsystem_log(
@@ -192,6 +200,16 @@ impl Reactor {
                 self.timers
                     .schedule_with_cancel(delay, callback, cancelled);
             }
+            ReactorCmd::Drain => {
+                self.draining = true;
+                let tokens: Vec<Token> = self.conns.keys().copied().collect();
+                for token in tokens {
+                    if let Some(conn) = self.conns.get_mut(&token) {
+                        conn.call_drain();
+                    }
+                    self.sync_or_close(token)?;
+                }
+            }
             ReactorCmd::Shutdown => {
                 self.active.store(false, Ordering::Release);
             }
@@ -312,6 +330,13 @@ impl Reactor {
             sync_interest(&self.poll, &mut conn)?;
         }
         self.conns.insert(token, conn);
+        self.open.fetch_add(1, Ordering::AcqRel);
+        if self.draining {
+            if let Some(conn) = self.conns.get_mut(&token) {
+                conn.call_drain();
+            }
+            self.sync_or_close(token)?;
+        }
         Ok(())
     }
 
@@ -414,6 +439,7 @@ impl Reactor {
         let Some(mut conn) = self.conns.remove(&token) else {
             return;
         };
+        self.open.fetch_sub(1, Ordering::AcqRel);
         if conn.registered {
             let _ = self.poll.registry().deregister(&mut conn.stream);
             conn.registered = false;

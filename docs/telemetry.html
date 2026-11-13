@@ -350,6 +350,8 @@ TelemetryHook enqueue    InstrumentedServerFactory
 <li>Still get Accept/Dial/Close via <code>TelemetryHook</code> when the runtime uses a pipeline.</li>
 </ul>
 <p>See <a href="dns.html#telemetry">DNS: Telemetry</a>.</p>
+<h3 id="runtime-metrics">Runtime state</h3>
+<p>The pipeline hook also reports the runtime's readiness and drain (see <a href="runtime-options.html#readiness-and-draining">Readiness and graceful shutdown</a>): <code>hopf.runtime.ready</code> and <code>hopf.runtime.draining</code> (up-down, 1 or 0), <code>hopf.runtime.bind_failures</code> (counter, with <code>net.address</code>), <code>hopf.runtime.drain.forced_connections</code> (counter, the connections closed by force at the end of a drain) and <code>hopf.runtime.drain.duration</code> (histogram, ms). They need the runtime to be started with <code>Runtime::start_with_telemetry(config, Some(pipeline.hook()))</code>.</p>
 <h3 id="dns-metrics">DNS metrics</h3>
 <p>Attach them with <code>service.set_telemetry(pipeline.dns_metrics())</code> (the server shell) and <code>upstream.set_telemetry(pipeline.dns_upstream_metrics())</code> (an <code>UpstreamClient</code>), or <code>resolver.set_upstream_telemetry(...)</code> for the DoT upstreams a <code>DnsResolver</code> opens. <code>hopf-dns</code> defines the small <code>DnsServerTelemetry</code> and <code>DnsUpstreamTelemetry</code> traits and <code>hopf-otel</code> implements them, so <code>hopf-dns</code> does not depend on an exporter and another sink can implement them too. Every server point carries <code>dns.transport</code> (<code>udp</code>, <code>tcp</code>, <code>dot</code>, <code>doq</code>).</p>
 <table>

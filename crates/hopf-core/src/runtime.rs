@@ -5,9 +5,10 @@
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use crate::accept::{AcceptHandle, AcceptLoop};
 use crate::binding::BindingId;
@@ -21,7 +22,7 @@ use crate::storage::{StorageConfig, StorageExecutor};
 use crate::telemetry::TelemetryHook;
 
 /// Runtime configuration.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     /// Number of worker reactor threads. `0` means `available_parallelism * 2` (min 2).
     pub worker_threads: usize,
@@ -34,8 +35,22 @@ pub struct RuntimeConfig {
     /// backend only: the handshake restrictions are applied separately, per
     /// listener and connector (`acceptor_with_fips`, `connector_with_fips`).
     pub fips: bool,
+    /// How long [`Runtime::shutdown_graceful`] lets open connections finish
+    /// after it stops accepting, before it closes what is left by force.
+    /// Default 30 s.
+    pub drain_timeout: Duration,
 }
 
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            worker_threads: 0,
+            storage: StorageConfig::default(),
+            fips: false,
+            drain_timeout: Duration::from_secs(30),
+        }
+    }
+}
 
 impl RuntimeConfig {
     pub(crate) fn resolved_workers(&self) -> usize {
@@ -59,6 +74,13 @@ pub struct Runtime {
     /// Round-robin index for dial affinity (peer of accept-loop RR).
     dial_rr: AtomicUsize,
     telemetry: Option<Arc<dyn TelemetryHook>>,
+    drain_timeout: Duration,
+    /// A drain has begun ([`Self::start_drain`]).
+    draining: AtomicBool,
+    /// Listeners that could not be bound.
+    bind_failures: AtomicU64,
+    /// Connections open on every worker.
+    open_connections: Arc<AtomicUsize>,
 }
 
 impl Runtime {
@@ -78,16 +100,20 @@ impl Runtime {
         let n = config.resolved_workers();
         let active = Arc::new(AtomicBool::new(true));
         let storage = Arc::new(StorageExecutor::new(config.storage));
+        let open_connections = Arc::new(AtomicUsize::new(0));
         let mut workers = Vec::with_capacity(n);
         let mut joins = Vec::with_capacity(n + 1);
         for id in 0..n {
-            let (handle, join) = Reactor::spawn(id, Arc::clone(&active))?;
+            let (handle, join) = Reactor::spawn(id, Arc::clone(&active), Arc::clone(&open_connections))?;
             workers.push(handle);
             joins.push(join);
         }
         let (accept, accept_join) =
             AcceptLoop::spawn(workers.clone(), Arc::clone(&active), telemetry.clone())?;
         joins.push(accept_join);
+        if let Some(t) = &telemetry {
+            t.on_runtime_state(true, false);
+        }
         Ok(Self {
             workers,
             accept,
@@ -96,6 +122,10 @@ impl Runtime {
             storage,
             dial_rr: AtomicUsize::new(0),
             telemetry,
+            drain_timeout: config.drain_timeout,
+            draining: AtomicBool::new(false),
+            bind_failures: AtomicU64::new(0),
+            open_connections,
         })
     }
 
@@ -104,8 +134,9 @@ impl Runtime {
         &self,
         config: TcpListenerConfig,
     ) -> io::Result<(SocketAddr, BindingId)> {
-        let std_listener = std::net::TcpListener::bind(config.addr)?;
-        std_listener.set_nonblocking(true)?;
+        let bound = std::net::TcpListener::bind(config.addr)
+            .and_then(|l| l.set_nonblocking(true).map(|()| l));
+        let std_listener = bound.map_err(|e| self.bind_failed(&config.addr.to_string(), e))?;
         let addr = std_listener.local_addr()?;
         let listener = mio::net::TcpListener::from_std(std_listener);
         let id = BindingId::next();
@@ -124,8 +155,9 @@ impl Runtime {
                 let _ = std::fs::remove_file(&config.path);
             }
         }
-        let std_listener = std::os::unix::net::UnixListener::bind(&config.path)?;
-        std_listener.set_nonblocking(true)?;
+        let bound = std::os::unix::net::UnixListener::bind(&config.path)
+            .and_then(|l| l.set_nonblocking(true).map(|()| l));
+        let std_listener = bound.map_err(|e| self.bind_failed(&config.path.display().to_string(), e))?;
         let path = config.path.clone();
         let listener = mio::net::UnixListener::from_std(std_listener);
         let id = BindingId::next();
@@ -227,7 +259,123 @@ impl Runtime {
         Some(w.schedule_timer(delay, callback))
     }
 
-    /// Request shutdown of accept + reactors + storage and join threads.
+    /// A listener could not be bound: count it and tell the telemetry hook.
+    fn bind_failed(&self, addr: &str, err: io::Error) -> io::Error {
+        self.bind_failures.fetch_add(1, Ordering::Relaxed);
+        if let Some(t) = &self.telemetry {
+            t.on_bind_failure(addr, &err.to_string());
+            t.on_runtime_state(self.is_ready(), self.is_draining());
+        }
+        err
+    }
+
+    /// Whether the runtime is fit to take traffic: it is not draining and
+    /// every listener registered with it so far was bound. A readiness probe
+    /// answers from this. After a failed bind it stays `false` for the life of
+    /// the runtime, since a service that lost a listener is not the service
+    /// that was configured; see [`Self::bind_failures`].
+    pub fn is_ready(&self) -> bool {
+        !self.is_draining() && self.bind_failures() == 0
+    }
+
+    /// Whether a drain has begun ([`Self::start_drain`] or
+    /// [`Self::shutdown_graceful`]).
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
+    }
+
+    /// How many [`Self::add_tcp_listener`] and [`Self::add_unix_listener`]
+    /// calls failed to bind.
+    pub fn bind_failures(&self) -> u64 {
+        self.bind_failures.load(Ordering::Relaxed)
+    }
+
+    /// The configured [`RuntimeConfig::drain_timeout`].
+    pub fn drain_timeout(&self) -> Duration {
+        self.drain_timeout
+    }
+
+    /// Connections open now on every worker, accepted and dialled.
+    pub fn open_connections(&self) -> usize {
+        self.open_connections.load(Ordering::Acquire)
+    }
+
+    /// Begin draining without shutting down: stop accepting on every
+    /// listener, make [`Self::is_ready`] false and [`Self::is_draining`] true,
+    /// and tell each open connection's handler
+    /// ([`ProtocolHandler::drain`](crate::ProtocolHandler::drain)) so it can say
+    /// goodbye. Connections stay open until they close or the runtime is shut
+    /// down. Use it to flip a readiness probe ahead of
+    /// [`Self::shutdown_graceful`], or to wind a service down by hand.
+    /// Calling it again does nothing.
+    pub fn start_drain(&self) {
+        if self.draining.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(t) = &self.telemetry {
+            t.on_runtime_state(false, true);
+        }
+        // No new connection after this returns...
+        self.accept.stop_accepting(Duration::from_secs(5));
+        // ...and every one already handed to a reactor is registered before
+        // the drain reaches it: commands to a reactor are in order, so a
+        // round trip through each worker is a barrier behind those.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        for w in &self.workers {
+            let tx = tx.clone();
+            w.send(ReactorCmd::Task(Box::new(move || {
+                let _ = tx.send(());
+            })));
+        }
+        drop(tx);
+        for _ in &self.workers {
+            let _ = rx.recv_timeout(Duration::from_secs(5));
+        }
+        for w in &self.workers {
+            w.send(ReactorCmd::Drain);
+        }
+    }
+
+    /// Shut down gracefully, waiting up to [`RuntimeConfig::drain_timeout`]:
+    /// [`Self::start_drain`], then wait for the open connections to close (it
+    /// returns as soon as none is left), then close any that remain by force
+    /// and stop the threads. The telemetry hook is told how many were forced.
+    pub fn shutdown_graceful(self) {
+        let timeout = self.drain_timeout;
+        self.shutdown_graceful_within(timeout);
+    }
+
+    /// [`Self::shutdown_graceful`] with a drain period of `timeout` instead of
+    /// the configured one.
+    pub fn shutdown_graceful_within(self, timeout: Duration) {
+        self.drain(timeout);
+        self.shutdown();
+    }
+
+    /// The drain half of [`Self::shutdown_graceful_within`], for a runtime
+    /// that is shared (held in an `Arc`, as a [`Composition`](crate::Composition)
+    /// does) and so cannot be consumed: [`Self::start_drain`], then wait up to
+    /// `timeout` for the open connections to close (returning as soon as none
+    /// is left). Returns how many were still open at the end; the runtime then
+    /// force-closes them when it is shut down. The telemetry hook is told the
+    /// same.
+    pub fn drain(&self, timeout: Duration) -> usize {
+        let started = Instant::now();
+        self.start_drain();
+        let deadline = started + timeout;
+        while self.open_connections() > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let forced = self.open_connections();
+        if let Some(t) = &self.telemetry {
+            t.on_drain_complete(forced, started.elapsed());
+        }
+        forced
+    }
+
+    /// Request shutdown of accept + reactors + storage and join threads,
+    /// closing every connection at once. See [`Self::shutdown_graceful`] for
+    /// one that lets them finish.
     pub fn shutdown(self) {
         self.active.store(false, Ordering::Release);
         self.accept.shutdown();

@@ -51,6 +51,21 @@ pub trait ProtocolHandler: Send {
     /// nothing.
     fn migrated(&mut self, _endpoint: &mut dyn Endpoint) {}
 
+    /// The runtime is draining ([`Runtime::start_drain`](crate::Runtime::start_drain),
+    /// [`Runtime::shutdown_graceful`](crate::Runtime::shutdown_graceful)): it
+    /// has stopped accepting connections and will force-close whatever is
+    /// still open when the drain period ends. Called once per connection, on
+    /// the reactor, for connections open when the drain began and for any
+    /// registered after it.
+    ///
+    /// This is the handler's chance to say goodbye: finish the request in
+    /// hand, send the protocol's own notice (SMTP `421`, a POP3 or IMAP
+    /// `BYE`, an HTTP `Connection: close` or `GOAWAY`) and close the
+    /// endpoint. The connection stays open until the handler closes it or
+    /// the drain period ends. Default: do nothing, so a handler that has not
+    /// opted in is left to finish by itself.
+    fn drain(&mut self, _endpoint: &mut dyn Endpoint) {}
+
     /// Unrecoverable I/O or protocol error on the endpoint.
     fn error(&mut self, endpoint: &mut dyn Endpoint, err: &io::Error);
 

@@ -210,6 +210,40 @@ impl TelemetryHook for Hook {
         HOOK_REENTRANT.with(|c| c.set(false));
     }
 
+    fn on_runtime_state(&self, ready: bool, draining: bool) {
+        for (name, on) in [("hopf.runtime.ready", ready), ("hopf.runtime.draining", draining)] {
+            self.0.try_send_metric(crate::metrics::MetricPoint::UpDown {
+                name,
+                attributes: Vec::new(),
+                value: i64::from(on),
+            });
+        }
+    }
+
+    fn on_bind_failure(&self, addr: &str, _error: &str) {
+        self.0.try_send_metric(crate::metrics::MetricPoint::Counter {
+            name: "hopf.runtime.bind_failures",
+            attributes: vec![("net.address".into(), addr.into())],
+            value: 1,
+        });
+    }
+
+    fn on_drain_complete(&self, forced: usize, elapsed: std::time::Duration) {
+        if forced > 0 {
+            self.0.try_send_metric(crate::metrics::MetricPoint::Counter {
+                name: "hopf.runtime.drain.forced_connections",
+                attributes: Vec::new(),
+                value: forced as u64,
+            });
+        }
+        self.0.try_send_metric(crate::metrics::MetricPoint::Histogram {
+            name: "hopf.runtime.drain.duration",
+            unit: "ms",
+            attributes: Vec::new(),
+            value: elapsed.as_secs_f64() * 1000.0,
+        });
+    }
+
     fn on_accept(&self, peer: PeerAddr) {
         self.try_send(log_record_from_event(
             EventKind::Accept,

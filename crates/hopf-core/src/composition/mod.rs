@@ -164,4 +164,16 @@ impl Composition {
             runtime.shutdown();
         }
     }
+
+    /// [`shutdown`](Self::shutdown) after a drain: stop accepting, let open
+    /// connections finish for up to [`RuntimeConfig::drain_timeout`] (their
+    /// handlers are told, see [`ProtocolHandler::drain`](crate::ProtocolHandler::drain)),
+    /// then stop. The drain happens even when services still hold clones of
+    /// the runtime; the threads stop, as for [`shutdown`](Self::shutdown), only
+    /// once the last clone is dropped.
+    pub fn shutdown_graceful(self) {
+        let timeout = self.runtime.drain_timeout();
+        self.runtime.drain(timeout);
+        self.shutdown();
+    }
 }

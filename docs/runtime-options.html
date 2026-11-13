@@ -81,6 +81,7 @@
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
 <li><a href="#runtimeconfig">RuntimeConfig</a></li>
+<li><a href="#readiness-and-draining">Readiness and graceful shutdown</a></li>
 <li><a href="#storageconfig">StorageConfig</a></li>
 <li><a href="#tcplistenerconfig">TcpListenerConfig</a></li>
 <li><a href="#tcpconnectorconfig">TcpConnectorConfig</a></li>
@@ -120,6 +121,12 @@
 <td><code>StorageConfig::default()</code></td>
 <td>Blocking pool</td>
 </tr>
+<tr>
+<td><code>drain_timeout</code></td>
+<td><code>Duration</code></td>
+<td><code>30 s</code></td>
+<td>How long <code>shutdown_graceful</code> lets open connections finish before closing the rest by force</td>
+</tr>
 </tbody>
 </table>
 <div class="sourceCode" id="cb1"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>Runtime<span class="op">,</span> RuntimeConfig<span class="op">};</span></span>
@@ -129,6 +136,15 @@
 <span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">..</span><span class="bu">Default</span><span class="pp">::</span><span class="kw">default</span>()</span>
 <span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>)<span class="op">?;</span></span></code></pre></div>
 <p>With telemetry: <code>Runtime::start_with_telemetry(config, Some(hook))</code> or <code>Composition::new_with_telemetry(config, Some(hook))</code>.</p>
+<h2 id="readiness-and-draining">Readiness and graceful shutdown</h2>
+<p><code>Runtime::shutdown</code> stops everything at once. To let work in progress finish:</p>
+<ul>
+<li><code>Runtime::is_ready()</code>: not draining, and every listener registered so far was bound. A readiness probe answers from it. <code>bind_failures()</code> counts the <code>add_tcp_listener</code> and <code>add_unix_listener</code> calls that failed; after one, <code>is_ready()</code> stays false.</li>
+<li><code>Runtime::start_drain()</code>: stop accepting on every listener, make <code>is_draining()</code> true, and call <code>ProtocolHandler::drain</code> on every open connection (and on any registered afterwards, dialled connections included). Nothing is closed. Use it to flip a readiness probe ahead of shutting down, or to wind a service down by hand.</li>
+<li><code>Runtime::shutdown_graceful()</code> (and <code>shutdown_graceful_within(timeout)</code>): <code>start_drain</code>, then wait for the open connections to close, then close any that remain by force and stop. It returns as soon as no connection is left, and never waits longer than <code>RuntimeConfig::drain_timeout</code>. <code>Runtime::drain(timeout)</code> is the same wait for a runtime you cannot consume, and <code>Composition::shutdown_graceful()</code> uses it while services still hold clones of the runtime. <code>open_connections()</code> says how many are open.</li>
+</ul>
+<p><code>ProtocolHandler::drain(&amp;mut self, endpoint)</code> is the handler's chance to say goodbye: finish the request in hand, send the protocol's own notice (an SMTP <code>421</code>, a POP3 or IMAP <code>BYE</code>, an HTTP <code>Connection: close</code> or <code>GOAWAY</code>) and close the endpoint. The default does nothing, so a handler that has not opted in is left to finish by itself and is closed by force if it is still open when the drain period ends. A handler that wraps another forwards <code>drain</code> to it; <code>AlpnHttpEndpoint</code> does.</p>
+<p>The telemetry hook is told through <code>on_runtime_state(ready, draining)</code> (at start, on a failed bind, when a drain begins), <code>on_bind_failure(addr, error)</code> and <code>on_drain_complete(forced, elapsed)</code>. With a <code>hopf-otel</code> pipeline these are the up-down values <code>hopf.runtime.ready</code> and <code>hopf.runtime.draining</code>, the counters <code>hopf.runtime.bind_failures</code> and <code>hopf.runtime.drain.forced_connections</code>, and the histogram <code>hopf.runtime.drain.duration</code> (ms).</p>
 <h2 id="storageconfig">StorageConfig</h2>
 <table>
 <colgroup>

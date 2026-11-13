@@ -55,3 +55,8 @@ libc = "0.2"
 name = "server_tls_builder"
 path = "tests/server_tls_builder.rs"
 required-features = ["integration"]
+
+[[test]]
+name = "graceful_drain"
+path = "tests/graceful_drain.rs"
+required-features = ["integration"]

@@ -72,6 +72,11 @@ pub(crate) enum AcceptCmd {
     RemoveListener {
         id: BindingId,
     },
+    /// Close every listener and answer once none is left, so nothing more is
+    /// accepted from then on.
+    StopAccepting {
+        ack: std::sync::mpsc::SyncSender<()>,
+    },
     Shutdown,
 }
 
@@ -115,6 +120,16 @@ impl AcceptHandle {
     pub fn remove_listener(&self, id: BindingId) {
         let _ = self.tx.send(AcceptCmd::RemoveListener { id });
         let _ = self.waker.wake();
+    }
+
+    /// Stop accepting on every listener, and return once that has happened (or
+    /// `wait` has passed, which means the accept loop is gone anyway).
+    pub fn stop_accepting(&self, wait: Duration) {
+        let (ack, done) = std::sync::mpsc::sync_channel(1);
+        if self.tx.send(AcceptCmd::StopAccepting { ack }).is_ok() {
+            let _ = self.waker.wake();
+            let _ = done.recv_timeout(wait);
+        }
     }
 
     pub fn shutdown(&self) {
@@ -237,6 +252,15 @@ impl AcceptLoop {
                 }
                 Ok(AcceptCmd::RemoveListener { id }) => {
                     self.unregister_listener(id)?;
+                }
+                Ok(AcceptCmd::StopAccepting { ack }) => {
+                    for mut bound in self.listeners.drain(..) {
+                        let _ = self.poll.registry().deregister(&mut bound.listener);
+                    }
+                    for mut bound in self.unix_listeners.drain(..) {
+                        let _ = self.poll.registry().deregister(&mut bound.listener);
+                    }
+                    let _ = ack.send(());
                 }
                 Ok(AcceptCmd::Shutdown) => {
                     self.active.store(false, Ordering::Release);

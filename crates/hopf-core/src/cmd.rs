@@ -58,6 +58,9 @@ pub(crate) enum ReactorCmd {
     },
     /// Run on the reactor thread (from [`crate::Endpoint::execute`] or internal).
     Task(Task),
+    /// Tell every open connection's handler that the runtime is draining,
+    /// and every connection registered from now on.
+    Drain,
     /// Run on the reactor thread with a specific connection as [`crate::Endpoint`].
     WithConn {
         /// Connection token.

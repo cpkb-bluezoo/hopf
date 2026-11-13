@@ -829,6 +829,7 @@ mod tests {
                 queue_capacity: 16,
             },
             fips: false,
+            ..Default::default()
         })
         .unwrap();
 
@@ -904,6 +905,7 @@ mod tests {
                 queue_capacity: 1,
             },
             fips: false,
+            ..Default::default()
         })
         .unwrap();
 
@@ -972,6 +974,7 @@ mod tests {
                 queue_capacity: 3,
             },
             fips: false,
+            ..Default::default()
         })
         .unwrap();
 

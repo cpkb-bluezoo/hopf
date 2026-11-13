@@ -1051,6 +1051,33 @@ mod tests {
         }
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn runtime_state_and_drain_reach_the_metrics_sink() {
+        let path = std::env::temp_dir().join(format!("hopf-otel-runtime-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let pipeline =
+            crate::pipeline::TelemetryPipeline::start(OtelConfig::new("runtime-test").with_jsonl_metrics(&path)).unwrap();
+        let hook = pipeline.hook();
+        hook.on_runtime_state(true, false);
+        hook.on_bind_failure("0.0.0.0:25", "address in use");
+        hook.on_runtime_state(false, true);
+        hook.on_drain_complete(3, std::time::Duration::from_millis(250));
+        pipeline.export_handle().flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let body = std::fs::read_to_string(&path).unwrap_or_default();
+        for needle in [
+            "hopf.runtime.ready",
+            "hopf.runtime.draining",
+            "hopf.runtime.bind_failures",
+            "0.0.0.0:25",
+            "hopf.runtime.drain.forced_connections",
+            "hopf.runtime.drain.duration",
+        ] {
+            assert!(body.contains(needle), "missing {needle}: {body}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 impl hopf_dns::telemetry::DnsServerTelemetry for DnsServerMetrics {

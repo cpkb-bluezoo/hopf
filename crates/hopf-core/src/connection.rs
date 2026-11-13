@@ -782,6 +782,32 @@ impl TcpConnection {
         self.interest_dirty = true;
     }
 
+    /// Tell the handler the runtime is draining (see
+    /// [`ProtocolHandler::drain`]).
+    pub fn call_drain(&mut self) {
+        if !self.open {
+            return;
+        }
+        let Some(mut handler) = self.handler.take() else {
+            return;
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handler.drain(self);
+        }));
+        self.handler = Some(handler);
+        if let Err(payload) = outcome {
+            self.log_runtime_error(
+                "connection.handler.panic",
+                format!(
+                    "protocol handler panicked in drain on {}: {payload:?}",
+                    self.remote
+                ),
+            );
+            self.force_close();
+        }
+        self.interest_dirty = true;
+    }
+
     pub fn call_security_established(&mut self) {
         let info = self.security.clone();
         let Some(mut handler) = self.handler.take() else {
@@ -1133,7 +1159,7 @@ mod tests {
     #[test]
     fn tls_dial_without_server_name_is_rejected_not_defaulted_to_localhost() {
         let active = Arc::new(AtomicBool::new(true));
-        let (reactor_handle, _thread) = Reactor::spawn(0, active).unwrap();
+        let (reactor_handle, _thread) = Reactor::spawn(0, active, Arc::new(std::sync::atomic::AtomicUsize::new(0))).unwrap();
         let pool = Arc::new(BufferPool::default());
         let stream = connected_stream_pair();
         let addr = stream.peer_addr().unwrap();

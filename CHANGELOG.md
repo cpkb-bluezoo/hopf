@@ -7,6 +7,22 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
 
 ### Added
 
+- **hopf-core:** readiness and graceful shutdown (#530).
+  `Runtime::is_ready()`, `is_draining()`, `bind_failures()` and
+  `open_connections()`; `Runtime::start_drain()` stops accepting and tells every
+  open connection's handler through the new `ProtocolHandler::drain` (default:
+  do nothing); `Runtime::shutdown_graceful()` (and `_within(timeout)`, and
+  `drain(timeout)` for a shared runtime) waits for open connections up to
+  `RuntimeConfig::drain_timeout` (new, default 30 s), returning as soon as none
+  is left, then closes the rest by force. `Composition::shutdown_graceful()`
+  does the same. `TelemetryHook` gains `on_runtime_state`, `on_bind_failure` and
+  `on_drain_complete`, which a `hopf-otel` pipeline exports as
+  `hopf.runtime.ready`, `.draining`, `.bind_failures`,
+  `.drain.forced_connections` and `.drain.duration`. No protocol crate says
+  goodbye on `drain` yet, so until each adopts it a drain waits for connections
+  to end by themselves or for the drain period; `AlpnHttpEndpoint` forwards the
+  call to its inner handler. `RuntimeConfig` has a new field, so a struct
+  literal without `..Default::default()` needs one.
 - **hopf-otel / hopf-dns:** DNS metrics over OTLP/JSONL (#529).
   `TelemetryPipeline::dns_metrics()` and `dns_upstream_metrics()` return
   instrument sets (`DnsServerMetrics`, `DnsUpstreamMetrics`) named

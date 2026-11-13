@@ -76,6 +76,12 @@ impl ProtocolHandler for AlpnHttpEndpoint {
         }
     }
 
+    fn drain(&mut self, endpoint: &mut dyn Endpoint) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.drain(endpoint);
+        }
+    }
+
     fn disconnected(&mut self, endpoint: &mut dyn Endpoint) {
         if let Some(inner) = self.inner.as_mut() {
             inner.disconnected(endpoint);

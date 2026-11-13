@@ -107,6 +107,17 @@ pub trait TelemetryHook: Send + Sync {
     /// Non-fatal configuration / operational warning (e.g. open relay with
     /// no CIDR allowlist). Default: no-op.
     fn on_warn(&self, _msg: &str) {}
+    /// The runtime's readiness changed: it is `ready` to serve (running, not
+    /// draining, every listener bound) and whether it is `draining`. Called at
+    /// start, on a failed bind, and when a drain begins. Default: no-op.
+    fn on_runtime_state(&self, _ready: bool, _draining: bool) {}
+    /// A listener could not be bound (`addr` is where it was meant to be).
+    /// Default: no-op.
+    fn on_bind_failure(&self, _addr: &str, _error: &str) {}
+    /// A drain finished: `forced` connections were still open at the end of
+    /// the drain period and were closed by force; `elapsed` is how long the
+    /// drain took. Default: no-op.
+    fn on_drain_complete(&self, _forced: usize, _elapsed: std::time::Duration) {}
     /// Structured log record. Default: map ERROR/WARN to [`Self::on_error`] /
     /// [`Self::on_warn`]; other levels are ignored.
     fn on_log(&self, record: &LogRecord) {
