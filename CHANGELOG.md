@@ -7,6 +7,16 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
 
 ### Added
 
+- **hopf-dns:** `DnsService` answers RFC 10029 multiple-QTYPE queries
+  (#531). `DnsService::set_max_multi_qtypes(n)` allows up to `n` extra types
+  per query; the default, `0`, leaves the mechanism off. A query that names
+  extra types in an `MQTYPE-Query` option has each one asked of the handler
+  as an ordinary single-question query with the same `QueryContext`, and the
+  answers are merged into one response whose `MQTYPE-Response` option lists
+  the types it covers. A type the handler declines or fails, or that is beyond
+  the cap, is left for the client to ask separately. Handlers need no change,
+  and one that answers late works as usual. New counters
+  `DnsServerMetrics::{mqtype_queries, mqtype_subqueries}`.
 - **hopf-core:** in-memory counterparts of the PEM builders, for identities
   generated at run time: `acceptor_from_pem_bytes`, `acceptor_from_pem_tls12_bytes`,
   `acceptor_from_credentials_tls12`, `acceptor_from_credentials_with_sni`,
@@ -25,6 +35,8 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
 
 ### Fixed
 
+- **hopf-dns:** a response that carries both a DNS Cookie and another EDNS
+  option now has one OPT record, not two (RFC 6891 section 6.1.1).
 - **hopf-amqp:** a client connection with heartbeats enabled no longer closes
   when its first heartbeat falls due. The send timer used `Endpoint::fail` to
   signal the handler, which on a real connection also force-closes it, so

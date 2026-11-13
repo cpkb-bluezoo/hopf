@@ -22,6 +22,7 @@ mod forwarder;
 mod framed;
 mod handler;
 mod minimal_any;
+mod multi_qtype;
 mod policy;
 mod udp;
 pub mod zone;
@@ -89,6 +90,11 @@ pub struct DnsServerMetrics {
     /// Of those, queries whose presented server cookie was verified
     /// against a freshly (re)computed one for the client's address.
     pub cookies_verified: u64,
+    /// Queries whose MQTYPE-Query option (RFC 10029) the service acted on.
+    pub mqtype_queries: u64,
+    /// Sub-queries those queries were expanded into, one per extra type
+    /// asked of the handler. Not counted in `queries`.
+    pub mqtype_subqueries: u64,
 }
 
 /// Where the messages that answer one request are delivered, exactly once,
@@ -105,6 +111,7 @@ pub struct DnsService {
     cookies: DnsCookie,
     metrics: Arc<std::sync::Mutex<DnsServerMetrics>>,
     keyring: Arc<TsigKeyring>,
+    max_mqtypes: usize,
 }
 
 impl Default for DnsService {
@@ -133,7 +140,24 @@ impl DnsService {
             cookies: DnsCookie::new(),
             metrics: Arc::default(),
             keyring: Arc::new(TsigKeyring::new()),
+            max_mqtypes: 0,
         }
+    }
+
+    /// Answer RFC 10029 multiple-QTYPE queries, asking the handler about at
+    /// most `max` extra types per query. `0`, the default, switches the
+    /// mechanism off: the option is ignored and no MQTYPE-Response is sent, so
+    /// a client that tries it learns the server does not support it.
+    ///
+    /// A query naming extra types in an MQTYPE-Query option is answered as
+    /// if each had been asked on its own, with the same [`QueryContext`], and
+    /// the answers are merged into one response whose MQTYPE-Response option
+    /// lists the types it covers. A type the handler declines, fails, or
+    /// that is beyond the cap is left out for the client to ask separately.
+    /// Each extra type costs the handler one more query (an upstream
+    /// round trip, for a forwarder), so keep the cap small.
+    pub fn set_max_multi_qtypes(&mut self, max: usize) {
+        self.max_mqtypes = max;
     }
 
     /// Accept TSIG-signed requests (RFC 8945) made with these keys. A
@@ -260,11 +284,7 @@ impl DnsService {
                 drop(m);
                 let option = self.cookies.encode_response_edns_option(&client, &ip_bytes);
                 let with_cookie: MessageSink = Box::new(move |mut out| {
-                    out[0].additionals.push(crate::wire::DnsResourceRecord::opt(
-                        crate::wire::OPT_UDP_PAYLOAD,
-                        false,
-                        &option,
-                    ));
+                    crate::multi_qtype::add_edns_option(&mut out[0], &option);
                     done(out)
                 });
                 if verified {
@@ -308,15 +328,34 @@ impl DnsService {
         }
         let fallback = if non_query { RCODE_NOTIMP } else { 0 };
         let request = Arc::clone(&query);
+        // RFC 10029: extra types to ask the handler about once the primary
+        // question is answered, with what the sub-queries need to run.
+        let multi = (!non_query)
+            .then(|| multi_qtype::requested_types(&query, self.max_mqtypes))
+            .flatten()
+            .map(|extra| {
+                (
+                    extra,
+                    Arc::clone(&self.handler),
+                    Arc::clone(&self.metrics),
+                    ctx.clone(),
+                )
+            });
         let callback = DnsQueryCallback::new(move |outcome| {
-            done(match outcome {
+            let responses = match outcome {
                 HandlerOutcome::Respond(resp) => vec![resp],
                 HandlerOutcome::Sequence(seq) if !seq.is_empty() => seq,
                 HandlerOutcome::Sequence(_) | HandlerOutcome::Decline => {
                     vec![request.response_template(fallback)]
                 }
                 HandlerOutcome::Error(rcode) => vec![request.response_template(rcode)],
-            })
+            };
+            match multi {
+                Some((extra, handler, metrics, ctx)) => {
+                    multi_qtype::merge(handler, metrics, request, ctx, extra, responses, done)
+                }
+                None => done(responses),
+            }
         });
         if non_query {
             self.handler.handle_non_query_opcode(&query, &ctx, callback);

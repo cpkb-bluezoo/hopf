@@ -14,7 +14,7 @@
 //! opportunistic-attach / per-server-capability-cache / standalone-fallback
 //! behavior on top of it.
 
-use crate::wire::DnsType;
+use crate::wire::{DnsMessage, DnsResourceRecord, DnsType, OPT_UDP_PAYLOAD};
 
 /// EDNS option code for MQTYPE-Query: additional RRTYPEs a client wants
 /// alongside the primary question.
@@ -87,6 +87,44 @@ pub fn find_mqtype_option(opt_rdata: &[u8], code: u16) -> Option<Vec<DnsType>> {
     None
 }
 
+/// `opt_rdata` with every option coded `code` removed. An option that is
+/// cut short ends the walk: what follows it cannot be told apart from its
+/// payload, so it is kept as it came.
+pub(crate) fn without_option(opt_rdata: &[u8], code: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(opt_rdata.len());
+    let mut i = 0;
+    while i + 4 <= opt_rdata.len() {
+        let opt_code = u16::from_be_bytes([opt_rdata[i], opt_rdata[i + 1]]);
+        let len = u16::from_be_bytes([opt_rdata[i + 2], opt_rdata[i + 3]]) as usize;
+        if i + 4 + len > opt_rdata.len() {
+            break;
+        }
+        if opt_code != code {
+            out.extend_from_slice(&opt_rdata[i..i + 4 + len]);
+        }
+        i += 4 + len;
+    }
+    out.extend_from_slice(&opt_rdata[i..]);
+    out
+}
+
+/// Add the encoded EDNS `option` (code, length, data) to `message`'s OPT
+/// record, creating the record if the message has none. A message carries at
+/// most one OPT record (RFC 6891 section 6.1.1), so every server-added option
+/// (a cookie, an MQTYPE-Response) goes through here.
+pub(crate) fn add_edns_option(message: &mut DnsMessage, option: &[u8]) {
+    match message
+        .additionals
+        .iter_mut()
+        .find(|rr| rr.rtype == Some(DnsType::Opt))
+    {
+        Some(opt) => opt.rdata.extend_from_slice(option),
+        None => message
+            .additionals
+            .push(DnsResourceRecord::opt(OPT_UDP_PAYLOAD, false, option)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +163,28 @@ mod tests {
         opt.extend_from_slice(&data);
         let types = find_mqtype_option(&opt, EDNS_OPTION_MQTYPE_RESPONSE).unwrap();
         assert_eq!(types, vec![DnsType::Aaaa]);
+    }
+
+    #[test]
+    fn without_option_drops_only_the_named_option() {
+        let mut blob = vec![0u8, 10, 0, 2, 9, 9]; // cookie-ish option
+        blob.extend_from_slice(&encode_mqtype_query_option(&[DnsType::Aaaa]));
+        blob.extend_from_slice(&[0, 12, 0, 1, 7]); // padding-ish option after it
+        let kept = without_option(&blob, EDNS_OPTION_MQTYPE_QUERY);
+        assert_eq!(kept, vec![0u8, 10, 0, 2, 9, 9, 0, 12, 0, 1, 7]);
+        assert_eq!(find_mqtype_option(&kept, EDNS_OPTION_MQTYPE_QUERY), None);
+    }
+
+    #[test]
+    fn add_edns_option_extends_the_one_opt_record() {
+        let mut m = DnsMessage::query(1, crate::wire::DnsQuestion::in_class("a.test", DnsType::A), false);
+        add_edns_option(&mut m, &encode_mqtype_response_option(&[DnsType::Aaaa]));
+        add_edns_option(&mut m, &[0, 10, 0, 1, 5]);
+        let opts: Vec<_> = m.additionals.iter().filter(|rr| rr.rtype == Some(DnsType::Opt)).collect();
+        assert_eq!(opts.len(), 1, "a message has one OPT record");
+        assert_eq!(
+            find_mqtype_option(&opts[0].rdata, EDNS_OPTION_MQTYPE_RESPONSE),
+            Some(vec![DnsType::Aaaa])
+        );
     }
 }

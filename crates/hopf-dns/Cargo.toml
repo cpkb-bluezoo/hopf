@@ -83,3 +83,8 @@ required-features = ["integration", "server"]
 name = "query_context"
 path = "tests/query_context.rs"
 required-features = ["integration", "server"]
+
+[[test]]
+name = "multi_qtype_server"
+path = "tests/multi_qtype_server.rs"
+required-features = ["integration", "server"]
