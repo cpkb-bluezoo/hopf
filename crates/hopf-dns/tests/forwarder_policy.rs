@@ -237,3 +237,42 @@ fn any_queries_get_a_minimal_answer_unless_disabled_or_dnssec_aware() {
     assert_eq!(resp.answers.len(), 2, "full answer for DO");
     rt.shutdown();
 }
+
+/// Issue #525: the forwarder no longer blocks the thread that dispatched the
+/// query while it waits for its upstream. `dispatch_wire` returns at once,
+/// and the answer is delivered when the upstream replies.
+#[test]
+fn forwarder_does_not_block_the_dispatching_thread_while_the_upstream_is_slow() {
+    use hopf_dns::server::DnsTransport;
+
+    let up = spawn_upstream(Ipv4Addr::new(203, 0, 113, 7));
+    up.mode.store(SLOW, Ordering::SeqCst);
+    let rt = Runtime::start(Default::default()).unwrap();
+    let service = DnsService::with_handler(
+        ForwarderHandler::new(Arc::new(DnsCache::default())).with_upstream(resolver(&rt, &up)),
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let started = Instant::now();
+    let wire = DnsMessage::query(21, DnsQuestion::in_class("slow.example", DnsType::A), true)
+        .serialize()
+        .unwrap();
+    assert!(service.dispatch_wire(
+        &wire,
+        "127.0.0.1:5353".parse().unwrap(),
+        DnsTransport::Udp,
+        Box::new(move |responses| tx.send(responses).unwrap()),
+    ));
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "dispatch must not wait for the 500 ms upstream, took {:?}",
+        started.elapsed()
+    );
+    assert!(rx.try_recv().is_err(), "nothing to send yet");
+
+    let responses = rx.recv_timeout(Duration::from_secs(5)).expect("answered once the upstream replies");
+    let resp = DnsMessage::parse(&responses[0]).unwrap();
+    assert_eq!(resp.id, 21);
+    assert_eq!(address(&resp), Some(Ipv4Addr::new(203, 0, 113, 7)));
+    rt.shutdown();
+}

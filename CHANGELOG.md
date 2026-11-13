@@ -53,6 +53,34 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
   with nothing buffered; before, no write event was requested for an empty
   buffer, so the callback never ran.
 
+### Breaking changes
+
+- **hopf-dns:** `DnsQueryHandler` is callback-shaped (#525). `handle_query` and
+  `handle_non_query_opcode` take a `DnsQueryCallback` and return nothing. The
+  callback is completed exactly once, with `respond`, `respond_sequence`,
+  `decline` or `error`, before the method returns or later from any thread, so
+  a handler that waits on a client (a Redis round trip, an upstream query) no
+  longer holds the listener. The answer is delivered on the connection's own
+  reactor; cookie handling, TSIG signing and UDP truncation happen when it is
+  ready. Stream transports write each answer as it completes, so several
+  queries on one connection may be answered out of order (RFC 7766
+  section 6.2.1.1). A callback dropped without being completed is logged and
+  answered `SERVFAIL`. `HandlerOutcome` is no longer public.
+  - **Migration:** a handler that returns its answer straight away implements
+    the new `SyncDnsQueryHandler::resolve(&self, &DnsMessage, &QueryContext)
+    -> Option<DnsMessage>` (`None` declines) with no other change, and is
+    adapted automatically. `FnHandler` and `EmptyHandler` already are. A
+    handler that has to wait implements `DnsQueryHandler` directly.
+  - `MetricsSink` no longer has a lifetime and is `Clone`, so a handler can
+    keep it for a later answer. `QueryContext::metrics` has that type.
+  - `DnsService::process_on`, `process_query_sync` and `process_wire` now wait
+    for the answer and are for tests and callers off the reactor. The
+    listeners use the new non-blocking `DnsService::dispatch_wire`.
+- **hopf-dns:** `ForwarderHandler` no longer blocks the listener thread while
+  it waits for its upstream. The upstream timeout and the RFC 8767 client
+  response timer run on the resolver's reactor, and the answer is delivered
+  when the upstream replies or the timer fires, whichever is first.
+
 ### Changed
 
 - **hopf-webdav (behaviour change):** RFC 3744 privileges are now enforced

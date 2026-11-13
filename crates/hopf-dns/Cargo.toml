@@ -73,3 +73,8 @@ required-features = ["integration", "server"]
 name = "aggressive_nsec"
 path = "tests/aggressive_nsec.rs"
 required-features = ["integration", "server", "dnssec"]
+
+[[test]]
+name = "async_handler"
+path = "tests/async_handler.rs"
+required-features = ["integration", "server"]

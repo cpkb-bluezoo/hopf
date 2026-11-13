@@ -9,6 +9,7 @@ use std::sync::Arc;
 use hopf_core::{Endpoint, ProtocolHandler};
 use hopf_quic::{listen_quic, QuicDriverHandle, QuicListenConfig, QuicServerConfig};
 
+use crate::server::framed::{dispatch_to_endpoint, write_length_prefixed};
 use crate::server::{DnsServiceHandle, DnsTransport};
 
 /// ALPN for DoQ.
@@ -58,17 +59,18 @@ impl ProtocolHandler for DoqServerHandler {
                     .ok()
                     .and_then(|a| a.as_socket_addr())
                     .unwrap_or_else(|| SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0));
-                let Some(responses) = self.service.process_wire(&payload, peer, DnsTransport::Doq) else {
+                if !dispatch_to_endpoint(
+                    &self.service,
+                    endpoint,
+                    &payload,
+                    peer,
+                    DnsTransport::Doq,
+                    write_length_prefixed,
+                ) {
                     // RFC 9250 §4.3: a malformed DNS message on the stream is
                     // a protocol violation, not something to silently drop.
                     endpoint.abort(crate::client::doq::DOQ_PROTOCOL_ERROR);
                     return;
-                };
-                for bytes in responses {
-                    let mut out = Vec::with_capacity(2 + bytes.len());
-                    out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-                    out.extend_from_slice(&bytes);
-                    endpoint.send(&out);
                 }
             }
         });

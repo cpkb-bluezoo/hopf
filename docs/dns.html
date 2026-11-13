@@ -210,11 +210,19 @@
 <tbody>
 <tr>
 <td><code>DnsService</code> / <code>DnsServiceHandle</code></td>
-<td>Shell; <code>with_handler</code>, <code>set_tsig_keyring</code>, <code>start</code>/<code>stop</code>, <code>process_wire</code>, <code>metrics</code></td>
+<td>Shell; <code>with_handler</code>, <code>set_tsig_keyring</code>, <code>start</code>/<code>stop</code>, <code>dispatch_wire</code> (non-blocking, used by the listeners), <code>process_wire</code>/<code>process_on</code> (wait for the answer), <code>metrics</code></td>
 </tr>
 <tr>
 <td><code>DnsQueryHandler</code></td>
-<td>Trait: <code>handle_query</code>, <code>handle_non_query_opcode</code>, <code>start</code>, <code>stop</code>. Returns <code>HandlerOutcome::{Respond, Sequence, Decline}</code></td>
+<td>Trait: <code>handle_query</code>, <code>handle_non_query_opcode</code>, <code>start</code>, <code>stop</code>. Callback-shaped: each message method takes a <code>DnsQueryCallback</code> and returns nothing</td>
+</tr>
+<tr>
+<td><code>DnsQueryCallback</code></td>
+<td>Owned, <code>Send</code> completion for one message. Call exactly one of <code>respond(msg)</code>, <code>respond_sequence(msgs)</code> (AXFR/IXFR), <code>decline()</code>, <code>error(rcode)</code>, once. Dropping it uncompleted is logged and answered <code>SERVFAIL</code></td>
+</tr>
+<tr>
+<td><code>SyncDnsQueryHandler</code></td>
+<td>For a handler whose answer is ready on return: <code>resolve(&amp;query, &amp;ctx) -&gt; Option&lt;DnsMessage&gt;</code> (<code>None</code> declines). Adapted to <code>DnsQueryHandler</code> automatically, answering inline</td>
 </tr>
 <tr>
 <td><code>EmptyHandler</code></td>
@@ -230,11 +238,11 @@
 </tr>
 <tr>
 <td><code>FnHandler</code></td>
-<td>Closure handler: <code>on_query</code>, <code>on_opcode</code></td>
+<td>Closure handler (a <code>SyncDnsQueryHandler</code>): <code>on_query</code>, <code>on_opcode</code></td>
 </tr>
 <tr>
 <td><code>ChainHandler</code></td>
-<td>Tries handlers in order; the first that does not <code>Decline</code> answers</td>
+<td>Tries handlers in order; the first that does not decline answers, even if an earlier one declines late, from another thread</td>
 </tr>
 <tr>
 <td><code>QueryContext</code></td>
@@ -266,7 +274,20 @@
 </tr>
 </tbody>
 </table>
-<p><strong>Composition.</strong> A handler that does not want a message returns <code>Decline</code>; for a query the shell then answers an empty <code>NOERROR</code>, for another opcode <code>NOTIMP</code>. Only requests reach a handler: a message with the QR bit set is refused by the shell. Handlers run on the listener thread and should not block. Handlers that need background work (the authoritative handler's NOTIFY, write-back and secondary refresh) get it from <code>DnsService::start(&amp;rt)</code>, which calls <code>DnsQueryHandler::start</code>; call it before binding listeners and <code>stop()</code> on shutdown.</p>
+<p><strong>Composition.</strong> A handler that does not want a message calls <code>callback.decline()</code>; for a query the shell then answers an empty <code>NOERROR</code>, for another opcode <code>NOTIMP</code>. Only requests reach a handler: a message with the QR bit set is refused by the shell.</p>
+<p><strong>Callback shape.</strong> Like every I/O operation in hopf, a handler takes a callback and returns nothing. It may complete the <code>DnsQueryCallback</code> before returning (a table lookup: no extra hop) or later, from any thread, once an upstream client or a store has answered; the listener is never held while a handler waits. The answer is delivered on the connection's own reactor (TCP, DoT and DoQ) or sent from the datagram socket's (UDP), and cookies, TSIG signing and UDP truncation are applied when it is ready. A stream connection writes each answer as it completes, so queries pipelined on one connection may be answered out of order (RFC 7766 §6.2.1.1). A handler that already has its answer implements <code>SyncDnsQueryHandler::resolve</code> instead.</p>
+<pre><code>struct Redis { /* ... */ }
+impl DnsQueryHandler for Redis {
+    fn handle_query(&amp;self, q: &amp;DnsMessage, _ctx: &amp;QueryContext&lt;'_&gt;, callback: DnsQueryCallback) {
+        let template = q.response_template(0);
+        self.client.get(key(q), move |reply| match reply {
+            Ok(Some(ip)) =&gt; callback.respond(with_answer(template, ip)),
+            Ok(None) =&gt; callback.decline(),
+            Err(_) =&gt; callback.error(RCODE_SERVFAIL),
+        });
+    }
+}</code></pre>
+<p>Handlers that need background work (the authoritative handler's NOTIFY, write-back and secondary refresh) get it from <code>DnsService::start(&amp;rt)</code>, which calls <code>DnsQueryHandler::start</code>; call it before binding listeners and <code>stop()</code> on shutdown.</p>
 <pre><code>// Caching forwarder
 let service = DnsService::with_handler(ForwarderHandler::new(cache).with_upstream(resolver));
 
@@ -293,7 +314,7 @@ listen_dns_tcp(&amp;rt, addr, handle)?;</code></pre>
 </ul>
 <p><strong>Other opcodes (NOTIFY, UPDATE).</strong> <code>DnsQueryHandler::handle_non_query_opcode</code> is offered every request whose opcode is not QUERY (RFC 1996 NOTIFY, RFC 2136 UPDATE, ...). Update sections arrive in the question (zone), answer (prerequisite), authority (update) and additional fields with the <code>NONE</code> class (254) preserved in each record's <code>raw_class</code>. For a closure, <code>FnHandler::on_opcode(|message, peer| ...)</code>. Build responses with <code>DnsMessage::response_template</code>, which echoes the opcode.</p>
 <p><strong>Server-side DNS Cookies</strong> (RFC 7873 §5.2): an inbound query's COOKIE option (if any) is parsed and any presented server cookie validated, via HMAC-SHA256 over the client cookie and source address keyed by a per-service secret from <code>getrandom</code> (fail closed), compared in constant time. A COOKIE option shorter than the mandatory 8-byte client cookie is FORMERR with no cookie exchange (§5.2.2). Otherwise the response carries a COOKIE option echoing the client cookie plus a freshly issued server cookie. A client that presents a cookie without a verifiable server cookie gets a cookie-only reply and the handler is <strong>not</strong> called (RFC 7873 §5.2.3 anti-amplification), which covers upstream forwarding, zone transfers and updates alike. A client presenting no cookie is not filtered.</p>
-<p><code>process_wire</code> is what every listener calls: it parses, verifies TSIG, dispatches, truncates UDP answers to the size the client advertised (records dropped, TC set), zeroes the message ID over DoQ, and signs. The forwarder uses a <strong>blocking</strong> upstream path (pragmatic).</p>
+<p><code>dispatch_wire</code> is what every listener calls: it parses, verifies TSIG, dispatches, and when the handler has answered truncates UDP answers to the size the client advertised (records dropped, TC set), zeroes the message ID over DoQ, signs, and hands the encoded responses to a reply closure, once. It returns <code>false</code> for bytes that are not DNS (DoQ treats that as a protocol error). It never blocks. <code>process_wire</code>, <code>process_on</code> and <code>process_query_sync</code> are blocking conveniences over it for tests and callers off the reactor; do not call them from the reactor thread a handler will answer on. The forwarder is non-blocking: its upstream timeout and RFC 8767 client response timer run on the resolver's reactor, and the answer is delivered when the upstream replies or the timer fires, whichever is first.</p>
 <h2 id="authoritative-zones">Authoritative zones</h2>
 <p><code>AuthoritativeZoneHandler</code> serves one or more zones from memory. Zones are loaded from BIND-style zone files, built with <code>Zone::from_records</code>, or transferred from a primary. Answers carry the AA bit and no RA; names outside every zone are <code>REFUSED</code>, or, with <code>decline_outside_zones(true)</code>, declined so a <code>ChainHandler</code> can forward them. The most specific zone wins when zones nest.</p>
 <h3 id="zone-lookup">Answers</h3>

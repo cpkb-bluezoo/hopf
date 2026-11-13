@@ -16,7 +16,7 @@ use super::model::{cname_target, in_record, Lookup, Zone};
 use super::options::{ZoneFileMode, ZoneOptions};
 use super::rdata::TYPE_HINFO;
 use super::{update, xfr};
-use crate::server::handler::{DnsQueryHandler, HandlerOutcome, QueryContext};
+use crate::server::handler::{DnsQueryCallback, DnsQueryHandler, HandlerOutcome, QueryContext};
 use crate::server::minimal_any::{MinimalAnyDisabled, MinimalAnyEnabled, MinimalAnyPolicy};
 use crate::wire::{
     normalize_name, DnsClass, DnsMessage, DnsResourceRecord, DnsType, FLAG_AA, FLAG_RA, FLAG_TC,
@@ -286,7 +286,46 @@ fn add_edns(query: &DnsMessage, resp: &mut DnsMessage) {
 }
 
 impl DnsQueryHandler for AuthoritativeZoneHandler {
-    fn handle_query(&self, query: &DnsMessage, ctx: &QueryContext<'_>) -> HandlerOutcome {
+    // Zone data is in memory, so every message is answered inline.
+    fn handle_query(&self, query: &DnsMessage, ctx: &QueryContext<'_>, callback: DnsQueryCallback) {
+        self.query_outcome(query, ctx).deliver(callback);
+    }
+
+    fn handle_non_query_opcode(
+        &self,
+        query: &DnsMessage,
+        ctx: &QueryContext<'_>,
+        callback: DnsQueryCallback,
+    ) {
+        match query.opcode() {
+            OPCODE_NOTIFY => self.notify(query, ctx),
+            OPCODE_UPDATE => self.update(query, ctx),
+            _ => HandlerOutcome::Decline,
+        }
+        .deliver(callback);
+    }
+
+    fn start(&self, _rt: &Runtime) -> io::Result<()> {
+        let mut m = self.inner.maintainer.lock().unwrap();
+        if m.is_none() {
+            *m = Some(Maintainer::spawn(Arc::clone(&self.inner))?);
+        }
+        Ok(())
+    }
+
+    fn stop(&self) {
+        // Take it out first: joining while holding the lock would deadlock
+        // a `signal` from the very thread being joined.
+        let m = self.inner.maintainer.lock().unwrap().take();
+        if let Some(m) = m {
+            m.stop();
+        }
+    }
+}
+
+impl AuthoritativeZoneHandler {
+    /// Decide a standard QUERY.
+    fn query_outcome(&self, query: &DnsMessage, ctx: &QueryContext<'_>) -> HandlerOutcome {
         let q = &query.questions[0];
 
         // RFC 6891 §6.1.3: an EDNS version we do not implement is BADVERS.
@@ -337,33 +376,6 @@ impl DnsQueryHandler for AuthoritativeZoneHandler {
         HandlerOutcome::Respond(answer(zone, query, &qname, q.raw_qtype, minimal))
     }
 
-    fn handle_non_query_opcode(&self, query: &DnsMessage, ctx: &QueryContext<'_>) -> HandlerOutcome {
-        match query.opcode() {
-            OPCODE_NOTIFY => self.notify(query, ctx),
-            OPCODE_UPDATE => self.update(query, ctx),
-            _ => HandlerOutcome::Decline,
-        }
-    }
-
-    fn start(&self, _rt: &Runtime) -> io::Result<()> {
-        let mut m = self.inner.maintainer.lock().unwrap();
-        if m.is_none() {
-            *m = Some(Maintainer::spawn(Arc::clone(&self.inner))?);
-        }
-        Ok(())
-    }
-
-    fn stop(&self) {
-        // Take it out first: joining while holding the lock would deadlock
-        // a `signal` from the very thread being joined.
-        let m = self.inner.maintainer.lock().unwrap().take();
-        if let Some(m) = m {
-            m.stop();
-        }
-    }
-}
-
-impl AuthoritativeZoneHandler {
     /// RFC 1996 NOTIFY: only meaningful to a secondary, from its primary.
     fn notify(&self, query: &DnsMessage, ctx: &QueryContext<'_>) -> HandlerOutcome {
         let Some(q) = query.questions.first() else {

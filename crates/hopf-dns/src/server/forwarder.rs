@@ -20,10 +20,11 @@
 //!   locally.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::handler::{DnsQueryHandler, HandlerOutcome, QueryContext};
+use super::handler::{DnsQueryCallback, DnsQueryHandler, QueryContext};
 use super::minimal_any::{MinimalAnyEnabled, MinimalAnyPolicy};
 #[cfg(feature = "dnssec")]
 use super::policy::{AggressiveNsecEnabled, AggressiveNsecPolicy};
@@ -172,25 +173,37 @@ impl ForwarderHandler {
             .is_some_and(|at| at.elapsed() < self.failure_recheck)
     }
 
-    fn note_failure(&self, q: &DnsQuestion) {
-        let mut failures = self.failures.lock().unwrap();
-        if failures.len() >= MAX_TRACKED_FAILURES {
-            let horizon = self.failure_recheck;
-            failures.retain(|_, at| at.elapsed() < horizon);
-            if failures.len() >= MAX_TRACKED_FAILURES {
-                failures.clear();
-            }
-        }
-        failures.insert(Self::failure_key(q), Instant::now());
-    }
-
-    fn respond_stale(query: &DnsMessage, ctx: &QueryContext<'_>, answers: Vec<DnsResourceRecord>) -> HandlerOutcome {
-        ctx.metrics.stale_served();
-        let mut resp = query.response_template(0);
-        resp.answers = answers;
-        HandlerOutcome::Respond(resp)
-    }
 }
+
+/// Record that the upstream just failed for `key`, bounding the table.
+fn note_failure(failures: &Failures, recheck: Duration, key: String) {
+    let mut failures = failures.lock().unwrap();
+    if failures.len() >= MAX_TRACKED_FAILURES {
+        failures.retain(|_, at| at.elapsed() < recheck);
+        if failures.len() >= MAX_TRACKED_FAILURES {
+            failures.clear();
+        }
+    }
+    failures.insert(key, Instant::now());
+}
+
+/// RFC 8767 §4: answer from stale data, counting it.
+fn respond_stale(
+    callback: DnsQueryCallback,
+    metrics: &super::MetricsSink,
+    mut response: DnsMessage,
+    answers: Vec<DnsResourceRecord>,
+) {
+    metrics.stale_served();
+    response.answers = answers;
+    callback.respond(response);
+}
+
+/// The query that is waiting on the upstream, and who gets to answer it.
+///
+/// The upstream's reply and the client-response timer race; whichever takes
+/// the callback first answers, and the other finds it gone.
+type Waiting = Arc<Mutex<Option<DnsQueryCallback>>>;
 
 /// Strip DNSSEC records a client that did not set DO must not see (RFC 4035
 /// §3.2.1).
@@ -246,28 +259,28 @@ fn learn_denial(resolver: &DnsResolver, cache: &Arc<DnsCache>, q: &DnsQuestion, 
 }
 
 impl DnsQueryHandler for ForwarderHandler {
-    fn handle_query(&self, query: &DnsMessage, ctx: &QueryContext<'_>) -> HandlerOutcome {
+    fn handle_query(&self, query: &DnsMessage, ctx: &QueryContext<'_>, callback: DnsQueryCallback) {
         let q = &query.questions[0];
 
         if self.cache.is_negatively_cached(&q.name) {
             ctx.metrics.cache_hit();
-            return HandlerOutcome::Respond(query.response_template(RCODE_NXDOMAIN));
+            return callback.respond(query.response_template(RCODE_NXDOMAIN));
         }
         // RFC 8020: nothing exists beneath a name that does not.
         if self.nxdomain_cut.nxdomain_cut(q) && self.cache.has_nxdomain_ancestor(&q.name) {
             ctx.metrics.cache_hit();
-            return HandlerOutcome::Respond(query.response_template(RCODE_NXDOMAIN));
+            return callback.respond(query.response_template(RCODE_NXDOMAIN));
         }
         if self.cache.is_nodata_cached(q) {
             // RFC 2308 §2 NODATA: NOERROR with an empty answer set, not NXDOMAIN.
             ctx.metrics.cache_hit();
-            return HandlerOutcome::Respond(query.response_template(0));
+            return callback.respond(query.response_template(0));
         }
         if let Some(answers) = self.cache.lookup(q) {
             ctx.metrics.cache_hit();
             let mut resp = query.response_template(0);
             resp.answers = answers;
-            return HandlerOutcome::Respond(resp);
+            return callback.respond(resp);
         }
 
         // RFC 8198: a cached, validated NSEC/NSEC3 proof may already answer.
@@ -285,7 +298,7 @@ impl DnsQueryHandler for ForwarderHandler {
                     // We validated these proofs when we cached them.
                     resp.flags |= crate::wire::FLAG_AD;
                 }
-                return HandlerOutcome::Respond(resp);
+                return callback.respond(resp);
             }
         }
 
@@ -299,13 +312,13 @@ impl DnsQueryHandler for ForwarderHandler {
         // RFC 8767 §5 failure recheck: the upstream just failed for this
         // question, so do not make the client wait for it to fail again.
         if let Some(answers) = stale.as_ref().filter(|_| self.recently_failed(q)) {
-            return Self::respond_stale(query, ctx, answers.clone());
+            return respond_stale(callback, &ctx.metrics, query.response_template(0), answers.clone());
         }
 
         let Some(ref upstream) = self.upstream else {
             return match stale {
-                Some(answers) => Self::respond_stale(query, ctx, answers),
-                None => HandlerOutcome::Respond(query.response_template(RCODE_SERVFAIL)),
+                Some(answers) => respond_stale(callback, &ctx.metrics, query.response_template(0), answers),
+                None => callback.error(RCODE_SERVFAIL),
             };
         };
 
@@ -316,19 +329,54 @@ impl DnsQueryHandler for ForwarderHandler {
         let minimal_ttl = (q.qtype == Some(DnsType::Any) && !has_do && self.minimal_any.should_return_minimal_any(q))
             .then_some(self.minimal_any_ttl);
 
-        let (tx, rx) = std::sync::mpsc::channel();
+        let key = Self::failure_key(q);
+        let recheck = self.failure_recheck;
+        let metrics = ctx.metrics.clone();
+        let waiting: Waiting = Arc::new(Mutex::new(Some(callback)));
+
+        // With stale data in hand there is no point waiting the full timeout.
+        let wait = if stale.is_some() {
+            self.client_response_timer.min(self.upstream_timeout)
+        } else {
+            self.upstream_timeout
+        };
+        let timer = {
+            let (waiting, failures, key, metrics) =
+                (Arc::clone(&waiting), Arc::clone(&self.failures), key.clone(), metrics.clone());
+            let template = query.response_template(0);
+            let stale = stale.clone();
+            upstream.schedule_timer(
+                wait,
+                Box::new(move || {
+                    let Some(callback) = waiting.lock().unwrap().take() else {
+                        return;
+                    };
+                    note_failure(&failures, recheck, key);
+                    match stale {
+                        Some(answers) => respond_stale(callback, &metrics, template, answers),
+                        None => {
+                            metrics.error();
+                            callback.error(RCODE_SERVFAIL);
+                        }
+                    }
+                }),
+            )
+        };
+
         // Everything that must happen whether or not anyone is still waiting -
         // caching, and clearing the failure record - happens in the callback,
         // so a late answer still refreshes the cache after a stale reply.
         let cache = Arc::clone(&self.cache);
         let failures = Arc::clone(&self.failures);
-        let (id, question, key) = (query.id, q.clone(), Self::failure_key(q));
+        let (id, question) = (query.id, q.clone());
+        let template = query.response_template(0);
         #[cfg(feature = "dnssec")]
         let resolver = learn_proofs.then(|| upstream.clone());
         upstream.query_with_cd(
             q.clone(),
             query.is_checking_disabled(),
             Box::new(move |r| {
+                timer.store(true, Ordering::Release);
                 let processed = r.map(|mut resp| {
                     resp.id = id;
                     if !has_do {
@@ -347,38 +395,34 @@ impl DnsQueryHandler for ForwarderHandler {
                     }
                     resp
                 });
-                let _ = tx.send(processed);
-            }),
-        );
-
-        // With stale data in hand there is no point waiting the full timeout.
-        let wait = if stale.is_some() {
-            self.client_response_timer.min(self.upstream_timeout)
-        } else {
-            self.upstream_timeout
-        };
-        match rx.recv_timeout(wait) {
-            // RFC 8767 §4: only NOERROR and NXDOMAIN count as having refreshed
-            // the data.
-            Ok(Ok(resp)) if matches!(resp.rcode(), 0 | RCODE_NXDOMAIN) => HandlerOutcome::Respond(resp),
-            Ok(Ok(resp)) => {
-                self.note_failure(q);
-                match stale {
-                    Some(answers) => Self::respond_stale(query, ctx, answers),
-                    None => HandlerOutcome::Respond(resp),
-                }
-            }
-            _ => {
-                self.note_failure(q);
-                match stale {
-                    Some(answers) => Self::respond_stale(query, ctx, answers),
-                    None => {
-                        ctx.metrics.error();
-                        HandlerOutcome::Respond(query.response_template(RCODE_SERVFAIL))
+                // Too late if the timer has already answered.
+                let Some(callback) = waiting.lock().unwrap().take() else {
+                    return;
+                };
+                match processed {
+                    // RFC 8767 §4: only NOERROR and NXDOMAIN count as having
+                    // refreshed the data.
+                    Ok(resp) if matches!(resp.rcode(), 0 | RCODE_NXDOMAIN) => callback.respond(resp),
+                    Ok(resp) => {
+                        note_failure(&failures, recheck, key);
+                        match stale {
+                            Some(answers) => respond_stale(callback, &metrics, template, answers),
+                            None => callback.respond(resp),
+                        }
+                    }
+                    Err(_) => {
+                        note_failure(&failures, recheck, key);
+                        match stale {
+                            Some(answers) => respond_stale(callback, &metrics, template, answers),
+                            None => {
+                                metrics.error();
+                                callback.error(RCODE_SERVFAIL);
+                            }
+                        }
                     }
                 }
-            }
-        }
+            }),
+        );
     }
 }
 

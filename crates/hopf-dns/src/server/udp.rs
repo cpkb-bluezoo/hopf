@@ -27,15 +27,22 @@ struct DnsUdpHandler {
 
 impl UdpDatagramHandler for DnsUdpHandler {
     fn on_datagram(&mut self, peer: SocketAddr, data: &[u8]) {
-        let Some(responses) = self.service.process_wire(data, peer, DnsTransport::Udp) else {
-            return;
-        };
         let Some(token) = *self.token.lock().unwrap() else {
             return;
         };
-        for bytes in responses {
-            self.reactor.udp_send(token, peer, bytes);
-        }
+        // `udp_send` queues onto the socket's reactor from any thread, so a
+        // handler that answers later needs no hop of its own.
+        let reactor = self.reactor.clone();
+        self.service.dispatch_wire(
+            data,
+            peer,
+            DnsTransport::Udp,
+            Box::new(move |responses| {
+                for bytes in responses {
+                    reactor.udp_send(token, peer, bytes);
+                }
+            }),
+        );
     }
 }
 

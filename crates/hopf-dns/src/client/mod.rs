@@ -1208,6 +1208,18 @@ impl DnsResolver {
         self.query(DnsQuestion::in_class(name, DnsType::Srv), cb);
     }
 
+    /// Run `task` on this resolver's reactor after `delay`. Returns the flag
+    /// that cancels it. For callers (the forwarder) that must bound how long
+    /// they wait on a query without blocking a thread.
+    pub(crate) fn schedule_timer(
+        &self,
+        delay: Duration,
+        task: hopf_core::handle::Task,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        let reactor = self.inner.lock().unwrap().reactor.clone();
+        reactor.schedule_timer(delay, task)
+    }
+
     /// Generic query.
     pub fn query(&self, question: DnsQuestion, cb: QueryCallback) {
         self.query_with_cd(question, false, cb);

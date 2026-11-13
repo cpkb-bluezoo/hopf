@@ -1945,19 +1945,19 @@ fn notify_over_udp_reaches_the_opcode_handler_or_is_notimp() {
 #[test]
 fn tcp_listener_frames_queries_and_multi_message_responses() {
     use hopf_dns::server::{
-        listen_dns_tcp, DnsQueryHandler, DnsServiceHandle, HandlerOutcome, QueryContext,
+        listen_dns_tcp, DnsQueryCallback, DnsQueryHandler, DnsServiceHandle, QueryContext,
     };
     use hopf_dns::wire::{DnsQuestion, DnsResourceRecord, DnsType};
     use std::io::{Read, Write};
 
     struct TwoMessages;
     impl DnsQueryHandler for TwoMessages {
-        fn handle_query(&self, q: &DnsMessage, _ctx: &QueryContext<'_>) -> HandlerOutcome {
+        fn handle_query(&self, q: &DnsMessage, _ctx: &QueryContext<'_>, callback: DnsQueryCallback) {
             let mut first = q.response_template(0);
             first.answers.push(DnsResourceRecord::a("a.test", 1, Ipv4Addr::new(192, 0, 2, 1)));
             let mut second = q.response_template(0);
             second.answers.push(DnsResourceRecord::a("a.test", 1, Ipv4Addr::new(192, 0, 2, 2)));
-            HandlerOutcome::Sequence(vec![first, second])
+            callback.respond_sequence(vec![first, second]);
         }
     }
 

@@ -40,9 +40,10 @@ pub use policy::{
 };
 pub use framed::listen_dns_tcp;
 pub use handler::{
-    ChainHandler, DnsQueryHandler, DnsTransport, EmptyHandler, FnHandler, HandlerOutcome,
-    MetricsSink, QueryContext,
+    ChainHandler, DnsQueryCallback, DnsQueryHandler, DnsTransport, EmptyHandler, FnHandler,
+    MetricsSink, QueryContext, SyncDnsQueryHandler,
 };
+pub(crate) use handler::HandlerOutcome;
 pub use minimal_any::{MinimalAnyDisabled, MinimalAnyEnabled, MinimalAnyPolicy};
 pub use udp::{listen_dns_udp, DnsUdpListenConfig};
 
@@ -90,12 +91,20 @@ pub struct DnsServerMetrics {
     pub cookies_verified: u64,
 }
 
+/// Where the messages that answer one request are delivered, exactly once,
+/// possibly from another thread.
+type MessageSink = Box<dyn FnOnce(Vec<DnsMessage>) + Send>;
+
+/// Where the encoded responses to one wire request are delivered, exactly
+/// once, possibly from another thread. Empty means there is nothing to send.
+pub type WireSink = Box<dyn FnOnce(Vec<Vec<u8>>) + Send>;
+
 /// DNS protocol shell. See the [module docs](self).
 pub struct DnsService {
     handler: Arc<dyn DnsQueryHandler>,
     cookies: DnsCookie,
-    metrics: std::sync::Mutex<DnsServerMetrics>,
-    keyring: TsigKeyring,
+    metrics: Arc<std::sync::Mutex<DnsServerMetrics>>,
+    keyring: Arc<TsigKeyring>,
 }
 
 impl Default for DnsService {
@@ -122,8 +131,8 @@ impl DnsService {
         Self {
             handler,
             cookies: DnsCookie::new(),
-            metrics: std::sync::Mutex::new(DnsServerMetrics::default()),
-            keyring: TsigKeyring::new(),
+            metrics: Arc::default(),
+            keyring: Arc::new(TsigKeyring::new()),
         }
     }
 
@@ -135,7 +144,7 @@ impl DnsService {
     /// the handler's decision. Not applied over DoQ, which has no use for
     /// it (RFC 9250 §4.2.1 requires message ID 0).
     pub fn set_tsig_keyring(&mut self, keyring: TsigKeyring) {
-        self.keyring = keyring;
+        self.keyring = Arc::new(keyring);
     }
 
     /// Replace the handler.
@@ -169,9 +178,15 @@ impl DnsService {
             .expect("process_on always returns at least one message")
     }
 
-    /// Process one message from `peer` over `transport`. Returns one
-    /// response, or several for a zone transfer on a stream transport;
-    /// never empty.
+    /// Process one message from `peer` over `transport` and **wait** for the
+    /// answer. Returns one response, or several for a zone transfer on a
+    /// stream transport; never empty.
+    ///
+    /// This is a blocking convenience for tests, tools and callers that are
+    /// not on a reactor. It returns at once for a handler that answers
+    /// inline, but a handler that answers later from the very reactor
+    /// thread the caller is blocking would never be heard from; the
+    /// listeners use [`Self::dispatch_wire`], which never blocks.
     ///
     /// Handles the server-side DNS Cookie exchange (RFC 7873 §5.2) around
     /// the handler dispatch: an inbound COOKIE option gets a response
@@ -193,19 +208,32 @@ impl DnsService {
         peer: SocketAddr,
         transport: DnsTransport,
     ) -> Vec<DnsMessage> {
-        self.process_authenticated(query, peer, transport, None)
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.dispatch_message(
+            Arc::new(query.clone()),
+            peer,
+            transport,
+            None,
+            Box::new(move |responses| {
+                let _ = tx.send(responses);
+            }),
+        );
+        rx.recv().expect("a dispatched message is always answered")
     }
 
-    fn process_authenticated(
+    /// The cookie exchange around [`Self::dispatch_handler`]; `done` receives
+    /// the messages that answer `query`, once.
+    fn dispatch_message(
         &self,
-        query: &DnsMessage,
+        query: Arc<DnsMessage>,
         peer: SocketAddr,
         transport: DnsTransport,
         tsig_key: Option<&str>,
-    ) -> Vec<DnsMessage> {
+        done: MessageSink,
+    ) {
         match crate::cookie::parse_client_cookie(&query.additionals) {
-            ClientCookieOption::Absent => self.compute_response(query, peer, transport, tsig_key),
-            ClientCookieOption::Malformed => vec![query.response_template(RCODE_FORMERR)],
+            ClientCookieOption::Absent => self.dispatch_handler(query, peer, transport, tsig_key, done),
+            ClientCookieOption::Malformed => done(vec![query.response_template(RCODE_FORMERR)]),
             ClientCookieOption::Present { client, server } => {
                 let ip_bytes = ip_octets(peer.ip());
                 let mut m = self.metrics.lock().unwrap();
@@ -218,130 +246,201 @@ impl DnsService {
                 }
                 drop(m);
                 let option = self.cookies.encode_response_edns_option(&client, &ip_bytes);
-                let mut out = if verified {
-                    self.compute_response(query, peer, transport, tsig_key)
+                let with_cookie: MessageSink = Box::new(move |mut out| {
+                    out[0].additionals.push(crate::wire::DnsResourceRecord::opt(
+                        crate::wire::OPT_UDP_PAYLOAD,
+                        false,
+                        &option,
+                    ));
+                    done(out)
+                });
+                if verified {
+                    self.dispatch_handler(query, peer, transport, tsig_key, with_cookie);
                 } else {
-                    vec![query.response_template(0)]
-                };
-                out[0].additionals.push(crate::wire::DnsResourceRecord::opt(
-                    crate::wire::OPT_UDP_PAYLOAD,
-                    false,
-                    &option,
-                ));
-                out
+                    with_cookie(vec![query.response_template(0)]);
+                }
             }
         }
     }
 
-    /// Core message handling, without the cookie exchange (factored out so
-    /// `process_on` can wrap every return path uniformly).
-    fn compute_response(
+    /// Core message handling, without the cookie exchange: hand the message
+    /// to the handler with a callback that gathers its decision into the
+    /// messages `done` is given.
+    fn dispatch_handler(
         &self,
-        query: &DnsMessage,
+        query: Arc<DnsMessage>,
         peer: SocketAddr,
         transport: DnsTransport,
         tsig_key: Option<&str>,
-    ) -> Vec<DnsMessage> {
+        done: MessageSink,
+    ) {
         self.metrics.lock().unwrap().queries += 1;
         // RFC 1035 §4.1.1: a message with QR set is a response, not a query.
         if !query.is_query() {
-            return vec![query.response_template(RCODE_NOTIMP)];
+            return done(vec![query.response_template(RCODE_NOTIMP)]);
         }
         let ctx = QueryContext {
             peer,
             transport,
             tsig_key,
-            metrics: MetricsSink(&self.metrics),
+            metrics: MetricsSink(Arc::clone(&self.metrics)),
         };
         // Only the standard QUERY opcode reaches `handle_query`. Anything
         // else (NOTIFY, UPDATE, ...) is offered to `handle_non_query_opcode`
         // and is NOTIMP if nothing claims it.
-        let (outcome, fallback) = if query.opcode() != OPCODE_QUERY {
-            (
-                self.handler.handle_non_query_opcode(query, &ctx),
-                RCODE_NOTIMP,
-            )
-        } else if query.questions.is_empty() {
+        let non_query = query.opcode() != OPCODE_QUERY;
+        if !non_query && query.questions.is_empty() {
             // RFC 1035 §4.1.2: the question section must not be empty.
-            return vec![query.response_template(RCODE_FORMERR)];
+            return done(vec![query.response_template(RCODE_FORMERR)]);
+        }
+        let fallback = if non_query { RCODE_NOTIMP } else { 0 };
+        let request = Arc::clone(&query);
+        let callback = DnsQueryCallback::new(move |outcome| {
+            done(match outcome {
+                HandlerOutcome::Respond(resp) => vec![resp],
+                HandlerOutcome::Sequence(seq) if !seq.is_empty() => seq,
+                HandlerOutcome::Sequence(_) | HandlerOutcome::Decline => {
+                    vec![request.response_template(fallback)]
+                }
+                HandlerOutcome::Error(rcode) => vec![request.response_template(rcode)],
+            })
+        });
+        if non_query {
+            self.handler.handle_non_query_opcode(&query, &ctx, callback);
         } else {
-            (self.handler.handle_query(query, &ctx), 0)
-        };
-        match outcome {
-            HandlerOutcome::Respond(resp) => vec![resp],
-            HandlerOutcome::Sequence(seq) if !seq.is_empty() => seq,
-            HandlerOutcome::Sequence(_) | HandlerOutcome::Decline => {
-                vec![query.response_template(fallback)]
-            }
+            self.handler.handle_query(&query, &ctx, callback);
         }
     }
 
-    /// Handle one request as received on the wire and return the encoded
-    /// responses to send (one, or several for a zone transfer on a stream
-    /// transport). `None` means the bytes are not a DNS message and nothing
-    /// should be sent.
+    /// Handle one request as received on the wire and **wait** for the
+    /// encoded responses to send (one, or several for a zone transfer on a
+    /// stream transport). `None` means the bytes are not a DNS message, or
+    /// nothing could be encoded, and nothing should be sent.
     ///
-    /// This is what the listeners call. It owns everything below the
-    /// handler: TSIG verification and signing, UDP truncation to the size
-    /// the client advertised (RFC 1035 §4.1.1, RFC 6891 §6.2.3: records are
-    /// dropped and TC set, and the client retries over TCP), and the zero
-    /// message ID required over DoQ (RFC 9250 §4.2.1).
+    /// A blocking convenience with the same caveat as [`Self::process_on`];
+    /// the listeners call [`Self::dispatch_wire`].
     pub fn process_wire(
         &self,
         raw: &[u8],
         peer: SocketAddr,
         transport: DnsTransport,
     ) -> Option<Vec<Vec<u8>>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let accepted = self.dispatch_wire(
+            raw,
+            peer,
+            transport,
+            Box::new(move |responses| {
+                let _ = tx.send(responses);
+            }),
+        );
+        if !accepted {
+            return None;
+        }
+        rx.recv().ok().filter(|responses| !responses.is_empty())
+    }
+
+    /// Handle one request as received on the wire, delivering the encoded
+    /// responses to `reply` when the handler has decided. Never blocks.
+    ///
+    /// Returns `false` when `raw` is not a DNS message; `reply` is then
+    /// dropped without being called and nothing should be sent (a DoQ
+    /// listener treats it as a protocol error, RFC 9250 §4.3). Otherwise
+    /// `reply` is called exactly once: before this returns if the handler
+    /// answered inline, later, and possibly on another thread, if not. It is
+    /// called with an empty list when there is nothing to send.
+    ///
+    /// This is what every listener uses. It owns everything below the
+    /// handler: TSIG verification and signing, UDP truncation to the size
+    /// the client advertised (RFC 1035 §4.1.1, RFC 6891 §6.2.3: records are
+    /// dropped and TC set, and the client retries over TCP), and the zero
+    /// message ID required over DoQ (RFC 9250 §4.2.1). Cookie processing,
+    /// signing and truncation happen when the answer is ready, not when the
+    /// query arrives.
+    pub fn dispatch_wire(
+        &self,
+        raw: &[u8],
+        peer: SocketAddr,
+        transport: DnsTransport,
+        reply: WireSink,
+    ) -> bool {
         let now = tsig::now();
         let use_tsig = !self.keyring.is_empty() && transport != DnsTransport::Doq;
-        let mut signer: Option<(&tsig::TsigKey, Vec<u8>)> = None;
+        let mut signer: Option<(String, Vec<u8>)> = None;
         let query = match use_tsig.then(|| tsig::locate(raw)).flatten() {
-            None => DnsMessage::parse(raw).ok()?,
+            None => match DnsMessage::parse(raw) {
+                Ok(q) => q,
+                Err(_) => return false,
+            },
             Some(rec) => match tsig::verify(raw, &self.keyring, Chain::default(), false, now) {
                 Ok(v) => {
-                    signer = self.keyring.get(&v.key_name).map(|k| (k, v.mac));
-                    DnsMessage::parse(&v.unsigned).ok()?
+                    signer = self
+                        .keyring
+                        .get(&v.key_name)
+                        .map(|k| (k.name().to_string(), v.mac));
+                    match DnsMessage::parse(&v.unsigned) {
+                        Ok(q) => q,
+                        Err(_) => return false,
+                    }
                 }
                 Err(e) => {
-                    let q = DnsMessage::parse(raw).ok()?;
-                    let reply = q.response_template(RCODE_NOTAUTH).serialize().ok()?;
-                    return Some(vec![tsig::error_reply(&reply, &rec, e.code(), now)]);
+                    let Ok(q) = DnsMessage::parse(raw) else {
+                        return false;
+                    };
+                    let bytes = q
+                        .response_template(RCODE_NOTAUTH)
+                        .serialize()
+                        .map(|reply_bytes| tsig::error_reply(&reply_bytes, &rec, e.code(), now));
+                    reply(bytes.into_iter().collect());
+                    return true;
                 }
             },
         };
-        let key_name = signer.as_ref().map(|(k, _)| k.name().to_string());
-        let mut responses = self.process_authenticated(&query, peer, transport, key_name.as_deref());
-        if transport == DnsTransport::Udp {
-            responses.truncate(1);
-        }
-        let mut out: Vec<Vec<u8>> = Vec::with_capacity(responses.len());
-        for mut resp in responses {
-            if transport == DnsTransport::Doq {
-                resp.id = 0;
+        let key_name = signer.as_ref().map(|(name, _)| name.clone());
+        let udp_limit = query.requested_udp_payload_size() as usize;
+        let keyring = Arc::clone(&self.keyring);
+        let done: MessageSink = Box::new(move |mut responses| {
+            if transport == DnsTransport::Udp {
+                responses.truncate(1);
             }
-            let mut bytes = resp.serialize().ok()?;
-            if transport == DnsTransport::Udp && bytes.len() > query.requested_udp_payload_size() as usize {
-                resp.answers.clear();
-                resp.authorities.clear();
-                resp.additionals.clear();
-                resp.flags |= FLAG_TC;
-                bytes = resp.serialize().ok()?;
-            }
-            out.push(bytes);
-        }
-        if let Some((key, request_mac)) = signer {
-            let mut prior = request_mac;
-            for (i, bytes) in out.iter_mut().enumerate() {
-                let chain = Chain {
-                    prior_mac: Some(&prior),
-                    unsigned_since: &[],
+            let mut out: Vec<Vec<u8>> = Vec::with_capacity(responses.len());
+            for mut resp in responses {
+                if transport == DnsTransport::Doq {
+                    resp.id = 0;
+                }
+                let Ok(mut bytes) = resp.serialize() else {
+                    return reply(Vec::new());
                 };
-                let (signed, mac) = tsig::sign(bytes, key, chain, i > 0, now);
-                *bytes = signed;
-                prior = mac;
+                if transport == DnsTransport::Udp && bytes.len() > udp_limit {
+                    resp.answers.clear();
+                    resp.authorities.clear();
+                    resp.additionals.clear();
+                    resp.flags |= FLAG_TC;
+                    let Ok(truncated) = resp.serialize() else {
+                        return reply(Vec::new());
+                    };
+                    bytes = truncated;
+                }
+                out.push(bytes);
             }
-        }
-        Some(out)
+            if let Some((name, request_mac)) = signer {
+                if let Some(key) = keyring.get(&name) {
+                    let mut prior = request_mac;
+                    for (i, bytes) in out.iter_mut().enumerate() {
+                        let chain = Chain {
+                            prior_mac: Some(&prior),
+                            unsigned_since: &[],
+                        };
+                        let (signed, mac) = tsig::sign(bytes, key, chain, i > 0, now);
+                        *bytes = signed;
+                        prior = mac;
+                    }
+                }
+            }
+            reply(out)
+        });
+        self.dispatch_message(Arc::new(query), peer, transport, key_name.as_deref(), done);
+        true
     }
 
     /// Server cookie helper.
@@ -364,12 +463,14 @@ impl DnsServiceHandle {
         }
     }
 
-    /// Process a UDP message from `peer`; see [`DnsService::process_query_sync`].
+    /// Process a UDP message from `peer` and wait for the answer; see
+    /// [`DnsService::process_query_sync`].
     pub fn process(&self, query: &DnsMessage, peer: SocketAddr) -> DnsMessage {
         self.inner.process_query_sync(query, peer)
     }
 
-    /// Process a message over `transport`; see [`DnsService::process_on`].
+    /// Process a message over `transport` and wait for the answer; see
+    /// [`DnsService::process_on`].
     pub fn process_on(
         &self,
         query: &DnsMessage,
@@ -379,7 +480,8 @@ impl DnsServiceHandle {
         self.inner.process_on(query, peer, transport)
     }
 
-    /// Handle wire bytes; see [`DnsService::process_wire`].
+    /// Handle wire bytes and wait for the answer; see
+    /// [`DnsService::process_wire`].
     pub fn process_wire(
         &self,
         raw: &[u8],
@@ -387,6 +489,17 @@ impl DnsServiceHandle {
         transport: DnsTransport,
     ) -> Option<Vec<Vec<u8>>> {
         self.inner.process_wire(raw, peer, transport)
+    }
+
+    /// Handle wire bytes without blocking; see [`DnsService::dispatch_wire`].
+    pub fn dispatch_wire(
+        &self,
+        raw: &[u8],
+        peer: SocketAddr,
+        transport: DnsTransport,
+        reply: WireSink,
+    ) -> bool {
+        self.inner.dispatch_wire(raw, peer, transport, reply)
     }
 
     /// Arc access.
@@ -780,15 +893,15 @@ mod tests {
     fn a_stream_transport_receives_every_message_of_a_sequence_but_udp_only_the_first() {
         struct Seq;
         impl DnsQueryHandler for Seq {
-            fn handle_query(&self, q: &DnsMessage, ctx: &QueryContext<'_>) -> HandlerOutcome {
+            fn handle_query(&self, q: &DnsMessage, ctx: &QueryContext<'_>, callback: DnsQueryCallback) {
                 let mut a = q.response_template(0);
                 a.id = q.id;
                 let mut b = a.clone();
                 b.answers.push(DnsResourceRecord::a("x.test", 1, Ipv4Addr::LOCALHOST));
                 if ctx.transport.supports_multi_message() {
-                    HandlerOutcome::Sequence(vec![a, b])
+                    callback.respond_sequence(vec![a, b]);
                 } else {
-                    HandlerOutcome::Respond(a)
+                    callback.respond(a);
                 }
             }
         }
