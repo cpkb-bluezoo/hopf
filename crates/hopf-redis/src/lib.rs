@@ -7,7 +7,8 @@
 //! replies, and each reply comes back as a callback on the reactor. It
 //! negotiates RESP3 (`HELLO 3`) and falls back to RESP2, authenticates,
 //! selects a database, resolves host names through `hopf-dns` and speaks TLS
-//! through a `hopf-core` connector.
+//! through a `hopf-core` connector. [`RedisSubscriber`] is a connection for
+//! publish/subscribe that reconnects and subscribes again by itself.
 //!
 //! ```no_run
 //! use hopf_core::{Runtime, RuntimeConfig};
@@ -23,10 +24,14 @@ mod client;
 mod commands;
 mod config;
 mod error;
+mod pubsub;
 pub mod resp;
 
 pub use client::{Callback, Command, RedisClient, Reply};
 pub use commands::SetOptions;
 pub use config::RedisConfig;
 pub use error::RedisError;
+pub use pubsub::{
+    Invalidation, Message, Push, RedisSubscriber, SubscriberHandler, SubscriptionChange, SubscriptionKind,
+};
 pub use resp::{encode_command, RespError, RespLimits, RespParser, ServerError, Value};

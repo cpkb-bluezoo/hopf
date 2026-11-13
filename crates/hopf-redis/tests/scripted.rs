@@ -451,3 +451,224 @@ fn a_command_issued_while_a_callback_holds_a_lock_is_not_reentered() {
     assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap_err(), RedisError::Closed);
     rt.shutdown();
 }
+
+// ---- publish/subscribe and push messages ----
+
+use hopf_redis::{Message, RedisSubscriber, SubscriptionChange, SubscriptionKind};
+
+fn b(s: &str) -> hopf_core::Bytes {
+    hopf_core::Bytes::copy_from_slice(s.as_bytes())
+}
+
+fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+    for _ in 0..1000 {
+        if cond() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for {what}");
+}
+
+#[test]
+fn a_resp2_server_delivers_messages_as_arrays_and_they_are_read_as_such() {
+    let server = serve(move |s, w| match name_of(w).as_str() {
+        "HELLO" => s.reply("-ERR unknown command 'HELLO'\r\n"),
+        "SUBSCRIBE" => {
+            for (i, ch) in w[1..].iter().enumerate() {
+                let name = String::from_utf8_lossy(ch);
+                s.reply(format!("*3\r\n$9\r\nsubscribe\r\n${}\r\n{name}\r\n:{}\r\n", name.len(), i + 1));
+            }
+            s.reply("*3\r\n$7\r\nmessage\r\n$1\r\na\r\n$2\r\nhi\r\n");
+        }
+        _ => s.reply("+OK\r\n"),
+    });
+    let rt = runtime();
+    let rec = Recorder::default();
+    let sub = RedisSubscriber::connect(rt.pick_worker(), RedisConfig::from_addr(server.addr), rec.clone());
+    sub.subscribe(&["a", "b"]);
+    rec.wait_for("the message", |e| e.iter().any(|x| matches!(x, Event::Message(_))));
+    assert_eq!(
+        rec.events(),
+        vec![
+            Event::Connected(false),
+            Event::Change(SubscriptionChange::Subscribed {
+                kind: SubscriptionKind::Channel,
+                name: b("a"),
+                count: 1
+            }),
+            Event::Change(SubscriptionChange::Subscribed {
+                kind: SubscriptionKind::Channel,
+                name: b("b"),
+                count: 2
+            }),
+            Event::Message(Message::Channel {
+                channel: b("a"),
+                payload: b("hi")
+            }),
+        ]
+    );
+    sub.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_push_of_a_kind_nobody_knows_is_delivered_and_replies_keep_their_place() {
+    // GET, then an unknown push, then the second GET's reply.
+    let server = serve(move |s, w| match (name_of(w).as_str(), s.seq) {
+        ("HELLO", _) => s.reply(HELLO_OK),
+        ("GET", 1) => s.reply("$1\r\n1\r\n>3\r\n$5\r\nweird\r\n:7\r\n$1\r\nx\r\n"),
+        ("GET", _) => s.reply("$1\r\n2\r\n"),
+        _ => s.reply("+OK\r\n"),
+    });
+    let (rt, c) = client(&server, |c| c);
+    let pushes = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&pushes);
+    c.set_push_handler(move |p| log.lock().unwrap().push(p));
+    assert_eq!(call!(|cb| c.get("a", cb)).unwrap().map(|v| v.to_vec()), Some(b"1".to_vec()));
+    assert_eq!(call!(|cb| c.get("b", cb)).unwrap().map(|v| v.to_vec()), Some(b"2".to_vec()));
+    let got = pushes.lock().unwrap().clone();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].kind, "weird");
+    assert_eq!(got[0].data, vec![Value::Int(7), Value::Bulk(b("x"))]);
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_push_with_no_handler_is_discarded_without_disturbing_anything() {
+    let server = serve(move |s, w| match name_of(w).as_str() {
+        "HELLO" => s.reply(HELLO_OK),
+        _ => s.reply(">2\r\n$5\r\nweird\r\n:1\r\n+PONG\r\n"),
+    });
+    let (rt, c) = client(&server, |c| c);
+    call!(|cb| c.ping(cb)).unwrap();
+    call!(|cb| c.ping(cb)).unwrap();
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_subscriber_whose_connection_goes_silent_notices_and_comes_back() {
+    // Connection 0 answers nothing after the handshake; connection 1 behaves.
+    let seen: Arc<Mutex<Vec<(usize, String)>>> = Arc::default();
+    let log = Arc::clone(&seen);
+    let server = serve(move |s, w| {
+        log.lock().unwrap().push((s.conn, name_of(w)));
+        match name_of(w).as_str() {
+            "HELLO" => s.reply(HELLO_OK),
+            "SUBSCRIBE" if s.conn == 0 => {} // never acknowledged, never answers a PING
+            "SUBSCRIBE" => s.reply(">3\r\n$9\r\nsubscribe\r\n$1\r\nc\r\n:1\r\n"),
+            "PING" if s.conn == 0 => {}
+            "PING" => s.reply("+PONG\r\n"),
+            _ => s.reply("+OK\r\n"),
+        }
+    });
+    let rt = runtime();
+    let rec = Recorder::default();
+    let sub = RedisSubscriber::connect(
+        rt.pick_worker(),
+        RedisConfig::from_addr(server.addr)
+            .ping_interval(Some(Duration::from_millis(100)))
+            .reconnect_backoff(Duration::from_millis(20), Duration::from_millis(50)),
+        rec.clone(),
+    );
+    sub.subscribe(&["c"]);
+    rec.wait_for("the second connection to subscribe", |e| e.iter().any(|x| matches!(x, Event::Change(_))));
+    let events = rec.events();
+    assert_eq!(events[0], Event::Connected(false));
+    assert!(events.contains(&Event::Disconnected), "{events:?}");
+    assert!(events.contains(&Event::Connected(true)));
+    let log = seen.lock().unwrap().clone();
+    assert!(log.contains(&(0, "PING".into())), "it pinged the quiet connection: {log:?}");
+    assert!(log.contains(&(1, "SUBSCRIBE".into())), "and subscribed again on the new one: {log:?}");
+    sub.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_busy_connection_is_not_mistaken_for_a_dead_one() {
+    // The server keeps sending messages but never answers a PING: traffic is
+    // life enough.
+    let server = serve(move |s, w| match name_of(w).as_str() {
+        "HELLO" => s.reply(HELLO_OK),
+        "SUBSCRIBE" => {
+            s.reply(">3\r\n$9\r\nsubscribe\r\n$1\r\nc\r\n:1\r\n");
+            let handle = s.endpoint.handle();
+            thread::spawn(move || {
+                for _ in 0..30 {
+                    thread::sleep(Duration::from_millis(40));
+                    handle.with_endpoint(|ep| ep.send(b">3\r\n$7\r\nmessage\r\n$1\r\nc\r\n$1\r\nx\r\n"));
+                }
+            });
+        }
+        _ => {}
+    });
+    let rt = runtime();
+    let rec = Recorder::default();
+    let sub = RedisSubscriber::connect(
+        rt.pick_worker(),
+        RedisConfig::from_addr(server.addr).ping_interval(Some(Duration::from_millis(100))),
+        rec.clone(),
+    );
+    sub.subscribe(&["c"]);
+    rec.wait_for("thirty messages", |e| e.iter().filter(|x| matches!(x, Event::Message(_))).count() == 30);
+    assert!(!rec.events().contains(&Event::Disconnected));
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+    sub.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn what_was_subscribed_to_before_and_after_a_drop_is_sent_again_in_full() {
+    let subscribes: Arc<Mutex<Vec<(usize, Vec<String>)>>> = Arc::default();
+    let log = Arc::clone(&subscribes);
+    let server = serve(move |s, w| match name_of(w).as_str() {
+        "HELLO" => s.reply(HELLO_OK),
+        "SUBSCRIBE" | "PSUBSCRIBE" => {
+            log.lock().unwrap().push((s.conn, w.iter().map(|x| String::from_utf8_lossy(x).into_owned()).collect()));
+            if s.conn == 0 && name_of(w) == "PSUBSCRIBE" {
+                s.close();
+            }
+        }
+        _ => {}
+    });
+    let rt = runtime();
+    let rec = Recorder::default();
+    // The subscriptions are asked for before the connection is up.
+    let sub = RedisSubscriber::connect(rt.pick_worker(), RedisConfig::from_addr(server.addr), rec.clone());
+    sub.subscribe(&["b", "a"]);
+    rec.wait_for("the first connection", |e| e.contains(&Event::Connected(false)));
+    sub.psubscribe(&["p*"]); // the server drops the connection on this
+    rec.wait_for("the reconnect", |e| e.contains(&Event::Connected(true)));
+    wait_until("the second connection's subscriptions", || subscribes.lock().unwrap().iter().filter(|(c, _)| *c == 1).count() == 2);
+    let log = subscribes.lock().unwrap().clone();
+    let second: Vec<_> = log.iter().filter(|(c, _)| *c == 1).map(|(_, w)| w.join(" ")).collect();
+    assert_eq!(second, vec!["SUBSCRIBE a b", "PSUBSCRIBE p*"], "everything wanted, one command per kind");
+    sub.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_closed_subscriber_stops_dialling() {
+    let server = serve(move |s, w| match name_of(w).as_str() {
+        "HELLO" => s.reply(HELLO_OK),
+        _ => {}
+    });
+    let rt = runtime();
+    let rec = Recorder::default();
+    let sub = RedisSubscriber::connect(rt.pick_worker(), RedisConfig::from_addr(server.addr), rec.clone());
+    rec.wait_for("connected", |e| e.contains(&Event::Connected(false)));
+    sub.close();
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1, "it did not reconnect after close");
+    assert!(!sub.is_connected());
+    rt.shutdown();
+    server.rt.shutdown();
+}

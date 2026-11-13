@@ -21,8 +21,15 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
   late reply is discarded in its place; after a failed connect commands fail
   fast for a growing time. `hopf_redis::resp` has the `Value` type, the command
   encoder and `RespParser`, an incremental parser with limits on bulk size,
-  aggregate size, depth, line length and total reply size. Pub/sub, push
-  messages and cluster mode follow. Tested against Redis 7.4 and Valkey 8.1.
+  aggregate size, depth, line length and total reply size.
+  `RedisSubscriber` is a connection for publish/subscribe (channels, patterns
+  and shard channels) that reconnects by itself, subscribes again to everything,
+  watches the connection with a keepalive and delivers messages,
+  acknowledgements and push kinds it does not know to a `SubscriberHandler`;
+  `RedisClient::publish` and `spublish` publish, and `set_push_handler`
+  receives the RESP3 pushes (key invalidations, for one) a command connection
+  gets. A command connection refuses `SUBSCRIBE` and its relatives. Cluster
+  mode follows. Tested against Redis 7.4 and Valkey 8.1.
 - **hopf-core:** readiness and graceful shutdown (#530).
   `Runtime::is_ready()`, `is_draining()`, `bind_failures()` and
   `open_connections()`; `Runtime::start_drain()` stops accepting and tells every

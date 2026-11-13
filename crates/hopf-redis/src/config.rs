@@ -31,6 +31,7 @@ pub struct RedisConfig {
     pub(crate) limits: RespLimits,
     pub(crate) backoff_initial: Duration,
     pub(crate) backoff_max: Duration,
+    pub(crate) ping_interval: Option<Duration>,
 }
 
 impl RedisConfig {
@@ -54,6 +55,7 @@ impl RedisConfig {
             limits: RespLimits::default(),
             backoff_initial: Duration::from_millis(100),
             backoff_max: Duration::from_secs(5),
+            ping_interval: Some(Duration::from_secs(30)),
         }
     }
 
@@ -147,6 +149,16 @@ impl RedisConfig {
     pub fn reconnect_backoff(mut self, initial: Duration, max: Duration) -> Self {
         self.backoff_initial = initial;
         self.backoff_max = max;
+        self
+    }
+
+    /// For a [`RedisSubscriber`](crate::RedisSubscriber): how often to check the
+    /// connection is alive. After this long with nothing received it sends a
+    /// `PING`; after three times as long with nothing at all, it drops the
+    /// connection and dials again (a connection can die without telling either
+    /// end). `None` never checks. Default 30 s.
+    pub fn ping_interval(mut self, interval: Option<Duration>) -> Self {
+        self.ping_interval = interval;
         self
     }
 

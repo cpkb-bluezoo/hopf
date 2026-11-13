@@ -510,6 +510,19 @@ impl RedisClient {
         self.typed(Command::new("ZCARD").arg(key), int, callback);
     }
 
+    // ---- publish ----
+
+    /// `PUBLISH`: how many subscribers received the message. Subscribing is
+    /// done with a [`RedisSubscriber`](crate::RedisSubscriber).
+    pub fn publish(&self, channel: impl AsRef<[u8]>, message: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+        self.typed(Command::new("PUBLISH").arg(channel).arg(message), int, callback);
+    }
+
+    /// `SPUBLISH` (Redis 7): publish to a shard channel.
+    pub fn spublish(&self, channel: impl AsRef<[u8]>, message: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
+        self.typed(Command::new("SPUBLISH").arg(channel).arg(message), int, callback);
+    }
+
     // ---- scripts ----
 
     /// `EVAL script numkeys key... arg...`: the script's result, as sent.

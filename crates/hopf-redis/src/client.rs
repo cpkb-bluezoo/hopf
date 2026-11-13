@@ -39,6 +39,7 @@ use hopf_dns::DnsResolver;
 
 use crate::config::RedisConfig;
 use crate::error::RedisError;
+use crate::pubsub::{self, Desired, Push, SubscriberHandler};
 use crate::resp::{encode_command, RespParser, ServerError, Value};
 
 /// What a command's callback is given.
@@ -124,7 +125,7 @@ struct Waiting {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Phase {
+pub(crate) enum Phase {
     /// No connection, and none being made.
     Idle,
     /// Resolving the host name or connecting (and, over TLS, handshaking).
@@ -135,12 +136,12 @@ enum Phase {
     Ready,
 }
 
-struct State {
-    phase: Phase,
+pub(crate) struct State {
+    pub(crate) phase: Phase,
     /// Identifies the connection attempt, so a late event from an earlier one
     /// is ignored.
-    conn_id: u64,
-    handle: Option<ConnHandle>,
+    pub(crate) conn_id: u64,
+    pub(crate) handle: Option<ConnHandle>,
     waiting: VecDeque<Waiting>,
     pending: VecDeque<Sent>,
     /// Bytes for the connection not yet handed to it.
@@ -151,18 +152,123 @@ struct State {
     /// RESP3 was negotiated on this connection.
     resp3: bool,
     /// Connection attempts that failed in a row, and when the next may start.
-    failures: u32,
-    retry_at: Option<Instant>,
-    last_error: Option<RedisError>,
+    pub(crate) failures: u32,
+    pub(crate) retry_at: Option<Instant>,
+    pub(crate) last_error: Option<RedisError>,
+    /// What a subscriber wants to be subscribed to.
+    pub(crate) desired: Desired,
+    /// When anything last arrived on the connection (a subscriber's health).
+    pub(crate) last_rx: Instant,
 }
 
 pub(crate) struct Inner {
     pub(crate) reactor: ReactorHandle,
     pub(crate) config: RedisConfig,
-    state: Mutex<State>,
-    closed: AtomicBool,
+    pub(crate) state: Mutex<State>,
+    pub(crate) closed: AtomicBool,
     next_qid: AtomicU64,
     resolver: Mutex<Option<Arc<DnsResolver>>>,
+    /// Where RESP3 pushes go on a command connection.
+    push: Mutex<Option<Box<dyn FnMut(Push) + Send>>>,
+    /// Set for a subscriber: its handler.
+    pub(crate) sub: Option<Mutex<Box<dyn SubscriberHandler>>>,
+    /// A subscriber has been connected at least once.
+    pub(crate) sub_connected_before: AtomicBool,
+}
+
+/// Build the shared state for a connection and dial it. A subscriber passes its
+/// handler.
+pub(crate) fn start(reactor: &ReactorHandle, config: RedisConfig, sub: Option<Box<dyn SubscriberHandler>>) -> Arc<Inner> {
+    let inner = Arc::new(Inner {
+        reactor: reactor.clone(),
+        config,
+        state: Mutex::new(State {
+            phase: Phase::Idle,
+            conn_id: 0,
+            handle: None,
+            waiting: VecDeque::new(),
+            pending: VecDeque::new(),
+            outbox: Vec::new(),
+            flush_scheduled: false,
+            addrs: VecDeque::new(),
+            resp3: false,
+            failures: 0,
+            retry_at: None,
+            last_error: None,
+            desired: Desired::default(),
+            last_rx: Instant::now(),
+        }),
+        closed: AtomicBool::new(false),
+        next_qid: AtomicU64::new(0),
+        resolver: Mutex::new(None),
+        push: Mutex::new(None),
+        sub: sub.map(Mutex::new),
+        sub_connected_before: AtomicBool::new(false),
+    });
+    let first = {
+        let mut st = inner.state.lock().unwrap();
+        begin_dial(&mut st)
+    };
+    if let Some(conn_id) = first {
+        dial(&inner, conn_id);
+    }
+    inner
+}
+
+/// Dial again (a subscriber, after a failure and its hold-off).
+pub(crate) fn redial(inner: &Arc<Inner>) {
+    if inner.closed.load(Ordering::SeqCst) {
+        return;
+    }
+    let start = {
+        let mut st = inner.state.lock().unwrap();
+        begin_dial(&mut st)
+    };
+    if let Some(conn_id) = start {
+        dial(inner, conn_id);
+    }
+}
+
+/// Write bytes to the connection outside the queue of commands (a subscriber's
+/// subscriptions and pings have no reply to wait for). Dropped if the
+/// connection is not ready.
+pub(crate) fn write_raw(inner: &Arc<Inner>, bytes: Vec<u8>) {
+    let need_flush = {
+        let mut st = inner.state.lock().unwrap();
+        if st.phase != Phase::Ready {
+            return;
+        }
+        st.outbox.extend_from_slice(&bytes);
+        !std::mem::replace(&mut st.flush_scheduled, true)
+    };
+    if need_flush {
+        flush(inner);
+    }
+}
+
+/// Close the connection, fail what is waiting, and refuse later commands.
+pub(crate) fn close(inner: &Arc<Inner>) {
+    inner.closed.store(true, Ordering::SeqCst);
+    let (handle, waiting, pending) = {
+        let mut st = inner.state.lock().unwrap();
+        st.phase = Phase::Idle;
+        st.conn_id += 1;
+        st.outbox.clear();
+        (st.handle.take(), std::mem::take(&mut st.waiting), std::mem::take(&mut st.pending))
+    };
+    if let Some(h) = handle {
+        h.close();
+    }
+    for w in waiting {
+        cancel_timer(&w.cancel);
+        finish(inner, w.callback, Err(RedisError::Closed));
+    }
+    for s in pending {
+        cancel_timer(&s.cancel);
+        if let Kind::User(Some(cb)) = s.kind {
+            finish(inner, cb, Err(RedisError::Closed));
+        }
+    }
 }
 
 /// A pipelined connection to one server. Cheap to clone; clones share the
@@ -176,45 +282,39 @@ impl RedisClient {
     /// A client bound to `reactor`, dialling `config`'s server now. Its
     /// callbacks run on `reactor`.
     pub fn connect(reactor: &ReactorHandle, config: RedisConfig) -> Self {
-        let inner = Arc::new(Inner {
-            reactor: reactor.clone(),
-            config,
-            state: Mutex::new(State {
-                phase: Phase::Idle,
-                conn_id: 0,
-                handle: None,
-                waiting: VecDeque::new(),
-                pending: VecDeque::new(),
-                outbox: Vec::new(),
-                flush_scheduled: false,
-                addrs: VecDeque::new(),
-                resp3: false,
-                failures: 0,
-                retry_at: None,
-                last_error: None,
-            }),
-            closed: AtomicBool::new(false),
-            next_qid: AtomicU64::new(0),
-            resolver: Mutex::new(None),
-        });
-        let start = {
-            let mut st = inner.state.lock().unwrap();
-            begin_dial(&mut st)
-        };
-        if let Some(conn_id) = start {
-            dial(&inner, conn_id);
+        Self {
+            inner: start(reactor, config, None),
         }
-        Self { inner }
+    }
+
+    /// Receive the RESP3 pushes this connection gets: key invalidations
+    /// (`CLIENT TRACKING`), and anything else a server pushes, of whatever kind
+    /// (see [`Push`]). `handler` runs on the client's reactor. Without one,
+    /// pushes are discarded. Subscriptions are not made here: they need a
+    /// [`RedisSubscriber`](crate::RedisSubscriber).
+    pub fn set_push_handler(&self, handler: impl FnMut(Push) + Send + 'static) {
+        *self.inner.push.lock().unwrap() = Some(Box::new(handler));
+    }
+
+    /// Stop passing pushes to the handler.
+    pub fn clear_push_handler(&self) {
+        *self.inner.push.lock().unwrap() = None;
     }
 
     /// Send `command` and call `callback` with the reply. Returns at once.
     pub fn send(&self, command: &Command, callback: impl FnOnce(Reply) + Send + 'static) {
+        if command.words().first().is_some_and(|w| pubsub::is_subscription_command(w)) {
+            return refuse_subscription(&self.inner, Box::new(callback));
+        }
         submit(&self.inner, vec![(command.encode(), Box::new(callback))]);
     }
 
     /// Send the command made of `words` (the name first) and call `callback`
     /// with the reply. Returns at once.
     pub fn command(&self, words: &[&[u8]], callback: impl FnOnce(Reply) + Send + 'static) {
+        if words.first().is_some_and(|w| pubsub::is_subscription_command(w)) {
+            return refuse_subscription(&self.inner, Box::new(callback));
+        }
         let mut bytes = Vec::new();
         encode_command(words, &mut bytes);
         submit(&self.inner, vec![(bytes, Box::new(callback))]);
@@ -224,6 +324,12 @@ impl RedisClient {
     /// caller between them. Each has its own callback, called in the order the
     /// commands were given.
     pub fn send_batch(&self, commands: Vec<(Command, Callback)>) {
+        if commands.iter().any(|(c, _)| c.words().first().is_some_and(|w| pubsub::is_subscription_command(w))) {
+            for (_, cb) in commands {
+                refuse_subscription(&self.inner, cb);
+            }
+            return;
+        }
         submit(&self.inner, commands.into_iter().map(|(c, cb)| (c.encode(), cb)).collect());
     }
 
@@ -240,29 +346,21 @@ impl RedisClient {
     /// Close the connection and fail every command still waiting with
     /// [`RedisError::Closed`]. Later commands fail the same way.
     pub fn close(&self) {
-        let inner = &self.inner;
-        inner.closed.store(true, Ordering::SeqCst);
-        let (handle, waiting, pending) = {
-            let mut st = inner.state.lock().unwrap();
-            st.phase = Phase::Idle;
-            st.conn_id += 1;
-            st.outbox.clear();
-            (st.handle.take(), std::mem::take(&mut st.waiting), std::mem::take(&mut st.pending))
-        };
-        if let Some(h) = handle {
-            h.close();
-        }
-        for w in waiting {
-            cancel_timer(&w.cancel);
-            finish(inner, w.callback, Err(RedisError::Closed));
-        }
-        for s in pending {
-            cancel_timer(&s.cancel);
-            if let Kind::User(Some(cb)) = s.kind {
-                finish(inner, cb, Err(RedisError::Closed));
-            }
-        }
+        close(&self.inner);
     }
+}
+
+/// A command connection does not take subscriptions: in RESP3 the server
+/// answers them with pushes, not a reply, which would put every later reply out
+/// of step with its command, and in RESP2 it would stop accepting commands.
+fn refuse_subscription(inner: &Inner, callback: Callback) {
+    finish(
+        inner,
+        callback,
+        Err(RedisError::Unexpected(
+            "subscriptions need a RedisSubscriber, not a command connection".into(),
+        )),
+    );
 }
 
 fn cancel_timer(cancel: &Option<Arc<AtomicBool>>) {
@@ -629,11 +727,12 @@ fn connect_failed(inner: &Arc<Inner>, conn_id: u64, error: RedisError) {
         cancel_timer(&w.cancel);
         finish(inner, w.callback, Err(error.clone()));
     }
+    pubsub::schedule_redial(inner);
 }
 
 /// Connection `conn_id` ended. Fail what was sent on it, and what was waiting
 /// if it never became ready.
-fn lost(inner: &Arc<Inner>, conn_id: u64, reason: &str) {
+pub(crate) fn lost(inner: &Arc<Inner>, conn_id: u64, reason: &str) {
     let (pending, waiting, was_ready, more_addrs) = {
         let mut st = inner.state.lock().unwrap();
         if st.conn_id != conn_id || st.phase == Phase::Idle {
@@ -650,9 +749,15 @@ fn lost(inner: &Arc<Inner>, conn_id: u64, reason: &str) {
             st.outbox.clear();
             st.flush_scheduled = false;
             st.resp3 = false;
-            if was_ready {
+            if was_ready && inner.sub.is_none() {
                 st.failures = 0;
                 st.retry_at = None;
+            } else if was_ready {
+                // A subscriber dials again by itself, after a short pause so a
+                // server that drops it as soon as it connects is not hammered.
+                st.failures = 1;
+                st.retry_at = Some(Instant::now() + backoff(inner.config.backoff_initial, inner.config.backoff_max, 1));
+                st.last_error = Some(RedisError::ConnectionLost(reason.to_string()));
             } else {
                 st.failures += 1;
                 st.retry_at = Some(
@@ -681,6 +786,12 @@ fn lost(inner: &Arc<Inner>, conn_id: u64, reason: &str) {
     for w in waiting {
         cancel_timer(&w.cancel);
         finish(inner, w.callback, Err(why.clone()));
+    }
+    if inner.sub.is_some() {
+        if was_ready {
+            pubsub::sub_lost(inner, &why);
+        }
+        pubsub::schedule_redial(inner);
     }
 }
 
@@ -725,6 +836,9 @@ impl Conn {
     /// The handshake is done: send what waited.
     fn ready(&mut self, endpoint: &mut dyn Endpoint) {
         let inner = &self.inner;
+        if inner.sub.is_some() {
+            return pubsub::sub_ready(inner, self.conn_id, endpoint);
+        }
         let bytes = {
             let mut st = inner.state.lock().unwrap();
             if st.conn_id != self.conn_id {
@@ -759,10 +873,22 @@ impl Conn {
     /// One reply from the server.
     fn on_reply(&mut self, endpoint: &mut dyn Endpoint, value: Value) {
         let inner = Arc::clone(&self.inner);
-        if let Value::Push(items) = value {
-            // Out-of-band data belongs to no command. Nothing consumes it on a
-            // plain command connection yet.
-            drop(items);
+        // A subscriber's connection, once past its handshake, gets messages and
+        // acknowledgements, not replies.
+        if inner.sub.is_some() && inner.state.lock().unwrap().phase == Phase::Ready {
+            return pubsub::sub_reply(&inner, value);
+        }
+        if let Value::Push(mut items) = value {
+            // Out-of-band data belongs to no command: to the push handler, of
+            // whatever kind.
+            if inner.state.lock().unwrap().conn_id != self.conn_id {
+                return;
+            }
+            let kind = items.first().and_then(Value::as_str).unwrap_or("").to_string();
+            let data = if items.is_empty() { Vec::new() } else { items.split_off(1) };
+            if let Some(handler) = inner.push.lock().unwrap().as_mut() {
+                handler(Push { kind, data });
+            }
             return;
         }
         let sent = {
@@ -856,6 +982,12 @@ impl ProtocolHandler for Conn {
     }
 
     fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        if self.inner.sub.is_some() {
+            let mut st = self.inner.state.lock().unwrap();
+            if st.conn_id == self.conn_id {
+                st.last_rx = Instant::now();
+            }
+        }
         let mut replies = Vec::new();
         let mut bad = None;
         hopf_core::with_slice(buf, |data| {

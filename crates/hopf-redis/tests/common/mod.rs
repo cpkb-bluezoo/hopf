@@ -62,3 +62,63 @@ pub fn client(rt: &Runtime, host: &str, port: u16) -> RedisClient {
 pub fn recv_within<T>(rx: &mpsc::Receiver<T>, secs: u64) -> Option<T> {
     rx.recv_timeout(Duration::from_secs(secs)).ok()
 }
+
+/// What a subscriber's handler saw, in order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Event {
+    Message(hopf_redis::Message),
+    Change(hopf_redis::SubscriptionChange),
+    Push(hopf_redis::Push),
+    Error(hopf_redis::ServerError),
+    Connected(bool),
+    Disconnected,
+}
+
+/// A handler that records what it is told.
+#[derive(Clone, Default)]
+pub struct Recorder(pub std::sync::Arc<std::sync::Mutex<Vec<Event>>>);
+
+impl Recorder {
+    pub fn events(&self) -> Vec<Event> {
+        self.0.lock().unwrap().clone()
+    }
+
+    pub fn messages(&self) -> Vec<hopf_redis::Message> {
+        self.events()
+            .into_iter()
+            .filter_map(|e| if let Event::Message(m) = e { Some(m) } else { None })
+            .collect()
+    }
+
+    /// Wait until `cond` holds of the events, or fail the test.
+    pub fn wait_for(&self, what: &str, cond: impl Fn(&[Event]) -> bool) {
+        for _ in 0..1000 {
+            if cond(&self.events()) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for {what}; saw {:?}", self.events());
+    }
+}
+
+impl hopf_redis::SubscriberHandler for Recorder {
+    fn on_message(&mut self, m: hopf_redis::Message) {
+        self.0.lock().unwrap().push(Event::Message(m));
+    }
+    fn on_subscription(&mut self, c: hopf_redis::SubscriptionChange) {
+        self.0.lock().unwrap().push(Event::Change(c));
+    }
+    fn on_push(&mut self, p: hopf_redis::Push) {
+        self.0.lock().unwrap().push(Event::Push(p));
+    }
+    fn on_error(&mut self, e: hopf_redis::ServerError) {
+        self.0.lock().unwrap().push(Event::Error(e));
+    }
+    fn on_connected(&mut self, reconnect: bool) {
+        self.0.lock().unwrap().push(Event::Connected(reconnect));
+    }
+    fn on_disconnected(&mut self, _reason: &hopf_redis::RedisError) {
+        self.0.lock().unwrap().push(Event::Disconnected);
+    }
+}

@@ -18,6 +18,11 @@ speaking RESP2 and RESP3.
   fails with `ConnectionLost` and is never re-sent; a timed-out command's late
   reply is discarded in its place; after a failed connect, commands fail fast for
   a growing time.
+- **Publish/subscribe:** `RedisSubscriber` is a dedicated connection that
+  reconnects by itself and subscribes again to everything (channels, patterns,
+  shard channels), notices a dead connection with a keepalive, and delivers
+  messages, acknowledgements and unknown push kinds to a handler. A command
+  connection takes a push handler for RESP3 pushes such as key invalidations.
 - **A push RESP parser** (`hopf_redis::resp`) that holds none of the stream,
   reads every RESP2 and RESP3 type in any split, and checks every size a server
   announces against configurable limits before reserving memory.
