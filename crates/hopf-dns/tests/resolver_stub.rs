@@ -1952,7 +1952,7 @@ fn tcp_listener_frames_queries_and_multi_message_responses() {
 
     struct TwoMessages;
     impl DnsQueryHandler for TwoMessages {
-        fn handle_query(&self, q: &DnsMessage, _ctx: &QueryContext<'_>, callback: DnsQueryCallback) {
+        fn handle_query(&self, q: &DnsMessage, _ctx: &QueryContext, callback: DnsQueryCallback) {
             let mut first = q.response_template(0);
             first.answers.push(DnsResourceRecord::a("a.test", 1, Ipv4Addr::new(192, 0, 2, 1)));
             let mut second = q.response_template(0);

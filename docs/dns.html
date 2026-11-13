@@ -238,7 +238,7 @@
 </tr>
 <tr>
 <td><code>FnHandler</code></td>
-<td>Closure handler (a <code>SyncDnsQueryHandler</code>): <code>on_query</code>, <code>on_opcode</code></td>
+<td>Closure handler (a <code>SyncDnsQueryHandler</code>): <code>on_query</code>, <code>on_opcode</code>, and <code>on_query_ctx</code>, <code>on_opcode_ctx</code> for closures that take the <code>QueryContext</code></td>
 </tr>
 <tr>
 <td><code>ChainHandler</code></td>
@@ -246,7 +246,11 @@
 </tr>
 <tr>
 <td><code>QueryContext</code></td>
-<td>Per-message context: <code>peer</code>, <code>transport</code> (<code>DnsTransport::{Udp, Tcp, Dot, Doq}</code>), <code>tsig_key</code>, metrics</td>
+<td>Per-message context, owned and <code>Clone</code>, read through accessors: <code>peer()</code>, <code>local()</code>, <code>transport()</code> (<code>DnsTransport::{Udp, Tcp, Dot, Doq}</code>), <code>tsig_key()</code>, <code>security()</code>, <code>sni()</code>, <code>peer_certificate_chain()</code>, <code>metrics()</code></td>
+</tr>
+<tr>
+<td><code>ConnectionInfo</code></td>
+<td>What a listener knows of a connection: <code>peer</code>, <code>local</code>, and the connection's shared <code>SecurityInfo</code>. Passed to <code>dispatch_wire_with</code>, <code>process_wire_with</code> and <code>process_on_with</code></td>
 </tr>
 <tr>
 <td><code>DnsServerMetrics</code></td>
@@ -278,7 +282,7 @@
 <p><strong>Callback shape.</strong> Like every I/O operation in hopf, a handler takes a callback and returns nothing. It may complete the <code>DnsQueryCallback</code> before returning (a table lookup: no extra hop) or later, from any thread, once an upstream client or a store has answered; the listener is never held while a handler waits. The answer is delivered on the connection's own reactor (TCP, DoT and DoQ) or sent from the datagram socket's (UDP), and cookies, TSIG signing and UDP truncation are applied when it is ready. A stream connection writes each answer as it completes, so queries pipelined on one connection may be answered out of order (RFC 7766 §6.2.1.1). A handler that already has its answer implements <code>SyncDnsQueryHandler::resolve</code> instead.</p>
 <pre><code>struct Redis { /* ... */ }
 impl DnsQueryHandler for Redis {
-    fn handle_query(&amp;self, q: &amp;DnsMessage, _ctx: &amp;QueryContext&lt;'_&gt;, callback: DnsQueryCallback) {
+    fn handle_query(&amp;self, q: &amp;DnsMessage, ctx: &amp;QueryContext, callback: DnsQueryCallback) {
         let template = q.response_template(0);
         self.client.get(key(q), move |reply| match reply {
             Ok(Some(ip)) =&gt; callback.respond(with_answer(template, ip)),
@@ -287,6 +291,7 @@ impl DnsQueryHandler for Redis {
         });
     }
 }</code></pre>
+<p><strong>Connection context.</strong> The <code>QueryContext</code> a handler is given says where the message came from and who sent it: the peer, the local address it arrived on (so a handler serving several listeners can tell them apart), and over DoT and DoQ the TLS session. <code>peer_certificate_chain()</code> is the client's certificate chain (DER, leaf first) when mutual TLS presented one, so a handler can authorise a client by its identity; <code>sni()</code> is the name it asked for. UDP and cleartext TCP have no security layer, and <code>security()</code> is <code>None</code>. The session is shared by every query on a connection, not copied per query. The context is owned and cheap to clone, so a handler that goes asynchronous moves a clone into its own callback and reads the peer's identity there, after <code>handle_query</code> has returned; a <code>ChainHandler</code> gives each handler it tries the same context. Over UDP the local address is the one the socket is bound to, which is the wildcard address if the listener is.</p>
 <p>Handlers that need background work (the authoritative handler's NOTIFY, write-back and secondary refresh) get it from <code>DnsService::start(&amp;rt)</code>, which calls <code>DnsQueryHandler::start</code>; call it before binding listeners and <code>stop()</code> on shutdown.</p>
 <pre><code>// Caching forwarder
 let service = DnsService::with_handler(ForwarderHandler::new(cache).with_upstream(resolver));
@@ -312,7 +317,7 @@ listen_dns_tcp(&amp;rt, addr, handle)?;</code></pre>
 <li><strong>Minimal <code>ANY</code></strong> (RFC 8482): the upstream's <code>ANY</code> answer for an existing name is reduced to one synthesised <code>HINFO "RFC8482" ""</code> (TTL <code>with_minimal_any_ttl</code>, default 3600) and cached that way; NXDOMAIN and NODATA are reported as they are. A query with DO set gets the full answer, since a synthesised record cannot be signed. It shares <code>MinimalAnyPolicy</code> with the authoritative handler (<code>with_minimal_any_policy</code>). The upstream still assembles the full RRset; the saving is in what the forwarder sends and caches.</li>
 <li><strong>Aggressive use of validated NSEC/NSEC3</strong> (RFC 8198, feature <code>dnssec</code>): while the upstream <code>DnsResolver</code> has DNSSEC validation enabled, a negative answer carrying NSEC or NSEC3 records is validated up its chain of trust in the background (the client's own answer does not wait for it), and a denial that comes out <code>Secure</code> is kept as a per-zone proof in <code>DnsCache::denials()</code>. Later queries the proof covers are answered NXDOMAIN or NODATA locally. NXDOMAIN needs the wildcard at the closest encloser ruled out as well, NSEC3 Opt-Out proves nothing, names at or below a delegation or DNAME are never synthesised, and NSEC3 iteration counts above 100 are not used. A DNSSEC-aware client (DO) gets the NSEC/NSEC3 records with their signatures and AD; others get the SOA alone. Lifetimes are capped at three hours and at the SOA minimum. Disable with <code>with_aggressive_nsec_policy</code> (<code>AggressiveNsecPolicy</code>); <code>DnsServerMetrics::aggressive_nsec_hits</code> counts synthesised answers. Not done: wildcard-positive synthesis (RFC 8198 §5.3) and more than one NSEC3 parameter set per zone.</li>
 </ul>
-<p><strong>Other opcodes (NOTIFY, UPDATE).</strong> <code>DnsQueryHandler::handle_non_query_opcode</code> is offered every request whose opcode is not QUERY (RFC 1996 NOTIFY, RFC 2136 UPDATE, ...). Update sections arrive in the question (zone), answer (prerequisite), authority (update) and additional fields with the <code>NONE</code> class (254) preserved in each record's <code>raw_class</code>. For a closure, <code>FnHandler::on_opcode(|message, peer| ...)</code>. Build responses with <code>DnsMessage::response_template</code>, which echoes the opcode.</p>
+<p><strong>Other opcodes (NOTIFY, UPDATE).</strong> <code>DnsQueryHandler::handle_non_query_opcode</code> is offered every request whose opcode is not QUERY (RFC 1996 NOTIFY, RFC 2136 UPDATE, ...). Update sections arrive in the question (zone), answer (prerequisite), authority (update) and additional fields with the <code>NONE</code> class (254) preserved in each record's <code>raw_class</code>. For a closure, <code>FnHandler::on_opcode(|message, peer| ...)</code>, or <code>on_opcode_ctx(|message, ctx| ...)</code> to see the whole context. Build responses with <code>DnsMessage::response_template</code>, which echoes the opcode.</p>
 <p><strong>Server-side DNS Cookies</strong> (RFC 7873 §5.2): an inbound query's COOKIE option (if any) is parsed and any presented server cookie validated, via HMAC-SHA256 over the client cookie and source address keyed by a per-service secret from <code>getrandom</code> (fail closed), compared in constant time. A COOKIE option shorter than the mandatory 8-byte client cookie is FORMERR with no cookie exchange (§5.2.2). Otherwise the response carries a COOKIE option echoing the client cookie plus a freshly issued server cookie. A client that presents a cookie without a verifiable server cookie gets a cookie-only reply and the handler is <strong>not</strong> called (RFC 7873 §5.2.3 anti-amplification), which covers upstream forwarding, zone transfers and updates alike. A client presenting no cookie is not filtered.</p>
 <p><code>dispatch_wire</code> is what every listener calls: it parses, verifies TSIG, dispatches, and when the handler has answered truncates UDP answers to the size the client advertised (records dropped, TC set), zeroes the message ID over DoQ, signs, and hands the encoded responses to a reply closure, once. It returns <code>false</code> for bytes that are not DNS (DoQ treats that as a protocol error). It never blocks. <code>process_wire</code>, <code>process_on</code> and <code>process_query_sync</code> are blocking conveniences over it for tests and callers off the reactor; do not call them from the reactor thread a handler will answer on. The forwarder is non-blocking: its upstream timeout and RFC 8767 client response timer run on the resolver's reactor, and the answer is delivered when the upstream replies or the timer fires, whichever is first.</p>
 <h2 id="authoritative-zones">Authoritative zones</h2>

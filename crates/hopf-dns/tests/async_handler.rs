@@ -47,7 +47,7 @@ fn answer_address(resp: &DnsMessage) -> Option<Ipv4Addr> {
 struct Scripted;
 
 impl DnsQueryHandler for Scripted {
-    fn handle_query(&self, q: &DnsMessage, _ctx: &QueryContext<'_>, callback: DnsQueryCallback) {
+    fn handle_query(&self, q: &DnsMessage, _ctx: &QueryContext, callback: DnsQueryCallback) {
         let mut resp = q.response_template(0);
         match q.questions[0].name.as_str() {
             "slow.test" => {
@@ -187,7 +187,7 @@ fn udp_answer_completed_from_another_thread_reaches_the_client() {
 struct DeclinesLater;
 
 impl DnsQueryHandler for DeclinesLater {
-    fn handle_query(&self, _q: &DnsMessage, _ctx: &QueryContext<'_>, callback: DnsQueryCallback) {
+    fn handle_query(&self, _q: &DnsMessage, _ctx: &QueryContext, callback: DnsQueryCallback) {
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
             callback.decline();
@@ -222,7 +222,7 @@ fn chain_that_runs_out_of_handlers_falls_back_to_empty_noerror() {
 fn chain_stops_at_the_first_late_answer() {
     struct Late;
     impl DnsQueryHandler for Late {
-        fn handle_query(&self, q: &DnsMessage, _ctx: &QueryContext<'_>, callback: DnsQueryCallback) {
+        fn handle_query(&self, q: &DnsMessage, _ctx: &QueryContext, callback: DnsQueryCallback) {
             let resp = q.response_template(RCODE_NXDOMAIN);
             thread::spawn(move || callback.respond(resp));
         }
@@ -239,7 +239,7 @@ fn chain_stops_at_the_first_late_answer() {
 fn a_sync_handler_is_adapted_without_writing_any_callback_code() {
     struct Fixed;
     impl SyncDnsQueryHandler for Fixed {
-        fn resolve(&self, q: &DnsMessage, _ctx: &QueryContext<'_>) -> Option<DnsMessage> {
+        fn resolve(&self, q: &DnsMessage, _ctx: &QueryContext) -> Option<DnsMessage> {
             (q.questions[0].name == "fixed.test").then(|| {
                 let mut r = q.response_template(0);
                 r.answers.push(a("fixed.test", 7));

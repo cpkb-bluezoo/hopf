@@ -40,7 +40,7 @@ pub use policy::{
 };
 pub use framed::listen_dns_tcp;
 pub use handler::{
-    ChainHandler, DnsQueryCallback, DnsQueryHandler, DnsTransport, EmptyHandler, FnHandler,
+    ChainHandler, ConnectionInfo, DnsQueryCallback, DnsQueryHandler, DnsTransport, EmptyHandler, FnHandler,
     MetricsSink, QueryContext, SyncDnsQueryHandler,
 };
 pub(crate) use handler::HandlerOutcome;
@@ -208,10 +208,22 @@ impl DnsService {
         peer: SocketAddr,
         transport: DnsTransport,
     ) -> Vec<DnsMessage> {
+        self.process_on_with(query, &ConnectionInfo::new(peer), transport)
+    }
+
+    /// [`Self::process_on`] for a message that arrived on a known connection:
+    /// handlers see its local address and TLS identity through the
+    /// [`QueryContext`].
+    pub fn process_on_with(
+        &self,
+        query: &DnsMessage,
+        conn: &ConnectionInfo,
+        transport: DnsTransport,
+    ) -> Vec<DnsMessage> {
         let (tx, rx) = std::sync::mpsc::channel();
         self.dispatch_message(
             Arc::new(query.clone()),
-            peer,
+            conn,
             transport,
             None,
             Box::new(move |responses| {
@@ -226,13 +238,14 @@ impl DnsService {
     fn dispatch_message(
         &self,
         query: Arc<DnsMessage>,
-        peer: SocketAddr,
+        conn: &ConnectionInfo,
         transport: DnsTransport,
         tsig_key: Option<&str>,
         done: MessageSink,
     ) {
+        let peer = conn.peer;
         match crate::cookie::parse_client_cookie(&query.additionals) {
-            ClientCookieOption::Absent => self.dispatch_handler(query, peer, transport, tsig_key, done),
+            ClientCookieOption::Absent => self.dispatch_handler(query, conn, transport, tsig_key, done),
             ClientCookieOption::Malformed => done(vec![query.response_template(RCODE_FORMERR)]),
             ClientCookieOption::Present { client, server } => {
                 let ip_bytes = ip_octets(peer.ip());
@@ -255,7 +268,7 @@ impl DnsService {
                     done(out)
                 });
                 if verified {
-                    self.dispatch_handler(query, peer, transport, tsig_key, with_cookie);
+                    self.dispatch_handler(query, conn, transport, tsig_key, with_cookie);
                 } else {
                     with_cookie(vec![query.response_template(0)]);
                 }
@@ -269,7 +282,7 @@ impl DnsService {
     fn dispatch_handler(
         &self,
         query: Arc<DnsMessage>,
-        peer: SocketAddr,
+        conn: &ConnectionInfo,
         transport: DnsTransport,
         tsig_key: Option<&str>,
         done: MessageSink,
@@ -279,12 +292,12 @@ impl DnsService {
         if !query.is_query() {
             return done(vec![query.response_template(RCODE_NOTIMP)]);
         }
-        let ctx = QueryContext {
-            peer,
+        let ctx = QueryContext::from_connection(
+            conn,
             transport,
             tsig_key,
-            metrics: MetricsSink(Arc::clone(&self.metrics)),
-        };
+            MetricsSink(Arc::clone(&self.metrics)),
+        );
         // Only the standard QUERY opcode reaches `handle_query`. Anything
         // else (NOTIFY, UPDATE, ...) is offered to `handle_non_query_opcode`
         // and is NOTIMP if nothing claims it.
@@ -325,10 +338,21 @@ impl DnsService {
         peer: SocketAddr,
         transport: DnsTransport,
     ) -> Option<Vec<Vec<u8>>> {
+        self.process_wire_with(raw, &ConnectionInfo::new(peer), transport)
+    }
+
+    /// [`Self::process_wire`] for a message that arrived on a known
+    /// connection; see [`Self::dispatch_wire_with`].
+    pub fn process_wire_with(
+        &self,
+        raw: &[u8],
+        conn: &ConnectionInfo,
+        transport: DnsTransport,
+    ) -> Option<Vec<Vec<u8>>> {
         let (tx, rx) = std::sync::mpsc::channel();
-        let accepted = self.dispatch_wire(
+        let accepted = self.dispatch_wire_with(
             raw,
-            peer,
+            conn,
             transport,
             Box::new(move |responses| {
                 let _ = tx.send(responses);
@@ -361,6 +385,21 @@ impl DnsService {
         &self,
         raw: &[u8],
         peer: SocketAddr,
+        transport: DnsTransport,
+        reply: WireSink,
+    ) -> bool {
+        self.dispatch_wire_with(raw, &ConnectionInfo::new(peer), transport, reply)
+    }
+
+    /// [`Self::dispatch_wire`] for a message that arrived on a known
+    /// connection. The listeners use this: `conn` carries the local address
+    /// and the connection's shared [`SecurityInfo`](hopf_core::SecurityInfo),
+    /// and handlers read them from the [`QueryContext`], including from a
+    /// callback completed after `handle_query` has returned.
+    pub fn dispatch_wire_with(
+        &self,
+        raw: &[u8],
+        conn: &ConnectionInfo,
         transport: DnsTransport,
         reply: WireSink,
     ) -> bool {
@@ -439,7 +478,7 @@ impl DnsService {
             }
             reply(out)
         });
-        self.dispatch_message(Arc::new(query), peer, transport, key_name.as_deref(), done);
+        self.dispatch_message(Arc::new(query), conn, transport, key_name.as_deref(), done);
         true
     }
 
@@ -502,6 +541,40 @@ impl DnsServiceHandle {
         self.inner.dispatch_wire(raw, peer, transport, reply)
     }
 
+    /// Handle wire bytes from a known connection without blocking; see
+    /// [`DnsService::dispatch_wire_with`].
+    pub fn dispatch_wire_with(
+        &self,
+        raw: &[u8],
+        conn: &ConnectionInfo,
+        transport: DnsTransport,
+        reply: WireSink,
+    ) -> bool {
+        self.inner.dispatch_wire_with(raw, conn, transport, reply)
+    }
+
+    /// Handle wire bytes from a known connection and wait for the answer; see
+    /// [`DnsService::process_wire_with`].
+    pub fn process_wire_with(
+        &self,
+        raw: &[u8],
+        conn: &ConnectionInfo,
+        transport: DnsTransport,
+    ) -> Option<Vec<Vec<u8>>> {
+        self.inner.process_wire_with(raw, conn, transport)
+    }
+
+    /// Process a message from a known connection and wait for the answer; see
+    /// [`DnsService::process_on_with`].
+    pub fn process_on_with(
+        &self,
+        query: &DnsMessage,
+        conn: &ConnectionInfo,
+        transport: DnsTransport,
+    ) -> Vec<DnsMessage> {
+        self.inner.process_on_with(query, conn, transport)
+    }
+
     /// Arc access.
     pub fn service(&self) -> &Arc<DnsService> {
         &self.inner
@@ -538,7 +611,7 @@ pub fn parse_upstream_list(s: &str) -> io::Result<Vec<SocketAddr>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{DnsQuestion, DnsResourceRecord, DnsType};
+    use crate::wire::{DnsQuestion, DnsResourceRecord, DnsType, RCODE_REFUSED};
     use std::net::Ipv4Addr;
 
     fn cookie_option(client: &[u8], server: Option<&[u8]>) -> DnsResourceRecord {
@@ -893,12 +966,12 @@ mod tests {
     fn a_stream_transport_receives_every_message_of_a_sequence_but_udp_only_the_first() {
         struct Seq;
         impl DnsQueryHandler for Seq {
-            fn handle_query(&self, q: &DnsMessage, ctx: &QueryContext<'_>, callback: DnsQueryCallback) {
+            fn handle_query(&self, q: &DnsMessage, ctx: &QueryContext, callback: DnsQueryCallback) {
                 let mut a = q.response_template(0);
                 a.id = q.id;
                 let mut b = a.clone();
                 b.answers.push(DnsResourceRecord::a("x.test", 1, Ipv4Addr::LOCALHOST));
-                if ctx.transport.supports_multi_message() {
+                if ctx.transport().supports_multi_message() {
                     callback.respond_sequence(vec![a, b]);
                 } else {
                     callback.respond(a);
@@ -910,5 +983,137 @@ mod tests {
         let q = DnsMessage::query(43, DnsQuestion::in_class("x.test", DnsType::A), true);
         assert_eq!(service.process_on(&q, peer, DnsTransport::Tcp).len(), 2);
         assert_eq!(service.process_on(&q, peer, DnsTransport::Udp).len(), 1);
+    }
+
+    // ---- connection context (issue #524) ----
+
+    /// A connection as the TLS listeners describe it: a local address, a
+    /// negotiated session, an SNI and a client certificate chain.
+    fn mtls_connection(peer: SocketAddr) -> (ConnectionInfo, Vec<hopf_core::Bytes>) {
+        let chain = vec![
+            hopf_core::Bytes::from_static(b"leaf-der"),
+            hopf_core::Bytes::from_static(b"issuer-der"),
+        ];
+        let security = hopf_core::SecurityInfo::secure(None, Some("TLSv1.3".into()), None)
+            .with_sni(Some("dns.example".into()))
+            .with_peer_certificate_chain(Some(chain.clone()));
+        let conn = ConnectionInfo::new(peer)
+            .with_local(Some("192.0.2.53:853".parse().unwrap()))
+            .with_security(Some(Arc::new(security)));
+        (conn, chain)
+    }
+
+    #[test]
+    fn a_handler_sees_the_local_address_and_the_tls_identity() {
+        let peer: SocketAddr = "198.51.100.7:5353".parse().unwrap();
+        let (conn, chain) = mtls_connection(peer);
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&seen);
+        let service = DnsService::with_handler(FnHandler::new().on_query_ctx(move |q, ctx| {
+            *sink.lock().unwrap() = Some((
+                ctx.peer(),
+                ctx.local(),
+                ctx.transport(),
+                ctx.sni().map(str::to_owned),
+                ctx.peer_certificate_chain().map(<[_]>::to_vec),
+                ctx.security().is_some(),
+            ));
+            Some(q.response_template(0))
+        }));
+        let q = DnsMessage::query(50, DnsQuestion::in_class("example.com", DnsType::A), true);
+        service.process_on_with(&q, &conn, DnsTransport::Dot);
+        let (got_peer, local, transport, sni, got_chain, secure) = seen.lock().unwrap().take().unwrap();
+        assert_eq!(got_peer, peer);
+        assert_eq!(local, Some("192.0.2.53:853".parse().unwrap()));
+        assert_eq!(transport, DnsTransport::Dot);
+        assert_eq!(sni.as_deref(), Some("dns.example"));
+        assert_eq!(got_chain, Some(chain));
+        assert!(secure);
+    }
+
+    #[test]
+    fn a_connection_with_no_security_layer_has_no_identity() {
+        let peer: SocketAddr = "198.51.100.7:5353".parse().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&seen);
+        let service = DnsService::with_handler(FnHandler::new().on_query_ctx(move |q, ctx| {
+            *sink.lock().unwrap() = Some((ctx.local(), ctx.security().is_some(), ctx.sni().is_some()));
+            Some(q.response_template(0))
+        }));
+        let q = DnsMessage::query(51, DnsQuestion::in_class("example.com", DnsType::A), true);
+        // `process_on` knows only the peer.
+        service.process_on(&q, peer, DnsTransport::Udp);
+        assert_eq!(seen.lock().unwrap().take(), Some((None, false, false)));
+    }
+
+    #[test]
+    fn a_handler_keeps_the_context_for_a_callback_completed_after_it_returned() {
+        // The point of an owned context: a handler that goes asynchronous
+        // reads the peer's identity again when the answer is ready.
+        struct Later(std::sync::mpsc::Sender<Option<Vec<hopf_core::Bytes>>>);
+        impl DnsQueryHandler for Later {
+            fn handle_query(&self, q: &DnsMessage, ctx: &QueryContext, callback: DnsQueryCallback) {
+                let (ctx, tx, resp) = (ctx.clone(), self.0.clone(), q.response_template(0));
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    let _ = tx.send(ctx.peer_certificate_chain().map(<[_]>::to_vec));
+                    callback.respond(resp);
+                });
+            }
+        }
+        let peer: SocketAddr = "198.51.100.7:5353".parse().unwrap();
+        let (conn, chain) = mtls_connection(peer);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let service = DnsService::with_handler(Later(tx));
+        let q = DnsMessage::query(52, DnsQuestion::in_class("example.com", DnsType::A), true);
+        service.process_on_with(&q, &conn, DnsTransport::Dot);
+        assert_eq!(rx.recv().unwrap(), Some(chain));
+    }
+
+    #[test]
+    fn a_chain_offers_the_same_context_to_the_handler_after_a_late_decline() {
+        struct LateDecline;
+        impl DnsQueryHandler for LateDecline {
+            fn handle_query(&self, _q: &DnsMessage, _ctx: &QueryContext, callback: DnsQueryCallback) {
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    callback.decline();
+                });
+            }
+        }
+        let peer: SocketAddr = "198.51.100.7:5353".parse().unwrap();
+        let (conn, chain) = mtls_connection(peer);
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&seen);
+        let service = DnsService::with_handler(ChainHandler::new().then(LateDecline).then(
+            FnHandler::new().on_query_ctx(move |q, ctx| {
+                *sink.lock().unwrap() = Some((
+                    ctx.local(),
+                    ctx.sni().map(str::to_owned),
+                    ctx.peer_certificate_chain().map(<[_]>::to_vec),
+                ));
+                Some(q.response_template(0))
+            }),
+        ));
+        let q = DnsMessage::query(53, DnsQuestion::in_class("example.com", DnsType::A), true);
+        service.process_on_with(&q, &conn, DnsTransport::Dot);
+        let (local, sni, got_chain) = seen.lock().unwrap().take().expect("the second handler ran");
+        assert_eq!(local, Some("192.0.2.53:853".parse().unwrap()));
+        assert_eq!(sni.as_deref(), Some("dns.example"));
+        assert_eq!(got_chain, Some(chain));
+    }
+
+    #[test]
+    fn on_opcode_ctx_receives_the_context() {
+        let peer: SocketAddr = "198.51.100.7:5353".parse().unwrap();
+        let (conn, _) = mtls_connection(peer);
+        let service = DnsService::with_handler(FnHandler::new().on_opcode_ctx(|q, ctx| {
+            // Only an identified client may NOTIFY.
+            let rcode = if ctx.peer_certificate_chain().is_some() { 0 } else { RCODE_REFUSED };
+            Some(q.response_template(rcode))
+        }));
+        let n = notify(54, "example.com");
+        assert_eq!(service.process_on_with(&n, &conn, DnsTransport::Dot)[0].rcode(), 0);
+        assert_eq!(service.process_on(&n, peer, DnsTransport::Tcp)[0].rcode(), RCODE_REFUSED);
     }
 }

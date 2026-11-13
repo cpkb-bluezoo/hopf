@@ -9,7 +9,7 @@ use std::sync::Arc;
 use mio::Token;
 use hopf_core::{ReactorHandle, UdpDatagramHandler};
 
-use super::{DnsServiceHandle, DnsTransport};
+use super::{ConnectionInfo, DnsServiceHandle, DnsTransport};
 
 /// UDP listen configuration.
 pub struct DnsUdpListenConfig {
@@ -21,6 +21,7 @@ pub struct DnsUdpListenConfig {
 
 struct DnsUdpHandler {
     service: DnsServiceHandle,
+    local: SocketAddr,
     reactor: ReactorHandle,
     token: Arc<std::sync::Mutex<Option<Token>>>,
 }
@@ -33,9 +34,10 @@ impl UdpDatagramHandler for DnsUdpHandler {
         // `udp_send` queues onto the socket's reactor from any thread, so a
         // handler that answers later needs no hop of its own.
         let reactor = self.reactor.clone();
-        self.service.dispatch_wire(
+        let conn = ConnectionInfo::new(peer).with_local(Some(self.local));
+        self.service.dispatch_wire_with(
             data,
-            peer,
+            &conn,
             DnsTransport::Udp,
             Box::new(move |responses| {
                 for bytes in responses {
@@ -58,6 +60,7 @@ pub fn listen_dns_udp(
     let token_slot = Arc::new(std::sync::Mutex::new(None));
     let handler = Box::new(DnsUdpHandler {
         service: config.service,
+        local,
         reactor: reactor.clone(),
         token: Arc::clone(&token_slot),
     });

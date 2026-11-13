@@ -259,25 +259,25 @@ fn learn_denial(resolver: &DnsResolver, cache: &Arc<DnsCache>, q: &DnsQuestion, 
 }
 
 impl DnsQueryHandler for ForwarderHandler {
-    fn handle_query(&self, query: &DnsMessage, ctx: &QueryContext<'_>, callback: DnsQueryCallback) {
+    fn handle_query(&self, query: &DnsMessage, ctx: &QueryContext, callback: DnsQueryCallback) {
         let q = &query.questions[0];
 
         if self.cache.is_negatively_cached(&q.name) {
-            ctx.metrics.cache_hit();
+            ctx.metrics().cache_hit();
             return callback.respond(query.response_template(RCODE_NXDOMAIN));
         }
         // RFC 8020: nothing exists beneath a name that does not.
         if self.nxdomain_cut.nxdomain_cut(q) && self.cache.has_nxdomain_ancestor(&q.name) {
-            ctx.metrics.cache_hit();
+            ctx.metrics().cache_hit();
             return callback.respond(query.response_template(RCODE_NXDOMAIN));
         }
         if self.cache.is_nodata_cached(q) {
             // RFC 2308 §2 NODATA: NOERROR with an empty answer set, not NXDOMAIN.
-            ctx.metrics.cache_hit();
+            ctx.metrics().cache_hit();
             return callback.respond(query.response_template(0));
         }
         if let Some(answers) = self.cache.lookup(q) {
-            ctx.metrics.cache_hit();
+            ctx.metrics().cache_hit();
             let mut resp = query.response_template(0);
             resp.answers = answers;
             return callback.respond(resp);
@@ -290,7 +290,7 @@ impl DnsQueryHandler for ForwarderHandler {
         #[cfg(feature = "dnssec")]
         if learn_proofs {
             if let Some(denial) = self.cache.denials().synthesize(q) {
-                ctx.metrics.aggressive_nsec();
+                ctx.metrics().aggressive_nsec();
                 let has_do = query.has_do();
                 let mut resp = query.response_template(denial.rcode);
                 resp.authorities = denial.authorities(has_do);
@@ -312,17 +312,17 @@ impl DnsQueryHandler for ForwarderHandler {
         // RFC 8767 §5 failure recheck: the upstream just failed for this
         // question, so do not make the client wait for it to fail again.
         if let Some(answers) = stale.as_ref().filter(|_| self.recently_failed(q)) {
-            return respond_stale(callback, &ctx.metrics, query.response_template(0), answers.clone());
+            return respond_stale(callback, &ctx.metrics(), query.response_template(0), answers.clone());
         }
 
         let Some(ref upstream) = self.upstream else {
             return match stale {
-                Some(answers) => respond_stale(callback, &ctx.metrics, query.response_template(0), answers),
+                Some(answers) => respond_stale(callback, &ctx.metrics(), query.response_template(0), answers),
                 None => callback.error(RCODE_SERVFAIL),
             };
         };
 
-        ctx.metrics.upstream();
+        ctx.metrics().upstream();
         let has_do = query.has_do();
         // A DNSSEC-aware client cannot verify a synthesised HINFO, so it gets
         // the full answer.
@@ -331,7 +331,7 @@ impl DnsQueryHandler for ForwarderHandler {
 
         let key = Self::failure_key(q);
         let recheck = self.failure_recheck;
-        let metrics = ctx.metrics.clone();
+        let metrics = ctx.metrics().clone();
         let waiting: Waiting = Arc::new(Mutex::new(Some(callback)));
 
         // With stale data in hand there is no point waiting the full timeout.

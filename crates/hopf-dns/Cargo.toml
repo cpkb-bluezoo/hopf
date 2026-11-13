@@ -78,3 +78,8 @@ required-features = ["integration", "server", "dnssec"]
 name = "async_handler"
 path = "tests/async_handler.rs"
 required-features = ["integration", "server"]
+
+[[test]]
+name = "query_context"
+path = "tests/query_context.rs"
+required-features = ["integration", "server"]

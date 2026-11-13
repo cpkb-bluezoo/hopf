@@ -9,7 +9,7 @@ use std::sync::Arc;
 use hopf_core::{Endpoint, ProtocolHandler};
 use hopf_quic::{listen_quic, QuicDriverHandle, QuicListenConfig, QuicServerConfig};
 
-use crate::server::framed::{dispatch_to_endpoint, write_length_prefixed};
+use crate::server::framed::{dispatch_to_endpoint, write_length_prefixed, ConnectionState};
 use crate::server::{DnsServiceHandle, DnsTransport};
 
 /// ALPN for DoQ.
@@ -30,6 +30,7 @@ pub fn listen_dns_doq(
             Box::new(DoqServerHandler {
                 service: svc.clone(),
                 buf: Vec::new(),
+                conn: ConnectionState::default(),
             }) as Box<dyn ProtocolHandler>
         }),
     ))
@@ -38,6 +39,7 @@ pub fn listen_dns_doq(
 struct DoqServerHandler {
     service: DnsServiceHandle,
     buf: Vec<u8>,
+    conn: ConnectionState,
 }
 
 impl ProtocolHandler for DoqServerHandler {
@@ -54,16 +56,12 @@ impl ProtocolHandler for DoqServerHandler {
                 }
                 let payload = self.buf[2..2 + len].to_vec();
                 self.buf.drain(..2 + len);
-                let peer = endpoint
-                    .remote_addr()
-                    .ok()
-                    .and_then(|a| a.as_socket_addr())
-                    .unwrap_or_else(|| SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0));
+                let conn = self.conn.info(endpoint);
                 if !dispatch_to_endpoint(
                     &self.service,
                     endpoint,
                     &payload,
-                    peer,
+                    &conn,
                     DnsTransport::Doq,
                     write_length_prefixed,
                 ) {

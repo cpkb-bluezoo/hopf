@@ -41,7 +41,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use hopf_core::Runtime;
+use hopf_core::{Bytes, Runtime, SecurityInfo};
 
 use super::DnsServerMetrics;
 use crate::wire::DnsMessage;
@@ -101,52 +101,174 @@ impl MetricsSink {
     }
 }
 
-/// Per-message context supplied by the shell.
+/// What the listener knows about the connection a message arrived on.
 ///
-/// Borrowed for the duration of the call. A handler that completes its
-/// callback later copies out what it needs: `peer` and `transport` are
-/// `Copy`, [`MetricsSink`] is `Clone`, and `tsig_key` can be `to_owned`.
-pub struct QueryContext<'a> {
-    /// The peer's address. An UPDATE or transfer handler needs the source to
-    /// authorise the request.
+/// Built once per message from the endpoint and handed to
+/// [`DnsService::dispatch_wire_with`](super::DnsService::dispatch_wire_with).
+/// The [`SecurityInfo`] is shared between every message on the connection, not
+/// copied per query.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ConnectionInfo {
+    /// The peer's address.
     pub peer: SocketAddr,
-    /// Transport the message arrived on.
-    pub transport: DnsTransport,
-    /// Name of the TSIG key (RFC 8945) that authenticated this message, if
-    /// it carried a valid signature. A signature that fails to verify never
-    /// reaches a handler.
-    pub tsig_key: Option<&'a str>,
-    /// Shell counters.
-    pub metrics: MetricsSink,
+    /// The local address the message arrived on, when known. For UDP this is
+    /// the address the socket is bound to, which is the wildcard address if
+    /// the listener is.
+    pub local: Option<SocketAddr>,
+    /// The negotiated TLS or QUIC parameters, with the client's certificate
+    /// chain when it presented one. `None` for UDP and cleartext TCP.
+    pub security: Option<Arc<SecurityInfo>>,
 }
 
-/// A [`QueryContext`] that owns its parts, for a chain that offers the same
-/// message to a later handler after an earlier one has gone asynchronous.
-#[derive(Clone)]
-pub(crate) struct OwnedContext {
-    peer: SocketAddr,
-    transport: DnsTransport,
-    tsig_key: Option<String>,
-    metrics: MetricsSink,
-}
-
-impl OwnedContext {
-    pub(crate) fn capture(ctx: &QueryContext<'_>) -> Self {
+impl ConnectionInfo {
+    /// A connection known only by its peer address.
+    pub fn new(peer: SocketAddr) -> Self {
         Self {
-            peer: ctx.peer,
-            transport: ctx.transport,
-            tsig_key: ctx.tsig_key.map(str::to_owned),
-            metrics: ctx.metrics.clone(),
+            peer,
+            local: None,
+            security: None,
         }
     }
 
-    pub(crate) fn borrow(&self) -> QueryContext<'_> {
-        QueryContext {
-            peer: self.peer,
-            transport: self.transport,
-            tsig_key: self.tsig_key.as_deref(),
-            metrics: self.metrics.clone(),
+    /// Set the local address.
+    pub fn with_local(mut self, local: Option<SocketAddr>) -> Self {
+        self.local = local;
+        self
+    }
+
+    /// Set the shared security parameters.
+    pub fn with_security(mut self, security: Option<Arc<SecurityInfo>>) -> Self {
+        self.security = security;
+        self
+    }
+}
+
+/// Per-message context supplied by the shell.
+///
+/// Owned and cheap to clone (a shared [`SecurityInfo`], a few `Copy` fields
+/// and two reference-counted handles), so a handler that completes its
+/// callback later keeps it and reads the peer's identity again from there:
+/// move a clone into the closure that runs when a store or an upstream
+/// answers. New fields can be added without breaking handlers, so read it
+/// through the accessors.
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct QueryContext {
+    peer: SocketAddr,
+    local: Option<SocketAddr>,
+    transport: DnsTransport,
+    tsig_key: Option<Arc<str>>,
+    security: Option<Arc<SecurityInfo>>,
+    metrics: MetricsSink,
+}
+
+impl QueryContext {
+    /// A context for `peer` over `transport`, with no TSIG key, no local
+    /// address, no security layer and counters that go nowhere. The shell
+    /// builds the real one; this is for exercising a handler directly.
+    pub fn new(peer: SocketAddr, transport: DnsTransport) -> Self {
+        Self {
+            peer,
+            local: None,
+            transport,
+            tsig_key: None,
+            security: None,
+            metrics: MetricsSink(Arc::new(Mutex::new(DnsServerMetrics::default()))),
         }
+    }
+
+    pub(crate) fn from_connection(
+        conn: &ConnectionInfo,
+        transport: DnsTransport,
+        tsig_key: Option<&str>,
+        metrics: MetricsSink,
+    ) -> Self {
+        Self {
+            peer: conn.peer,
+            local: conn.local,
+            transport,
+            tsig_key: tsig_key.map(Arc::from),
+            security: conn.security.clone(),
+            metrics,
+        }
+    }
+
+    /// Set the local address.
+    pub fn with_local(mut self, local: Option<SocketAddr>) -> Self {
+        self.local = local;
+        self
+    }
+
+    /// Set the shared security parameters.
+    pub fn with_security(mut self, security: Option<Arc<SecurityInfo>>) -> Self {
+        self.security = security;
+        self
+    }
+
+    /// Set the name of the TSIG key that authenticated the message.
+    pub fn with_tsig_key(mut self, name: Option<&str>) -> Self {
+        self.tsig_key = name.map(Arc::from);
+        self
+    }
+
+    /// The peer's address. An UPDATE or transfer handler needs the source to
+    /// authorise the request.
+    pub fn peer(&self) -> SocketAddr {
+        self.peer
+    }
+
+    /// The local address the message arrived on, when the listener knows it.
+    /// A handler serving several listeners can tell them apart by this.
+    pub fn local(&self) -> Option<SocketAddr> {
+        self.local
+    }
+
+    /// Transport the message arrived on.
+    pub fn transport(&self) -> DnsTransport {
+        self.transport
+    }
+
+    /// Name of the TSIG key (RFC 8945) that authenticated this message, if it
+    /// carried a valid signature. A signature that fails to verify never
+    /// reaches a handler.
+    pub fn tsig_key(&self) -> Option<&str> {
+        self.tsig_key.as_deref()
+    }
+
+    /// The connection's negotiated security parameters: `Some` over DoT and
+    /// DoQ, `None` over UDP and cleartext TCP.
+    pub fn security(&self) -> Option<&SecurityInfo> {
+        self.security.as_deref()
+    }
+
+    /// The Server Name Indication the client requested in its handshake.
+    pub fn sni(&self) -> Option<&str> {
+        self.security().and_then(SecurityInfo::sni)
+    }
+
+    /// The client's certificate chain (DER, leaf first) when it presented one
+    /// during the handshake (mTLS). A handler authorises a client by its
+    /// identity here.
+    pub fn peer_certificate_chain(&self) -> Option<&[Bytes]> {
+        self.security().and_then(SecurityInfo::peer_certificate_chain)
+    }
+
+    /// Shell counters.
+    pub fn metrics(&self) -> &MetricsSink {
+        &self.metrics
+    }
+}
+
+impl std::fmt::Debug for QueryContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryContext")
+            .field("peer", &self.peer)
+            .field("local", &self.local)
+            .field("transport", &self.transport)
+            .field("tsig_key", &self.tsig_key)
+            .field("security", &self.security)
+            .finish_non_exhaustive()
     }
 }
 
@@ -254,7 +376,7 @@ impl Drop for DnsQueryCallback {
 pub trait DnsQueryHandler: Send + Sync {
     /// Handle a standard `QUERY` (opcode 0) with a non-empty question
     /// section. Build responses with [`DnsMessage::response_template`].
-    fn handle_query(&self, query: &DnsMessage, ctx: &QueryContext<'_>, callback: DnsQueryCallback);
+    fn handle_query(&self, query: &DnsMessage, ctx: &QueryContext, callback: DnsQueryCallback);
 
     /// Handle a request whose opcode is not `QUERY`: NOTIFY (RFC 1996),
     /// UPDATE (RFC 2136) and the rest. Decline (the default) to leave it to
@@ -267,7 +389,7 @@ pub trait DnsQueryHandler: Send + Sync {
     fn handle_non_query_opcode(
         &self,
         query: &DnsMessage,
-        ctx: &QueryContext<'_>,
+        ctx: &QueryContext,
         callback: DnsQueryCallback,
     ) {
         let _ = (query, ctx);
@@ -288,13 +410,13 @@ pub trait DnsQueryHandler: Send + Sync {
 }
 
 impl<T: DnsQueryHandler + ?Sized> DnsQueryHandler for Arc<T> {
-    fn handle_query(&self, query: &DnsMessage, ctx: &QueryContext<'_>, callback: DnsQueryCallback) {
+    fn handle_query(&self, query: &DnsMessage, ctx: &QueryContext, callback: DnsQueryCallback) {
         (**self).handle_query(query, ctx, callback)
     }
     fn handle_non_query_opcode(
         &self,
         query: &DnsMessage,
-        ctx: &QueryContext<'_>,
+        ctx: &QueryContext,
         callback: DnsQueryCallback,
     ) {
         (**self).handle_non_query_opcode(query, ctx, callback)
@@ -315,14 +437,14 @@ impl<T: DnsQueryHandler + ?Sized> DnsQueryHandler for Arc<T> {
 /// Reach for [`DnsQueryHandler`] directly only to wait on I/O.
 pub trait SyncDnsQueryHandler: Send + Sync {
     /// Answer a standard `QUERY`, or `None` to decline.
-    fn resolve(&self, query: &DnsMessage, ctx: &QueryContext<'_>) -> Option<DnsMessage>;
+    fn resolve(&self, query: &DnsMessage, ctx: &QueryContext) -> Option<DnsMessage>;
 
     /// Answer a request whose opcode is not `QUERY` (NOTIFY, UPDATE, ...), or
     /// `None` (the default) to decline.
     fn resolve_non_query_opcode(
         &self,
         query: &DnsMessage,
-        ctx: &QueryContext<'_>,
+        ctx: &QueryContext,
     ) -> Option<DnsMessage> {
         let _ = (query, ctx);
         None
@@ -330,7 +452,7 @@ pub trait SyncDnsQueryHandler: Send + Sync {
 }
 
 impl<T: SyncDnsQueryHandler> DnsQueryHandler for T {
-    fn handle_query(&self, query: &DnsMessage, ctx: &QueryContext<'_>, callback: DnsQueryCallback) {
+    fn handle_query(&self, query: &DnsMessage, ctx: &QueryContext, callback: DnsQueryCallback) {
         match self.resolve(query, ctx) {
             Some(response) => callback.respond(response),
             None => callback.decline(),
@@ -340,7 +462,7 @@ impl<T: SyncDnsQueryHandler> DnsQueryHandler for T {
     fn handle_non_query_opcode(
         &self,
         query: &DnsMessage,
-        ctx: &QueryContext<'_>,
+        ctx: &QueryContext,
         callback: DnsQueryCallback,
     ) {
         match self.resolve_non_query_opcode(query, ctx) {
@@ -355,13 +477,13 @@ impl<T: SyncDnsQueryHandler> DnsQueryHandler for T {
 pub struct EmptyHandler;
 
 impl SyncDnsQueryHandler for EmptyHandler {
-    fn resolve(&self, query: &DnsMessage, _ctx: &QueryContext<'_>) -> Option<DnsMessage> {
+    fn resolve(&self, query: &DnsMessage, _ctx: &QueryContext) -> Option<DnsMessage> {
         Some(query.response_template(crate::wire::RCODE_NOERROR))
     }
 }
 
-type QueryFn = dyn Fn(&DnsMessage) -> Option<DnsMessage> + Send + Sync;
-type OpcodeFn = dyn Fn(&DnsMessage, SocketAddr) -> Option<DnsMessage> + Send + Sync;
+type QueryFn = dyn Fn(&DnsMessage, &QueryContext) -> Option<DnsMessage> + Send + Sync;
+type OpcodeFn = dyn Fn(&DnsMessage, &QueryContext) -> Option<DnsMessage> + Send + Sync;
 
 /// Closure-backed handler for tests and small local overrides.
 ///
@@ -380,9 +502,18 @@ impl FnHandler {
     }
 
     /// Answer standard queries.
-    pub fn on_query<F>(mut self, f: F) -> Self
+    pub fn on_query<F>(self, f: F) -> Self
     where
         F: Fn(&DnsMessage) -> Option<DnsMessage> + Send + Sync + 'static,
+    {
+        self.on_query_ctx(move |query, _ctx| f(query))
+    }
+
+    /// Answer standard queries, with the [`QueryContext`] (peer, local
+    /// address, transport, TLS identity) alongside the message.
+    pub fn on_query_ctx<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&DnsMessage, &QueryContext) -> Option<DnsMessage> + Send + Sync + 'static,
     {
         self.query = Some(Box::new(f));
         self
@@ -390,9 +521,18 @@ impl FnHandler {
 
     /// Answer messages whose opcode is not QUERY (NOTIFY, UPDATE, ...). The
     /// closure receives the peer's address.
-    pub fn on_opcode<F>(mut self, f: F) -> Self
+    pub fn on_opcode<F>(self, f: F) -> Self
     where
         F: Fn(&DnsMessage, SocketAddr) -> Option<DnsMessage> + Send + Sync + 'static,
+    {
+        self.on_opcode_ctx(move |query, ctx| f(query, ctx.peer()))
+    }
+
+    /// Answer messages whose opcode is not QUERY, with the full
+    /// [`QueryContext`].
+    pub fn on_opcode_ctx<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&DnsMessage, &QueryContext) -> Option<DnsMessage> + Send + Sync + 'static,
     {
         self.opcode = Some(Box::new(f));
         self
@@ -400,16 +540,12 @@ impl FnHandler {
 }
 
 impl SyncDnsQueryHandler for FnHandler {
-    fn resolve(&self, query: &DnsMessage, _ctx: &QueryContext<'_>) -> Option<DnsMessage> {
-        self.query.as_ref().and_then(|f| f(query))
+    fn resolve(&self, query: &DnsMessage, ctx: &QueryContext) -> Option<DnsMessage> {
+        self.query.as_ref().and_then(|f| f(query, ctx))
     }
 
-    fn resolve_non_query_opcode(
-        &self,
-        query: &DnsMessage,
-        ctx: &QueryContext<'_>,
-    ) -> Option<DnsMessage> {
-        self.opcode.as_ref().and_then(|f| f(query, ctx.peer))
+    fn resolve_non_query_opcode(&self, query: &DnsMessage, ctx: &QueryContext) -> Option<DnsMessage> {
+        self.opcode.as_ref().and_then(|f| f(query, ctx))
     }
 }
 
@@ -446,7 +582,7 @@ impl ChainHandler {
         index: usize,
         kind: Dispatch,
         query: Arc<DnsMessage>,
-        ctx: OwnedContext,
+        ctx: QueryContext,
         callback: DnsQueryCallback,
     ) {
         let Some(handler) = handlers.get(index).cloned() else {
@@ -460,10 +596,9 @@ impl ChainHandler {
                 other => callback.complete(other),
             })
         };
-        let borrowed = ctx.borrow();
-        match kind {
-            Dispatch::Query => handler.handle_query(&query, &borrowed, next),
-            Dispatch::NonQuery => handler.handle_non_query_opcode(&query, &borrowed, next),
+                match kind {
+            Dispatch::Query => handler.handle_query(&query, &ctx, next),
+            Dispatch::NonQuery => handler.handle_non_query_opcode(&query, &ctx, next),
         }
     }
 
@@ -471,7 +606,7 @@ impl ChainHandler {
         &self,
         kind: Dispatch,
         query: &DnsMessage,
-        ctx: &QueryContext<'_>,
+        ctx: &QueryContext,
         callback: DnsQueryCallback,
     ) {
         Self::run(
@@ -479,21 +614,21 @@ impl ChainHandler {
             0,
             kind,
             Arc::new(query.clone()),
-            OwnedContext::capture(ctx),
+            ctx.clone(),
             callback,
         );
     }
 }
 
 impl DnsQueryHandler for ChainHandler {
-    fn handle_query(&self, query: &DnsMessage, ctx: &QueryContext<'_>, callback: DnsQueryCallback) {
+    fn handle_query(&self, query: &DnsMessage, ctx: &QueryContext, callback: DnsQueryCallback) {
         self.dispatch(Dispatch::Query, query, ctx, callback);
     }
 
     fn handle_non_query_opcode(
         &self,
         query: &DnsMessage,
-        ctx: &QueryContext<'_>,
+        ctx: &QueryContext,
         callback: DnsQueryCallback,
     ) {
         self.dispatch(Dispatch::NonQuery, query, ctx, callback);

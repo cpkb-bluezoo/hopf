@@ -76,6 +76,21 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
   - `DnsService::process_on`, `process_query_sync` and `process_wire` now wait
     for the answer and are for tests and callers off the reactor. The
     listeners use the new non-blocking `DnsService::dispatch_wire`.
+- **hopf-dns:** `QueryContext` carries the whole connection (#524), and is
+  owned. It has no lifetime, is `Clone` and `#[non_exhaustive]`, and is read
+  through accessors (`peer()`, `local()`, `transport()`, `tsig_key()`,
+  `security()`, `sni()`, `peer_certificate_chain()`, `metrics()`) instead of
+  public fields; `QueryContext<'_>` in a handler signature becomes
+  `QueryContext`. A handler that answers later keeps a clone and reads the
+  client's mTLS identity from its own callback. `FnHandler::on_opcode` is
+  unchanged; `on_query_ctx` and `on_opcode_ctx` add closures that take the
+  context.
+  - **New:** `ConnectionInfo { peer, local, security }` and
+    `DnsService::{dispatch_wire_with, process_wire_with, process_on_with}`.
+    `dispatch_wire`, `process_wire` and `process_on` are thin wrappers that
+    know only the peer. The TCP, DoT and DoQ listeners fill in the local
+    address and the connection's shared `SecurityInfo` (client certificate
+    chain and SNI); the UDP listener fills in its bound address.
 - **hopf-dns:** `ForwarderHandler` no longer blocks the listener thread while
   it waits for its upstream. The upstream timeout and the RFC 8767 client
   response timer run on the resolver's reactor, and the answer is delivered

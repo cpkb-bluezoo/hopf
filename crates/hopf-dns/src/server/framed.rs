@@ -7,9 +7,9 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use hopf_core::{Endpoint, ProtocolHandler, Runtime, TcpListenerConfig};
+use hopf_core::{Endpoint, ProtocolHandler, Runtime, SecurityInfo, TcpListenerConfig};
 
-use super::{DnsServiceHandle, DnsTransport, WireSink};
+use super::{ConnectionInfo, DnsServiceHandle, DnsTransport, WireSink};
 
 /// Cleartext DNS over TCP (RFC 1035 §4.2.2, RFC 7766). Required for zone
 /// transfers and for clients that retry a truncated UDP answer.
@@ -53,12 +53,12 @@ pub(super) fn dispatch_to_endpoint(
     service: &DnsServiceHandle,
     endpoint: &mut dyn Endpoint,
     payload: &[u8],
-    peer: SocketAddr,
+    conn: &ConnectionInfo,
     transport: DnsTransport,
     write: fn(&mut dyn Endpoint, &[u8]),
 ) -> bool {
     let state = Arc::new(Mutex::new(ReplyState::Dispatching));
-    let conn = endpoint.handle();
+    let handle = endpoint.handle();
     let shared = Arc::clone(&state);
     let reply: WireSink = Box::new(move |responses| {
         let mut state = shared.lock().unwrap();
@@ -66,7 +66,7 @@ pub(super) fn dispatch_to_endpoint(
             ReplyState::Dispatching => *state = ReplyState::Answered(responses),
             _ => {
                 drop(state);
-                conn.with_endpoint(move |ep| {
+                handle.with_endpoint(move |ep| {
                     if ep.is_open() {
                         for bytes in &responses {
                             write(ep, bytes);
@@ -76,7 +76,7 @@ pub(super) fn dispatch_to_endpoint(
             }
         }
     });
-    let accepted = service.dispatch_wire(payload, peer, transport, reply);
+    let accepted = service.dispatch_wire_with(payload, conn, transport, reply);
     let answered = std::mem::replace(&mut *state.lock().unwrap(), ReplyState::Detached);
     if let ReplyState::Answered(responses) = answered {
         for bytes in &responses {
@@ -95,11 +95,43 @@ pub(super) fn write_length_prefixed(endpoint: &mut dyn Endpoint, bytes: &[u8]) {
     endpoint.send(&out);
 }
 
+/// What a stream handler remembers about its connection between messages: the
+/// local address and the [`SecurityInfo`], read from the endpoint once (the
+/// handshake is over by the first byte of application data) and shared by
+/// every query after that.
+#[derive(Default)]
+pub(super) struct ConnectionState {
+    local: Option<Option<SocketAddr>>,
+    security: Option<Option<Arc<SecurityInfo>>>,
+}
+
+impl ConnectionState {
+    /// The connection as of now. The peer is read each time, since QUIC can
+    /// migrate it.
+    pub(super) fn info(&mut self, endpoint: &dyn Endpoint) -> ConnectionInfo {
+        let socket_addr = |addr: io::Result<hopf_core::PeerAddr>| addr.ok().and_then(|a| a.as_socket_addr());
+        let peer = socket_addr(endpoint.remote_addr())
+            .unwrap_or_else(|| SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0));
+        let local = *self
+            .local
+            .get_or_insert_with(|| socket_addr(endpoint.local_addr()));
+        let security = self
+            .security
+            .get_or_insert_with(|| {
+                let info = endpoint.security_info();
+                info.is_secure().then(|| Arc::new(info.clone()))
+            })
+            .clone();
+        ConnectionInfo::new(peer).with_local(local).with_security(security)
+    }
+}
+
 /// Frames DNS messages on a stream and dispatches them to the service.
 pub(super) struct FramedServerHandler {
     service: Arc<DnsServiceHandle>,
     transport: DnsTransport,
     buf: Vec<u8>,
+    conn: ConnectionState,
 }
 
 impl FramedServerHandler {
@@ -108,6 +140,7 @@ impl FramedServerHandler {
             service,
             transport,
             buf: Vec::new(),
+            conn: ConnectionState::default(),
         }
     }
 }
@@ -126,19 +159,13 @@ impl ProtocolHandler for FramedServerHandler {
                 }
                 let payload = self.buf[2..2 + len].to_vec();
                 self.buf.drain(..2 + len);
-                let peer = endpoint
-                    .remote_addr()
-                    .ok()
-                    .and_then(|a| a.as_socket_addr())
-                    .unwrap_or_else(|| {
-                        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
-                    });
+                let conn = self.conn.info(endpoint);
                 // A message that is not DNS is dropped; the stream carries on.
                 let _ = dispatch_to_endpoint(
                     &self.service,
                     endpoint,
                     &payload,
-                    peer,
+                    &conn,
                     self.transport,
                     write_length_prefixed,
                 );

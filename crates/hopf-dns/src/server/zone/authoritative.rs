@@ -287,14 +287,14 @@ fn add_edns(query: &DnsMessage, resp: &mut DnsMessage) {
 
 impl DnsQueryHandler for AuthoritativeZoneHandler {
     // Zone data is in memory, so every message is answered inline.
-    fn handle_query(&self, query: &DnsMessage, ctx: &QueryContext<'_>, callback: DnsQueryCallback) {
+    fn handle_query(&self, query: &DnsMessage, ctx: &QueryContext, callback: DnsQueryCallback) {
         self.query_outcome(query, ctx).deliver(callback);
     }
 
     fn handle_non_query_opcode(
         &self,
         query: &DnsMessage,
-        ctx: &QueryContext<'_>,
+        ctx: &QueryContext,
         callback: DnsQueryCallback,
     ) {
         match query.opcode() {
@@ -325,7 +325,7 @@ impl DnsQueryHandler for AuthoritativeZoneHandler {
 
 impl AuthoritativeZoneHandler {
     /// Decide a standard QUERY.
-    fn query_outcome(&self, query: &DnsMessage, ctx: &QueryContext<'_>) -> HandlerOutcome {
+    fn query_outcome(&self, query: &DnsMessage, ctx: &QueryContext) -> HandlerOutcome {
         let q = &query.questions[0];
 
         // RFC 6891 §6.1.3: an EDNS version we do not implement is BADVERS.
@@ -377,7 +377,7 @@ impl AuthoritativeZoneHandler {
     }
 
     /// RFC 1996 NOTIFY: only meaningful to a secondary, from its primary.
-    fn notify(&self, query: &DnsMessage, ctx: &QueryContext<'_>) -> HandlerOutcome {
+    fn notify(&self, query: &DnsMessage, ctx: &QueryContext) -> HandlerOutcome {
         let Some(q) = query.questions.first() else {
             return HandlerOutcome::Respond(plain(query, RCODE_FORMERR));
         };
@@ -386,7 +386,7 @@ impl AuthoritativeZoneHandler {
         };
         match slot.primary {
             // Only the configured primary may trigger a transfer.
-            Some(primary) if primary.ip() == ctx.peer.ip() => {
+            Some(primary) if primary.ip() == ctx.peer().ip() => {
                 self.inner.signal(Cmd::Notified(slot.origin.clone()));
                 HandlerOutcome::Respond(authoritative(query, RCODE_NOERROR))
             }
@@ -395,7 +395,7 @@ impl AuthoritativeZoneHandler {
     }
 
     /// RFC 2136 UPDATE.
-    fn update(&self, query: &DnsMessage, ctx: &QueryContext<'_>) -> HandlerOutcome {
+    fn update(&self, query: &DnsMessage, ctx: &QueryContext) -> HandlerOutcome {
         let reply = |rcode| HandlerOutcome::Respond(plain(query, rcode));
         // §3.1: exactly one zone-section entry, of type SOA.
         let [zone_q] = query.questions.as_slice() else {
@@ -409,7 +409,7 @@ impl AuthoritativeZoneHandler {
         };
         // A secondary's data comes from its primary; a local change would be
         // overwritten (or worse, diverge), so it refuses (§3.1).
-        if slot.primary.is_some() || !slot.options.allow_update.allows(ctx.peer.ip(), ctx.tsig_key) {
+        if slot.primary.is_some() || !slot.options.allow_update.allows(ctx.peer().ip(), ctx.tsig_key()) {
             return reply(RCODE_REFUSED);
         }
         let mut guard = slot.zone.write().unwrap();
@@ -430,14 +430,14 @@ fn transfer(
     slot: &ZoneSlot,
     zone: &Zone,
     query: &DnsMessage,
-    ctx: &QueryContext<'_>,
+    ctx: &QueryContext,
     qname: &str,
 ) -> HandlerOutcome {
     let q = &query.questions[0];
     if qname != zone.origin() {
         return HandlerOutcome::Respond(plain(query, RCODE_REFUSED));
     }
-    if !slot.options.allow_transfer.allows(ctx.peer.ip(), ctx.tsig_key) {
+    if !slot.options.allow_transfer.allows(ctx.peer().ip(), ctx.tsig_key()) {
         return HandlerOutcome::Respond(plain(query, RCODE_REFUSED));
     }
     let messages = if q.raw_qtype == TYPE_IXFR {
@@ -455,7 +455,7 @@ fn transfer(
     } else {
         xfr::axfr(query, zone)
     };
-    if !ctx.transport.supports_multi_message() {
+    if !ctx.transport().supports_multi_message() {
         // RFC 5936 §4.2 wants AXFR on TCP. A one-message IXFR may go over
         // UDP (RFC 1995 §2); anything else is truncated so the client
         // retries over TCP.
