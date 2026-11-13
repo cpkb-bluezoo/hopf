@@ -1,0 +1,946 @@
+// Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
+//! [`RedisClient`]: one pipelined connection to a Redis or Valkey server,
+//! bound to a reactor.
+//!
+//! Commands may be issued from any thread. Each is written to the connection
+//! at once, without waiting for the replies to earlier ones, and replies are
+//! matched to commands in the order they were sent (FIFO), which is all RESP
+//! gives. Every callback runs on the reactor the client is bound to, exactly
+//! once, and never before the call that issued the command has returned.
+//!
+//! # Connecting
+//!
+//! The client dials when it is created and again, when a command arrives,
+//! after a connection is lost. On the new connection it first negotiates the
+//! protocol and authenticates: `HELLO 3` (with `AUTH` and `SETNAME` when
+//! configured) and, for a server that does not know `HELLO` (Redis before
+//! 6.0), `AUTH` / `CLIENT SETNAME` in RESP2; then `SELECT` for a non-zero
+//! database. Commands issued meanwhile wait, and are sent in order once the
+//! connection is ready, so a command never runs before the connection is
+//! authenticated.
+//!
+//! # Failure
+//!
+//! A command that was sent when its connection was lost fails with
+//! [`RedisError::ConnectionLost`]. It is not sent again: it may have run, and
+//! most commands are not safe to repeat. After a connection fails to come up,
+//! commands fail at once for a short and growing time instead of each dialling
+//! again.
+
+use std::collections::VecDeque;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, ReactorHandle, TcpConnectorConfig};
+use hopf_dns::DnsResolver;
+
+use crate::config::RedisConfig;
+use crate::error::RedisError;
+use crate::resp::{encode_command, RespParser, ServerError, Value};
+
+/// What a command's callback is given.
+pub type Reply = Result<Value, RedisError>;
+
+/// A command's callback.
+pub type Callback = Box<dyn FnOnce(Reply) + Send>;
+
+/// A command written as an array of bulk strings, ready to send.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Command {
+    args: Vec<Vec<u8>>,
+}
+
+impl Command {
+    /// A command named `name`.
+    pub fn new(name: impl AsRef<[u8]>) -> Self {
+        Self {
+            args: vec![name.as_ref().to_vec()],
+        }
+    }
+
+    /// Add an argument.
+    pub fn arg(mut self, arg: impl AsRef<[u8]>) -> Self {
+        self.args.push(arg.as_ref().to_vec());
+        self
+    }
+
+    /// Add several arguments.
+    pub fn args<I>(mut self, args: I) -> Self
+    where
+        I: IntoIterator,
+        I::Item: AsRef<[u8]>,
+    {
+        for a in args {
+            self.args.push(a.as_ref().to_vec());
+        }
+        self
+    }
+
+    /// The command's words, name first.
+    pub fn words(&self) -> &[Vec<u8>] {
+        &self.args
+    }
+
+    /// The command as it goes on the wire.
+    pub fn encode(&self) -> Vec<u8> {
+        let refs: Vec<&[u8]> = self.args.iter().map(Vec::as_slice).collect();
+        let mut out = Vec::new();
+        encode_command(&refs, &mut out);
+        out
+    }
+}
+
+/// Part of the connection handshake, and what to do with its reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Hello,
+    Auth,
+    SetName,
+    Select,
+}
+
+enum Kind {
+    User(Option<Callback>),
+    Internal(Step),
+}
+
+/// Written to the connection, awaiting its reply.
+struct Sent {
+    qid: u64,
+    kind: Kind,
+    /// Stops the command's timeout timer once it is answered.
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+/// Not yet written: waiting for the connection.
+struct Waiting {
+    qid: u64,
+    bytes: Vec<u8>,
+    callback: Callback,
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Phase {
+    /// No connection, and none being made.
+    Idle,
+    /// Resolving the host name or connecting (and, over TLS, handshaking).
+    Connecting,
+    /// Connected; negotiating the protocol and authenticating.
+    Handshaking,
+    /// Ready: commands go straight out.
+    Ready,
+}
+
+struct State {
+    phase: Phase,
+    /// Identifies the connection attempt, so a late event from an earlier one
+    /// is ignored.
+    conn_id: u64,
+    handle: Option<ConnHandle>,
+    waiting: VecDeque<Waiting>,
+    pending: VecDeque<Sent>,
+    /// Bytes for the connection not yet handed to it.
+    outbox: Vec<u8>,
+    flush_scheduled: bool,
+    /// Addresses still to try for this attempt.
+    addrs: VecDeque<SocketAddr>,
+    /// RESP3 was negotiated on this connection.
+    resp3: bool,
+    /// Connection attempts that failed in a row, and when the next may start.
+    failures: u32,
+    retry_at: Option<Instant>,
+    last_error: Option<RedisError>,
+}
+
+pub(crate) struct Inner {
+    pub(crate) reactor: ReactorHandle,
+    pub(crate) config: RedisConfig,
+    state: Mutex<State>,
+    closed: AtomicBool,
+    next_qid: AtomicU64,
+    resolver: Mutex<Option<Arc<DnsResolver>>>,
+}
+
+/// A pipelined connection to one server. Cheap to clone; clones share the
+/// connection. See the module documentation.
+#[derive(Clone)]
+pub struct RedisClient {
+    pub(crate) inner: Arc<Inner>,
+}
+
+impl RedisClient {
+    /// A client bound to `reactor`, dialling `config`'s server now. Its
+    /// callbacks run on `reactor`.
+    pub fn connect(reactor: &ReactorHandle, config: RedisConfig) -> Self {
+        let inner = Arc::new(Inner {
+            reactor: reactor.clone(),
+            config,
+            state: Mutex::new(State {
+                phase: Phase::Idle,
+                conn_id: 0,
+                handle: None,
+                waiting: VecDeque::new(),
+                pending: VecDeque::new(),
+                outbox: Vec::new(),
+                flush_scheduled: false,
+                addrs: VecDeque::new(),
+                resp3: false,
+                failures: 0,
+                retry_at: None,
+                last_error: None,
+            }),
+            closed: AtomicBool::new(false),
+            next_qid: AtomicU64::new(0),
+            resolver: Mutex::new(None),
+        });
+        let start = {
+            let mut st = inner.state.lock().unwrap();
+            begin_dial(&mut st)
+        };
+        if let Some(conn_id) = start {
+            dial(&inner, conn_id);
+        }
+        Self { inner }
+    }
+
+    /// Send `command` and call `callback` with the reply. Returns at once.
+    pub fn send(&self, command: &Command, callback: impl FnOnce(Reply) + Send + 'static) {
+        submit(&self.inner, vec![(command.encode(), Box::new(callback))]);
+    }
+
+    /// Send the command made of `words` (the name first) and call `callback`
+    /// with the reply. Returns at once.
+    pub fn command(&self, words: &[&[u8]], callback: impl FnOnce(Reply) + Send + 'static) {
+        let mut bytes = Vec::new();
+        encode_command(words, &mut bytes);
+        submit(&self.inner, vec![(bytes, Box::new(callback))]);
+    }
+
+    /// Send several commands as one write, in order, with nothing from another
+    /// caller between them. Each has its own callback, called in the order the
+    /// commands were given.
+    pub fn send_batch(&self, commands: Vec<(Command, Callback)>) {
+        submit(&self.inner, commands.into_iter().map(|(c, cb)| (c.encode(), cb)).collect());
+    }
+
+    /// Whether the connection is up and past its handshake.
+    pub fn is_ready(&self) -> bool {
+        self.inner.state.lock().unwrap().phase == Phase::Ready
+    }
+
+    /// Whether RESP3 was negotiated on the current connection.
+    pub fn is_resp3(&self) -> bool {
+        self.inner.state.lock().unwrap().resp3
+    }
+
+    /// Close the connection and fail every command still waiting with
+    /// [`RedisError::Closed`]. Later commands fail the same way.
+    pub fn close(&self) {
+        let inner = &self.inner;
+        inner.closed.store(true, Ordering::SeqCst);
+        let (handle, waiting, pending) = {
+            let mut st = inner.state.lock().unwrap();
+            st.phase = Phase::Idle;
+            st.conn_id += 1;
+            st.outbox.clear();
+            (st.handle.take(), std::mem::take(&mut st.waiting), std::mem::take(&mut st.pending))
+        };
+        if let Some(h) = handle {
+            h.close();
+        }
+        for w in waiting {
+            cancel_timer(&w.cancel);
+            finish(inner, w.callback, Err(RedisError::Closed));
+        }
+        for s in pending {
+            cancel_timer(&s.cancel);
+            if let Kind::User(Some(cb)) = s.kind {
+                finish(inner, cb, Err(RedisError::Closed));
+            }
+        }
+    }
+}
+
+fn cancel_timer(cancel: &Option<Arc<AtomicBool>>) {
+    if let Some(c) = cancel {
+        c.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Run `callback` on the reactor, never inline: a caller holding a lock when it
+/// issues a command must not see its callback re-enter that lock.
+fn finish(inner: &Inner, callback: Callback, reply: Reply) {
+    inner.reactor.execute(Box::new(move || callback(reply)));
+}
+
+/// An error reply is an error; anything else is the reply.
+fn into_reply(value: Value) -> Reply {
+    match value {
+        Value::Error(e) => Err(RedisError::Server(e)),
+        v => Ok(v),
+    }
+}
+
+/// How long to hold off after `failures` failed connection attempts in a row.
+fn backoff(initial: Duration, max: Duration, failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(20);
+    initial.saturating_mul(1u32 << shift).min(max)
+}
+
+/// Whether `HELLO` failed because this server predates it (or is a proxy that
+/// does not carry it), so RESP2 and a plain `AUTH` should be tried.
+fn hello_unsupported(e: &ServerError) -> bool {
+    let text = e.message.to_ascii_lowercase();
+    e.code == "NOPROTO"
+        || (e.code == "ERR"
+            && (text.contains("unknown command") || text.contains("unknown subcommand") || text.contains("protocol")))
+}
+
+/// The commands that start a connection, and what each is for.
+fn handshake_plan(config: &RedisConfig, resp3: bool) -> Vec<(Step, Vec<u8>)> {
+    fn enc(words: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_command(words, &mut out);
+        out
+    }
+    let mut plan = Vec::new();
+    if resp3 {
+        let mut words: Vec<&[u8]> = vec![b"HELLO", b"3"];
+        if let Some(password) = &config.password {
+            words.push(b"AUTH");
+            words.push(config.username.as_deref().unwrap_or("default").as_bytes());
+            words.push(password.as_bytes());
+        }
+        if let Some(name) = &config.client_name {
+            words.push(b"SETNAME");
+            words.push(name.as_bytes());
+        }
+        plan.push((Step::Hello, enc(&words)));
+        return plan;
+    }
+    plan.extend(resp2_plan(config));
+    plan
+}
+
+/// The RESP2 handshake: `AUTH`, `CLIENT SETNAME`, `SELECT`.
+fn resp2_plan(config: &RedisConfig) -> Vec<(Step, Vec<u8>)> {
+    fn enc(words: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_command(words, &mut out);
+        out
+    }
+    let mut plan = Vec::new();
+    if let Some(password) = &config.password {
+        plan.push((
+            Step::Auth,
+            match &config.username {
+                Some(u) => enc(&[b"AUTH", u.as_bytes(), password.as_bytes()]),
+                None => enc(&[b"AUTH", password.as_bytes()]),
+            },
+        ));
+    }
+    if let Some(name) = &config.client_name {
+        plan.push((Step::SetName, enc(&[b"CLIENT", b"SETNAME", name.as_bytes()])));
+    }
+    if config.database != 0 {
+        plan.push((Step::Select, enc(&[b"SELECT", config.database.to_string().as_bytes()])));
+    }
+    plan
+}
+
+/// Move an idle client to connecting, if it may start now. Returns the id of
+/// the attempt to dial.
+fn begin_dial(st: &mut State) -> Option<u64> {
+    if st.phase != Phase::Idle || st.retry_at.is_some_and(|at| at > Instant::now()) {
+        return None;
+    }
+    st.phase = Phase::Connecting;
+    st.conn_id += 1;
+    st.addrs.clear();
+    Some(st.conn_id)
+}
+
+/// Accept commands from a caller: send them, queue them for the connection, or
+/// fail them.
+fn submit(inner: &Arc<Inner>, items: Vec<(Vec<u8>, Callback)>) {
+    if inner.closed.load(Ordering::SeqCst) {
+        for (_, cb) in items {
+            finish(inner, cb, Err(RedisError::Closed));
+        }
+        return;
+    }
+    // Each command's timeout starts now, covering the connect.
+    let mut prepared = Vec::with_capacity(items.len());
+    for (bytes, callback) in items {
+        let qid = inner.next_qid.fetch_add(1, Ordering::Relaxed);
+        let cancel = inner.config.command_timeout.map(|timeout| {
+            let weak = Arc::downgrade(inner);
+            inner.reactor.schedule_timer(
+                timeout,
+                Box::new(move || {
+                    if let Some(inner) = weak.upgrade() {
+                        expire(&inner, qid);
+                    }
+                }),
+            )
+        });
+        prepared.push(Waiting {
+            qid,
+            bytes,
+            callback,
+            cancel,
+        });
+    }
+
+    enum Next {
+        Flush,
+        Queued,
+        Dial(u64),
+        Fail(Vec<Waiting>, RedisError),
+    }
+    let next = {
+        let mut st = inner.state.lock().unwrap();
+        let max = inner.config.max_pending;
+        let in_hand = st.pending.len() + st.waiting.len();
+        if max > 0 && in_hand + prepared.len() > max {
+            Next::Fail(prepared, RedisError::Overloaded)
+        } else {
+            match st.phase {
+                Phase::Ready => {
+                    for w in prepared {
+                        st.outbox.extend_from_slice(&w.bytes);
+                        st.pending.push_back(Sent {
+                            qid: w.qid,
+                            kind: Kind::User(Some(w.callback)),
+                            cancel: w.cancel,
+                        });
+                    }
+                    if std::mem::replace(&mut st.flush_scheduled, true) {
+                        Next::Queued
+                    } else {
+                        Next::Flush
+                    }
+                }
+                Phase::Connecting | Phase::Handshaking => {
+                    st.waiting.extend(prepared);
+                    Next::Queued
+                }
+                Phase::Idle => {
+                    if st.retry_at.is_some_and(|at| at > Instant::now()) {
+                        let why = st
+                            .last_error
+                            .clone()
+                            .unwrap_or_else(|| RedisError::Connect("the server is unreachable".into()));
+                        Next::Fail(prepared, why)
+                    } else {
+                        st.waiting.extend(prepared);
+                        match begin_dial(&mut st) {
+                            Some(id) => Next::Dial(id),
+                            None => Next::Queued,
+                        }
+                    }
+                }
+            }
+        }
+    };
+    match next {
+        Next::Flush => flush(inner),
+        Next::Queued => {}
+        Next::Dial(id) => dial(inner, id),
+        Next::Fail(jobs, why) => {
+            for w in jobs {
+                cancel_timer(&w.cancel);
+                finish(inner, w.callback, Err(why.clone()));
+            }
+        }
+    }
+}
+
+/// Hand what is in the outbox to the connection, on the reactor.
+fn flush(inner: &Arc<Inner>) {
+    let (handle, conn_id) = {
+        let st = inner.state.lock().unwrap();
+        (st.handle.clone(), st.conn_id)
+    };
+    let Some(handle) = handle else {
+        return;
+    };
+    let inner = Arc::clone(inner);
+    handle.with_endpoint(move |ep| {
+        let bytes = {
+            let mut st = inner.state.lock().unwrap();
+            if st.conn_id != conn_id {
+                return;
+            }
+            st.flush_scheduled = false;
+            std::mem::take(&mut st.outbox)
+        };
+        if !bytes.is_empty() {
+            ep.send(&bytes);
+        }
+    });
+}
+
+/// A command's timeout fired: fail it if it is still unanswered.
+fn expire(inner: &Arc<Inner>, qid: u64) {
+    let callback = {
+        let mut st = inner.state.lock().unwrap();
+        if let Some(pos) = st.waiting.iter().position(|w| w.qid == qid) {
+            st.waiting.remove(pos).map(|w| w.callback)
+        } else {
+            // Sent: the reply is still to come and still takes its place in the
+            // queue, so the entry stays and only loses its callback.
+            st.pending.iter_mut().find(|s| s.qid == qid).and_then(|s| match &mut s.kind {
+                Kind::User(cb) => cb.take(),
+                Kind::Internal(_) => None,
+            })
+        }
+    };
+    if let Some(cb) = callback {
+        finish(inner, cb, Err(RedisError::Timeout));
+    }
+}
+
+/// The resolver for a host name: the configured one, or one made on first use.
+fn resolver(inner: &Inner) -> Result<Arc<DnsResolver>, RedisError> {
+    if let Some(r) = &inner.config.resolver {
+        return Ok(Arc::clone(r));
+    }
+    let mut slot = inner.resolver.lock().unwrap();
+    if let Some(r) = slot.as_ref() {
+        return Ok(Arc::clone(r));
+    }
+    let r = DnsResolver::new(inner.reactor.clone());
+    r.open_with_system_resolvers()
+        .map_err(|e| RedisError::Connect(format!("no name resolver: {e}")))?;
+    let r = Arc::new(r);
+    *slot = Some(Arc::clone(&r));
+    Ok(r)
+}
+
+/// Find the server's address and connect to it, for attempt `conn_id`.
+fn dial(inner: &Arc<Inner>, conn_id: u64) {
+    let config = &inner.config;
+    let literal = config
+        .addr
+        .or_else(|| config.host.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, config.port)));
+    if let Some(addr) = literal {
+        inner.state.lock().unwrap().addrs = VecDeque::from([addr]);
+        dial_next(inner, conn_id);
+        return;
+    }
+    let resolver = match resolver(inner) {
+        Ok(r) => r,
+        Err(e) => return connect_failed(inner, conn_id, e),
+    };
+    let inner2 = Arc::clone(inner);
+    resolver.resolve(
+        &config.host,
+        config.port,
+        Box::new(move |result| match result {
+            Ok(addrs) if !addrs.is_empty() => {
+                {
+                    let mut st = inner2.state.lock().unwrap();
+                    if st.conn_id != conn_id || st.phase != Phase::Connecting {
+                        return;
+                    }
+                    st.addrs = addrs.into();
+                }
+                dial_next(&inner2, conn_id);
+            }
+            Ok(_) => connect_failed(
+                &inner2,
+                conn_id,
+                RedisError::Connect(format!("{} has no address", inner2.config.host)),
+            ),
+            Err(e) => connect_failed(
+                &inner2,
+                conn_id,
+                RedisError::Connect(format!("could not resolve {}: {e}", inner2.config.host)),
+            ),
+        }),
+    );
+}
+
+/// Connect to the next address left for attempt `conn_id`.
+fn dial_next(inner: &Arc<Inner>, conn_id: u64) {
+    loop {
+        let addr = {
+            let mut st = inner.state.lock().unwrap();
+            if st.conn_id != conn_id || st.phase != Phase::Connecting {
+                return;
+            }
+            st.addrs.pop_front()
+        };
+        let Some(addr) = addr else {
+            return connect_failed(inner, conn_id, RedisError::Connect("no address to try".into()));
+        };
+        let handler_inner = Arc::clone(inner);
+        let tls = inner.config.tls.is_some();
+        let mut cfg = TcpConnectorConfig::new(addr, move || {
+            Box::new(Conn {
+                inner: Arc::clone(&handler_inner),
+                conn_id,
+                parser: RespParser::with_limits(handler_inner.config.limits),
+                tls,
+            }) as Box<dyn ProtocolHandler>
+        });
+        if let Some((connector, name)) = &inner.config.tls {
+            cfg = cfg.with_tls(connector.clone(), name.clone());
+        }
+        cfg.connect_timeout = Some(inner.config.connect_timeout);
+        match inner.reactor.connect(cfg) {
+            Ok(()) => return,
+            Err(e) => {
+                // Try the next address, or give up when none is left.
+                let more = !inner.state.lock().unwrap().addrs.is_empty();
+                if !more {
+                    return connect_failed(inner, conn_id, RedisError::Connect(format!("{addr}: {e}")));
+                }
+            }
+        }
+    }
+}
+
+/// Attempt `conn_id` could not be made: fail what waited for it, and hold off
+/// further attempts for a while.
+fn connect_failed(inner: &Arc<Inner>, conn_id: u64, error: RedisError) {
+    let waiting = {
+        let mut st = inner.state.lock().unwrap();
+        if st.conn_id != conn_id || st.phase == Phase::Idle {
+            return;
+        }
+        st.phase = Phase::Idle;
+        st.handle = None;
+        st.outbox.clear();
+        st.flush_scheduled = false;
+        st.failures += 1;
+        st.retry_at = Some(
+            Instant::now() + backoff(inner.config.backoff_initial, inner.config.backoff_max, st.failures),
+        );
+        st.last_error = Some(error.clone());
+        std::mem::take(&mut st.waiting)
+    };
+    for w in waiting {
+        cancel_timer(&w.cancel);
+        finish(inner, w.callback, Err(error.clone()));
+    }
+}
+
+/// Connection `conn_id` ended. Fail what was sent on it, and what was waiting
+/// if it never became ready.
+fn lost(inner: &Arc<Inner>, conn_id: u64, reason: &str) {
+    let (pending, waiting, was_ready, more_addrs) = {
+        let mut st = inner.state.lock().unwrap();
+        if st.conn_id != conn_id || st.phase == Phase::Idle {
+            return;
+        }
+        let was_ready = st.phase == Phase::Ready;
+        let more_addrs = st.phase == Phase::Connecting && !st.addrs.is_empty();
+        if more_addrs {
+            // Connecting failed on one address; the next is tried.
+            (VecDeque::new(), VecDeque::new(), false, true)
+        } else {
+            st.phase = Phase::Idle;
+            st.handle = None;
+            st.outbox.clear();
+            st.flush_scheduled = false;
+            st.resp3 = false;
+            if was_ready {
+                st.failures = 0;
+                st.retry_at = None;
+            } else {
+                st.failures += 1;
+                st.retry_at = Some(
+                    Instant::now() + backoff(inner.config.backoff_initial, inner.config.backoff_max, st.failures),
+                );
+                st.last_error = Some(RedisError::Connect(reason.to_string()));
+            }
+            (std::mem::take(&mut st.pending), std::mem::take(&mut st.waiting), was_ready, false)
+        }
+    };
+    if more_addrs {
+        dial_next(inner, conn_id);
+        return;
+    }
+    for s in pending {
+        cancel_timer(&s.cancel);
+        if let Kind::User(Some(cb)) = s.kind {
+            finish(inner, cb, Err(RedisError::ConnectionLost(reason.to_string())));
+        }
+    }
+    let why = if was_ready {
+        RedisError::ConnectionLost(reason.to_string())
+    } else {
+        RedisError::Connect(reason.to_string())
+    };
+    for w in waiting {
+        cancel_timer(&w.cancel);
+        finish(inner, w.callback, Err(why.clone()));
+    }
+}
+
+/// The reactor-side half of a connection.
+struct Conn {
+    inner: Arc<Inner>,
+    conn_id: u64,
+    parser: RespParser,
+    tls: bool,
+}
+
+impl Conn {
+    /// Send the handshake. Runs once the connection (and any TLS) is up.
+    fn begin_handshake(&mut self, endpoint: &mut dyn Endpoint) {
+        let inner = &self.inner;
+        let plan = {
+            let mut st = inner.state.lock().unwrap();
+            if st.conn_id != self.conn_id || st.phase != Phase::Connecting {
+                return;
+            }
+            st.phase = Phase::Handshaking;
+            let plan = handshake_plan(&inner.config, inner.config.resp3);
+            for (step, _) in &plan {
+                st.pending.push_back(Sent {
+                    qid: u64::MAX,
+                    kind: Kind::Internal(*step),
+                    cancel: None,
+                });
+            }
+            plan
+        };
+        if plan.is_empty() {
+            return self.ready(endpoint);
+        }
+        let mut bytes = Vec::new();
+        for (_, b) in &plan {
+            bytes.extend_from_slice(b);
+        }
+        endpoint.send(&bytes);
+    }
+
+    /// The handshake is done: send what waited.
+    fn ready(&mut self, endpoint: &mut dyn Endpoint) {
+        let inner = &self.inner;
+        let bytes = {
+            let mut st = inner.state.lock().unwrap();
+            if st.conn_id != self.conn_id {
+                return;
+            }
+            st.phase = Phase::Ready;
+            st.failures = 0;
+            st.retry_at = None;
+            st.last_error = None;
+            while let Some(w) = st.waiting.pop_front() {
+                st.outbox.extend_from_slice(&w.bytes);
+                st.pending.push_back(Sent {
+                    qid: w.qid,
+                    kind: Kind::User(Some(w.callback)),
+                    cancel: w.cancel,
+                });
+            }
+            st.flush_scheduled = false;
+            std::mem::take(&mut st.outbox)
+        };
+        if !bytes.is_empty() {
+            endpoint.send(&bytes);
+        }
+    }
+
+    /// The handshake failed for good: fail what waited and drop the connection.
+    fn handshake_failed(&mut self, endpoint: &mut dyn Endpoint, error: RedisError) {
+        connect_failed(&self.inner, self.conn_id, error);
+        endpoint.close();
+    }
+
+    /// One reply from the server.
+    fn on_reply(&mut self, endpoint: &mut dyn Endpoint, value: Value) {
+        let inner = Arc::clone(&self.inner);
+        if let Value::Push(items) = value {
+            // Out-of-band data belongs to no command. Nothing consumes it on a
+            // plain command connection yet.
+            drop(items);
+            return;
+        }
+        let sent = {
+            let mut st = inner.state.lock().unwrap();
+            if st.conn_id != self.conn_id {
+                return;
+            }
+            st.pending.pop_front()
+        };
+        let Some(sent) = sent else {
+            // A reply for nothing: the stream has lost step with us.
+            lost(&inner, self.conn_id, "the server sent a reply nobody asked for");
+            endpoint.close();
+            return;
+        };
+        cancel_timer(&sent.cancel);
+        match sent.kind {
+            Kind::User(Some(cb)) => cb(into_reply(value)),
+            Kind::User(None) => {} // timed out: the reply is discarded
+            Kind::Internal(step) => self.on_handshake_reply(endpoint, step, value),
+        }
+    }
+
+    fn on_handshake_reply(&mut self, endpoint: &mut dyn Endpoint, step: Step, value: Value) {
+        let inner = Arc::clone(&self.inner);
+        let error = match value {
+            Value::Error(e) => Some(e),
+            _ => None,
+        };
+        match (step, error) {
+            (Step::Hello, None) => {
+                inner.state.lock().unwrap().resp3 = true;
+                // HELLO carries no database: select it now.
+                if inner.config.database != 0 {
+                    return self.push_internal(endpoint, Step::Select, &select_command(inner.config.database));
+                }
+            }
+            (Step::Hello, Some(e)) if hello_unsupported(&e) => {
+                // An older server: start again in RESP2.
+                for (step, bytes) in resp2_plan(&inner.config) {
+                    self.push_internal(endpoint, step, &bytes);
+                }
+            }
+            (Step::SetName, _) => {} // a name is a convenience; a proxy may refuse it
+            (_, Some(e)) => {
+                return self.handshake_failed(endpoint, RedisError::Server(e));
+            }
+            (_, None) => {}
+        }
+        let outstanding = {
+            let st = inner.state.lock().unwrap();
+            st.pending.iter().any(|s| matches!(s.kind, Kind::Internal(_)))
+        };
+        if !outstanding {
+            self.ready(endpoint);
+        }
+    }
+
+    /// Send one more handshake command, and expect its reply.
+    fn push_internal(&mut self, endpoint: &mut dyn Endpoint, step: Step, bytes: &[u8]) {
+        self.inner.state.lock().unwrap().pending.push_back(Sent {
+            qid: u64::MAX,
+            kind: Kind::Internal(step),
+            cancel: None,
+        });
+        endpoint.send(bytes);
+    }
+}
+
+fn select_command(database: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_command(&[b"SELECT", database.to_string().as_bytes()], &mut out);
+    out
+}
+
+impl ProtocolHandler for Conn {
+    fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+        {
+            let mut st = self.inner.state.lock().unwrap();
+            if st.conn_id == self.conn_id {
+                st.handle = Some(endpoint.handle());
+            }
+        }
+        if !self.tls {
+            self.begin_handshake(endpoint);
+        }
+    }
+
+    fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &hopf_core::SecurityInfo) {
+        self.begin_handshake(endpoint);
+    }
+
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
+        let mut replies = Vec::new();
+        let mut bad = None;
+        hopf_core::with_slice(buf, |data| {
+            if let Err(e) = self.parser.feed(data, &mut |v| replies.push(v)) {
+                bad = Some(e);
+                *data = &[];
+            }
+        });
+        for v in replies {
+            self.on_reply(endpoint, v);
+        }
+        if let Some(e) = bad {
+            lost(&self.inner, self.conn_id, &format!("protocol error: {e}"));
+            endpoint.close();
+        }
+    }
+
+    fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
+        lost(&self.inner, self.conn_id, "the connection closed");
+    }
+
+    fn error(&mut self, _endpoint: &mut dyn Endpoint, err: &std::io::Error) {
+        lost(&self.inner, self.conn_id, &err.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_doubles_to_a_ceiling() {
+        let (i, m) = (Duration::from_millis(100), Duration::from_secs(5));
+        let secs: Vec<u128> = (1..=8).map(|n| backoff(i, m, n).as_millis()).collect();
+        assert_eq!(secs, vec![100, 200, 400, 800, 1600, 3200, 5000, 5000]);
+        assert_eq!(backoff(i, m, 1000), m, "no overflow");
+    }
+
+    #[test]
+    fn hello_is_treated_as_unsupported_only_for_an_old_server() {
+        let old = ServerError::parse("ERR unknown command 'HELLO', with args beginning with: '3'");
+        assert!(hello_unsupported(&old));
+        assert!(hello_unsupported(&ServerError::parse("NOPROTO sorry, this protocol version is not supported")));
+        // A wrong password is not a reason to try again in RESP2.
+        assert!(!hello_unsupported(&ServerError::parse("WRONGPASS invalid username-password pair")));
+        assert!(!hello_unsupported(&ServerError::parse("NOAUTH Authentication required.")));
+    }
+
+    #[test]
+    fn the_resp3_handshake_is_one_hello_with_auth_and_a_name() {
+        let cfg = RedisConfig::new("h", 1).username("u").password("p").client_name("n");
+        let plan = handshake_plan(&cfg, true);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].0, Step::Hello);
+        assert_eq!(
+            plan[0].1,
+            b"*7\r\n$5\r\nHELLO\r\n$1\r\n3\r\n$4\r\nAUTH\r\n$1\r\nu\r\n$1\r\np\r\n$7\r\nSETNAME\r\n$1\r\nn\r\n"
+        );
+        // With a password and no user, the default user.
+        let cfg = RedisConfig::new("h", 1).password("p");
+        let plan = handshake_plan(&cfg, true);
+        assert!(String::from_utf8_lossy(&plan[0].1).contains("default"));
+    }
+
+    #[test]
+    fn the_resp2_handshake_is_auth_setname_select() {
+        let cfg = RedisConfig::new("h", 1).password("p").client_name("n").database(3);
+        let steps: Vec<Step> = resp2_plan(&cfg).into_iter().map(|(s, _)| s).collect();
+        assert_eq!(steps, vec![Step::Auth, Step::SetName, Step::Select]);
+        // Nothing configured, nothing sent.
+        assert!(resp2_plan(&RedisConfig::new("h", 1)).is_empty());
+        assert!(handshake_plan(&RedisConfig::new("h", 1).resp2_only(), false).is_empty());
+    }
+
+    #[test]
+    fn commands_encode_and_expose_their_words() {
+        let c = Command::new("SET").arg("k").args(["v", "EX"]).arg(b"10");
+        assert_eq!(c.words().len(), 5);
+        assert_eq!(c.encode(), b"*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$2\r\n10\r\n");
+    }
+
+    #[test]
+    fn the_config_does_not_print_its_password() {
+        let shown = format!("{:?}", RedisConfig::new("h", 6379).password("hunter2"));
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("redacted"));
+    }
+}

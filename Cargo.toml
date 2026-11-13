@@ -22,6 +22,7 @@ members = [
     "crates/hopf-pop3",
     "crates/hopf-imap",
     "crates/hopf-nntp",
+    "crates/hopf-redis",
     "crates/hopf-mqtt",
     "crates/hopf-amqp",
     "crates/hopf-amqp1",
@@ -75,6 +76,7 @@ default-members = [
     "crates/hopf-pop3",
     "crates/hopf-imap",
     "crates/hopf-nntp",
+    "crates/hopf-redis",
     "crates/hopf-mqtt",
     "crates/hopf-amqp",
     "crates/hopf-amqp1",
@@ -125,6 +127,7 @@ hopf-mailbox = { version = "0.7.0", path = "crates/hopf-mailbox" }
 hopf-pop3 = { version = "0.7.0", path = "crates/hopf-pop3" }
 hopf-imap = { version = "0.7.0", path = "crates/hopf-imap" }
 hopf-nntp = { version = "0.7.0", path = "crates/hopf-nntp" }
+hopf-redis = { version = "0.7.0", path = "crates/hopf-redis" }
 hopf-mqtt = { version = "0.7.0", path = "crates/hopf-mqtt" }
 hopf-amqp = { version = "0.7.0", path = "crates/hopf-amqp" }
 hopf-amqp1 = { version = "0.7.0", path = "crates/hopf-amqp1" }

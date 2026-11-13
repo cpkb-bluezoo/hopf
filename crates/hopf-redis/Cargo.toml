@@ -1,0 +1,41 @@
+# Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
+[package]
+name = "hopf-redis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Async RESP2/RESP3 Redis and Valkey client for Hopf, with cluster support"
+readme = "README.md"
+keywords = ["redis", "valkey", "resp3", "cluster", "networking"]
+categories = ["network-programming", "database"]
+
+[features]
+default = []
+# Tests that open sockets: a scripted RESP server on loopback, and a real
+# Redis or Valkey named by the HOPF_TEST_REDIS environment variable
+# (host:port; those tests are skipped when it is unset).
+integration = []
+
+[dependencies]
+hopf-core = { workspace = true }
+hopf-dns = { workspace = true }
+getrandom = "0.2"
+
+[dev-dependencies]
+hopf-core = { workspace = true, features = ["testing"] }
+rcgen = { workspace = true }
+
+[[test]]
+name = "redis_server"
+path = "tests/redis_server.rs"
+required-features = ["integration"]
+
+[[test]]
+name = "scripted"
+path = "tests/scripted.rs"
+required-features = ["integration"]

@@ -44,6 +44,7 @@ NAV = [
         ("mqtt.html", "MQTT"),
         ("amqp.html", "AMQP 0-9-1"),
         ("amqp1.html", "AMQP 1.0"),
+        ("redis.html", "Redis"),
         ("mailbox.html", "Mailbox"),
     ]),
     ("Cross-cutting", [

@@ -7,6 +7,22 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
 
 ### Added
 
+- **hopf-redis (new crate):** an async Redis and Valkey client (#527), behind
+  the `redis` feature of `hopf`. `RedisClient::connect(&reactor, RedisConfig)`
+  is one pipelined connection bound to a reactor: commands from any thread, each
+  reply a callback on the reactor, exactly once and in issue order. It negotiates
+  RESP3 (`HELLO 3`) and falls back to RESP2, authenticates (password, or ACL
+  user and password), selects a database, resolves host names through
+  `hopf-dns` and speaks TLS through a `hopf-core` connector. Typed helpers cover
+  strings, keys, hashes, lists, sets, sorted sets and scripts, `SetOptions`
+  covers `SET`, `transaction` writes `MULTI`..`EXEC` as one batch, and `command`
+  and `send` carry anything else. A command in flight when the connection is
+  lost fails with `ConnectionLost` and is not sent again; a timed-out command's
+  late reply is discarded in its place; after a failed connect commands fail
+  fast for a growing time. `hopf_redis::resp` has the `Value` type, the command
+  encoder and `RespParser`, an incremental parser with limits on bulk size,
+  aggregate size, depth, line length and total reply size. Pub/sub, push
+  messages and cluster mode follow. Tested against Redis 7.4 and Valkey 8.1.
 - **hopf-core:** readiness and graceful shutdown (#530).
   `Runtime::is_ready()`, `is_draining()`, `bind_failures()` and
   `open_connections()`; `Runtime::start_drain()` stops accepting and tells every

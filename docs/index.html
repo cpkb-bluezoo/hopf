@@ -48,6 +48,7 @@
 <li><a href="mqtt.html">MQTT</a></li>
 <li><a href="amqp.html">AMQP 0-9-1</a></li>
 <li><a href="amqp1.html">AMQP 1.0</a></li>
+<li><a href="redis.html">Redis</a></li>
 <li><a href="mailbox.html">Mailbox</a></li>
 </ul>
 <h2>Cross-cutting</h2><ul>
@@ -99,6 +100,7 @@
 <li><a href="#smtp-hopf-smtp">SMTP</a></li>
 <li><a href="#pop3-hopf-pop3">POP3</a></li>
 <li><a href="#nntp-hopf-nntp">NNTP</a></li>
+<li><a href="#redis-hopf-redis">Redis</a></li>
 <li><a href="#imap-hopf-imap">IMAP</a></li>
 <li><a href="#mqtt-hopf-mqtt">MQTT</a></li>
 <li><a href="#amqp-hopf-amqp">AMQP</a></li>
@@ -277,6 +279,12 @@
 <li>Async NNTP / NNTPS client (RFC 3977, 4642, 4643): greeting, CAPABILITIES, STARTTLS or implicit TLS, AUTHINFO SASL / USER-PASS</li>
 <li><code>NntpSession</code> command queue usable from any thread; LIST ACTIVE, GROUP, OVER, ARTICLE, HEAD, POST, QUIT helpers; multi-line replies streamed and dot-unstuffed</li>
 </ul>
+<h3 id="redis-hopf-redis">Redis (<code>hopf-redis</code>)</h3>
+<ul>
+<li>Async Redis / Valkey client, RESP2 and RESP3 (<code>HELLO 3</code> with RESP2 fallback), AUTH / ACL users, database selection, TLS, host names through <code>hopf-dns</code></li>
+<li><code>RedisClient</code>: one pipelined connection bound to a reactor; commands from any thread, replies as callbacks; typed helpers for strings, keys, hashes, lists, sets, sorted sets, scripts; <code>transaction</code> as one atomic write</li>
+<li>Incremental push RESP parser with size and depth limits; timeouts, backoff and reconnect without re-sending a command that may have run</li>
+</ul>
 <h3 id="imap-hopf-imap">IMAP (<code>hopf-imap</code>)</h3>
 <ul>
 <li>IMAP4rev2 / IMAPS server (RFC 9051) over <code>hopf-mailbox</code>; staged handler SPI</li>
@@ -420,6 +428,13 @@
 <td style="text-align: center;">—</td>
 <td style="text-align: center;">✓</td>
 <td>callback-driven client (<code>NntpSession</code>)</td>
+</tr>
+<tr>
+<td>Redis / Valkey (RESP2, RESP3)</td>
+<td><code>hopf-redis</code></td>
+<td style="text-align: center;">—</td>
+<td style="text-align: center;">✓</td>
+<td>pipelined client (<code>RedisClient</code>)</td>
 </tr>
 <tr>
 <td>IMAP / IMAPS</td>

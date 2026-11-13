@@ -36,6 +36,7 @@ full = [
     "pop3",
     "imap",
     "nntp",
+    "redis",
     "mailbox",
     "otel",
     "mqtt",
@@ -59,6 +60,7 @@ smtp = ["dep:hopf-smtp"]
 pop3 = ["dep:hopf-pop3"]
 imap = ["dep:hopf-imap"]
 nntp = ["dep:hopf-nntp"]
+redis = ["dep:hopf-redis"]
 mailbox = ["dep:hopf-mailbox"]
 otel = ["dep:hopf-otel"]
 mqtt = ["dep:hopf-mqtt"]
@@ -97,6 +99,7 @@ hopf-smtp = { workspace = true, optional = true }
 hopf-pop3 = { workspace = true, optional = true }
 hopf-imap = { workspace = true, optional = true }
 hopf-nntp = { workspace = true, optional = true }
+hopf-redis = { workspace = true, optional = true }
 hopf-mailbox = { workspace = true, optional = true }
 hopf-otel = { workspace = true, optional = true }
 hopf-mqtt = { workspace = true, optional = true }

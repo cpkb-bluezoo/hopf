@@ -64,6 +64,7 @@ CRATES=(
   hopf-pop3
   hopf-imap
   hopf-nntp
+  hopf-redis
   hopf-mqtt
   hopf
 )

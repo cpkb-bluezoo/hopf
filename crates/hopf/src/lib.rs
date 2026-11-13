@@ -39,6 +39,7 @@
 //! | [`pop3`] | `hopf-pop3` | `pop3` |
 //! | [`imap`] | `hopf-imap` | `imap` |
 //! | [`nntp`] | `hopf-nntp` | `nntp` |
+//! | [`redis`] | `hopf-redis` | `redis` |
 //! | [`mailbox`] | `hopf-mailbox` | `mailbox` |
 //! | [`otel`] | `hopf-otel` | `otel` |
 //! | [`mqtt`] | `hopf-mqtt` | `mqtt` (`mqtt-ws` for MQTT-over-WebSocket) |
@@ -119,6 +120,8 @@ pub use hopf_imap as imap;
 /// NNTP / NNTPS async client.
 #[cfg(feature = "nntp")]
 pub use hopf_nntp as nntp;
+#[cfg(feature = "redis")]
+pub use hopf_redis as redis;
 
 /// mbox / Maildir++ mailbox storage SPI.
 #[cfg(feature = "mailbox")]

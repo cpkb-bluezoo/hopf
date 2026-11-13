@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Redis — Hopf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
+<a class="brand" href="index.html">Hopf</a>
+<p class="tag">Networking framework reference</p>
+<h2>Start</h2><ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<h2>Core</h2><ul>
+<li><a href="services.html">Services</a></li>
+<li><a href="clients.html">Clients</a></li>
+<li><a href="composition.html">Composition</a></li>
+<li><a href="runtime-options.html">Runtime options</a></li>
+</ul>
+<h2>Protocols</h2><ul>
+<li><a href="tls.html">TLS</a></li>
+<li><a href="http/overview.html">HTTP overview</a></li>
+<li><a href="http/server.html">HTTP server</a></li>
+<li><a href="http/client.html">HTTP client</a></li>
+<li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="masque.html">MASQUE</a></li>
+<li><a href="dns.html">DNS</a></li>
+<li><a href="mdns.html">mDNS</a></li>
+<li><a href="ldap.html">LDAP</a></li>
+<li><a href="webdav.html">WebDAV</a></li>
+<li><a href="websocket.html">WebSocket</a></li>
+<li><a href="grpc.html">gRPC</a></li>
+<li><a href="socks.html">SOCKS</a></li>
+<li><a href="ftp.html">FTP</a></li>
+<li><a href="smtp.html">SMTP</a></li>
+<li><a href="pop3.html">POP3</a></li>
+<li><a href="imap.html">IMAP</a></li>
+<li><a href="nntp.html">NNTP</a></li>
+<li><a href="mqtt.html">MQTT</a></li>
+<li><a href="amqp.html">AMQP 0-9-1</a></li>
+<li><a href="amqp1.html">AMQP 1.0</a></li>
+<li><a href="redis.html" aria-current="page">Redis</a></li>
+<li><a href="mailbox.html">Mailbox</a></li>
+</ul>
+<h2>Cross-cutting</h2><ul>
+<li><a href="auth.html">Auth</a></li>
+<li><a href="quota.html">Quota</a></li>
+<li><a href="access-control.html">Access control</a></li>
+<li><a href="telemetry.html">Telemetry</a></li>
+</ul>
+<h2>Architecture audit</h2><ul>
+<li><a href="conformance.html">Conformance</a></li>
+</ul>
+<h2>Cookbook</h2><ul>
+<li><a href="cookbook/echo.html">Echo</a></li>
+<li><a href="cookbook/tls-echo.html">TLS echo</a></li>
+<li><a href="cookbook/http-hello-get.html">HTTP hello / get</a></li>
+<li><a href="cookbook/dns-proxy.html">DNS proxy</a></li>
+<li><a href="cookbook/dns-authoritative.html">DNS authoritative</a></li>
+<li><a href="cookbook/webdav.html">WebDAV</a></li>
+<li><a href="cookbook/websocket.html">WebSocket</a></li>
+<li><a href="cookbook/grpc.html">gRPC</a></li>
+<li><a href="cookbook/ftp.html">FTP</a></li>
+<li><a href="cookbook/smtp.html">SMTP</a></li>
+<li><a href="cookbook/pop3.html">POP3</a></li>
+</ul>
+</nav>
+    <main class="main">
+      <header>
+        <h1>Redis</h1>
+        <p class="lead"><code>hopf-redis</code> is an async <strong>Redis and Valkey client</strong> speaking RESP2 and RESP3. One <code>RedisClient</code> is one pipelined connection bound to a reactor: commands go out at once from any thread, and each reply comes back as a callback on the reactor.</p>
+      </header>
+<div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#quick-start">Quick start</a></li>
+<li><a href="#connecting">Connecting</a></li>
+<li><a href="#configuration">Configuration</a></li>
+<li><a href="#commands">Commands</a></li>
+<li><a href="#pipelining-and-failure">Pipelining and failure</a></li>
+<li><a href="#transactions-and-scripts">Transactions and scripts</a></li>
+<li><a href="#tls">TLS</a></li>
+<li><a href="#resp">The RESP codec</a></li>
+<li><a href="#testing">Testing</a></li>
+<li><a href="#limitations">Limitations</a></li>
+</ul></div>
+<h2 id="quick-start">Quick start</h2>
+<pre class="rust,ignore"><code>use hopf_core::{Runtime, RuntimeConfig};
+use hopf_redis::{RedisClient, RedisConfig};
+
+let rt = Runtime::start(RuntimeConfig::default())?;
+let redis = RedisClient::connect(rt.pick_worker(), RedisConfig::new("redis.example.com", 6379));
+
+redis.set("greeting", "hello", |r| assert!(r.is_ok()));
+redis.get("greeting", |r| println!("{:?}", r));      // Ok(Some(b"hello"))
+redis.incr("visits", |r| println!("{:?}", r));       // Ok(1)</code></pre>
+<p>Every method returns at once and calls its callback exactly once, on the reactor the client was bound to, and never before the call that issued it has returned. The callbacks of one client run in the order the replies arrive, which is the order the commands were issued.</p>
+<h2 id="connecting">Connecting</h2>
+<p><code>RedisClient::connect(&amp;reactor, config)</code> dials at once. A host name is resolved through <code>hopf-dns</code> (a resolver made on the client's reactor from the system's nameservers, unless <code>RedisConfig::resolver</code> gives one); a literal address is used as it is. On the new connection the client negotiates and authenticates before any command runs:</p>
+<ol>
+<li><code>HELLO 3</code>, with <code>AUTH</code> (user <code>default</code> unless <code>username</code> is set) and <code>SETNAME</code> when configured. The reply tells the client RESP3 is in use (<code>is_resp3()</code>).</li>
+<li>A server that does not know <code>HELLO</code> (Redis before 6.0; a proxy that does not carry it) answers an error, and the client starts again in RESP2: <code>AUTH</code>, <code>CLIENT SETNAME</code>. A refused password (<code>WRONGPASS</code>, <code>NOAUTH</code>) is <strong>not</strong> a reason to fall back: it fails the connection.</li>
+<li><code>SELECT</code> for a non-zero database.</li>
+</ol>
+<p>Commands issued before this is done wait, and are sent in order when the connection is ready, so a command never runs unauthenticated. <code>resp2_only()</code> skips <code>HELLO</code>.</p>
+<h2 id="configuration">Configuration</h2>
+<table>
+<thead><tr><th>Method</th><th>Default</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>RedisConfig::new(host, port)</code> / <code>from_addr(addr)</code></td><td></td><td>The server; <code>from_addr</code> does no name lookup</td></tr>
+<tr><td><code>tls(connector, server_name)</code></td><td>off</td><td>Speak TLS; see <a href="#tls">TLS</a></td></tr>
+<tr><td><code>username(..)</code>, <code>password(..)</code></td><td>none</td><td>Authenticate on every connection (the password never appears in <code>Debug</code> output)</td></tr>
+<tr><td><code>database(n)</code></td><td>0</td><td><code>SELECT</code> on every connection</td></tr>
+<tr><td><code>client_name(..)</code></td><td>none</td><td><code>CLIENT SETNAME</code></td></tr>
+<tr><td><code>resp2_only()</code></td><td>RESP3 first</td><td>Do not try <code>HELLO 3</code></td></tr>
+<tr><td><code>resolver(..)</code></td><td>made on first use</td><td>The <code>DnsResolver</code> for a host name</td></tr>
+<tr><td><code>connect_timeout(..)</code></td><td>5 s</td><td>TCP connect</td></tr>
+<tr><td><code>command_timeout(..)</code></td><td>10 s</td><td>How long a command may go unanswered, counted from when it is issued (the connect included); <code>None</code> waits for ever, as a blocking command needs</td></tr>
+<tr><td><code>max_pending(n)</code></td><td>0 (no limit)</td><td>The most commands sent and unanswered or waiting at once; more fail with <code>Overloaded</code></td></tr>
+<tr><td><code>reconnect_backoff(initial, max)</code></td><td>100 ms, 5 s</td><td>How long commands fail fast after a connect fails; doubles each time</td></tr>
+<tr><td><code>limits(RespLimits)</code></td><td>see <a href="#resp">the codec</a></td><td>Bounds on what a reply may make the client hold</td></tr>
+</tbody>
+</table>
+<h2 id="commands">Commands</h2>
+<p>Typed helpers return the reply as the type the command returns, with a nil as <code>None</code>: strings (<code>get</code>, <code>set</code>, <code>set_with(SetOptions)</code>, <code>setnx</code>, <code>getdel</code>, <code>mget</code>, <code>mset</code>, <code>incr</code>, <code>incrby</code>, <code>decr</code>, <code>decrby</code>, <code>append</code>, <code>strlen</code>), keys (<code>del</code>, <code>exists</code>, <code>expire</code>, <code>pexpire</code>, <code>ttl</code>, <code>pttl</code>, <code>persist</code>), hashes (<code>hset</code>, <code>hget</code>, <code>hmget</code>, <code>hgetall</code>, <code>hdel</code>, <code>hexists</code>, <code>hincrby</code>, <code>hlen</code>), lists (<code>lpush</code>, <code>rpush</code>, <code>lpop</code>, <code>rpop</code>, <code>llen</code>, <code>lrange</code>, <code>lindex</code>), sets (<code>sadd</code>, <code>srem</code>, <code>smembers</code>, <code>sismember</code>, <code>scard</code>), sorted sets (<code>zadd</code>, <code>zrem</code>, <code>zrange</code>, <code>zrange_withscores</code>, <code>zscore</code>, <code>zincrby</code>, <code>zcard</code>), scripts (<code>eval</code>, <code>evalsha</code>, <code>script_load</code>) and the connection (<code>ping</code>, <code>auth</code>, <code>auth_user</code>, <code>select</code>). <code>SetOptions { nx, xx, ex, px, exat, pxat, keepttl }</code> covers <code>SET</code>'s modifiers.</p>
+<p>Anything else goes through <code>command(&amp;[words], callback)</code> or <code>send(&amp;Command, callback)</code> and comes back as a <code>Value</code>: <code>Null</code>, <code>Int</code>, <code>Simple</code>, <code>Bulk</code>, <code>Array</code>, and, from RESP3, <code>Map</code>, <code>Set</code>, <code>Double</code>, <code>Bool</code>, <code>BigNumber</code>, <code>Verbatim</code>, <code>Push</code>. An error reply to a command is <code>Err(RedisError::Server)</code> with its code (<code>WRONGTYPE</code>, <code>MOVED</code>, ...); an error inside an array (one command's result in a transaction) stays a <code>Value::Error</code>.</p>
+<h2 id="pipelining-and-failure">Pipelining and failure</h2>
+<p>A command is written when it is issued, without waiting for the replies to those before it; replies are matched to commands in the order sent, which is all RESP gives. One connection therefore carries many commands in flight from any number of threads. <code>send_batch</code> writes several commands together with nothing from another caller between them.</p>
+<ul>
+<li><strong>Connection lost.</strong> A command sent and unanswered fails with <code>ConnectionLost</code> and is <em>not</em> sent again: it may have run, and most commands are not safe to repeat. The next command dials a new connection.</li>
+<li><strong>Failed connect or handshake.</strong> Commands waiting for it fail (<code>Connect</code>, or the server's own error for a refused password). Then, for a growing time, new commands fail at once instead of each dialling again.</li>
+<li><strong>Timeout.</strong> The command fails with <code>Timeout</code> once; its reply, if it comes, is discarded in its place, so it cannot be mistaken for the reply to the command behind it. (A command that blocks the connection, such as <code>BLPOP</code>, holds up everything behind it until it returns; give blocking commands a connection of their own.)</li>
+<li><strong>Close.</strong> <code>close()</code> fails what is waiting with <code>Closed</code>, and so does every later command.</li>
+</ul>
+<h2 id="transactions-and-scripts">Transactions and scripts</h2>
+<p><code>transaction(commands, callback)</code> writes <code>MULTI</code>, the commands and <code>EXEC</code> as one batch, so nothing from another caller can come between them on the shared connection. The callback gets each command's result in order, or <code>None</code> if <code>EXEC</code> was aborted by a watched key. A command that fails when it runs is a <code>Value::Error</code> in the list; one refused when queued fails the transaction with that error.</p>
+<p><code>watch</code>, <code>unwatch</code>, <code>multi</code>, <code>exec</code> and <code>discard</code> act on the <em>connection</em>, which every user of a client shares, so another caller's commands can run in between. For a watch-then-transact sequence use a client of your own. <code>eval</code> and <code>evalsha</code> run a script; <code>EVALSHA</code> answers <code>NOSCRIPT</code> for one the server has not seen, so <code>script_load</code> it and try again.</p>
+<h2 id="tls">TLS</h2>
+<pre class="rust,ignore"><code>use hopf_core::ClientTlsBuilder;
+
+let tls = ClientTlsBuilder::new()
+    .trust_anchors([ca_der])                 // or .public_trust() (the default)
+    .client_credentials(client_identity)     // mutual TLS, if the server asks
+    .build();
+let redis = RedisClient::connect(rt.pick_worker(), RedisConfig::new("redis.example.com", 6380).tls(tls, "redis.example.com"));</code></pre>
+<p>The connector verifies the server's certificate against <code>server_name</code>. See <a href="tls.html#client-tls-builder">TLS: ClientTlsBuilder</a>.</p>
+<h2 id="resp">The RESP codec</h2>
+<p><code>hopf_redis::resp</code> is usable on its own. <code>RespParser</code> is a push parser: <code>feed(&amp;mut data, &amp;mut sink)</code> takes bytes in any split, consumes all of them, and hands each reply to the sink the moment its last byte arrives. It keeps no input: a header line in progress is a small scratch buffer, a bulk payload is appended to the value it becomes, and aggregates wait on an explicit stack, so nesting depth is a limit, not a stack overflow. RESP3 attributes are read and dropped. <code>RespLimits</code> bounds what a server may make the parser hold, and each size is checked when it is announced, before memory is reserved for it:</p>
+<table>
+<thead><tr><th>Limit</th><th>Default</th><th>Bounds</th></tr></thead>
+<tbody>
+<tr><td><code>max_bulk</code></td><td>512 MiB</td><td>one bulk, verbatim or error string (Redis's own <code>proto-max-bulk-len</code> default)</td></tr>
+<tr><td><code>max_aggregate</code></td><td>2<sup>26</sup></td><td>elements an aggregate may announce</td></tr>
+<tr><td><code>max_depth</code></td><td>32</td><td>aggregates inside aggregates</td></tr>
+<tr><td><code>max_line</code></td><td>64 KiB</td><td>a header or simple-string line</td></tr>
+<tr><td><code>max_reply_bytes</code></td><td>1 GiB</td><td>one whole reply</td></tr>
+</tbody>
+</table>
+<p>A violation is an error and the connection is closed. <code>encode_command</code> writes a command as an array of bulk strings.</p>
+<h2 id="testing">Testing</h2>
+<p>The codec and the connection logic have unit tests with no I/O, including every reply type split at every byte boundary. <code>--features integration</code> adds two suites with real sockets. <code>scripted</code> runs the client against a scripted RESP server inside the test: an old server without <code>HELLO</code>, a wrong password, a drop mid-pipeline, a stray reply, a slow handshake, a timed-out command with another behind it, a server that appears later, and TLS. <code>redis_server</code> runs it against a real server named by <code>HOPF_TEST_REDIS</code> (and <code>HOPF_TEST_REDIS_AUTH</code>, a server started with <code>--requirepass hunter2</code>); a test with no server named is skipped. It has been run against Redis 7.4 and Valkey 8.1:</p>
+<pre><code>podman run -d --rm -p 127.0.0.1:16379:6379 docker.io/library/redis:7
+podman run -d --rm -p 127.0.0.1:16380:6379 docker.io/library/redis:7 redis-server --requirepass hunter2
+HOPF_TEST_REDIS=127.0.0.1:16379 HOPF_TEST_REDIS_AUTH=127.0.0.1:16380 \
+    cargo test -p hopf-redis --features integration</code></pre>
+<h2 id="limitations">Limitations</h2>
+<ul>
+<li>Pub/sub, push messages and cluster mode are not in this page's client yet.</li>
+<li>One connection per client. Spread load by creating clients on several reactors; there is no pool.</li>
+<li>A command that was sent when a connection was lost is not retried.</li>
+<li>No URL form of the configuration (<code>redis://</code>, <code>rediss://</code>).</li>
+</ul>
+</main>
+  </div>
+</body>
+</html>
