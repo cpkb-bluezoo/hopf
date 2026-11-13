@@ -22,6 +22,7 @@
 use std::sync::{Arc, Mutex};
 
 use super::handler::{DnsQueryCallback, DnsQueryHandler, HandlerOutcome, QueryContext};
+use super::telemetry::Telemetry;
 use super::{DnsServerMetrics, MessageSink};
 use crate::multi_qtype::{
     add_edns_option, encode_mqtype_response_option, find_mqtype_option, without_option, EDNS_OPTION_MQTYPE_QUERY,
@@ -70,6 +71,7 @@ struct Gather {
 pub(super) fn merge(
     handler: Arc<dyn DnsQueryHandler>,
     metrics: Arc<Mutex<DnsServerMetrics>>,
+    telemetry: Telemetry,
     query: Arc<DnsMessage>,
     ctx: QueryContext,
     extra: Vec<DnsType>,
@@ -82,6 +84,7 @@ pub(super) fn merge(
         Some(RCODE_NXDOMAIN) => {
             // The name does not exist, so no type of it does: every extra
             // type is answered, with nothing.
+            telemetry.multi_qtype(ctx.transport(), 0);
             add_edns_option(&mut primary[0], &encode_mqtype_response_option(&extra));
             done(primary);
         }
@@ -102,6 +105,7 @@ pub(super) fn merge(
                 sub_queries.push(sub);
             }
             metrics.lock().unwrap().mqtype_subqueries += sub_queries.len() as u64;
+            telemetry.multi_qtype(ctx.transport(), sub_queries.len() as u64);
             let gather = Arc::new(Mutex::new(Gather {
                 slots: vec![None; sub_queries.len()],
                 remaining: sub_queries.len(),
@@ -143,6 +147,7 @@ pub(super) fn merge(
             }
         }
         _ => {
+            telemetry.multi_qtype(ctx.transport(), 0);
             if let Some(first) = primary.first_mut() {
                 add_edns_option(first, &encode_mqtype_response_option(&[]));
             }

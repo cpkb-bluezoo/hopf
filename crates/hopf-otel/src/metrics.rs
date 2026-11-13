@@ -649,6 +649,202 @@ impl RequestTimer {
     }
 }
 
+/// The standard name of a DNS response code, for the `dns.response.code`
+/// attribute; a code with no name is `RCODE<n>`.
+fn rcode_name(rcode: u16) -> String {
+    match rcode {
+        0 => "NOERROR".into(),
+        1 => "FORMERR".into(),
+        2 => "SERVFAIL".into(),
+        3 => "NXDOMAIN".into(),
+        4 => "NOTIMP".into(),
+        5 => "REFUSED".into(),
+        6 => "YXDOMAIN".into(),
+        7 => "YXRRSET".into(),
+        8 => "NXRRSET".into(),
+        9 => "NOTAUTH".into(),
+        10 => "NOTZONE".into(),
+        other => format!("RCODE{other}"),
+    }
+}
+
+/// DNS server metrics instruments (OTLP export).
+///
+/// Every point carries a `dns.transport` attribute (`udp`, `tcp`, `dot` or
+/// `doq`). Names:
+///
+/// | Name | Kind | Meaning |
+/// |---|---|---|
+/// | `dns.server.queries` | counter | messages received |
+/// | `dns.server.responses` | counter | answers sent, with `dns.response.code` |
+/// | `dns.server.query.duration` | histogram, ms | time from receipt to the answer being ready |
+/// | `dns.server.cache.hits` | counter | answers served from the cache |
+/// | `dns.server.upstream.queries` | counter | queries forwarded to an upstream |
+/// | `dns.server.stale_served` | counter | answers served stale because the upstream failed |
+/// | `dns.server.aggressive_nsec_hits` | counter | negative answers built from cached NSEC/NSEC3 proofs |
+/// | `dns.server.errors` | counter | handler errors |
+/// | `dns.server.cookies.presented` | counter | queries carrying a DNS Cookie |
+/// | `dns.server.cookies.verified` | counter | of those, with a verified server cookie |
+/// | `dns.server.mqtype.queries` | counter | RFC 10029 multiple-QTYPE queries acted on |
+/// | `dns.server.mqtype.subqueries` | counter | sub-queries those were expanded into |
+pub struct DnsServerMetrics {
+    export: ExportHandle,
+}
+
+impl DnsServerMetrics {
+    /// Create with export handle.
+    pub fn new(export: ExportHandle) -> Arc<Self> {
+        Arc::new(Self { export })
+    }
+
+    fn count(&self, name: &'static str, transport: &str, value: u64) {
+        self.export.try_send_metric(MetricPoint::Counter {
+            name,
+            attributes: vec![("dns.transport".into(), transport.into())],
+            value,
+        });
+    }
+
+    /// A message was received.
+    pub fn query_received(&self, transport: &str) {
+        self.count("dns.server.queries", transport, 1);
+    }
+
+    /// An answer is ready to send, `duration` after the message arrived.
+    pub fn response_sent(&self, transport: &str, rcode: u16, duration: std::time::Duration) {
+        let transport_a = ("dns.transport".to_string(), transport.to_string());
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "dns.server.responses",
+            attributes: vec![transport_a.clone(), ("dns.response.code".into(), rcode_name(rcode))],
+            value: 1,
+        });
+        self.export.try_send_metric(MetricPoint::Histogram {
+            name: "dns.server.query.duration",
+            unit: "ms",
+            attributes: vec![transport_a],
+            value: duration.as_secs_f64() * 1000.0,
+        });
+    }
+
+    /// An answer was served from the cache.
+    pub fn cache_hit(&self, transport: &str) {
+        self.count("dns.server.cache.hits", transport, 1);
+    }
+
+    /// A query was forwarded to an upstream.
+    pub fn upstream_query(&self, transport: &str) {
+        self.count("dns.server.upstream.queries", transport, 1);
+    }
+
+    /// An answer was served stale (RFC 8767) because the upstream failed.
+    pub fn stale_served(&self, transport: &str) {
+        self.count("dns.server.stale_served", transport, 1);
+    }
+
+    /// A negative answer was built from cached NSEC/NSEC3 proofs (RFC 8198).
+    pub fn aggressive_nsec_hit(&self, transport: &str) {
+        self.count("dns.server.aggressive_nsec_hits", transport, 1);
+    }
+
+    /// A handler error.
+    pub fn error(&self, transport: &str) {
+        self.count("dns.server.errors", transport, 1);
+    }
+
+    /// A query carried a DNS Cookie (RFC 7873).
+    pub fn cookie_presented(&self, transport: &str) {
+        self.count("dns.server.cookies.presented", transport, 1);
+    }
+
+    /// A presented server cookie was verified.
+    pub fn cookie_verified(&self, transport: &str) {
+        self.count("dns.server.cookies.verified", transport, 1);
+    }
+
+    /// A multiple-QTYPE query (RFC 10029) was expanded into `subqueries`.
+    pub fn multi_qtype(&self, transport: &str, subqueries: u64) {
+        self.count("dns.server.mqtype.queries", transport, 1);
+        if subqueries > 0 {
+            self.count("dns.server.mqtype.subqueries", transport, subqueries);
+        }
+    }
+}
+
+/// DNS upstream client metrics instruments (OTLP export), one set of points
+/// per upstream.
+///
+/// Every point carries `dns.upstream` (the resolver's address) and
+/// `dns.transport` (`dot` or `doq`). Names:
+///
+/// | Name | Kind | Meaning |
+/// |---|---|---|
+/// | `dns.upstream.queries` | counter | queries sent |
+/// | `dns.upstream.responses` | counter | answers received |
+/// | `dns.upstream.query.duration` | histogram, ms | time to an answer |
+/// | `dns.upstream.timeouts` | counter | queries that timed out |
+/// | `dns.upstream.failures` | counter | queries that failed for another reason |
+/// | `dns.upstream.retries` | counter | queries sent again after a lost connection |
+/// | `dns.upstream.connects` | counter | connections established |
+/// | `dns.upstream.connect_failures` | counter | connections that did not come up |
+/// | `dns.upstream.reconnects` | counter | connections opened after an earlier one |
+/// | `dns.upstream.connections` | up-down | connections open (the pool size) |
+/// | `dns.upstream.in_flight` | up-down | queries sent or waiting, not yet completed |
+pub struct DnsUpstreamMetrics {
+    export: ExportHandle,
+}
+
+impl DnsUpstreamMetrics {
+    /// Create with export handle.
+    pub fn new(export: ExportHandle) -> Arc<Self> {
+        Arc::new(Self { export })
+    }
+
+    fn attrs(upstream: &str, transport: &str) -> Vec<(String, String)> {
+        vec![
+            ("dns.upstream".into(), upstream.into()),
+            ("dns.transport".into(), transport.into()),
+        ]
+    }
+
+    /// Increment the counter `name` for this upstream.
+    pub fn count(&self, name: &'static str, upstream: &str, transport: &str) {
+        self.export.try_send_metric(MetricPoint::Counter {
+            name,
+            attributes: Self::attrs(upstream, transport),
+            value: 1,
+        });
+    }
+
+    /// An answer arrived `duration` after the query was made.
+    pub fn response(&self, upstream: &str, transport: &str, duration: std::time::Duration) {
+        self.count("dns.upstream.responses", upstream, transport);
+        self.export.try_send_metric(MetricPoint::Histogram {
+            name: "dns.upstream.query.duration",
+            unit: "ms",
+            attributes: Self::attrs(upstream, transport),
+            value: duration.as_secs_f64() * 1000.0,
+        });
+    }
+
+    /// The number of open connections is now `value`.
+    pub fn connections(&self, upstream: &str, transport: &str, value: i64) {
+        self.export.try_send_metric(MetricPoint::UpDown {
+            name: "dns.upstream.connections",
+            attributes: Self::attrs(upstream, transport),
+            value,
+        });
+    }
+
+    /// The number of queries sent or waiting is now `value`.
+    pub fn in_flight(&self, upstream: &str, transport: &str, value: i64) {
+        self.export.try_send_metric(MetricPoint::UpDown {
+            name: "dns.upstream.in_flight",
+            attributes: Self::attrs(upstream, transport),
+            value,
+        });
+    }
+}
+
 #[cfg(all(test, feature = "integration"))]
 mod tests {
     use super::*;
@@ -802,5 +998,118 @@ mod tests {
             "missing duration metric: {body}"
         );
         let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn dns_server_metrics_emit_transport_and_response_code() {
+        let path = std::env::temp_dir().join(format!("hopf-otel-dns-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let cfg = OtelConfig::new("dns-test").with_jsonl_metrics(&path);
+        let (handle, join, _running) = spawn_worker(cfg);
+        let m = DnsServerMetrics::new(handle.clone());
+        m.query_received("udp");
+        m.response_sent("udp", 3, std::time::Duration::from_millis(7));
+        m.cache_hit("dot");
+        m.multi_qtype("tcp", 2);
+        handle.flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        handle.shutdown();
+        let _ = join.join();
+        let body = std::fs::read_to_string(&path).unwrap_or_default();
+        for needle in [
+            "dns.server.queries",
+            "dns.server.responses",
+            "NXDOMAIN",
+            "dns.server.query.duration",
+            "dns.server.cache.hits",
+            "dns.server.mqtype.subqueries",
+            "dns.transport",
+        ] {
+            assert!(body.contains(needle), "missing {needle}: {body}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dns_upstream_metrics_emit_the_upstream_and_transport() {
+        let path = std::env::temp_dir().join(format!("hopf-otel-dnsup-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let cfg = OtelConfig::new("dnsup-test").with_jsonl_metrics(&path);
+        let (handle, join, _running) = spawn_worker(cfg);
+        let m = DnsUpstreamMetrics::new(handle.clone());
+        m.count("dns.upstream.queries", "192.0.2.1:853", "dot");
+        m.response("192.0.2.1:853", "dot", std::time::Duration::from_millis(3));
+        m.connections("192.0.2.1:853", "dot", 1);
+        m.in_flight("192.0.2.1:853", "dot", 2);
+        handle.flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        handle.shutdown();
+        let _ = join.join();
+        let body = std::fs::read_to_string(&path).unwrap_or_default();
+        for needle in ["dns.upstream.queries", "dns.upstream.query.duration", "dns.upstream.connections", "dns.upstream.in_flight", "192.0.2.1:853", "dns.upstream"] {
+            assert!(body.contains(needle), "missing {needle}: {body}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+impl hopf_dns::telemetry::DnsServerTelemetry for DnsServerMetrics {
+    fn query_received(&self, transport: &str) {
+        DnsServerMetrics::query_received(self, transport);
+    }
+    fn response_sent(&self, transport: &str, rcode: u16, duration: std::time::Duration) {
+        DnsServerMetrics::response_sent(self, transport, rcode, duration);
+    }
+    fn cache_hit(&self, transport: &str) {
+        DnsServerMetrics::cache_hit(self, transport);
+    }
+    fn upstream_query(&self, transport: &str) {
+        DnsServerMetrics::upstream_query(self, transport);
+    }
+    fn stale_served(&self, transport: &str) {
+        DnsServerMetrics::stale_served(self, transport);
+    }
+    fn aggressive_nsec_hit(&self, transport: &str) {
+        DnsServerMetrics::aggressive_nsec_hit(self, transport);
+    }
+    fn error(&self, transport: &str) {
+        DnsServerMetrics::error(self, transport);
+    }
+    fn cookie_presented(&self, transport: &str) {
+        DnsServerMetrics::cookie_presented(self, transport);
+    }
+    fn cookie_verified(&self, transport: &str) {
+        DnsServerMetrics::cookie_verified(self, transport);
+    }
+    fn multi_qtype(&self, transport: &str, subqueries: u64) {
+        DnsServerMetrics::multi_qtype(self, transport, subqueries);
+    }
+}
+
+impl hopf_dns::telemetry::DnsUpstreamTelemetry for DnsUpstreamMetrics {
+    fn event(&self, upstream: &str, transport: &str, event: hopf_dns::telemetry::UpstreamEvent) {
+        use hopf_dns::telemetry::UpstreamEvent as E;
+        let name = match event {
+            E::Query => "dns.upstream.queries",
+            E::Timeout => "dns.upstream.timeouts",
+            E::Failure => "dns.upstream.failures",
+            E::Retry => "dns.upstream.retries",
+            E::Connect => "dns.upstream.connects",
+            E::ConnectFailure => "dns.upstream.connect_failures",
+            E::Reconnect => "dns.upstream.reconnects",
+            // A kind added to the (non-exhaustive) enum later is counted
+            // under a generic name rather than lost.
+            _ => "dns.upstream.events",
+        };
+        self.count(name, upstream, transport);
+    }
+    fn response(&self, upstream: &str, transport: &str, duration: std::time::Duration) {
+        DnsUpstreamMetrics::response(self, upstream, transport, duration);
+    }
+    fn connections(&self, upstream: &str, transport: &str, value: i64) {
+        DnsUpstreamMetrics::connections(self, upstream, transport, value);
+    }
+    fn in_flight(&self, upstream: &str, transport: &str, value: i64) {
+        DnsUpstreamMetrics::in_flight(self, upstream, transport, value);
     }
 }

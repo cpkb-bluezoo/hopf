@@ -92,7 +92,13 @@ impl ExportHandle {
         }
     }
 
-    /// Enqueue a metric point.
+    /// Enqueue a metric point. This is the supported way for an application
+    /// to export meters of its own beside the built-in ones: build a
+    /// [`MetricPoint`](crate::MetricPoint) (a counter increment, a histogram
+    /// observation or an up-down value, each with a static name and string
+    /// attributes) and send it. It never blocks; a point is dropped if the
+    /// export queue is full or the worker has stopped. Get the handle from
+    /// [`TelemetryPipeline::export_handle`](crate::TelemetryPipeline::export_handle).
     pub fn try_send_metric(&self, point: MetricPoint) {
         let _ = self.tx.try_send(Msg::Metric(point));
     }

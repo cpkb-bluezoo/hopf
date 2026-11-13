@@ -552,6 +552,50 @@ fn a_client_certificate_is_presented_for_mutual_tls() {
     c.close();
 }
 
+/// The client's events reach a `hopf-otel` pipeline: queries, answers and
+/// their latency, a timeout, the connection and the in-flight gauge, each
+/// labelled with the upstream and transport.
+#[test]
+fn upstream_events_are_exported_through_a_telemetry_pipeline() {
+    use hopf_otel::{OtelConfig, TelemetryPipeline};
+
+    let path = std::env::temp_dir().join(format!("hopf-dns-upstream-telemetry-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let pipeline = TelemetryPipeline::start(OtelConfig::new("upstream-test").with_jsonl_metrics(&path)).unwrap();
+
+    let (server, _id, tls) = Server::plain();
+    let c = client(
+        &server,
+        tls,
+        UpstreamConfig {
+            timeout: Duration::from_millis(300),
+            ..Default::default()
+        },
+    );
+    c.set_telemetry(pipeline.dns_upstream_metrics());
+    assert!(await_result(&ask(&c, query(1, "fast-1.test"))).0.is_ok());
+    assert_eq!(await_result(&ask(&c, query(2, "hang-1.test"))).0.unwrap_err(), UpstreamError::Timeout);
+
+    pipeline.export_handle().flush().unwrap();
+    thread::sleep(Duration::from_millis(100));
+    let body = std::fs::read_to_string(&path).unwrap_or_default();
+    for needle in [
+        "dns.upstream.queries",
+        "dns.upstream.responses",
+        "dns.upstream.query.duration",
+        "dns.upstream.timeouts",
+        "dns.upstream.connects",
+        "dns.upstream.connections",
+        "dns.upstream.in_flight",
+        "\"dot\"",
+        &server.addr.to_string(),
+    ] {
+        assert!(body.contains(needle), "missing {needle} in:\n{body}");
+    }
+    c.close();
+    let _ = std::fs::remove_file(&path);
+}
+
 /// The forwarder, over a resolver whose upstream is DoT, answers a quick query
 /// while a slow one is still outstanding at the same upstream: the listener
 /// thread is never held, and the two share one pipelined connection.

@@ -346,10 +346,29 @@ TelemetryHook enqueue    InstrumentedServerFactory
 <p>What people usually do instead:</p>
 <ul>
 <li>Time a client lookup as a <strong>local child span</strong> under the application request (duration/error only — nothing propagates on the DNS wire).</li>
-<li>Export <strong>resolver/server ops metrics</strong> (qps, NXDOMAIN, cache hits). Hopf’s <code>DnsService::metrics()</code> is process-local; it is not an OTLP instrument set.</li>
+<li>Export <strong>resolver/server ops metrics</strong> (qps, NXDOMAIN, cache hits). Hopf does: <code>pipeline.dns_metrics()</code> and <code>pipeline.dns_upstream_metrics()</code> are OTLP/JSONL instrument sets for the server and the encrypted upstream client (below). <code>DnsService::metrics()</code> still returns the process-local snapshot counters.</li>
 <li>Still get Accept/Dial/Close via <code>TelemetryHook</code> when the runtime uses a pipeline.</li>
 </ul>
 <p>See <a href="dns.html#telemetry">DNS: Telemetry</a>.</p>
+<h3 id="dns-metrics">DNS metrics</h3>
+<p>Attach them with <code>service.set_telemetry(pipeline.dns_metrics())</code> (the server shell) and <code>upstream.set_telemetry(pipeline.dns_upstream_metrics())</code> (an <code>UpstreamClient</code>), or <code>resolver.set_upstream_telemetry(...)</code> for the DoT upstreams a <code>DnsResolver</code> opens. <code>hopf-dns</code> defines the small <code>DnsServerTelemetry</code> and <code>DnsUpstreamTelemetry</code> traits and <code>hopf-otel</code> implements them, so <code>hopf-dns</code> does not depend on an exporter and another sink can implement them too. Every server point carries <code>dns.transport</code> (<code>udp</code>, <code>tcp</code>, <code>dot</code>, <code>doq</code>).</p>
+<table>
+<thead><tr><th>Name</th><th>Kind</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>dns.server.queries</code></td><td>counter</td><td>messages received</td></tr>
+<tr><td><code>dns.server.responses</code></td><td>counter</td><td>answers ready, with <code>dns.response.code</code> (<code>NOERROR</code>, <code>NXDOMAIN</code>, ...)</td></tr>
+<tr><td><code>dns.server.query.duration</code></td><td>histogram, ms</td><td>from receipt to the answer being ready (includes any upstream wait)</td></tr>
+<tr><td><code>dns.server.cache.hits</code></td><td>counter</td><td>answers served from the cache</td></tr>
+<tr><td><code>dns.server.upstream.queries</code></td><td>counter</td><td>queries forwarded to an upstream</td></tr>
+<tr><td><code>dns.server.stale_served</code></td><td>counter</td><td>answers served stale (RFC 8767) because the upstream failed</td></tr>
+<tr><td><code>dns.server.aggressive_nsec_hits</code></td><td>counter</td><td>negative answers built from cached NSEC/NSEC3 proofs (RFC 8198)</td></tr>
+<tr><td><code>dns.server.errors</code></td><td>counter</td><td>handler errors</td></tr>
+<tr><td><code>dns.server.cookies.presented</code> / <code>.verified</code></td><td>counter</td><td>queries with a DNS Cookie (RFC 7873), and those with a verified server cookie</td></tr>
+<tr><td><code>dns.server.mqtype.queries</code> / <code>.subqueries</code></td><td>counter</td><td>RFC 10029 queries acted on, and the sub-queries they were expanded into</td></tr>
+</tbody>
+</table>
+<p>The upstream client's points carry <code>dns.upstream</code> (the resolver's address) and <code>dns.transport</code> (<code>dot</code> or <code>doq</code>): <code>dns.upstream.queries</code>, <code>.responses</code>, <code>.timeouts</code>, <code>.failures</code>, <code>.retries</code>, <code>.connects</code>, <code>.connect_failures</code>, <code>.reconnects</code> (counters), <code>dns.upstream.query.duration</code> (histogram, ms) and <code>dns.upstream.connections</code> (the pool size) and <code>dns.upstream.in_flight</code> (up-down values).</p>
+<p><strong>Your own meters.</strong> <code>pipeline.export_handle()</code> returns an <code>ExportHandle</code>; <code>ExportHandle::try_send_metric(MetricPoint)</code> is the supported way to export meters of your own beside the built-in ones. A <code>MetricPoint</code> is a counter increment, a histogram observation or an up-down value, each with a static name and string attributes. It never blocks; a point is dropped if the export queue is full or the worker has stopped.</p>
 <h2 id="wiring">Wiring</h2>
 <div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>Runtime<span class="op">,</span> RuntimeConfig<span class="op">};</span></span>
 <span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_otel::</span><span class="op">{</span>OtelConfig<span class="op">,</span> TelemetryPipeline<span class="op">};</span></span>
@@ -370,7 +389,7 @@ TelemetryHook enqueue    InstrumentedServerFactory
 <span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="co">// Later:</span></span>
 <span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>pipeline<span class="op">.</span>flush()<span class="op">;</span></span>
 <span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>pipeline<span class="op">.</span>shutdown()<span class="op">;</span></span></code></pre></div>
-<p>Accessors: <code>pipeline.hook()</code>, <code>pipeline.http_metrics()</code>, <code>pipeline.smtp_metrics()</code>, <code>pipeline.ftp_metrics()</code>, <code>pipeline.pop3_metrics()</code>, <code>pipeline.imap_metrics()</code>, <code>pipeline.mqtt_metrics()</code>, <code>pipeline.export_handle()</code>.</p>
+<p>Accessors: <code>pipeline.hook()</code>, <code>pipeline.http_metrics()</code>, <code>pipeline.smtp_metrics()</code>, <code>pipeline.ftp_metrics()</code>, <code>pipeline.pop3_metrics()</code>, <code>pipeline.imap_metrics()</code>, <code>pipeline.mqtt_metrics()</code>, <code>pipeline.dns_metrics()</code>, <code>pipeline.dns_upstream_metrics()</code>, <code>pipeline.export_handle()</code>.</p>
 <h2 id="examples">Examples</h2>
 <p>No standalone example crate. README-style snippet:</p>
 <div class="sourceCode" id="cb5"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="pp">OtelConfig::</span>new(<span class="st">&quot;echo&quot;</span>)<span class="op">.</span>with_otlp_endpoint(<span class="st">&quot;http://127.0.0.1:4318&quot;</span>)</span></code></pre></div>

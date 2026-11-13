@@ -38,8 +38,8 @@ pub use event::{log_record_from_event, EventKind};
 pub use log_record::{AttrValue, LogLevel, LogRecord};
 pub use instrument::InstrumentedServerFactory;
 pub use metrics::{
-    FtpServerMetrics, HttpServerMetrics, ImapServerMetrics, MetricPoint, MqttServerMetrics,
-    Pop3ServerMetrics, RequestTimer, SmtpServerMetrics,
+    DnsServerMetrics, DnsUpstreamMetrics, FtpServerMetrics, HttpServerMetrics, ImapServerMetrics, MetricPoint,
+    MqttServerMetrics, Pop3ServerMetrics, RequestTimer, SmtpServerMetrics,
 };
 pub use pipeline::TelemetryPipeline;
 pub use propagate::{

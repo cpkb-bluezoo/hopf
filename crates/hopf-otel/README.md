@@ -5,6 +5,10 @@ OpenTelemetry for Hopf:
 - **Connection logs** — `TelemetryPipeline::hook` implements `TelemetryHook`
 - **HTTP request traces & metrics** — `InstrumentedServerFactory` at the
   Stream handler (Gumdrop-style; not TCP accept)
+- **DNS metrics** — `pipeline.dns_metrics()` and `pipeline.dns_upstream_metrics()`
+  implement `hopf-dns`'s telemetry traits; attach them with
+  `DnsService::set_telemetry` and `UpstreamClient::set_telemetry`
+- **Your own meters** — `ExportHandle::try_send_metric(MetricPoint)`
 - **Exporters** — OTLP/HTTP (`/v1/logs`, `/v1/traces`, `/v1/metrics`) and JSONL
 
 Hot-path methods only enqueue. Encoding and I/O run on a dedicated export worker.

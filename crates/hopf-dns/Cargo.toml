@@ -47,6 +47,10 @@ hopf-quic = { workspace = true, optional = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }
+# The telemetry end-to-end test exports through a real pipeline. A
+# dev-dependency on a crate that depends on this one is allowed, and only
+# integration tests (which link this crate as a library) use it.
+hopf-otel = { workspace = true }
 hopf-core = { workspace = true, features = ["ed448"] }
 
 [[test]]
@@ -94,4 +98,7 @@ name = "upstream_client"
 path = "tests/upstream_client.rs"
 required-features = ["integration", "server", "dot"]
 
-
+[[test]]
+name = "telemetry"
+path = "tests/telemetry.rs"
+required-features = ["integration", "server"]

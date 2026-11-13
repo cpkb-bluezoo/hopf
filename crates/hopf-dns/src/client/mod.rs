@@ -744,6 +744,10 @@ struct ResolverInner {
     /// reconfigured server gets a new one.
     #[cfg(feature = "dot")]
     dot_upstreams: HashMap<SocketAddr, (String, hopf_core::SharedTlsConnector, upstream::UpstreamClient)>,
+    /// Where the DoT upstream clients report, once set
+    /// ([`DnsResolver::set_upstream_telemetry`]).
+    #[cfg(feature = "dot")]
+    upstream_telemetry: Option<Arc<dyn crate::telemetry::DnsUpstreamTelemetry>>,
     /// As `public_trust_dot_connector`, for DoQ — see
     /// [`public_trust_doq_config`].
     #[cfg(feature = "doq")]
@@ -881,6 +885,8 @@ impl DnsResolver {
                 public_trust_dot_connector: None,
             #[cfg(feature = "dot")]
             dot_upstreams: HashMap::new(),
+#[cfg(feature = "dot")]
+            upstream_telemetry: None,
                 #[cfg(feature = "doq")]
                 public_trust_doq_config: None,
                 #[cfg(feature = "dnssec")]
@@ -986,6 +992,22 @@ impl DnsResolver {
             auto: false,
             well_known: None,
         });
+    }
+
+    /// Report the events of this resolver's DoT upstream clients (queries,
+    /// answers and latency, timeouts, retries, reconnects, pool size, in-flight)
+    /// to `telemetry`, for the ones it has opened and any it opens later. To
+    /// export them over OTLP or JSONL pass a `hopf_otel` pipeline's
+    /// `dns_upstream_metrics()`. A client you built and added with
+    /// [`Self::add_server_upstream`] is yours to set up with
+    /// [`upstream::UpstreamClient::set_telemetry`].
+    #[cfg(feature = "dot")]
+    pub fn set_upstream_telemetry(&self, telemetry: Arc<dyn crate::telemetry::DnsUpstreamTelemetry>) {
+        let mut g = self.inner.lock().unwrap();
+        for (_, _, client) in g.dot_upstreams.values() {
+            client.set_telemetry(Arc::clone(&telemetry));
+        }
+        g.upstream_telemetry = Some(telemetry);
     }
 
     /// Counters of the DoT upstream clients this resolver has opened, by
@@ -1866,6 +1888,9 @@ fn dot_upstream(
         upstream::UpstreamTls::new(server_name, Arc::clone(connector)),
         upstream::UpstreamConfig::default(),
     );
+    if let Some(t) = &g.upstream_telemetry {
+        client.set_telemetry(Arc::clone(t));
+    }
     g.dot_upstreams
         .insert(addr, (server_name.to_string(), Arc::clone(connector), client.clone()));
     client
@@ -2445,6 +2470,8 @@ mod tests {
             public_trust_dot_connector: None,
             #[cfg(feature = "dot")]
             dot_upstreams: HashMap::new(),
+#[cfg(feature = "dot")]
+            upstream_telemetry: None,
             #[cfg(feature = "doq")]
             public_trust_doq_config: None,
             #[cfg(feature = "dnssec")]
@@ -2540,6 +2567,8 @@ mod tests {
             public_trust_dot_connector: None,
             #[cfg(feature = "dot")]
             dot_upstreams: HashMap::new(),
+#[cfg(feature = "dot")]
+            upstream_telemetry: None,
             #[cfg(feature = "doq")]
             public_trust_doq_config: None,
             #[cfg(feature = "dnssec")]
@@ -2775,6 +2804,8 @@ mod tests {
             public_trust_dot_connector: None,
             #[cfg(feature = "dot")]
             dot_upstreams: HashMap::new(),
+#[cfg(feature = "dot")]
+            upstream_telemetry: None,
             #[cfg(feature = "doq")]
             public_trust_doq_config: None,
             #[cfg(feature = "dnssec")]
@@ -3136,6 +3167,8 @@ mod tests {
             public_trust_dot_connector: None,
             #[cfg(feature = "dot")]
             dot_upstreams: HashMap::new(),
+#[cfg(feature = "dot")]
+            upstream_telemetry: None,
             #[cfg(feature = "doq")]
             public_trust_doq_config: None,
             dnssec_enabled: true,

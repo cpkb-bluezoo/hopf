@@ -18,7 +18,7 @@ use crate::config::{LogSinkConfig, OtelConfig};
 use crate::event::{log_record_from_event, EventKind};
 use crate::log_record::LogLevel;
 use crate::metrics::{
-    FtpServerMetrics, HttpServerMetrics, ImapServerMetrics, MqttServerMetrics, Pop3ServerMetrics,
+    DnsServerMetrics, DnsUpstreamMetrics, FtpServerMetrics, HttpServerMetrics, ImapServerMetrics, MqttServerMetrics, Pop3ServerMetrics,
     SmtpServerMetrics,
 };
 
@@ -32,6 +32,8 @@ pub struct TelemetryPipeline {
     pop3_metrics: Arc<Pop3ServerMetrics>,
     imap_metrics: Arc<ImapServerMetrics>,
     mqtt_metrics: Arc<MqttServerMetrics>,
+    dns_metrics: Arc<DnsServerMetrics>,
+    dns_upstream_metrics: Arc<DnsUpstreamMetrics>,
     join: Option<JoinHandle<()>>,
     running: Arc<AtomicBool>,
 }
@@ -71,6 +73,8 @@ impl TelemetryPipeline {
         let pop3_metrics = Pop3ServerMetrics::new(sender.clone());
         let imap_metrics = ImapServerMetrics::new(sender.clone());
         let mqtt_metrics = MqttServerMetrics::new(sender.clone());
+        let dns_metrics = DnsServerMetrics::new(sender.clone());
+        let dns_upstream_metrics = DnsUpstreamMetrics::new(sender.clone());
         let pipeline = Self {
             config,
             sender,
@@ -80,6 +84,8 @@ impl TelemetryPipeline {
             pop3_metrics,
             imap_metrics,
             mqtt_metrics,
+            dns_metrics,
+            dns_upstream_metrics,
             join: Some(join),
             running,
         };
@@ -131,6 +137,16 @@ impl TelemetryPipeline {
     /// Shared MQTT server metrics instruments.
     pub fn mqtt_metrics(&self) -> Arc<MqttServerMetrics> {
         Arc::clone(&self.mqtt_metrics)
+    }
+
+    /// Shared DNS server metrics instruments.
+    pub fn dns_metrics(&self) -> Arc<DnsServerMetrics> {
+        Arc::clone(&self.dns_metrics)
+    }
+
+    /// Shared DNS upstream client metrics instruments.
+    pub fn dns_upstream_metrics(&self) -> Arc<DnsUpstreamMetrics> {
+        Arc::clone(&self.dns_upstream_metrics)
     }
 
     /// Snapshot of exporter configuration.

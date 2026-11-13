@@ -24,6 +24,7 @@ mod handler;
 mod minimal_any;
 mod multi_qtype;
 mod policy;
+mod telemetry;
 mod udp;
 pub mod zone;
 
@@ -61,6 +62,7 @@ use std::sync::Arc;
 use hopf_core::Runtime;
 
 use crate::cookie::{ClientCookieOption, DnsCookie};
+use crate::telemetry::DnsServerTelemetry;
 use crate::tsig::{self, Chain, TsigKeyring};
 use crate::wire::{
     DnsMessage, FLAG_TC, OPCODE_QUERY, RCODE_FORMERR, RCODE_NOTAUTH, RCODE_NOTIMP,
@@ -112,6 +114,7 @@ pub struct DnsService {
     metrics: Arc<std::sync::Mutex<DnsServerMetrics>>,
     keyring: Arc<TsigKeyring>,
     max_mqtypes: usize,
+    telemetry: telemetry::Telemetry,
 }
 
 impl Default for DnsService {
@@ -141,7 +144,19 @@ impl DnsService {
             metrics: Arc::default(),
             keyring: Arc::new(TsigKeyring::new()),
             max_mqtypes: 0,
+            telemetry: telemetry::Telemetry::default(),
         }
+    }
+
+    /// Report this service's counters to `telemetry`: queries, responses (with
+    /// their response code), the time to each answer, cache hits, upstream
+    /// queries, stale answers, aggressive-NSEC answers, errors, DNS Cookies and
+    /// RFC 10029 expansion, each with the transport the message arrived on. To
+    /// export them over OTLP or JSONL pass a `hopf_otel` pipeline's
+    /// `dns_metrics()`; any other sink can implement [`DnsServerTelemetry`].
+    /// The snapshot counters of [`Self::metrics`] are unchanged.
+    pub fn set_telemetry(&mut self, telemetry: Arc<dyn DnsServerTelemetry>) {
+        self.telemetry = telemetry::Telemetry::new(telemetry);
     }
 
     /// Answer RFC 10029 multiple-QTYPE queries, asking the handler about at
@@ -268,6 +283,18 @@ impl DnsService {
         done: MessageSink,
     ) {
         let peer = conn.peer;
+        let done = if self.telemetry.enabled() {
+            self.telemetry.query(transport);
+            let (telemetry, started) = (self.telemetry.clone(), std::time::Instant::now());
+            let observed: MessageSink = Box::new(move |responses| {
+                let rcode = responses.first().map_or(0, DnsMessage::rcode);
+                telemetry.response(transport, rcode, started.elapsed());
+                done(responses)
+            });
+            observed
+        } else {
+            done
+        };
         match crate::cookie::parse_client_cookie(&query.additionals) {
             ClientCookieOption::Absent => self.dispatch_handler(query, conn, transport, tsig_key, done),
             ClientCookieOption::Malformed => done(vec![query.response_template(RCODE_FORMERR)]),
@@ -282,6 +309,7 @@ impl DnsService {
                     m.cookies_verified += 1;
                 }
                 drop(m);
+                self.telemetry.cookie(transport, verified);
                 let option = self.cookies.encode_response_edns_option(&client, &ip_bytes);
                 let with_cookie: MessageSink = Box::new(move |mut out| {
                     crate::multi_qtype::add_edns_option(&mut out[0], &option);
@@ -316,7 +344,7 @@ impl DnsService {
             conn,
             transport,
             tsig_key,
-            MetricsSink(Arc::clone(&self.metrics)),
+            MetricsSink::new(Arc::clone(&self.metrics), self.telemetry.clone(), transport),
         );
         // Only the standard QUERY opcode reaches `handle_query`. Anything
         // else (NOTIFY, UPDATE, ...) is offered to `handle_non_query_opcode`
@@ -338,6 +366,7 @@ impl DnsService {
                     extra,
                     Arc::clone(&self.handler),
                     Arc::clone(&self.metrics),
+                    self.telemetry.clone(),
                     ctx.clone(),
                 )
             });
@@ -351,8 +380,8 @@ impl DnsService {
                 HandlerOutcome::Error(rcode) => vec![request.response_template(rcode)],
             };
             match multi {
-                Some((extra, handler, metrics, ctx)) => {
-                    multi_qtype::merge(handler, metrics, request, ctx, extra, responses, done)
+                Some((extra, handler, metrics, telemetry, ctx)) => {
+                    multi_qtype::merge(handler, metrics, telemetry, request, ctx, extra, responses, done)
                 }
                 None => done(responses),
             }
@@ -469,6 +498,8 @@ impl DnsService {
                         .response_template(RCODE_NOTAUTH)
                         .serialize()
                         .map(|reply_bytes| tsig::error_reply(&reply_bytes, &rec, e.code(), now));
+                    self.telemetry.query(transport);
+                    self.telemetry.response(transport, RCODE_NOTAUTH, std::time::Duration::ZERO);
                     reply(bytes.into_iter().collect());
                     return true;
                 }

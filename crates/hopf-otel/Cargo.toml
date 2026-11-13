@@ -23,6 +23,7 @@ integration = []
 [dependencies]
 hopf-core = { workspace = true }
 hopf-http = { workspace = true }
+hopf-dns = { workspace = true }
 rprotobuf = { workspace = true }
 loopbuf = { workspace = true }
 getrandom = "0.2"

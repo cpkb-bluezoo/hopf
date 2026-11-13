@@ -61,6 +61,17 @@ pub enum DnsTransport {
 }
 
 impl DnsTransport {
+    /// The lowercase name used as the `dns.transport` attribute of exported
+    /// metrics: `udp`, `tcp`, `dot` or `doq`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Udp => "udp",
+            Self::Tcp => "tcp",
+            Self::Dot => "dot",
+            Self::Doq => "doq",
+        }
+    }
+
     /// Whether one query may be answered with several messages
     /// (AXFR/IXFR, RFC 5936 §2.2). True for every stream transport.
     pub fn supports_multi_message(self) -> bool {
@@ -72,32 +83,53 @@ impl DnsTransport {
 ///
 /// Owned and cheap to clone, so a handler that answers later can keep it.
 #[derive(Clone)]
-pub struct MetricsSink(pub(super) Arc<Mutex<DnsServerMetrics>>);
+pub struct MetricsSink {
+    counters: Arc<Mutex<DnsServerMetrics>>,
+    telemetry: super::telemetry::Telemetry,
+    transport: DnsTransport,
+}
 
 impl MetricsSink {
+    pub(super) fn new(
+        counters: Arc<Mutex<DnsServerMetrics>>,
+        telemetry: super::telemetry::Telemetry,
+        transport: DnsTransport,
+    ) -> Self {
+        Self {
+            counters,
+            telemetry,
+            transport,
+        }
+    }
+
     /// Count a cache hit.
     pub fn cache_hit(&self) {
-        self.0.lock().unwrap().cache_hits += 1;
+        self.counters.lock().unwrap().cache_hits += 1;
+        self.telemetry.cache_hit(self.transport);
     }
 
     /// Count an upstream forward.
     pub fn upstream(&self) {
-        self.0.lock().unwrap().upstreams += 1;
+        self.counters.lock().unwrap().upstreams += 1;
+        self.telemetry.upstream(self.transport);
     }
 
     /// Count an answer served stale (RFC 8767) because the upstream failed.
     pub fn stale_served(&self) {
-        self.0.lock().unwrap().stale_served += 1;
+        self.counters.lock().unwrap().stale_served += 1;
+        self.telemetry.stale_served(self.transport);
     }
 
     /// Count a negative answer synthesised from cached NSEC/NSEC3 proofs.
     pub fn aggressive_nsec(&self) {
-        self.0.lock().unwrap().aggressive_nsec_hits += 1;
+        self.counters.lock().unwrap().aggressive_nsec_hits += 1;
+        self.telemetry.aggressive_nsec(self.transport);
     }
 
     /// Count an error.
     pub fn error(&self) {
-        self.0.lock().unwrap().errors += 1;
+        self.counters.lock().unwrap().errors += 1;
+        self.telemetry.error(self.transport);
     }
 }
 
@@ -174,7 +206,11 @@ impl QueryContext {
             transport,
             tsig_key: None,
             security: None,
-            metrics: MetricsSink(Arc::new(Mutex::new(DnsServerMetrics::default()))),
+            metrics: MetricsSink::new(
+                Arc::new(Mutex::new(DnsServerMetrics::default())),
+                Default::default(),
+                transport,
+            ),
         }
     }
 

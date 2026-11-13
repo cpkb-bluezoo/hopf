@@ -60,6 +60,7 @@ use hopf_core::{Bytes, ConnHandle, Endpoint, ProtocolHandler, SharedTlsConnector
 use hopf_core::ReactorHandle;
 
 use super::questions_match;
+use crate::telemetry::{DnsUpstreamTelemetry, UpstreamEvent};
 #[cfg(feature = "doq")]
 use crate::wire::DnsQuestion;
 use crate::wire::DnsMessage;
@@ -418,6 +419,68 @@ struct Inner {
     closed: AtomicBool,
     next_qid: AtomicU64,
     ever_connected: AtomicBool,
+    /// Where events are reported, if anywhere.
+    telemetry: std::sync::OnceLock<Arc<dyn DnsUpstreamTelemetry>>,
+    /// `addr` as text, and the transport's name, for reported events.
+    label: String,
+    transport: &'static str,
+    /// Queries accepted and not yet completed (the in-flight gauge).
+    pending: std::sync::atomic::AtomicI64,
+}
+
+impl Inner {
+    /// Count `event`, and report it.
+    fn note(&self, event: UpstreamEvent) {
+        let c = &self.counters;
+        let counter = match event {
+            UpstreamEvent::Query => &c.queries,
+            UpstreamEvent::Timeout => &c.timeouts,
+            UpstreamEvent::Failure => &c.failures,
+            UpstreamEvent::Retry => &c.retries,
+            UpstreamEvent::Connect => &c.connects,
+            UpstreamEvent::ConnectFailure => &c.connect_failures,
+            UpstreamEvent::Reconnect => &c.reconnects,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        if let Some(t) = self.telemetry.get() {
+            t.event(&self.label, self.transport, event);
+        }
+    }
+
+    /// A query was accepted.
+    fn query_accepted(&self) {
+        self.note(UpstreamEvent::Query);
+        let now = self.pending.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(t) = self.telemetry.get() {
+            t.in_flight(&self.label, self.transport, now);
+        }
+    }
+
+    /// A query completed, either way.
+    fn query_done(&self) {
+        let now = self.pending.fetch_sub(1, Ordering::Relaxed) - 1;
+        if let Some(t) = self.telemetry.get() {
+            t.in_flight(&self.label, self.transport, now.max(0));
+        }
+    }
+
+    /// An answer arrived `micros` after the query was made.
+    fn answered(&self, micros: u64) {
+        let c = &self.counters;
+        c.responses.fetch_add(1, Ordering::Relaxed);
+        c.latency_micros_total.fetch_add(micros, Ordering::Relaxed);
+        c.latency_micros_max.fetch_max(micros, Ordering::Relaxed);
+        if let Some(t) = self.telemetry.get() {
+            t.response(&self.label, self.transport, Duration::from_micros(micros));
+        }
+    }
+
+    /// The pool now holds `n` connections.
+    fn connections(&self, n: i64) {
+        if let Some(t) = self.telemetry.get() {
+            t.connections(&self.label, self.transport, n);
+        }
+    }
 }
 
 /// A client for one encrypted upstream resolver. See the
@@ -476,11 +539,20 @@ impl UpstreamClient {
                 reactor,
                 addr,
                 config,
-                backend,
                 counters: Counters::default(),
                 closed: AtomicBool::new(false),
                 next_qid: AtomicU64::new(0),
                 ever_connected: AtomicBool::new(false),
+                telemetry: std::sync::OnceLock::new(),
+                label: addr.to_string(),
+                transport: match &backend {
+                    #[cfg(feature = "dot")]
+                    Backend::Dot { .. } => "dot",
+                    #[cfg(feature = "doq")]
+                    Backend::Doq { .. } => "doq",
+                },
+                pending: std::sync::atomic::AtomicI64::new(0),
+                backend,
             }),
         }
     }
@@ -519,7 +591,7 @@ impl UpstreamClient {
         callback: impl FnOnce(UpstreamResult) + Send + 'static,
     ) {
         let inner = &self.inner;
-        inner.counters.queries.fetch_add(1, Ordering::Relaxed);
+        inner.query_accepted();
         // The timeout covers the connect, so the timer starts now. Its flag
         // is the job's `cancel`: completing the job stops the timer.
         let qid = inner.next_qid.fetch_add(1, Ordering::Relaxed);
@@ -544,6 +616,17 @@ impl UpstreamClient {
 
     fn dispatch(&self, job: Job) {
         dispatch(&self.inner, job);
+    }
+
+    /// Report this client's events to `telemetry`: queries, answers and their
+    /// latency, timeouts, failures, retries, connects, connect failures,
+    /// reconnects, the pool size and the number of queries in flight, each
+    /// labelled with this upstream's address and transport. To export them over
+    /// OTLP or JSONL pass a `hopf_otel` pipeline's `dns_upstream_metrics()`.
+    /// Only the first call takes effect; the counters of [`Self::metrics`] are
+    /// unchanged.
+    pub fn set_telemetry(&self, telemetry: Arc<dyn DnsUpstreamTelemetry>) {
+        let _ = self.inner.telemetry.set(telemetry);
     }
 
     /// A snapshot of the counters.
@@ -589,6 +672,7 @@ impl UpstreamClient {
             #[cfg(feature = "dot")]
             Backend::Dot { state, .. } => {
                 let conns = std::mem::take(&mut state.lock().unwrap().conns);
+                inner.connections(0);
                 for mut conn in conns {
                     if let Some(handle) = conn.handle.take() {
                         handle.close();
@@ -606,6 +690,7 @@ impl UpstreamClient {
                     doq_complete(inner, &job, Err(UpstreamError::Closed));
                 }
                 *pool.lock().unwrap() = super::doq::DoqConnectionPool::new();
+                inner.connections(0);
             }
         }
     }
@@ -622,22 +707,20 @@ fn finish(inner: &Inner, callback: Callback, result: UpstreamResult) {
 fn succeed(inner: &Inner, job: Job, message: DnsMessage) {
     job.cancel.store(true, Ordering::SeqCst);
     let micros = job.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-    let c = &inner.counters;
-    c.responses.fetch_add(1, Ordering::Relaxed);
-    c.latency_micros_total.fetch_add(micros, Ordering::Relaxed);
-    c.latency_micros_max.fetch_max(micros, Ordering::Relaxed);
+    inner.answered(micros);
+    inner.query_done();
     finish(inner, job.callback, Ok(message));
 }
 
 /// Complete `job` with `error`.
 fn fail(inner: &Inner, job: Job, error: UpstreamError) {
     job.cancel.store(true, Ordering::SeqCst);
-    let counter = if error == UpstreamError::Timeout {
-        &inner.counters.timeouts
+    inner.note(if error == UpstreamError::Timeout {
+        UpstreamEvent::Timeout
     } else {
-        &inner.counters.failures
-    };
-    counter.fetch_add(1, Ordering::Relaxed);
+        UpstreamEvent::Failure
+    });
+    inner.query_done();
     finish(inner, job.callback, Err(error));
 }
 
@@ -713,6 +796,13 @@ fn dot_state(inner: &Inner) -> &Mutex<DotState> {
         #[cfg(feature = "doq")]
         _ => unreachable!("a DoT call on a DoQ client"),
     }
+}
+
+/// Report the number of ready DoT connections.
+#[cfg(feature = "dot")]
+fn dot_report_pool(inner: &Inner) {
+    let ready = dot_state(inner).lock().unwrap().conns.iter().filter(|c| c.ready).count();
+    inner.connections(ready as i64);
 }
 
 #[cfg(feature = "dot")]
@@ -794,7 +884,7 @@ fn dot_dial(inner: &Arc<Inner>, conn_id: u64) {
         return;
     };
     if inner.ever_connected.load(Ordering::SeqCst) {
-        inner.counters.reconnects.fetch_add(1, Ordering::Relaxed);
+        inner.note(UpstreamEvent::Reconnect);
     }
     let handler_inner = Arc::clone(inner);
     let mut config = TcpConnectorConfig::new(inner.addr, move || {
@@ -851,6 +941,7 @@ fn dot_idle_check(inner: &Arc<Inner>, conn_id: u64) {
             if let Some(handle) = conn.handle {
                 handle.close();
             }
+            dot_report_pool(inner);
             return;
         }
     };
@@ -872,14 +963,15 @@ fn dot_lost(inner: &Arc<Inner>, conn_id: u64, reason: &str) {
         (jobs, was_ready)
     };
     if !was_ready {
-        inner.counters.connect_failures.fetch_add(1, Ordering::Relaxed);
+        inner.note(UpstreamEvent::ConnectFailure);
     }
+    dot_report_pool(inner);
     for mut job in jobs {
         if !was_ready {
             fail(inner, job, UpstreamError::Connect(reason.to_string()));
         } else if job.attempts < inner.config.retries && !inner.closed.load(Ordering::SeqCst) {
             job.attempts += 1;
-            inner.counters.retries.fetch_add(1, Ordering::Relaxed);
+            inner.note(UpstreamEvent::Retry);
             dot_dispatch(inner, job);
         } else {
             fail(inner, job, UpstreamError::ConnectionLost(reason.to_string()));
@@ -938,7 +1030,7 @@ impl ProtocolHandler for DotConn {
 
     fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &hopf_core::SecurityInfo) {
         let inner = Arc::clone(&self.inner);
-        inner.counters.connects.fetch_add(1, Ordering::Relaxed);
+        inner.note(UpstreamEvent::Connect);
         inner.ever_connected.store(true, Ordering::SeqCst);
         let mut outbound = Vec::new();
         let mut failed = Vec::new();
@@ -971,6 +1063,7 @@ impl ProtocolHandler for DotConn {
             fail(&inner, job, e);
         }
         dot_arm_idle(&inner, self.conn_id, inner.config.idle_timeout);
+        dot_report_pool(&inner);
     }
 
     fn receive(&mut self, _endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
@@ -1035,21 +1128,12 @@ fn doq_complete(inner: &Arc<Inner>, job: &DoqJob, result: UpstreamResult) {
         jobs.lock().unwrap().remove(&job.qid);
     }
     doq_settle(inner, job, &result);
-    let c = &inner.counters;
     match &result {
-        Ok(_) => {
-            let micros = job.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-            c.responses.fetch_add(1, Ordering::Relaxed);
-            c.latency_micros_total.fetch_add(micros, Ordering::Relaxed);
-            c.latency_micros_max.fetch_max(micros, Ordering::Relaxed);
-        }
-        Err(UpstreamError::Timeout) => {
-            c.timeouts.fetch_add(1, Ordering::Relaxed);
-        }
-        Err(_) => {
-            c.failures.fetch_add(1, Ordering::Relaxed);
-        }
+        Ok(_) => inner.answered(job.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64),
+        Err(UpstreamError::Timeout) => inner.note(UpstreamEvent::Timeout),
+        Err(_) => inner.note(UpstreamEvent::Failure),
     }
+    inner.query_done();
     finish(inner, callback, result);
 }
 
@@ -1156,6 +1240,7 @@ fn doq_settle(inner: &Arc<Inner>, job: &DoqJob, result: &UpstreamResult) {
             g.probe = None;
             if answered {
                 g.warm = true;
+                inner.connections(1);
                 (g.queue.drain(..).collect::<Vec<_>>(), false)
             } else {
                 g.warm = false;
@@ -1192,6 +1277,7 @@ fn doq_settle(inner: &Arc<Inner>, job: &DoqJob, result: &UpstreamResult) {
                 // next send dials a new one.
                 if let Backend::Doq { pool, .. } = &inner.backend {
                     *pool.lock().unwrap() = super::doq::DoqConnectionPool::new();
+                    inner.connections(0);
                 }
             }
             for job in release {
@@ -1218,7 +1304,7 @@ fn doq_send(inner: &Arc<Inner>, job: &Arc<DoqJob>) {
     });
     let sent = pool.lock().unwrap().send_query(inner.addr, client, server_name, &bytes, handler);
     if let Err(e) = sent {
-        inner.counters.connect_failures.fetch_add(1, Ordering::Relaxed);
+        inner.note(UpstreamEvent::ConnectFailure);
         doq_complete(inner, job, Err(UpstreamError::Connect(e.to_string())));
     }
 }
@@ -1269,7 +1355,7 @@ impl super::DnsClientTransportHandler for DoqAnswer {
             again
         };
         if retry && self.job.callback.lock().unwrap().is_some() {
-            inner.counters.retries.fetch_add(1, Ordering::Relaxed);
+            inner.note(UpstreamEvent::Retry);
             // Through the gate, on the reactor: this is the QUIC driver
             // thread, and sending waits on the driver.
             let (inner, job) = (Arc::clone(inner), Arc::clone(&self.job));

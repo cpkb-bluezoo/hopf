@@ -7,6 +7,22 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
 
 ### Added
 
+- **hopf-otel / hopf-dns:** DNS metrics over OTLP/JSONL (#529).
+  `TelemetryPipeline::dns_metrics()` and `dns_upstream_metrics()` return
+  instrument sets (`DnsServerMetrics`, `DnsUpstreamMetrics`) named
+  `dns.server.*` (queries, responses with `dns.response.code`, query duration,
+  cache hits, upstream queries, stale and aggressive-NSEC answers, errors,
+  cookies, RFC 10029 expansion) and `dns.upstream.*` (queries, answers,
+  latency, timeouts, failures, retries, connects, reconnects, pool size and
+  in-flight), with a `dns.transport` attribute. Attach them with
+  `DnsService::set_telemetry`, `UpstreamClient::set_telemetry` and
+  `DnsResolver::set_upstream_telemetry`. `hopf-dns` defines the
+  `DnsServerTelemetry` and `DnsUpstreamTelemetry` traits (module `telemetry`)
+  and `hopf-otel` implements them, so `hopf-dns` gains no exporter dependency;
+  `hopf-otel` now depends on `hopf-dns`. The snapshot counters of
+  `DnsService::metrics()` are unchanged. `DnsTransport::as_str()` is new.
+  `ExportHandle::try_send_metric` is documented as the way for an application
+  to add meters of its own.
 - **hopf-core:** `ServerTlsBuilder` (#528), a public server TLS configuration
   that combines what the fixed acceptor helpers each offer one of: client
   authentication (`client_auth`), a credentials resolver consulted on every
