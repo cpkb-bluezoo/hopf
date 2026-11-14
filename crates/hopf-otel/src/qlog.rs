@@ -1,6 +1,8 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! qlog JSON-SEQ file sink (draft-ietf-quic-qlog-main-schema-14).
+//! qlog JSON-SEQ file sink (draft-ietf-quic-qlog-main-schema-15, with the
+//! QUIC events of draft-ietf-quic-qlog-quic-events; see
+//! [`hopf_core::QLOG_SCHEMA_QUIC`] for the draft number).
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -9,13 +11,16 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use hopf_core::{
-    AttrValue, LogLevel, LogRecord, QLOG_GROUP_ID, QLOG_SCHEMA, QLOG_SCHEMA_HTTP,
-    QLOG_SCHEMA_HTTP3, QLOG_SCHEMA_QUIC, QLOG_VANTAGE_POINT,
+    AttrValue, LogLevel, LogRecord, QLOG_EVENTS_DRAFT_SUFFIX, QLOG_GROUP_ID, QLOG_SCHEMA, QLOG_SCHEMA_QUIC,
+    QLOG_VANTAGE_POINT,
 };
 
-/// The revision of the qlog drafts the files follow.
-pub const QLOG_REVISION: &str = "draft-ietf-quic-qlog-main-schema-14, \
-draft-ietf-quic-qlog-quic-events-13, draft-ietf-quic-qlog-h3-events-13";
+/// The revision of the qlog drafts the files follow, as the trace description
+/// names it. The draft number of the event schema is the one the schema URI
+/// carries ([`hopf_core::QLOG_EVENTS_DRAFT_SUFFIX`]), so the two cannot differ.
+pub fn qlog_revision() -> String {
+    format!("draft-ietf-quic-qlog-main-schema-15, draft-ietf-quic-qlog-quic-events{QLOG_EVENTS_DRAFT_SUFFIX}")
+}
 
 const IDLE_AFTER: Duration = Duration::from_secs(60);
 
@@ -152,14 +157,12 @@ impl TraceFile {
         sb.push_str("\"trace\":{\"vantage_point\":{\"type\":");
         json_escape_into(&mut sb, vantage);
         sb.push_str("},\"description\":");
-        json_escape_into(&mut sb, &format!("hopf, {QLOG_REVISION}"));
+        json_escape_into(&mut sb, &format!("hopf, {}", qlog_revision()));
+        // Only the schemas whose events the trace holds: hopf writes QUIC
+        // events and no HTTP/3 ones.
         sb.push_str(",\"event_schemas\":[");
         sb.push('"');
         sb.push_str(QLOG_SCHEMA_QUIC);
-        sb.push_str("\",\"");
-        sb.push_str(QLOG_SCHEMA_HTTP3);
-        sb.push_str("\",\"");
-        sb.push_str(QLOG_SCHEMA_HTTP);
         sb.push_str("\"],\"common_fields\":{\"group_id\":");
         json_escape_into(&mut sb, group);
         sb.push_str(",\"time_format\":\"relative_to_epoch\",\"reference_time\":{");
@@ -423,6 +426,13 @@ mod tests {
         let records = parse_json_seq_records(&bytes);
         assert!(records[0].contains("urn:ietf:params:qlog:file:sequential"));
         assert!(records[0].contains("aa01"));
+        // Only the schema whose events are written, in its draft form.
+        assert!(
+            records[0].contains("\"event_schemas\":[\"urn:ietf:params:qlog:events:quic-14\"]"),
+            "{}",
+            records[0]
+        );
+        assert!(!records[0].contains("http3") && !records[0].contains("events:http"), "{}", records[0]);
         let _ = fs::remove_dir_all(&dir);
     }
 

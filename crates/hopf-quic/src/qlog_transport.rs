@@ -11,7 +11,7 @@ use crate::qlog_events::{
     INITIAL_MAX_DATA, INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
     INITIAL_MAX_STREAM_DATA_UNI, INITIAL_MAX_STREAMS_BIDI, INITIAL_MAX_STREAMS_UNI, IP_VERSION,
     LENGTH, MAX_ACK_DELAY, MAX_IDLE_TIMEOUT, MAX_UDP_PAYLOAD_SIZE, MIN_RTT, ORIGINAL_DESTINATION_CONNECTION_ID,
-    INITIAL_SOURCE_CONNECTION_ID, RETRY_SOURCE_CONNECTION_ID, OWNER, PACKET_NUMBER, PACKET_TYPE,
+    INITIAL_SOURCE_CONNECTION_ID, RETRY_SOURCE_CONNECTION_ID, INITIATOR, PACKET_NUMBER, PACKET_TYPE,
     PACING_RATE,
     RAW, RTT_VARIANCE, SCID, SMOOTHED_RTT, SSTHRESH, TRIGGER, VERSION, LATEST_RTT,
 };
@@ -49,8 +49,8 @@ pub(crate) fn build_connection_started(
         .build()
 }
 
-pub(crate) fn build_parameters_set(owner: &str, tp: &TransportParameters) -> String {
-    let mut o = QlogJson::object().put(OWNER, owner);
+pub(crate) fn build_parameters_set(initiator: &str, tp: &TransportParameters) -> String {
+    let mut o = QlogJson::object().put(INITIATOR, initiator);
     if let Some(v) = &tp.original_dst_cid {
         o = o.put_hex(ORIGINAL_DESTINATION_CONNECTION_ID, v.as_slice());
     }
@@ -190,3 +190,19 @@ pub use crate::qlog_events::{
     CONNECTION_CLOSED, CONNECTION_STARTED, PACKET_LOST, PACKET_RECEIVED, PACKET_SENT,
     PARAMETERS_SET, RECOVERY_METRICS_UPDATED,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::qlog_events::{INITIATOR_LOCAL, INITIATOR_REMOTE};
+
+    #[test]
+    fn parameters_set_names_who_set_them_with_initiator() {
+        let tp = TransportParameters::default();
+        let local = build_parameters_set(INITIATOR_LOCAL, &tp);
+        assert!(local.contains("\"initiator\":\"local\""), "{local}");
+        assert!(!local.contains("\"owner\""), "owner was renamed initiator in quic-events-12: {local}");
+        let remote = build_parameters_set(INITIATOR_REMOTE, &tp);
+        assert!(remote.contains("\"initiator\":\"remote\""), "{remote}");
+    }
+}

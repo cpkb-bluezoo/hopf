@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::qlog::QlogSink;
-use crate::qlog_events::{OWNER_LOCAL, OWNER_REMOTE};
+use crate::qlog_events::{INITIATOR_LOCAL, INITIATOR_REMOTE};
 use crate::qlog_transport::{
     self, build_connection_closed, build_connection_started, build_packet_lost,
     build_packet_received, build_packet_sent, build_parameters_set, build_recovery_metrics,
@@ -791,7 +791,7 @@ impl Connection {
             return;
         }
         self.qlog_local_params_logged = true;
-        let data = build_parameters_set(OWNER_LOCAL, &self.local_tp);
+        let data = build_parameters_set(INITIATOR_LOCAL, &self.local_tp);
         self.qlog_emit(PARAMETERS_SET, data);
     }
 
@@ -1878,7 +1878,7 @@ impl Connection {
                 self.peer_max_datagram = tp.max_datagram_frame_size.unwrap_or(0);
                 self.peer_tp = Some(tp.clone());
                 if self.qlog_enabled() {
-                    let data = build_parameters_set(OWNER_REMOTE, &tp);
+                    let data = build_parameters_set(INITIATOR_REMOTE, &tp);
                     self.qlog_emit(PARAMETERS_SET, data);
                 }
             }

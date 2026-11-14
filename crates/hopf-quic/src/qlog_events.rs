@@ -18,7 +18,9 @@ pub const DST_PORT: &str = "dst_port";
 pub const SRC_CID: &str = "src_cid";
 pub const DST_CID: &str = "dcid";
 
-pub const OWNER: &str = "owner";
+/// `parameters_set` field naming who set the parameters (renamed from `owner`
+/// in draft-ietf-quic-qlog-quic-events-12).
+pub const INITIATOR: &str = "initiator";
 pub const TRIGGER: &str = "trigger";
 pub const HEADER: &str = "header";
 pub const PACKET_TYPE: &str = "packet_type";
@@ -52,8 +54,8 @@ pub const INITIAL_MAX_STREAM_DATA_UNI: &str = "initial_max_stream_data_uni";
 pub const INITIAL_MAX_STREAMS_BIDI: &str = "initial_max_streams_bidi";
 pub const INITIAL_MAX_STREAMS_UNI: &str = "initial_max_streams_uni";
 
-pub const OWNER_LOCAL: &str = "local";
-pub const OWNER_REMOTE: &str = "remote";
+pub const INITIATOR_LOCAL: &str = "local";
+pub const INITIATOR_REMOTE: &str = "remote";
 
 pub const PACKET_TYPE_INITIAL: &str = "initial";
 pub const PACKET_TYPE_HANDSHAKE: &str = "handshake";

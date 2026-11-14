@@ -112,7 +112,7 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::new()));
         hopf_core::set_process_telemetry(Arc::new(Capture(Arc::clone(&buf))));
         let sink = TelemetryQlogSink::maybe_new(true, &[0xab, 0x01]).unwrap();
-        sink.emit_qlog("urn:ietf:params:qlog:events:quic", "quic:packet_sent", "{\"x\":1}");
+        sink.emit_qlog("urn:ietf:params:qlog:events:quic-14", "quic:packet_sent", "{\"x\":1}");
         let rec = buf.lock().unwrap().pop().unwrap();
         assert_eq!(rec.level, LogLevel::Qlog);
         assert_eq!(rec.name, "quic:packet_sent");

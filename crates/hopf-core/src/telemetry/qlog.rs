@@ -13,14 +13,28 @@ pub const QLOG_GROUP_ID: &str = "qlog.group_id";
 /// The vantage point: `client` or `server`.
 pub const QLOG_VANTAGE_POINT: &str = "qlog.vantage_point";
 
-/// draft-ietf-quic-qlog-quic-events: the QUIC event schema.
-pub const QLOG_SCHEMA_QUIC: &str = "urn:ietf:params:qlog:events:quic";
+/// The draft suffix of the event schema URIs: `-` and the draft number.
+///
+/// draft-ietf-quic-qlog-quic-events ("Draft Event Schema Identification")
+/// says an implementation of a draft MUST append `-` and the draft number to
+/// the URI, and MUST NOT use the bare form until the RFC exists. This is the
+/// one place the number is held: when the RFC is published, make the body
+/// empty and every URI built from it becomes the bare registered one.
+macro_rules! draft_suffix {
+    () => {
+        "-14"
+    };
+}
 
-/// draft-ietf-quic-qlog-h3-events: the HTTP/3 event schema.
-pub const QLOG_SCHEMA_HTTP3: &str = "urn:ietf:params:qlog:events:http3";
+/// The draft suffix of the event schema URIs (see the module's `draft_suffix`).
+pub const QLOG_EVENTS_DRAFT_SUFFIX: &str = draft_suffix!();
 
-/// draft-ietf-quic-qlog-h3-events: the HTTP event schema (capsules).
-pub const QLOG_SCHEMA_HTTP: &str = "urn:ietf:params:qlog:events:http";
+/// draft-ietf-quic-qlog-quic-events: the QUIC event schema, as the draft
+/// revision hopf follows names it (`urn:ietf:params:qlog:events:quic-14`).
+///
+/// hopf writes no HTTP/3 events, so there is no constant for that schema: a
+/// trace lists only the schemas whose events it holds.
+pub const QLOG_SCHEMA_QUIC: &str = concat!("urn:ietf:params:qlog:events:quic", draft_suffix!());
 
 static QLOG_EXPORT_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -32,4 +46,17 @@ pub fn qlog_export_enabled() -> bool {
 /// Updated by [`hopf_otel::TelemetryPipeline::start`] (and cleared on shutdown).
 pub fn set_qlog_export_enabled(enabled: bool) {
     QLOG_EXPORT_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_event_schema_uri_carries_the_draft_number() {
+        // draft-ietf-quic-qlog-quic-events, "Draft Event Schema
+        // Identification": an implementation of a draft MUST append `-` and
+        // the draft number, and MUST NOT use the bare URI before the RFC.
+        assert_eq!(QLOG_SCHEMA_QUIC, "urn:ietf:params:qlog:events:quic-14");
+    }
 }

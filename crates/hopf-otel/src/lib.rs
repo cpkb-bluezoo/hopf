@@ -31,7 +31,7 @@ mod trace;
 pub use access_log::{
     AccessLogFormat, AccessLogUserSelection, HttpAccessLogFormatter, EVENT_NAME as HTTP_ACCESS_EVENT,
 };
-pub use qlog::{qlog_event, QlogFileSink, QLOG_REVISION};
+pub use qlog::{qlog_event, qlog_revision, QlogFileSink};
 pub use batch::ExportHandle;
 pub use config::{LevelSet, LogSinkConfig, OtelConfig};
 pub use event::{log_record_from_event, EventKind};
