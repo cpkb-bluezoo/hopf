@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -29,7 +29,6 @@ pub struct QlogFileSink {
     directory: PathBuf,
     idle_after: Duration,
     open: HashMap<String, TraceFile>,
-    finished: HashMap<String, u64>,
 }
 
 impl QlogFileSink {
@@ -39,7 +38,6 @@ impl QlogFileSink {
             directory: directory.into(),
             idle_after: IDLE_AFTER,
             open: HashMap::new(),
-            finished: HashMap::new(),
         }
     }
 
@@ -64,11 +62,9 @@ impl QlogFileSink {
     }
 
     pub(crate) fn close_idle(&mut self, now: Instant) {
-        self.open.retain(|stem, file| {
+        self.open.retain(|_, file| {
             if now.duration_since(file.last_write) >= self.idle_after {
-                let reference = file.reference_unix_nano;
                 let _ = file.close();
-                self.finished.insert(stem.clone(), reference);
                 false
             } else {
                 true
@@ -77,10 +73,8 @@ impl QlogFileSink {
     }
 
     pub(crate) fn shutdown(&mut self) -> Result<(), String> {
-        for (stem, mut file) in self.open.drain() {
-            let reference = file.reference_unix_nano;
+        for (_, mut file) in self.open.drain() {
             file.close()?;
-            self.finished.insert(stem, reference);
         }
         Ok(())
     }
@@ -92,15 +86,7 @@ impl QlogFileSink {
         let stem = format!("{group}_{vantage}");
 
         if !self.open.contains_key(&stem) {
-            let reference = self.finished.get(&stem).copied();
-            let file = open_trace_file(
-                &self.directory,
-                &stem,
-                &group,
-                &vantage,
-                reference,
-                record.time_unix_nano,
-            )?;
+            let file = open_trace_file(&self.directory, &stem, &group, &vantage, record.time_unix_nano)?;
             self.open.insert(stem.clone(), file);
         }
 
@@ -110,9 +96,7 @@ impl QlogFileSink {
 
         if name == "quic:connection_closed" {
             let mut closed = self.open.remove(&stem).expect("open");
-            let reference = closed.reference_unix_nano;
             closed.close()?;
-            self.finished.insert(stem, reference);
         }
         Ok(())
     }
@@ -175,39 +159,63 @@ impl TraceFile {
     }
 }
 
+/// Open the trace file for `stem`, appending to it if it exists.
+///
+/// An existing file already says which epoch its times are relative to, in its
+/// header's `reference_time`, so a later event for the same connection (after
+/// the file was closed for idleness or at `connection_closed`, or by another
+/// sink over the same directory, as after a restart) goes on that epoch and
+/// the sink needs to remember nothing about connections it has finished. A
+/// file that is new, or whose header cannot be read, gets a header whose
+/// reference is the first event's time.
 fn open_trace_file(
     directory: &Path,
     stem: &str,
     group: &str,
     vantage: &str,
-    reference: Option<u64>,
     first_unix_nano: u64,
 ) -> Result<TraceFile, String> {
     fs::create_dir_all(directory).map_err(|e| e.to_string())?;
     let path = directory.join(format!("{stem}.sqlog"));
+    let existing = read_reference(&path);
     let file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
         .map_err(|e| e.to_string())?;
-    let mut trace = if let Some(reference) = reference {
-        TraceFile {
-            writer: BufWriter::new(file),
-            reference_unix_nano: reference,
-            last_write: Instant::now(),
-        }
-    } else {
-        let reference_unix_nano = (first_unix_nano / 1_000_000) * 1_000_000;
-        TraceFile {
-            writer: BufWriter::new(file),
-            reference_unix_nano,
-            last_write: Instant::now(),
-        }
+    let reference_unix_nano = existing.unwrap_or((first_unix_nano / 1_000_000) * 1_000_000);
+    let mut trace = TraceFile {
+        writer: BufWriter::new(file),
+        reference_unix_nano,
+        last_write: Instant::now(),
     };
-    if reference.is_none() {
+    if existing.is_none() {
         trace.write_header(group, vantage)?;
     }
     Ok(trace)
+}
+
+/// The most of a header record that is read: it is a few hundred bytes.
+const HEADER_READ_LIMIT: u64 = 16 * 1024;
+
+/// The epoch of the trace file at `path`, in nanoseconds since the Unix epoch,
+/// from the `reference_time` of its header (its first record). `None` if the
+/// file does not exist, is empty, or does not begin with a readable header.
+fn read_reference(path: &Path) -> Option<u64> {
+    let file = File::open(path).ok()?;
+    let mut line = Vec::new();
+    BufReader::new(file.take(HEADER_READ_LIMIT)).read_until(b'\n', &mut line).ok()?;
+    if line.first() != Some(&0x1e) {
+        return None;
+    }
+    let header = std::str::from_utf8(&line[1..]).ok()?;
+    if !header.contains("\"file_schema\"") {
+        return None;
+    }
+    const KEY: &str = "\"epoch\":\"";
+    let start = header.find(KEY)? + KEY.len();
+    let end = start + header[start..].find('"')?;
+    parse_iso_millis_utc(&header[start..end])
 }
 
 fn write_record(writer: &mut BufWriter<File>, json: &str) -> Result<(), String> {
@@ -264,6 +272,49 @@ fn iso_millis_utc(unix_nano: u64) -> String {
     let second = day_secs % 60;
     let (year, month, day) = civil_from_days(days);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{ms:03}Z")
+}
+
+/// The inverse of [`iso_millis_utc`]: `YYYY-MM-DDTHH:MM:SS.mmmZ` as nanoseconds
+/// since the Unix epoch. `None` for anything else.
+fn parse_iso_millis_utc(text: &str) -> Option<u64> {
+    let b = text.as_bytes();
+    if b.len() != 24
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'.'
+        || b[23] != b'Z'
+    {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<u64> {
+        let digits = text.get(from..to)?;
+        if !digits.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse().ok()
+    };
+    let (year, month, day) = (num(0, 4)? as i64, num(5, 7)? as u32, num(8, 10)? as u32);
+    let (hour, minute, second, ms) = (num(11, 13)?, num(14, 16)?, num(17, 19)?, num(20, 23)?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let days = u64::try_from(days_from_civil(year, month, day)).ok()?;
+    Some((((days * 24 + hour) * 60 + minute) * 60 + second) * 1_000_000_000 + ms * 1_000_000)
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date (the inverse of
+/// [`civil_from_days`]).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe as i64 - 719_468
 }
 
 fn civil_from_days(z: i64) -> (i32, u32, u32) {
@@ -491,6 +542,58 @@ mod tests {
 
     #[cfg(feature = "integration")]
     #[test]
+    fn a_later_sink_appends_to_a_finished_file_on_its_original_epoch() {
+        let dir = temp_dir("restart");
+        let _ = fs::remove_dir_all(&dir);
+        // The first event is not on a millisecond: the file's epoch is the
+        // millisecond before it.
+        let first = T0 + 7_654_321;
+        let mut one = QlogFileSink::new(&dir);
+        one.write(&[
+            event(first, "aa01", "server", "quic:connection_started", "{}"),
+            event(first + 1_000_000, "aa01", "server", "quic:packet_sent", "{}"),
+        ])
+        .unwrap();
+        one.shutdown().unwrap();
+        drop(one);
+
+        // A sink that knows nothing of the first, as after a restart, or one
+        // that has forgotten a connection it closed long ago.
+        let mut two = QlogFileSink::new(&dir);
+        two.write(&[event(first + 3_000_000_000, "aa01", "server", "quic:packet_lost", "{}")])
+            .unwrap();
+        two.shutdown().unwrap();
+
+        let records = parse_json_seq_records(&fs::read(dir.join("aa01_server.sqlog")).unwrap());
+        assert_eq!(records.len(), 4, "{records:?}");
+        assert_eq!(records.iter().filter(|r| r.contains("file_schema")).count(), 1, "one header");
+        // 3000.654 ms after the epoch the file's header names, not after the
+        // time of the late event itself.
+        assert!(records[3].contains("\"time\":3000.654"), "{}", records[3]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "integration")]
+    #[test]
+    fn a_file_without_a_readable_header_gets_one() {
+        let dir = temp_dir("badhead");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("aa01_server.sqlog"), b"not a qlog file\n").unwrap();
+        let mut sink = QlogFileSink::new(&dir);
+        sink.write(&[event(T0 + 5_000_000, "aa01", "server", "quic:connection_started", "{}")])
+            .unwrap();
+        sink.shutdown().unwrap();
+        let bytes = fs::read(dir.join("aa01_server.sqlog")).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        // The first event is the new header's reference: time 0.
+        assert!(text.contains("file_schema"), "{text}");
+        assert!(text.contains("\"time\":0.000"), "{text}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "integration")]
+    #[test]
     fn idle_close() {
         let dir = temp_dir("idle");
         let _ = fs::remove_dir_all(&dir);
@@ -503,6 +606,23 @@ mod tests {
         assert!(sink.open.is_empty());
         sink.shutdown().unwrap();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_header_epoch_reads_back_as_the_time_it_was_written_from() {
+        for nanos in [
+            0,
+            1_000_000,
+            951_782_400_123_000_000,    // 2000-02-29
+            1_700_000_000_007_000_000,
+            4_102_444_800_999_000_000, // 2100-01-01
+        ] {
+            let text = iso_millis_utc(nanos);
+            assert_eq!(parse_iso_millis_utc(&text), Some(nanos), "{text}");
+        }
+        for bad in ["", "2023-11-14", "2023-11-14T22:13:20Z", "2023-13-14T22:13:20.000Z", "2023-11-14T22:13:20.00xZ", "x023-11-14T22:13:20.000Z"] {
+            assert_eq!(parse_iso_millis_utc(bad), None, "{bad}");
+        }
     }
 
     #[test]
