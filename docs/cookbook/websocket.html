@@ -77,11 +77,11 @@
     <main class="main">
       <header>
         <h1>Cookbook: WebSocket</h1>
-        <p class="lead">```bash</p>
+        <p class="lead">A WebSocket echo server on the HTTP stack.</p>
       </header>
       <div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> websocket-echo <span class="at">--</span> 127.0.0.1:8080</span>
 <span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># connect any WebSocket client to ws://127.0.0.1:8080/</span></span></code></pre></div>
-<p>HTTP/1.1 Upgrade echo via <code>CleartextHttpEndpoint</code> + stock <code>EchoFactory</code>.</p>
+<p>Echo via <code>CleartextHttpEndpoint</code> + the stock <code>EchoFactory</code>: HTTP/1.1 Upgrade, or HTTP/2 Extended CONNECT from an h2c client. To dial a WebSocket server from Hopf, see <a href="../websocket.html#client-role">WebSocket: Client role</a>.</p>
 <p>Source: <a href="../../examples/websocket"><code>examples/websocket</code></a>. Guide: <a href="../websocket.html">WebSocket</a>.</p>
 
       <p class="footer">

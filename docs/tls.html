@@ -79,7 +79,7 @@
         <h1>TLS</h1>
         <p class="lead"><code>hopf-core::tls</code>: an <strong>in-tree</strong> TLS 1.2 (RFC 5246) and TLS 1.3 (RFC 8446) implementation — handshake state machines and record layers built directly on <strong>AWS-LC</strong> (via <code>aws-lc-rs</code>), with no <code>rustls</code> anywhere in the path. The module implements its own <code>TlsAcceptor</code> / <code>TlsConnector</code> factory traits and produces a <code>TlsVariant</code> session that <code>TcpConnection</code> drives through the sink-based <code>TlsRecordSink</code> interface. Protocol handlers always see <strong>plaintext</strong> — encryption is under the <code>Endpoint</code>. Supports TLS-from-accept and STARTTLS, one-port 1.2/1.3 version negotiation, hybrid post-quantum key exchange, ALPN, mutual TLS, session tickets, Encrypted Client Hello, and certificate compression.</p>
       </header>
-      <p>QUIC/TLS 1.3 for HTTP/3 lives in <a href="quic-h3.html"><code>hopf-quic</code></a> and is <strong>PQC-first</strong> (TLS 1.3 only, hybrid <code>X25519MLKEM768</code> offered first) — it also runs on the same in-tree AWS-LC foundation, with no separate TLS record layer (QUIC packet protection replaces it). This page covers TCP TLS (1.2 + 1.3, same crypto provider and key-exchange policy).</p>
+      <p>QUIC/TLS 1.3 for HTTP/3 lives in <a href="quic-h3.html"><code>hopf-quic</code></a> and is TLS 1.3 only, with classical X25519 key exchange by default and hybrid ML-KEM opt-in (<code>QuicTlsOptions::with_pqc</code>) because a hybrid key share makes the ClientHello span two Initial datagrams. It also runs on the same in-tree AWS-LC foundation, with no separate TLS record layer (QUIC packet protection replaces it). This page covers TCP TLS (1.2 + 1.3, same crypto provider and key-exchange policy).</p>
 <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
 <li><a href="#standards">Standards</a></li>
@@ -152,6 +152,7 @@ TlsVariant::Negotiating(..)             — buffers the first flight, picks 1.3 
         ▼
 Endpoint  →  ProtocolHandler sees plaintext
              security_info() after handshake</code></pre>
+<p><strong>Buffers.</strong> A TLS connection has two fixed inbound rings: the ciphertext ring every connection has (sized by <code>max_net_in</code>, at least 32 KiB so a whole 16 KiB record always fits) and a 64 KiB plaintext ring that records are decrypted into. The handler's <code>receive</code> is given the plaintext ring as a <code>LoopBuf</code>; it consumes whole tokens and leaves the rest in place, exactly as on a cleartext connection. A record is decrypted only while the plaintext ring has room for one, so a handler that stops consuming stops the connection reading (backpressure) rather than growing a buffer.</p>
 <p>There is no separate adapter crate in this path: <code>PemAcceptor</code> / <code>SniAcceptor</code> / <code>TrustedConnector</code> and their TLS-1.2 counterparts (private types in <code>hopf-core/src/tls/pem.rs</code>) implement the crate's own <code>TlsAcceptor</code> / <code>TlsConnector</code> traits directly; the PEM helper functions just return them as <code>Arc&lt;dyn TlsAcceptor&gt;</code> / <code>Arc&lt;dyn TlsConnector&gt;</code> (<code>SharedTlsAcceptor</code> / <code>SharedTlsConnector</code>).</p>
 <p><code>TlsVariant</code> is a thin enum, not a trait object: <code>V13</code> wraps <code>TlsRecordEngine</code> (<code>tls/record.rs</code>), which frames <code>HandshakeEngine</code>'s (<code>tls/engine.rs</code>) handshake messages into TLS 1.3 records and does the AEAD sealing/opening; <code>V12</code> wraps <code>tls12::Tls12RecordEngine</code> (<code>tls/tls12/record.rs</code>) around <code>tls12::Tls12Engine</code> (<code>tls/tls12/engine.rs</code>) the same way for TLS 1.2/RFC 5246. Both record engines expose the same method set and consume the same <code>TlsRecordSink</code>, so <code>TcpConnection</code> pumps whichever one it got without caring which version is underneath.</p>
 <p>The default PEM builders (<code>acceptor_from_pem</code> / <code>connector_from_pem</code>) produce <code>TlsVariant::Negotiating</code>: the server buffers the first flight until a complete <code>ClientHello</code> is seen, inspects its <code>supported_versions</code> (falling back to the legacy version field) to pick 1.3 or 1.2 (preferring 1.3), materializes the matching engine, and replays the buffered bytes into it — the same approach on the client side, keyed off the first <code>ServerHello</code>. One TCP connection speaks exactly one version for its life; there is no mid-connection renegotiation. Pin a fixed version with <code>*_with_tcp_version_policy</code> or the <code>*_tls12</code> builders instead of negotiating. Credentials generated at run time (an ephemeral loopback CA, a test fixture) need no files: <code>server_credentials_from_pem_bytes</code> parses PEM from memory and <code>acceptor_from_credentials</code> / <code>acceptor_from_credentials_with_client_auth</code> build the acceptor from the resulting <code>ServerCredentials</code>, the latter verifying client certificates against DER CA certificates handed in directly.</p>
@@ -332,7 +333,7 @@ let server_config = hopf_quic::server_config_from_tls_builder(&builder)?;</code>
 </table>
 <p>Sessions support <code>send_close_notify</code> via <code>TlsVariant</code>'s inherent methods, driven the same way on both TLS versions.</p>
 <h2 id="configuration">Configuration</h2>
-<p>The PEM builders take no numeric knobs beyond what's listed below; everything else is a fixed, spec-conformant default. Key exchange always prefers the hybrid post-quantum group <code>X25519MLKEM768</code> when the peer supports it, falling back through <code>SecP256r1MLKEM768</code> / <code>SecP384r1MLKEM1024</code> to classical curves — this isn't a caller-adjustable setting via the PEM helpers. <a href="quic-h3.html#pqc-first-tls-13">QUIC</a> uses the same crypto provider but pins TLS 1.3, so every QUIC handshake is PQC-first with no 1.2 fallback.</p>
+<p>The PEM builders take no numeric knobs beyond what's listed below; everything else is a fixed, spec-conformant default. Key exchange always prefers the hybrid post-quantum group <code>X25519MLKEM768</code> when the peer supports it, falling back through <code>SecP256r1MLKEM768</code> / <code>SecP384r1MLKEM1024</code> to classical curves; this isn't a caller-adjustable setting via the PEM helpers. <a href="quic-h3.html#pqc-first-tls-13">QUIC</a> uses the same crypto provider but pins TLS 1.3, and defaults to classical X25519 (hybrid PQC is opt-in there).</p>
 <table>
 <thead>
 <tr>
@@ -419,7 +420,7 @@ let cfg = TcpConnectorConfig::new(addr, factory)
 <h3 id="fips-backend">The validated backend</h3>
 <pre class="rust,ignore"><code>// Cargo.toml
 hopf-core = { version = "...", features = ["fips"] }   // or hopf = { features = ["fips"] }</code></pre>
-<p>The feature enables <code>aws-lc-rs/fips</code>, which compiles the FIPS module from source: <strong>cmake and Go are needed at build time</strong>. Cargo unifies features, so every crate in the build links the same FIPS-built library, <code>hopf-quic</code> and <code>hopf-tls</code> included.</p>
+<p>The feature enables <code>aws-lc-rs/fips</code>, which compiles the FIPS module from source: <strong>cmake and Go are needed at build time</strong>. Cargo unifies features, so every crate in the build links the same FIPS-built library, <code>hopf-quic</code> included.</p>
 <pre class="rust,ignore"><code>use hopf_core::{Runtime, RuntimeConfig};
 
 // Fails with ErrorKind::Unsupported unless the FIPS module is linked and
@@ -475,7 +476,7 @@ let acceptor = acceptor_with_fips(acceptor_from_pem(&amp;cert, &amp;key, &amp;[b
 <h2 id="securityinfo">SecurityInfo</h2>
 <p>After handshake, <code>Endpoint::security_info()</code> reports (via core <code>SecurityInfo</code>): secure flag, ALPN protocol, TLS protocol version, cipher suite, the SNI hostname the peer requested (<code>sni()</code>, server side), and — when mTLS presented a client certificate — its SHA-256 fingerprint as lowercase hex (<code>peer_certificate_fingerprint()</code>) and full certificate chain (<code>peer_certificate_chain()</code>), server side. Handlers may gate AUTH or HTTP/2 on this metadata (<code>ProtocolHandler::security_established</code>). The fingerprint is the <code>cert_key</code> expected by <a href="auth.html">SASL EXTERNAL</a>'s <code>CredentialStore::authenticate_certificate</code>.</p>
 <h2 id="examples">Examples</h2>
-<div class="sourceCode" id="cb5"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> tls-echo <span class="at">--</span> 127.0.0.1:8443 cert.pem key.pem</span></code></pre></div>
+<div class="sourceCode" id="cb5"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> tls-echo <span class="at">--</span> 127.0.0.1:8443</span></code></pre></div>
 <table>
 <thead>
 <tr>
@@ -486,7 +487,7 @@ let acceptor = acceptor_with_fips(acceptor_from_pem(&amp;cert, &amp;key, &amp;[b
 <tbody>
 <tr>
 <td><code>examples/tls-echo</code></td>
-<td>Accept TLS, echo plaintext to handler</td>
+<td>Accept TLS with a freshly generated self-signed certificate (written to <code>$TMPDIR/hopf-tls-echo/</code>), log the negotiated ALPN and suite, echo plaintext</td>
 </tr>
 </tbody>
 </table>
@@ -499,7 +500,7 @@ let acceptor = acceptor_with_fips(acceptor_from_pem(&amp;cert, &amp;key, &amp;[b
 <li>RFC 8446 §4.1.3's downgrade sentinel is not implemented on the negotiating client's 1.2-fallback path.</li>
 <li><code>record_size_limit</code> (RFC 8449) is TLS 1.3 only — the TLS 1.2 engine neither sends nor answers it.</li>
 <li>Encrypted Client Hello is shared-mode only (no split-mode backend), and a real ECH offer does not support session resumption or 0-RTT.</li>
-<li>QUIC crypto is configured in <code>hopf-quic</code>, not here (though it shares this module's AWS-LC provider and key-exchange policy).</li>
+<li>QUIC crypto is configured in <code>hopf-quic</code> (<code>QuicTlsOptions</code>), not here; it shares this module's AWS-LC provider and handshake engine but has its own key-exchange default.</li>
 <li><strong>No DTLS through this page's types.</strong> DTLS 1.2 and DTLS 1.3 (RFC 6347 / RFC 9147) are implemented — <code>hopf-core::dtls</code> / <code>dtls12</code>, reusing this same handshake engine over a UDP driver with per-peer version negotiation — but as a low-level seam only, not yet exposed through the generic <code>Endpoint</code>/<code>ProtocolHandler</code> contract or through this page's <code>TlsAcceptor</code>/<code>TlsConnector</code>/<code>TlsVariant</code> types. See <a href="conformance.html#tls">Conformance → TLS</a> and <a href="architecture.html#security-substrate">Architecture → Security substrate</a>.</li>
 </ul>
 <h2 id="independent-verification">Independent verification</h2>

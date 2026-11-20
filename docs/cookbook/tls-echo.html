@@ -77,11 +77,11 @@
     <main class="main">
       <header>
         <h1>Cookbook: tls-echo</h1>
-        <p class="lead">```bash</p>
+        <p class="lead">The echo server behind TLS: the handler code is unchanged and sees only plaintext.</p>
       </header>
       <div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> tls-echo <span class="at">--</span> 127.0.0.1:8443</span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># openssl s_client -connect 127.0.0.1:8443 -alpn echo</span></span></code></pre></div>
-<p>Source: <a href="../../examples/tls-echo"><code>examples/tls-echo</code></a>. Self-signed PEM via <code>rcgen</code> + <code>acceptor_from_pem</code>, then <code>TcpListenerConfig::with_tls</code>.</p>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># openssl s_client -connect 127.0.0.1:8443 -alpn http/1.1</span></span></code></pre></div>
+<p>Source: <a href="../../examples/tls-echo"><code>examples/tls-echo</code></a>. Self-signed PEM via <code>rcgen</code> (written to <code>$TMPDIR/hopf-tls-echo/</code>) + <code>acceptor_from_pem</code> with ALPN <code>http/1.1</code>, then <code>TcpListenerConfig::with_tls</code>. <code>security_established</code> logs the negotiated ALPN and cipher suite. Guide: <a href="../tls.html">TLS</a>.</p>
 
       <p class="footer">
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>

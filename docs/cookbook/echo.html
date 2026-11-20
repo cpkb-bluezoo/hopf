@@ -77,11 +77,11 @@
     <main class="main">
       <header>
         <h1>Cookbook: echo</h1>
-        <p class="lead">```bash</p>
+        <p class="lead">The smallest Hopf server: a <code>ProtocolHandler</code> that writes back whatever it receives.</p>
       </header>
       <div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> echo <span class="at">--</span> 127.0.0.1:8080</span>
 <span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nc</span> 127.0.0.1 8080</span></code></pre></div>
-<p>Source: <a href="../../examples/echo"><code>examples/echo</code></a>. Binds with <code>Runtime::add_tcp_listener</code>, echoes in <code>ProtocolHandler::receive</code>. Press Enter to shut down.</p>
+<p>Source: <a href="../../examples/echo"><code>examples/echo</code></a>. Binds with <code>Runtime::add_tcp_listener</code>, echoes in <code>ProtocolHandler::receive</code>: the handler is given the connection's inbound ring (<code>LoopBuf</code>), sends its readable spans with <code>Endpoint::send</code> and consumes them with <code>advance</code>. A handler for a real protocol would advance only past whole tokens and leave a partial one in the ring for the next call. Press Enter to shut down.</p>
 
       <p class="footer">
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>

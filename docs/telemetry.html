@@ -115,7 +115,15 @@
 </tr>
 <tr>
 <td>JSONL</td>
-<td>Optional file sinks</td>
+<td>Optional file sinks (OTLP JSON per line)</td>
+</tr>
+<tr>
+<td>Access logs</td>
+<td>Common Log Format and W3C Extended Log File Format</td>
+</tr>
+<tr>
+<td>qlog</td>
+<td>QUIC qlog JSON-SEQ files, one per connection</td>
 </tr>
 <tr>
 <td>Semconv</td>
@@ -132,15 +140,22 @@ TelemetryHook enqueue    InstrumentedServerFactory
         └──────────► TelemetryPipeline export worker
                           │
                           ├── OTLP HTTP endpoints
-                          └── JSONL files</code></pre>
+                          ├── JSONL files
+                          ├── stderr / access log / qlog directory
+                          └── (per-sink level filters)</code></pre>
 <h2 id="connection-telemetryhook">Connection TelemetryHook</h2>
 <p>Core trait (implemented / adapted by the pipeline):</p>
-<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> TelemetryHook<span class="op">:</span> <span class="bu">Send</span> <span class="op">+</span> <span class="bu">Sync</span> <span class="op">{</span></span>
-<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> on_accept(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> peer<span class="op">:</span> SocketAddr) <span class="op">{}</span></span>
-<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> on_dial(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> peer<span class="op">:</span> SocketAddr) <span class="op">{}</span></span>
-<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> on_close(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> peer<span class="op">:</span> SocketAddr) <span class="op">{}</span></span>
-<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> on_error(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> peer<span class="op">:</span> <span class="dt">Option</span><span class="op">&lt;</span>SocketAddr<span class="op">&gt;,</span> msg<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span>) <span class="op">{}</span></span>
-<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<pre class="sourceCode rust"><code>pub trait TelemetryHook: Send + Sync {
+    fn on_accept(&amp;self, peer: PeerAddr) {}
+    fn on_dial(&amp;self, peer: PeerAddr) {}
+    fn on_close(&amp;self, peer: PeerAddr) {}
+    fn on_error(&amp;self, peer: Option&lt;PeerAddr&gt;, msg: &amp;str) {}
+    fn on_warn(&amp;self, msg: &amp;str) {}
+    fn on_log(&amp;self, record: &amp;LogRecord) { /* default: ERROR/WARN to on_error/on_warn */ }
+    fn on_runtime_state(&amp;self, ready: bool, draining: bool) {}
+    fn on_bind_failure(&amp;self, addr: &amp;str, error: &amp;str) {}
+    fn on_drain_complete(&amp;self, forced: usize, elapsed: Duration) {}
+}</code></pre>
 <p>Attach via <code>Runtime::start_with_telemetry</code> or <code>Composition::new_with_telemetry</code> / <code>from_xml*_with_telemetry</code>. ACL / rate-limit denials report through <code>on_error</code>. <code>NopTelemetry</code> discards everything.</p>
 <p><strong>Implementations must not perform I/O on accept or reactor threads.</strong></p>
 <p>Events: <code>TelemetryEvent</code> / <code>EventKind::{Accept,Dial,Close,Error}</code>.</p>
@@ -184,7 +199,7 @@ TelemetryHook enqueue    InstrumentedServerFactory
 </tr>
 </tbody>
 </table>
-<p>Flags <code>traces_enabled</code> / <code>metrics_enabled</code> mirror Gumdrop-style toggles.</p>
+<p><code>traces_enabled</code> / <code>metrics_enabled</code> switch spans and metrics off without removing the wrapper. When a sink accepts the <code>Access</code> level, the wrapper also emits one access record per request (event <code>http.server.request</code>: client address, method, target, protocol version, status, response bytes, user); <code>InstrumentedServerFactory</code> can be told the protocol version to report for HTTP/2 or HTTP/3 listeners.</p>
 <div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
 <span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_otel::</span><span class="op">{</span>InstrumentedServerFactory<span class="op">,</span> OtelConfig<span class="op">,</span> TelemetryPipeline<span class="op">};</span></span>
 <span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
@@ -192,7 +207,7 @@ TelemetryHook enqueue    InstrumentedServerFactory
 <span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="pp">OtelConfig::</span>new(<span class="st">&quot;echo&quot;</span>)<span class="op">.</span>with_otlp_endpoint(<span class="st">&quot;http://127.0.0.1:4318&quot;</span>)<span class="op">,</span></span>
 <span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span>
 <span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> factory <span class="op">=</span> <span class="pp">InstrumentedServerFactory::</span>new(inner_factory<span class="op">,</span> <span class="op">&amp;</span>pipeline)<span class="op">;</span></span>
-<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="co">// or: InstrumentedServerFactory::with_parts(inner, export, metrics, traces_enabled)</span></span></code></pre></div>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="co">// or: InstrumentedServerFactory::with_parts(inner, export, metrics, traces_enabled, access_enabled, protocol_version)</span></span></code></pre></div>
 <h2 id="configuration">Configuration</h2>
 <h3 id="otelconfig"><code>OtelConfig</code></h3>
 <table>
@@ -266,10 +281,16 @@ TelemetryHook enqueue    InstrumentedServerFactory
 <td></td>
 </tr>
 <tr>
-<td><code>otlp_logs_endpoint</code></td>
-<td><code>Option&lt;…&gt;</code></td>
-<td><code>None</code></td>
-<td></td>
+<td><code>flush_timeout</code></td>
+<td>duration</td>
+<td><code>30s</code></td>
+<td>Longest <code>flush()</code> waits for the worker to drain</td>
+</tr>
+<tr>
+<td><code>log_sinks</code></td>
+<td><code>Vec&lt;LogSinkConfig&gt;</code></td>
+<td>empty (stderr added at start)</td>
+<td>Level-filtered log destinations; see <a href="#log-records-and-sinks">Log records and sinks</a></td>
 </tr>
 <tr>
 <td><code>otlp_traces_endpoint</code></td>
@@ -279,12 +300,6 @@ TelemetryHook enqueue    InstrumentedServerFactory
 </tr>
 <tr>
 <td><code>otlp_metrics_endpoint</code></td>
-<td><code>Option&lt;…&gt;</code></td>
-<td><code>None</code></td>
-<td></td>
-</tr>
-<tr>
-<td><code>jsonl_logs_path</code></td>
 <td><code>Option&lt;…&gt;</code></td>
 <td><code>None</code></td>
 <td></td>
@@ -303,8 +318,21 @@ TelemetryHook enqueue    InstrumentedServerFactory
 </tr>
 </tbody>
 </table>
-<p><strong>Builders:</strong> <code>with_otlp_endpoint(base)</code> (derives the three <code>/v1/*</code> URLs), <code>with_otlp_logs</code>, <code>with_jsonl_logs</code> / <code>with_jsonl_traces</code> / <code>with_jsonl_metrics</code>, <code>with_traces(bool)</code>, <code>with_metrics(bool)</code>, <code>has_sink()</code>.</p>
-<p><code>TelemetryPipeline::start</code> validates OTLP URLs and <strong>errors</strong> if no sink is configured or a URL is bad.</p>
+<p><strong>Builders:</strong> <code>with_otlp_endpoint(base)</code> (derives the three <code>/v1/*</code> URLs and adds an OTLP log sink), <code>with_otlp_logs</code>, <code>with_jsonl_logs</code> / <code>with_jsonl_traces</code> / <code>with_jsonl_metrics</code>, <code>with_stderr_logs</code>, <code>with_access_log(path, format, user_selection)</code>, <code>with_qlog_dir(dir)</code>, <code>with_log_sink(LogSinkConfig)</code> and the <code>*_log_sink(.., LevelSet)</code> variants, <code>with_traces(bool)</code>, <code>with_metrics(bool)</code>, <code>with_logs(bool)</code>, <code>has_sink()</code>.</p>
+<p><code>TelemetryPipeline::start</code> validates OTLP URLs and <strong>errors</strong> if a URL is bad. With no log sink configured it adds a stderr sink for the operational levels; if <code>QLOGDIR</code> is set and no sink takes qlog it adds a qlog directory sink. Starting a pipeline also registers its hook as the process-wide telemetry hook, so library log records reach it.</p>
+<h3 id="log-records-and-sinks">Log records and sinks</h3>
+<p>Library crates do not print: they emit structured <code>LogRecord</code>s (a <code>LogLevel</code>, a name, a message and typed attributes) through the process-wide hook (<code>hopf_core::emit_log</code>, <code>log_warn</code>, <code>log_error</code>), and connection events become records too. Each sink in <code>OtelConfig::log_sinks</code> takes the levels in its <code>LevelSet</code>:</p>
+<table>
+<thead><tr><th><code>LogSinkConfig</code></th><th>Output</th><th>Default levels</th></tr></thead>
+<tbody>
+<tr><td><code>Stderr</code></td><td>Human-readable console lines</td><td><code>LevelSet::OPERATIONAL</code> (Info, Warn, Error)</td></tr>
+<tr><td><code>Jsonl</code></td><td>OTLP JSON log batches appended to a file</td><td>operational</td></tr>
+<tr><td><code>OtlpHttp</code></td><td>Protobuf <code>ExportLogsServiceRequest</code> to <code>/v1/logs</code></td><td>operational</td></tr>
+<tr><td><code>AccessLog</code></td><td>HTTP access log file, <code>AccessLogFormat::Clf</code> or <code>Elff</code>; <code>AccessLogUserSelection</code> picks the protocol (authenticated) or application user, or both columns in ELFF</td><td><code>Access</code> only</td></tr>
+<tr><td><code>Qlog</code></td><td><code>{group_id}_{vantage}.sqlog</code> per QUIC connection (see <a href="quic-h3.html#qlog">QUIC qlog</a>)</td><td><code>Qlog</code> only</td></tr>
+</tbody>
+</table>
+<p>A full queue drops records rather than blocking; <code>dropped_log_records()</code> and <code>dropped_logs_by_level()</code> report how many.</p>
 <p>No Cargo features.</p>
 <h2 id="propagation">Propagation</h2>
 <table>
@@ -408,7 +436,7 @@ TelemetryHook enqueue    InstrumentedServerFactory
 <li>MQTT publish duration histograms and handler <code>traceparent</code>: <code>MqttService::with_telemetry</code> / <code>MqttWsFactory::with_telemetry</code> (see <a href="mqtt.html#metrics">MQTT metrics</a>).</li>
 <li>DNS is not instrumented for Trace Context propagation (no IETF standard; experimental EDNS TRACEPARENT out of scope). Client lookups may still be timed as local child spans; <code>DnsService::metrics()</code> stays process-local — see <a href="#dns">DNS</a> and <a href="dns.html#telemetry">DNS docs</a>.</li>
 <li>Bounded queue <strong>drops</strong> on overflow.</li>
-<li><code>flush()</code> sleeps ~50 ms to let the worker drain.</li>
+<li><code>flush()</code> blocks until the worker has drained what was queued, up to <code>flush_timeout</code>.</li>
 <li>OTLP is <strong>HTTP/protobuf only</strong> (no gRPC OTLP exporter).</li>
 </ul>
 

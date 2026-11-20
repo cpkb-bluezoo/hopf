@@ -77,12 +77,12 @@
     <main class="main">
       <header>
         <h1>Cookbook: WebDAV</h1>
-        <p class="lead">```bash</p>
+        <p class="lead">A WebDAV file server over a local directory.</p>
       </header>
       <div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> /tmp/webdav-root</span>
 <span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> webdav <span class="at">--</span> /tmp/webdav-root</span>
 <span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co"># or: cargo run -p webdav -- 127.0.0.1:8080 /path/to/files</span></span></code></pre></div>
-<p>Env: <code>WEBDAV_ROOT</code>, <code>WEBDAV_WRITE=1|true</code> (default write on). Default listen <code>127.0.0.1:8080</code>.</p>
+<p>Env: <code>WEBDAV_ROOT</code>, <code>WEBDAV_WRITE=1|true</code> (write is off unless set). Default listen <code>127.0.0.1:8080</code>. The example has no authentication (it sets <code>allow_unauthenticated_access</code>); a real deployment wraps <code>WebDavFactory</code> in an <code>hopf-http</code> auth factory, which also enables RFC 3744 privilege checks.</p>
 <p>Source: <a href="../../examples/webdav"><code>examples/webdav</code></a>. Guide: <a href="../webdav.html">WebDAV</a>.</p>
 
       <p class="footer">

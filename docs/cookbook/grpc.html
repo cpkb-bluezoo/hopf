@@ -77,11 +77,11 @@
     <main class="main">
       <header>
         <h1>Cookbook: gRPC</h1>
-        <p class="lead">```bash</p>
+        <p class="lead">A unary gRPC echo server with its schema parsed from <code>.proto</code> text at run time.</p>
       </header>
       <div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> grpc-echo <span class="at">--</span> 127.0.0.1:8080</span>
 <span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># unary POST http://{bound}/demo.Echo/Say  (application/grpc)</span></span></code></pre></div>
-<p>Inline <code>.proto</code> (<code>demo.Echo/Say</code>) over cleartext HTTP/2-capable endpoint.</p>
+<p>Inline <code>.proto</code> (<code>demo.Echo/Say</code>) over a cleartext HTTP/2-capable endpoint. Streaming RPCs, metadata, deadlines and compression are covered in the <a href="../grpc.html">gRPC guide</a>.</p>
 <p>Source: <a href="../../examples/grpc"><code>examples/grpc</code></a>. Guide: <a href="../grpc.html">gRPC</a>.</p>
 
       <p class="footer">
