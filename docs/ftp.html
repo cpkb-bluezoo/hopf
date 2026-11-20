@@ -77,7 +77,7 @@
     <main class="main">
       <header>
         <h1>FTP</h1>
-        <p class="lead">Crate <code>hopf-ftp</code>: FTP / FTPS <strong>server</strong> and callback-driven <strong>client</strong>, a port of Gumdrop <code>org.bluezoo.gumdrop.ftp</code>. The server runs on the Hopf thread-per-core reactor; data connections use dynamic PASV listeners on a shared <code>Arc&lt;Runtime&gt;</code>. TLS is provided by <a href="tls.html"><code>hopf-core::tls</code></a> (in-tree, on AWS-LC). Authentication uses <a href="auth.html"><code>hopf-auth</code></a> <code>TrustPolicy</code>.</p>
+        <p class="lead">Crate <code>hopf-ftp</code>: FTP / FTPS <strong>server</strong> and callback-driven <strong>client</strong>, peer roles in one crate. The server runs on the Hopf thread-per-core reactor; data connections use dynamic PASV listeners on a shared <code>Arc&lt;Runtime&gt;</code>. TLS is provided by <a href="tls.html"><code>hopf-core::tls</code></a> (in-tree, on AWS-LC). Authentication uses <a href="auth.html"><code>hopf-auth</code></a> <code>TrustPolicy</code>.</p>
       </header>
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
@@ -142,7 +142,7 @@
                     ├── PASV/EPSV → Runtime::add_tcp_listener (ephemeral data port)
                     └── PORT/EPRT → outbound data connect (bounce guard)</code></pre>
 <ul>
-<li><strong>Control connection</strong> — one <code>FtpControlHandler</code> per accept; commands are lexed incrementally (<code>FtpServerLexer</code>).</li>
+<li><strong>Control connection</strong> - one <code>FtpControlHandler</code> per accept; commands are lexed incrementally by <code>FtpServerLexer</code>, a push parser over the connection's inbound ring buffer (<code>hopf_core::LoopBuf</code>) that reads arguments as they arrive. Commands received while a transfer is being set up are held and answered in order; a client that sends too many without waiting for replies is closed with <code>421</code>.</li>
 <li><strong>Data connection</strong> — active (<code>PORT</code>/<code>EPRT</code>) or passive (<code>PASV</code>/<code>EPSV</code>). Passive binds allocate a short-lived listener on the same <code>Runtime</code>.</li>
 <li><strong>Filesystem</strong> — stock path is chrooted <code>BasicFtpFileSystem</code>; apps can supply any <code>FtpFileSystem</code>. Blocking FS work should stay off the reactor (storage pool).</li>
 <li><strong>TLS</strong> — cleartext, explicit <code>AUTH TLS</code>, or implicit FTPS (<code>secure</code> from first byte). Optional <code>PROT P</code> for data channels.</li>
@@ -153,7 +153,7 @@
 <h3 id="transfer-parameters">Transfer parameters</h3>
 <p>PORT, PASV, EPRT, EPSV, TYPE (<code>A</code> / <code>I</code>), STRU (<code>F</code> only), MODE (<code>S</code> only)</p>
 <h3 id="service-commands">Service commands</h3>
-<p>RETR, STOR, STOU (server-generated unique name, actually unique per call — see <code>FtpFileSystem::generate_unique_name</code>), APPE, ALLO (dispatched to <code>FtpFileSystem::allocate_space</code>; <code>202</code> by default, matching Gumdrop's own no-op default), REST, ABOR, DELE, RMD / XRMD, MKD / XMKD, PWD / XPWD, LIST, NLST, STAT, HELP, NOOP, SYST, RNFR / RNTO, SITE (dispatched to <code>FtpConnectionHandler::handle_site_command</code>; <code>502</code> by default)</p>
+<p>RETR, STOR, STOU (server-generated unique name, actually unique per call; see <code>FtpFileSystem::generate_unique_name</code>), APPE, ALLO (dispatched to <code>FtpFileSystem::allocate_space</code>; <code>202</code> by default), REST, ABOR, DELE, RMD / XRMD, MKD / XMKD, PWD / XPWD, LIST, NLST, STAT, HELP, NOOP, SYST, RNFR / RNTO, SITE (dispatched to <code>FtpConnectionHandler::handle_site_command</code>; <code>502</code> by default)</p>
 <h3 id="extensions">Extensions</h3>
 <table>
 <thead>
@@ -253,6 +253,45 @@ S: 200 Protection level set to P</code></pre>
 <span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> rt <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">Runtime::</span>start(<span class="pp">RuntimeConfig::</span><span class="kw">default</span>())<span class="op">?</span>)<span class="op">;</span></span>
 <span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> bound <span class="op">=</span> service<span class="op">.</span>start(<span class="pp">Arc::</span>clone(<span class="op">&amp;</span>rt))<span class="op">?;</span></span></code></pre></div>
 <p>Custom handlers return <code>FtpAuthResult::{Success, NeedPassword, NeedAccount, Failed, Unavailable}</code>. See <a href="auth.html">Auth</a>.</p>
+<h3 id="failed-login-limits">Failed-login limits</h3>
+<p><code>FtpConfig::login_limits</code> (<code>LoginLimits</code>, set with <code>.with_login_limits(..)</code>) makes password guessing expensive. Failures are counted per connection and per source address; the per-address count is shared by every connection using the same configuration (clones share it).</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>max_failures_per_connection</code></td>
+<td>3</td>
+<td>Close the connection with <code>421</code> after this many failures (<code>0</code> = no limit)</td>
+</tr>
+<tr>
+<td><code>failure_delay</code></td>
+<td>1 s</td>
+<td>Hold the failure reply and the connection's later commands this long</td>
+</tr>
+<tr>
+<td><code>lockout_after</code></td>
+<td>10</td>
+<td>Failures from one address within <code>lockout_window</code> that lock it out (<code>0</code> = off)</td>
+</tr>
+<tr>
+<td><code>lockout_window</code></td>
+<td>10 min</td>
+<td>How long an address's failures are remembered, from its first</td>
+</tr>
+<tr>
+<td><code>lockout_duration</code></td>
+<td>10 min</td>
+<td>A locked-out address gets <code>421</code> at connect, with no banner</td>
+</tr>
+</tbody>
+</table>
+<p><code>LoginLimits::unlimited()</code> turns all of this off.</p>
 <h2 id="file-system-handler">File system handler</h2>
 <table>
 <colgroup>
@@ -389,9 +428,15 @@ S: 200 Protection level set to P</code></pre>
 <td><code>false</code></td>
 <td>Stock FS write denied</td>
 </tr>
+<tr>
+<td><code>login_limits</code></td>
+<td><code>LoginLimits</code></td>
+<td>see <a href="#failed-login-limits">above</a></td>
+<td>Failed-login delay, per-connection cap, per-address lockout</td>
+</tr>
 </tbody>
 </table>
-<p><strong>Builders:</strong> <code>FtpConfig::new(listen, root, policy)</code>, <code>.with_tls(acceptor)</code>, <code>.with_data_tls_connector(connector, server_name)</code>, <code>.implicit_ftps()</code>, <code>.require_data_tls()</code>.</p>
+<p><strong>Builders:</strong> <code>FtpConfig::new(listen, root, policy)</code>, <code>.with_tls(acceptor)</code>, <code>.with_data_tls_connector(connector, server_name)</code>, <code>.implicit_ftps()</code>, <code>.require_data_tls()</code>, <code>.with_login_limits(limits)</code>.</p>
 <h3 id="ftpservice"><code>FtpService</code></h3>
 <table>
 <colgroup>
@@ -425,6 +470,10 @@ S: 200 Protection level set to P</code></pre>
 <td><code>metrics()</code></td>
 <td><code>FtpServerMetrics</code> snapshot</td>
 </tr>
+<tr>
+<td><code>with_telemetry(&amp;pipeline)</code> / <code>stop()</code></td>
+<td>OTLP/JSONL export (see <a href="#metrics">Metrics</a>) / remove the listener</td>
+</tr>
 </tbody>
 </table>
 <h2 id="handler-spi">Handler SPI</h2>
@@ -455,11 +504,11 @@ S: 200 Protection level set to P</code></pre>
 <span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> FtpConnectionHandlerFactory<span class="op">:</span> <span class="bu">Send</span> <span class="op">+</span> <span class="bu">Sync</span> <span class="op">{</span></span>
 <span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> create(<span class="op">&amp;</span><span class="kw">self</span>) <span class="op">-&gt;</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> FtpConnectionHandler<span class="op">&gt;;</span></span>
 <span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
-<p><code>FtpConnectionMetadata</code>: <code>peer</code>, <code>local</code>, <code>user</code>, <code>tls</code>. <code>is_authorized</code> now gates CWD/CDUP (<code>Navigate</code>), MKD (<code>CreateDir</code>), RMD (<code>DeleteDir</code>), and RNFR/RNTO (<code>Rename</code>) in addition to RETR/LIST/STAT (<code>Read</code>), STOR/APPE/STOU (<code>Write</code>), and DELE (<code>Delete</code>); <code>SiteCommand</code>/<code>Admin</code> are available for handlers to use from within <code>handle_site_command</code> itself (the framework doesn't auto-gate SITE, matching Gumdrop).</p>
-<p><strong>Transfer progress</strong> (Gumdrop <code>transferStarting</code>/<code>transferProgress</code>/<code>transferCompleted</code>): <code>transfer_starting(path, upload, size, meta)</code> fires synchronously on the control connection before RETR/STOR/APPE/STOU open a data connection. Per-chunk and completion notifications go through a separate <code>transfer_observer(meta) -&gt; Option&lt;Arc&lt;dyn TransferObserver&gt;&gt;</code> instead of more <code>FtpConnectionHandler</code> methods — RETR runs on a <code>StorageExecutor</code> thread and STOR/APPE/STOU on the data connection's own reactor thread, neither of which is the control connection's thread where the rest of the handler lives, so <code>TransferObserver</code> is <code>Send + Sync</code> and obtained once per transfer rather than called back through <code>&amp;mut self</code>.</p>
-<p><strong>Quota</strong> (Gumdrop <code>getQuotaManager</code>/<code>canStore</code>/<code>getQuota</code>/<code>recordBytesAdded</code>/<code>recordBytesRemoved</code>): <code>quota_manager() -&gt; Option&lt;Arc&lt;dyn hopf_core::QuotaManager&gt;&gt;</code> plus default-implemented <code>can_store</code>/<code>quota</code>/<code>record_bytes_added</code>/<code>record_bytes_removed</code> delegating to it — see <a href="quota.html">Quota</a>. STOR/APPE/STOU are rejected (<code>552</code>) up front if the user is already over quota; usage is recorded once the upload completes, via the quota handle carried alongside the transfer (same cross-thread reasoning as <code>TransferObserver</code>). The stock <code>FilesystemFtpHandler</code>/<code>FilesystemFtpHandlerFactory</code> take one via <code>with_quota(Arc&lt;dyn QuotaManager&gt;)</code>.</p>
+<p><code>FtpConnectionMetadata</code>: <code>peer</code>, <code>local</code>, <code>user</code>, <code>tls</code>. <code>is_authorized</code> gates CWD/CDUP (<code>Navigate</code>), MKD (<code>CreateDir</code>), RMD (<code>DeleteDir</code>), RNFR/RNTO (<code>Rename</code>), RETR, LIST/NLST, STAT with a path, MLSD, MLST, SIZE and MDTM (<code>Read</code>, checked against the path named, before anything about it is revealed), STOR/APPE/STOU (<code>Write</code>), and DELE (<code>Delete</code>); <code>SiteCommand</code>/<code>Admin</code> are available for handlers to use from within <code>handle_site_command</code> itself (the framework doesn't auto-gate SITE). <code>file_system_handle(meta)</code> optionally returns a shareable <code>Arc&lt;dyn FtpFileSystem + Sync&gt;</code> so RETR/STOR can open files on the storage pool rather than the reactor (the stock handler does).</p>
+<p><strong>Transfer progress</strong>: <code>transfer_starting(path, upload, size, meta)</code> fires synchronously on the control connection before RETR/STOR/APPE/STOU open a data connection. Per-chunk and completion notifications go through a separate <code>transfer_observer(meta) -&gt; Option&lt;Arc&lt;dyn TransferObserver&gt;&gt;</code> instead of more <code>FtpConnectionHandler</code> methods: RETR runs on a <code>StorageExecutor</code> thread and STOR/APPE/STOU on the data connection's own reactor thread, neither of which is the control connection's thread where the rest of the handler lives, so <code>TransferObserver</code> is <code>Send + Sync</code> and obtained once per transfer rather than called back through <code>&amp;mut self</code>.</p>
+<p><strong>Quota</strong>: <code>quota_manager() -&gt; Option&lt;Arc&lt;dyn hopf_core::QuotaManager&gt;&gt;</code> plus default-implemented <code>can_store</code>/<code>quota</code>/<code>record_bytes_added</code>/<code>record_bytes_removed</code> delegating to it; see <a href="quota.html">Quota</a>. STOR/APPE/STOU are rejected (<code>552</code>) up front if the user is already over quota; usage is recorded once the upload completes, via the quota handle carried alongside the transfer (same cross-thread reasoning as <code>TransferObserver</code>). The stock <code>FilesystemFtpHandler</code>/<code>FilesystemFtpHandlerFactory</code> take one via <code>with_quota(Arc&lt;dyn QuotaManager&gt;)</code>.</p>
 <h2 id="client">Client</h2>
-<p>Callback-driven <code>FtpClient</code> on an <code>Arc&lt;Runtime&gt;</code>. DNS (when needed) and the control/data session run on worker reactors; <code>connect</code> returns immediately. Drive the session with an <code>FtpPipeline</code> — stock pipelines <code>FtpGet</code> (RETR) and <code>FtpPut</code> (STOR).</p>
+<p>Callback-driven <code>FtpClient</code> on an <code>Arc&lt;Runtime&gt;</code>. DNS (when needed) and the control/data session run on worker reactors; <code>connect</code> returns immediately. Drive the session with an <code>FtpPipeline</code>; stock pipelines are <code>FtpGet</code> (RETR, streamed to a <code>MessageReceiveCallback</code>) and <code>FtpPut</code> (STOR from any <code>Read</code>). Server replies are read by an incremental parser over the connection's inbound ring.</p>
 <h3 id="ftpclienttimeouts"><code>FtpClientTimeouts</code></h3>
 <table>
 <thead>
@@ -527,6 +576,22 @@ S: 200 Protection level set to P</code></pre>
 <td>Prefer EPSV over PASV (default <code>true</code>)</td>
 </tr>
 <tr>
+<td><code>.active_mode(bool)</code> / <code>.prefer_eprt(bool)</code></td>
+<td>Active data connections (PORT/EPRT, server dials the client) instead of the default passive</td>
+</tr>
+<tr>
+<td><code>.auth_tls(connector, name)</code> / <code>.implicit_tls(connector, name)</code></td>
+<td>Explicit <code>AUTH TLS</code> or implicit FTPS</td>
+</tr>
+<tr>
+<td><code>.data_tls_acceptor(acceptor)</code></td>
+<td>TLS for active-mode protected data connections (the client accepts them)</td>
+</tr>
+<tr>
+<td><code>FtpClient::from_unix_path(path)</code></td>
+<td>Control connection over a Unix socket</td>
+</tr>
+<tr>
 <td><code>.resolver(Arc&lt;DnsResolver&gt;)</code></td>
 <td>Reuse a resolver</td>
 </tr>
@@ -539,15 +604,20 @@ S: 200 Protection level set to P</code></pre>
 <div class="sourceCode" id="cb7"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
 <span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::time::</span>Duration<span class="op">;</span></span>
 <span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>Runtime<span class="op">,</span> RuntimeConfig<span class="op">};</span></span>
-<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_ftp::</span><span class="op">{</span>FtpClient<span class="op">,</span> FtpClientTimeouts<span class="op">,</span> FtpGet<span class="op">};</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_ftp::</span><span class="op">{</span>FtpClient<span class="op">,</span> FtpClientTimeouts<span class="op">,</span> FtpGet<span class="op">,</span> MessageReceiveCallback<span class="op">};</span></span>
 <span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> rt <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">Runtime::</span>start(<span class="pp">RuntimeConfig::</span><span class="kw">default</span>())<span class="op">?</span>)<span class="op">;</span></span>
-<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> pipeline <span class="op">=</span> <span class="pp">FtpGet::</span>new(<span class="st">&quot;/readme.txt&quot;</span><span class="op">,</span> <span class="op">|</span>r<span class="op">|</span> <span class="op">{</span></span>
-<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">match</span> r <span class="op">{</span></span>
-<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Ok</span>(bytes) <span class="op">=&gt;</span> <span class="pp">eprintln!</span>(<span class="st">&quot;got {} bytes&quot;</span><span class="op">,</span> bytes<span class="op">.</span>len())<span class="op">,</span></span>
-<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Err</span>(e) <span class="op">=&gt;</span> <span class="pp">eprintln!</span>(<span class="st">&quot;RETR failed: {e}&quot;</span>)<span class="op">,</span></span>
-<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
-<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> Count(<span class="dt">usize</span>)<span class="op">;</span>
+<span class="kw">impl</span> MessageReceiveCallback <span class="kw">for</span> Count <span class="op">{</span>
+    <span class="kw">fn</span> message_content(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> chunk<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">u8</span>]) <span class="op">-&gt;</span> <span class="dt">bool</span> <span class="op">{</span> <span class="kw">self</span><span class="op">.</span><span class="dv">0</span> <span class="op">+=</span> chunk<span class="op">.</span>len()<span class="op">;</span> <span class="cn">true</span> <span class="op">}</span> <span class="co">// false aborts</span>
+    <span class="kw">fn</span> end_message(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> r<span class="op">:</span> <span class="pp">std::io::</span><span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">&gt;</span>) <span class="op">{</span>
+        <span class="kw">match</span> r <span class="op">{</span>
+            <span class="cn">Ok</span>(()) <span class="op">=&gt;</span> <span class="pp">eprintln!</span>(<span class="st">&quot;got {} bytes&quot;</span><span class="op">,</span> <span class="kw">self</span><span class="op">.</span><span class="dv">0</span>)<span class="op">,</span>
+            <span class="cn">Err</span>(e) <span class="op">=&gt;</span> <span class="pp">eprintln!</span>(<span class="st">&quot;RETR failed: {e}&quot;</span>)<span class="op">,</span>
+        <span class="op">}</span>
+    <span class="op">}</span>
+<span class="op">}</span>
+<span class="kw">let</span> pipeline <span class="op">=</span> <span class="pp">FtpGet::</span>new(<span class="st">&quot;/readme.txt&quot;</span><span class="op">,</span> <span class="dt">Box</span><span class="pp">::</span>new(Count(<span class="dv">0</span>)))<span class="op">;</span></span>
 <span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="pp">FtpClient::</span>new(<span class="st">&quot;127.0.0.1&quot;</span>)</span>
 <span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>port(<span class="dv">2121</span>)</span>
 <span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>credentials(<span class="st">&quot;ftp&quot;</span><span class="op">,</span> <span class="st">&quot;ftp&quot;</span>)</span>
@@ -558,7 +628,7 @@ S: 200 Protection level set to P</code></pre>
 <span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a>        data<span class="op">:</span> <span class="pp">Duration::</span>from_secs(<span class="dv">120</span>)<span class="op">,</span></span>
 <span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>)</span>
 <span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>connect(<span class="op">&amp;</span>rt<span class="op">,</span> <span class="dt">Box</span><span class="pp">::</span>new(pipeline))<span class="op">?;</span></span></code></pre></div>
-<p><code>FtpGet</code> / <code>FtpPut</code> sequence: auth (from credentials) → <code>TYPE I</code> → PASV/EPSV → RETR or STOR → QUIT. Custom workflows implement <code>FtpPipeline</code> (<code>start</code> / <code>done</code> / <code>failed</code>) and issue ops via <code>FtpSessionWrite</code>.</p>
+<p><code>FtpGet</code> / <code>FtpPut</code> sequence: auth (from credentials) → <code>TYPE I</code> → PASV/EPSV (or PORT/EPRT in active mode) → RETR or STOR → QUIT. Custom workflows implement <code>FtpPipeline</code> (<code>start(session, abort)</code> / <code>done</code> / <code>failed</code>) and issue ops via <code>FtpSessionWrite</code>; <code>FtpAbortHandle</code> sends ABOR from any thread, and uploads push content through an <code>FtpStorHandle</code> (<code>feed</code> / <code>finish</code>).</p>
 <h2 id="metrics">Metrics</h2>
 <p>Process-local <code>FtpServerMetrics</code> (in <code>hopf-ftp</code>): connections, <code>auth_ok</code> / <code>auth_fail</code>, commands, <code>bytes_in</code> / <code>bytes_out</code>, and <code>pasv_binds</code> via <code>FtpService::metrics()</code>.</p>
 <p>OTLP/JSONL export (when <code>FtpService::with_telemetry(&amp;pipeline)</code> is used): <code>hopf_otel::FtpServerMetrics</code> emits <code>ftp.server.connections</code>, <code>ftp.server.active_connections</code>, <code>ftp.server.auth</code>, <code>ftp.server.commands</code>, <code>ftp.server.pasv_binds</code>, <code>ftp.server.transfers</code> (direction/outcome), <code>ftp.server.transfer.duration</code> (ms), and <code>ftp.server.transfer.size</code>.</p>
@@ -599,7 +669,7 @@ S: 200 Protection level set to P</code></pre>
 <h2 id="limitations">Limitations</h2>
 <ul>
 <li>CCC and SMNT are not implemented (rejected); SITE is dispatched to the application (<code>FtpConnectionHandler::handle_site_command</code>, <code>502</code> by default — no subcommands are built in).</li>
-<li>Stock examples are cleartext; FTPS is available via API + <a href="tls.html"><code>tls.md</code></a> but not wired in the demo binaries.</li>
+<li>Stock examples are cleartext; FTPS is available via the API (see <a href="tls.html">TLS</a>) but not wired in the demo binaries.</li>
 <li>The quota gate can only check "is the user already over quota" before a STOR/APPE/STOU, not "would this specific upload push them over" — <code>ALLO</code> reaches <code>FtpFileSystem::allocate_space</code> (so a backend can reject an unreasonable declared size there), but that call isn't automatically wired into the STOR/APPE/STOU quota check that follows it; a backend wanting precise pre-emption would need to correlate the two itself. See <a href="quota.html">Quota</a>.</li>
 <li>Client completion is callback-driven — callers wait on their own signalling (see <code>examples/ftp-get</code>).</li>
 </ul>

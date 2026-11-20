@@ -130,9 +130,10 @@
     .credentials("guest", "guest")
     .connect(&amp;rt, Arc::new(Factory))?;</code></pre>
 <p>On <code>on_connection_open</code>, begin a session; on <code>on_session_begin</code>, attach a sender and/or receiver; on <code>on_link_attached</code> for a receiver, call <code>add_credit</code> before expecting deliveries; on <code>on_credit</code> for a sender, <code>send</code> is safe to call.</p>
+<p>Builder options: <code>from_addr(addr)</code> and <code>from_unix_path(path)</code> skip DNS; <code>container_id(..)</code> (default generated per client), <code>hostname(..)</code> (the <code>open</code> hostname), <code>max_frame_size(n)</code>, <code>timeouts(Amqp1ClientTimeouts)</code> (dns=5s, connect=10s, handshake=10s), <code>implicit_tls(connector, name)</code> and <code>resolver(..)</code>.</p>
 
       <h2 id="messages">Messages</h2>
-<p><code>MessageHeader</code> (durability, priority, TTL, …) and <code>MessageProperties</code> (content-type, message-id, correlation-id, …) are list-based sections; <code>application-properties</code>, <code>delivery-annotations</code>, and <code>message-annotations</code> are bare maps, encoded/decoded as such (not wrapped in a list — a spec-correctness detail this crate gets right). <code>delivery-annotations</code>, <code>message-annotations</code>, and <code>footer</code> sections are received as raw maps but not yet offered on the send side.</p>
+<p><code>MessageHeader</code> (durability, priority, TTL, …) and <code>MessageProperties</code> (content-type, message-id, correlation-id, …) are list-based sections; <code>application-properties</code>, <code>delivery-annotations</code>, and <code>message-annotations</code> are bare maps, encoded/decoded as such (not wrapped in a list). <code>delivery-annotations</code>, <code>message-annotations</code>, and <code>footer</code> sections are decoded by the codec's <code>MessageParser</code> but not passed to <code>Amqp1ClientDriver</code>, and are not offered on the send side.</p>
 
       <h2 id="examples">Examples</h2>
 <pre><code>cargo test -p hopf-amqp1 --lib client::tests
@@ -143,7 +144,7 @@ cargo test -p hopf-amqp1 --features integration</code></pre>
 <ul>
 <li>No automatic reconnection (unlike <code>hopf-amqp</code>'s <code>AmqpRecoveringClient</code>)</li>
 <li>No heartbeat send, and no enforcement of a peer's advertised <code>idle-time-out</code>; advertises no requirement of its own. Fine for short-lived or steadily-busy connections; a long-idle connection against a broker with a strict idle timeout could be dropped</li>
-<li><code>delivery-annotations</code>, <code>message-annotations</code>, and <code>footer</code> message sections are received (raw maps) but not yet offered on the send side</li>
+<li><code>delivery-annotations</code>, <code>message-annotations</code>, and <code>footer</code> message sections are not delivered to the driver, and not offered on the send side</li>
 <li>No broker / server module, and no transactions</li>
 <li>No Composition/XML registration in v1</li>
 </ul>

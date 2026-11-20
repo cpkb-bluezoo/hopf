@@ -77,11 +77,29 @@
     <main class="main">
       <header>
         <h1>Cookbook: dns-proxy</h1>
-        <p class="lead">```bash</p>
+        <p class="lead">A UDP caching DNS forwarder: queries arriving on a local port are answered from a shared cache or forwarded to upstream resolvers.</p>
       </header>
-      <div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> dns-proxy <span class="at">--</span> …</span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># point a stub resolver / dig @… at the bound address</span></span></code></pre></div>
-<p>Source: <a href="../../examples/dns-proxy"><code>examples/dns-proxy</code></a>. Caching forwarder using <code>DnsService</code> with a <code>ForwarderHandler</code> + UDP (and optional DoT/DoQ features). See <a href="../dns.html">DNS</a>.</p>
+      <pre><code>DNS_UPSTREAM="8.8.8.8 1.1.1.1" cargo run -p dns-proxy -- 127.0.0.1:5353
+
+dig @127.0.0.1 -p 5353 www.example.com A
+dig @127.0.0.1 -p 5353 www.example.com A   # second time: from the cache</code></pre>
+      <p>The bind address defaults to <code>127.0.0.1:5353</code> and <code>DNS_UPSTREAM</code> to <code>8.8.8.8 1.1.1.1</code> (pre-resolved addresses, parsed with <code>parse_upstream_list</code>).</p>
+      <pre><code>let rt = Runtime::start(Default::default())?;
+let cache = Arc::new(DnsCache::default());
+let resolver = DnsResolver::new(rt.pick_worker().clone());
+resolver.set_cache(Arc::clone(&amp;cache));
+for a in &amp;upstream_addrs {
+    resolver.add_server(*a);
+}
+resolver.open()?;
+
+let service = DnsService::with_handler(ForwarderHandler::new(cache).with_upstream(resolver));
+let (local, _token) = listen_dns_udp(
+    rt.pick_worker(),
+    DnsUdpListenConfig { addr: bind, service: DnsServiceHandle::new(service) },
+)?;</code></pre>
+      <p>The forwarder is non-blocking: each query is completed from the resolver's callback when the upstream answers, and serve-stale, the RFC 8020 NXDOMAIN cut and minimal <code>ANY</code> are on by default. Upstreams added with <code>add_server</code> are in auto mode, so a well-known public resolver (or one that advertises itself through RFC 9462 discovery) is reached over DoQ or DoT when the <code>hopf-dns</code> features <code>doq</code>/<code>dot</code> are enabled; the example itself enables only <code>server</code>.</p>
+      <p>Source: <a href="../../examples/dns-proxy"><code>examples/dns-proxy</code></a>. See <a href="../dns.html#forwarder">DNS: Caching forwarder</a> for the forwarder's policies and <a href="../dns.html#upstream-client">UpstreamClient</a> for pipelined DoT/DoQ upstreams.</p>
 
       <p class="footer">
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>

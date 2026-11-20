@@ -130,7 +130,7 @@
 </tr>
 </tbody>
 </table>
-<p>Coming from Gumdrop: <code>HTTPRequestHandlerFactory.createHandler(state, headers)</code> sees the request and can route by path or reject early (401/404) before a handler exists. <code>ServerHandlerFactory::create_handler()</code> deliberately does not — it takes no arguments. Routing and auth-gating are composed by <em>decoration</em> instead: wrap an inner factory/handler in one that inspects headers inside <code>ServerHandler::headers</code> and either forwards or answers directly. <code>BasicAuthFactory</code>/<code>DigestAuthFactory</code>/<code>BearerAuthFactory</code> below are the reference examples; a path router is the same shape, dispatching to a different inner handler per route instead of challenging.</p>
+<p><code>ServerHandlerFactory::create_handler()</code> takes no arguments: the factory does not see the request, so it cannot route by path or reject early (401/404) before a handler exists. Routing and auth-gating are composed by <em>decoration</em> instead: wrap an inner factory/handler in one that inspects headers inside <code>ServerHandler::headers</code> and either forwards or answers directly. <code>BasicAuthFactory</code>/<code>DigestAuthFactory</code>/<code>BearerAuthFactory</code> below are the reference examples; a path router is the same shape, dispatching to a different inner handler per route instead of challenging.</p>
 <h3 id="callback-sequence">Callback sequence</h3>
 <p>With a request body:</p>
 <ol type="1">
@@ -138,9 +138,11 @@
 <li><code>start_request_body</code></li>
 <li><code>request_body_content</code> (zero-copy chunks)</li>
 <li><code>end_request_body</code></li>
+<li><code>request_trailers</code> (H2/H3 only, when the client sends trailers)</li>
 <li><code>request_complete</code></li>
 </ol>
 <p>Without a body: <code>headers</code> → <code>request_complete</code>. Body callbacks have empty default implementations.</p>
+<p><code>aborted(&amp;mut dyn ServerWriter, &amp;io::Error)</code> fires at most once when the peer ends the stream abruptly or the connection goes away before the response is finished (<code>RST_STREAM</code> or <code>GOAWAY</code> on HTTP/2, a stream reset or <code>STOP_SENDING</code> on HTTP/3, a connection close on HTTP/1.1). It never fires after the response has completed. A handler that answers over time (a streaming body, server-sent events) uses it to stop its work; later writes go nowhere.</p>
 <div class="sourceCode" id="cb1"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>Headers<span class="op">,</span> ServerHandler<span class="op">,</span> ServerWriter<span class="op">};</span></span>
 <span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> Hello<span class="op">;</span></span>
@@ -228,7 +230,7 @@
 </tbody>
 </table>
 <p>Pseudo-headers on outbound responses use <code>Headers::status(u16)</code> (sets <code>:status</code>). Request inspection uses <code>:method</code>, <code>:path</code>, <code>:scheme</code>, <code>:authority</code>, plus ordinary fields.</p>
-<p><code>connection_info()</code> (Gumdrop <code>getRemoteAddress</code>/<code>getLocalAddress</code>/<code>isSecure</code>/<code>getSecurityInfo</code>) returns a <code>ConnectionInfo</code> snapshot — <code>remote_addr()</code>, <code>local_addr()</code>, <code>is_secure()</code>, and <code>security_info()</code> (ALPN, TLS protocol/cipher, SNI, and — for mTLS — the peer's certificate fingerprint and full DER certificate chain). Captured once per connection, so it's cheap to read from every callback; useful for access logging, per-client rate limiting, or gating on the mTLS fingerprint. Wired for H1 and H2 today; H3 (QUIC) returns the default (unknown/plaintext) until <code>hopf_quic::QuicConnApi</code> grows the equivalent accessors.</p>
+<p><code>connection_info()</code> returns a <code>ConnectionInfo</code> snapshot: <code>remote_addr()</code>, <code>local_addr()</code>, <code>is_secure()</code>, and <code>security_info()</code> (ALPN, TLS protocol/cipher, SNI, and, for mTLS, the peer's certificate fingerprint and full DER certificate chain). Captured once per connection, so it's cheap to read from every callback; useful for access logging, per-client rate limiting, or gating on the mTLS fingerprint. Wired for H1 and H2 today; H3 (QUIC) returns the default (unknown/plaintext) until <code>hopf_quic::QuicConnApi</code> grows the equivalent accessors.</p>
 <h2 id="deferred-responses">Deferred responses</h2>
 <p>When request handling needs blocking work (filesystem, mailbox, remote call), do <strong>not</strong> block the reactor. Take a <code>ServerResponseHandle</code>, pause the body if needed, submit to <code>StorageExecutor</code>, then hop back with <code>execute</code>:</p>
 <div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span>StorageExecutor<span class="op">;</span></span>
@@ -325,7 +327,7 @@ response.headers(h);</code></pre>
 <tr>
 <td><code>DigestAuthFactory</code></td>
 <td><code>CredentialStore</code> (HA1)</td>
-<td><code>DigestAuthConfig { realm }</code></td>
+<td><code>DigestAuthConfig::new(realm)</code>; SHA-256 only unless <code>allow_md5</code> is set</td>
 </tr>
 <tr>
 <td><code>BearerAuthFactory</code></td>
@@ -362,7 +364,7 @@ response.headers(h);</code></pre>
 <span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>    )</span>
 <span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_realm(<span class="st">&quot;api&quot;</span>)<span class="op">,</span></span>
 <span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>)<span class="op">;</span></span></code></pre></div>
-<p>Helpers: <code>parse_basic_authorization</code>, <code>build_digest_authorization</code>. Failed auth sends <code>401</code> with <code>WWW-Authenticate</code> and does not forward body events to the inner handler.</p>
+<p>Helpers: <code>parse_basic_authorization</code>, <code>build_digest_authorization</code>. Failed auth sends <code>401</code> with <code>WWW-Authenticate</code> and does not forward body events to the inner handler. On success the inner handler sees the authenticated username in the internal request header <code>x-hopf-authenticated-user</code> (<code>hopf_http::auth::AUTHENTICATED_USER</code>; <code>hopf-webdav</code> uses it for RFC 3744 access control). Any copy of that header supplied by the client is removed first, so a handler can trust it.</p>
 <h2 id="protocol-upgrades">Protocol upgrades</h2>
 <div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>Headers<span class="op">,</span> ProtocolUpgradeHandler<span class="op">,</span> ServerHandler<span class="op">,</span> ServerWriter<span class="op">};</span></span>
 <span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a></span>

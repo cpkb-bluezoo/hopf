@@ -77,7 +77,7 @@
     <main class="main">
       <header>
         <h1>Mailbox</h1>
-        <p class="lead">Crate <code>hopf-mailbox</code>: <strong>mailbox storage SPI</strong> (Gumdrop <code>org.bluezoo.gumdrop.mailbox</code> port) — Maildir++ and mbox backends with SEARCH, flags, and optional <code>.gidx</code> indexing. This is <strong>not</strong> an IMAP wire server; <a href="imap.html"><code>hopf-imap</code></a> sits on top of these traits.</p>
+        <p class="lead">Crate <code>hopf-mailbox</code>: <strong>mailbox storage SPI</strong>: Maildir++ and mbox backends with SEARCH, flags, and optional <code>.gidx</code> indexing. This is <strong>not</strong> an IMAP wire server; <a href="imap.html"><code>hopf-imap</code></a> sits on top of these traits.</p>
       </header>
       <p>SMTP local delivery is wired stock via <a href="smtp.html#local-delivery"><code>LocalDeliveryService</code></a>, which APPENDs each accepted message to the recipient's <code>INBOX</code> through this crate's <code>MailboxFactory</code> on the Runtime storage pool. POP3 and IMAP (<code>hopf-pop3</code>, <code>hopf-imap</code>) read from and write to mailboxes the same way, so all three protocols can share one backend in a single composed process — see <a href="composition.html">Composition</a>.</p>
 <div class="toc"><h2 id="contents">Contents</h2>
@@ -125,7 +125,7 @@
 </tr>
 <tr>
 <td><code>.gidx</code></td>
-<td>Gumdrop-compatible index: v1 headers, v2 body</td>
+<td>Binary message index (versions 1 to 4, below)</td>
 </tr>
 </tbody>
 </table>
@@ -261,7 +261,8 @@ MailboxFactory → MailboxStore → Mailbox
 </tr>
 </tbody>
 </table>
-<p>Consts: <code>INDEX_MAGIC</code>, <code>INDEX_VERSION_HEADERS = 1</code>, <code>INDEX_VERSION_BODY = 2</code>.</p>
+<p>Consts: <code>INDEX_MAGIC</code> (<code>GIDX</code>), <code>INDEX_VERSION_HEADERS = 1</code>, <code>INDEX_VERSION_BODY = 2</code>, <code>INDEX_VERSION_THREADING = 3</code>, <code>INDEX_VERSION_THREADING_BODY = 4</code>.</p>
+<p>Other public items: <code>AppendGuard</code> (streaming append with rollback on drop), <code>MailboxStatus</code>, <code>MessageReadCallback</code>, <code>MboxFlagsFile</code>, and the streaming search helpers <code>body_contains_streaming</code> / <code>StreamingSubstringMatcher</code>.</p>
 <h2 id="configuration">Configuration</h2>
 <h3 id="indexconfig"><code>IndexConfig</code></h3>
 <table>
@@ -289,32 +290,37 @@ MailboxFactory → MailboxStore → Mailbox
 </tbody>
 </table>
 <p><strong>Builders:</strong> <code>IndexConfig::headers_only()</code>, <code>IndexConfig::with_body_indexing()</code>.</p>
-<p>No Cargo features on this crate.</p>
+<p>Cargo features: only <code>integration</code>, which enables the tests that read and write real mailbox files.</p>
 <h2 id="mailbox-api">Mailbox API</h2>
 <p>Typical flow:</p>
-<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_mailbox::</span><span class="op">{</span>IndexConfig<span class="op">,</span> MaildirFactory<span class="op">,</span> SearchCriteria<span class="op">};</span></span>
+<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_mailbox::</span><span class="op">{</span>AppendGuard<span class="op">,</span> IndexConfig<span class="op">,</span> MailboxFactory<span class="op">,</span> MaildirFactory<span class="op">,</span> SearchCriteria<span class="op">};</span></span>
 <span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> factory <span class="op">=</span> <span class="pp">MaildirFactory::</span>new(<span class="st">&quot;/var/mail&quot;</span>)</span>
 <span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_index_config(<span class="pp">IndexConfig::</span>with_body_indexing())<span class="op">;</span></span>
 <span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> store <span class="op">=</span> factory<span class="op">.</span>create_store()<span class="op">;</span></span>
 <span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>store<span class="op">.</span>open(<span class="st">&quot;alice&quot;</span>)<span class="op">?;</span></span>
 <span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> mb <span class="op">=</span> store<span class="op">.</span>open_mailbox(<span class="st">&quot;INBOX&quot;</span><span class="op">,</span> <span class="cn">false</span>)<span class="op">?;</span> <span class="co">// read_only flag</span></span>
-<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>mb<span class="op">.</span>append_message(rfc822_bytes<span class="op">,</span> <span class="op">&amp;</span>flags<span class="op">,</span> <span class="cn">None</span>)<span class="op">?;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> append <span class="op">=</span> <span class="pp">AppendGuard::</span>start(mb<span class="op">.</span>as_mut()<span class="op">,</span> <span class="op">&amp;</span>flags<span class="op">,</span> <span class="cn">None</span>)<span class="op">?;</span> <span class="co">// flags: BTreeSet&lt;Flag&gt;</span>
+append<span class="op">.</span>append_content(rfc822_bytes)<span class="op">?;</span>               <span class="co">// call once per chunk</span>
+<span class="kw">let</span> uid <span class="op">=</span> append<span class="op">.</span>commit()<span class="op">?;</span>                       <span class="co">// dropping without commit rolls back</span></span>
 <span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> hits <span class="op">=</span> mb<span class="op">.</span>search(<span class="op">&amp;</span><span class="pp">SearchCriteria::</span>text(<span class="st">&quot;needle&quot;</span>))<span class="op">?;</span></span>
 <span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>mb<span class="op">.</span>close(<span class="cn">true</span>)<span class="op">?;</span> <span class="co">// expunge when true</span></span></code></pre></div>
-<p>Operations (trait surface): <code>close(expunge)</code>, counts/size, <code>messages</code>, <code>read_message</code>, UID / uidvalidity / uidnext, flags / keywords, set/replace flags, append stream, <code>search</code>, <code>copy</code> / <code>move</code> (Maildir).</p>
+<p>Operations (trait surface): <code>close(expunge)</code>, counts/size, <code>messages</code>, <code>read_message</code>, UID / uidvalidity / uidnext, flags / keywords, set/replace flags, streaming append (<code>start_append</code> / <code>append_content</code> / <code>end_append</code> / <code>abort_append</code>, or <code>AppendGuard</code>), <code>search</code>, <code>with_message_context</code> (SORT/THREAD keys), <code>refresh</code>, <code>copy_messages</code> / <code>move_messages</code> (Maildir). Maildir's <code>refresh</code> picks up other writers' changes without discarding the session's own pending flag changes.</p>
 <p><strong>Streaming reads:</strong> <code>read_message</code> is a default method built on a lower-level <code>start_read</code> / <code>read_chunk</code> / <code>end_read</code> triad — callers that don't want a whole message pulled into memory (POP3 RETR/TOP, IMAP FETCH) can drive the triad directly and process fixed-size chunks as they arrive. <code>append_content</code> is likewise chunk-fed rather than taking one whole buffer, so SMTP delivery and IMAP APPEND can stream message bytes straight through to storage. Maildir implements both ends as true streaming (bounded memory regardless of message size); mbox's <code>start_read</code> materializes the one requested message (not the whole mailbox) because its <code>&gt;From</code>-line unescaping is stateful and unsafe to chunk naively — see <a href="#limitations">Limitations</a>.</p>
 <h2 id="search">SEARCH</h2>
 <p>Criteria include: ALL, system flags, NEW/OLD, KEYWORD, LARGER/SMALLER, BEFORE/ON/SINCE, SENT*, HEADER, BODY, TEXT, UID / sequence sets, MODSEQ, AND / OR / NOT.</p>
 <p><strong>BODY / TEXT:</strong> use the <code>.gidx</code> body index when <code>body_indexing</code> is enabled; otherwise parse message content on demand.</p>
-<p><strong>HEADER:</strong> six fields (From/Sender/To/Cc/Bcc/Subject/Message-ID) resolve straight from the index; any other header name falls back to a raw per-message header scan (<code>search::HeaderExtractor</code>) rather than reporting empty.</p>
+<p><strong>HEADER:</strong> From (and Sender), To, Cc, Bcc, Subject, Message-ID, References and In-Reply-To resolve straight from the index (address fields keep display names as well as addresses, so a search for a person's name matches; entries indexed before this change hold addresses only until re-indexed); any other header name falls back to a raw per-message header scan (<code>search::HeaderExtractor</code>) rather than reporting empty.</p>
 <p><strong>MODSEQ:</strong> matches against the real, persisted per-message mod-sequence described under Backends compared above.</p>
 <h2 id="indexing">Indexing</h2>
-<p><code>.gidx</code> is Gumdrop-compatible:</p>
+<p><code>.gidx</code> is big-endian; its layout (like the <code>.uidlist</code> and <code>.keywords</code> files, whose header lines read <code># gumdrop-uidlist</code> / <code># gumdrop-keywords</code>) is a format shared with the sibling Gumdrop project for interoperability, so both can open the same mail store.</p>
 <ul>
-<li>Version <strong>1</strong> — headers</li>
-<li>Version <strong>2</strong> — body (when enabled)</li>
+<li>Version <strong>1</strong> - headers (read-only; older layout)</li>
+<li>Version <strong>2</strong> - headers + body (read-only; older layout)</li>
+<li>Version <strong>3</strong> - headers + <code>References</code> / <code>In-Reply-To</code> (for THREAD REFERENCES)</li>
+<li>Version <strong>4</strong> - version 3 + body (when enabled)</li>
 </ul>
+<p>An index in an older layout is rewritten as version 3 or 4 the next time anything in it changes.</p>
 <p>Body indexing is <strong>off by default</strong> (disk cost). Enable with <code>IndexConfig::with_body_indexing()</code>.</p>
 <p><code>IndexBuilder::build_streaming</code> feeds any <code>Read</code> to <code>rmimeparser</code>'s incremental <code>MessageParser</code> in fixed-size chunks (carrying a small buffer for lines split across chunk boundaries) rather than reading the whole message into a <code>Vec&lt;u8&gt;</code> first; <code>build</code> (whole-slice) is a thin wrapper over it. Maildir's mailbox-open indexing loop uses <code>build_streaming</code> directly against an open <code>File</code>.</p>
 <h2 id="storage-pool-helpers">Storage pool helpers</h2>
@@ -337,13 +343,15 @@ MailboxFactory → MailboxStore → Mailbox
 <span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> store <span class="op">=</span> factory<span class="op">.</span>create_store()<span class="op">;</span></span>
 <span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    store<span class="op">.</span>open(<span class="st">&quot;alice&quot;</span>)<span class="op">?;</span></span>
 <span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> mb <span class="op">=</span> store<span class="op">.</span>open_mailbox(<span class="st">&quot;INBOX&quot;</span><span class="op">,</span> <span class="cn">false</span>)<span class="op">?;</span></span>
-<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    mb<span class="op">.</span>append_message(<span class="op">&amp;</span>bytes<span class="op">,</span> <span class="op">&amp;</span>flags<span class="op">,</span> <span class="cn">None</span>)<span class="op">?;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> append <span class="op">=</span> <span class="pp">AppendGuard::</span>start(mb<span class="op">.</span>as_mut()<span class="op">,</span> <span class="op">&amp;</span>flags<span class="op">,</span> <span class="cn">None</span>)<span class="op">?;</span>
+    append<span class="op">.</span>append_content(<span class="op">&amp;</span>bytes)<span class="op">?;</span>
+    append<span class="op">.</span>commit()<span class="op">?;</span></span>
 <span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    mb<span class="op">.</span>close(<span class="cn">false</span>)<span class="op">?;</span></span>
 <span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Ok</span>(())</span>
 <span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="op">},</span> <span class="op">|</span>result<span class="op">|</span> <span class="op">{</span> <span class="co">/* reply 250/550 via ConnHandle */</span> <span class="op">}</span>)<span class="op">;</span></span></code></pre></div>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li><strong>Not an IMAP server</strong> — storage SPI only; <a href="imap.html"><code>hopf-imap</code></a> provides the wire server (use <a href="smtp.html#local-delivery"><code>LocalDeliveryService</code></a> for SMTP → INBOX).</li>
+<li><strong>Not an IMAP server</strong>: storage SPI only; <a href="imap.html"><code>hopf-imap</code></a> provides the wire server (use <a href="smtp.html#local-delivery"><code>LocalDeliveryService</code></a> for SMTP → INBOX).</li>
 <li>mbox: no hierarchy / COPY / MOVE. <code>start_read</code> streams in fixed-size chunks but still materializes the one target message up front (not the whole mailbox) — safe re-chunking of the stateful <code>&gt;From</code>-line unescaping across arbitrary chunk boundaries isn't implemented; <code>open()</code>'s full-mailbox scan and append internals are unchanged.</li>
 <li>Body indexing off by default.</li>
 <li>Must keep search/index off the reactor (use <code>StorageExecutor</code>).</li>

@@ -106,7 +106,7 @@
 <tbody>
 <tr>
 <td>Base protocol</td>
-<td>IMAP4rev2 (<a href="https://www.rfc-editor.org/rfc/rfc9051">RFC 9051</a>): LOGIN, AUTHENTICATE PLAIN, SELECT/EXAMINE, LIST/LSUB, STATUS, CREATE/DELETE/RENAME, SUBSCRIBE, APPEND, FETCH/UID FETCH, SEARCH/UID SEARCH, STORE, COPY, EXPUNGE, CLOSE, NOOP, LOGOUT</td>
+<td>IMAP4rev2 (<a href="https://www.rfc-editor.org/rfc/rfc9051">RFC 9051</a>): LOGIN, AUTHENTICATE, SELECT/EXAMINE, LIST/LSUB, STATUS, CREATE/DELETE/RENAME, SUBSCRIBE, APPEND, FETCH/UID FETCH, SEARCH/UID SEARCH, STORE, COPY, EXPUNGE, CLOSE, NOOP, LOGOUT</td>
 </tr>
 <tr>
 <td>FETCH data items</td>
@@ -158,7 +158,7 @@
 </tr>
 <tr>
 <td>Auth</td>
-<td><code>CredentialStore</code> — LOGIN and AUTHENTICATE (all 5 <a href="auth.html">hopf-auth</a> SASL mechanisms: PLAIN, LOGIN, SCRAM-SHA-256, OAUTHBEARER, EXTERNAL — SASL-IR, capability advertisement via <code>store.supported_mechanisms()</code> filtered by TLS requirement); <code>LOGINDISABLED</code> before STARTTLS</td>
+<td><code>CredentialStore</code>: LOGIN and AUTHENTICATE with the <a href="auth.html">hopf-auth</a> SASL mechanisms the store supports (default PLAIN, LOGIN, SCRAM-SHA-256, OAUTHBEARER, XOAUTH2, EXTERNAL), SASL-IR, advertisement via <code>store.supported_mechanisms()</code> filtered by TLS requirement; EXTERNAL uses the SHA-256 fingerprint of the mTLS client certificate; <code>LOGINDISABLED</code> before STARTTLS; optional <code>PREAUTH</code> greeting (<code>with_preauth</code>)</td>
 </tr>
 <tr>
 <td>TLS</td>
@@ -170,9 +170,9 @@
 </tr>
 </tbody>
 </table>
-<p>Commands are lexed incrementally with the shared push-parser style (tag / verb / arguments / literals) — synchronizing literals emit <code>+</code> continuations, and <code>LITERAL-</code> non-synchronizing literals are accepted. The APPEND message literal is never buffered whole: the codec emits it as a series of chunk events as wire bytes arrive, and the control layer streams each chunk straight to a bounded temp file, which is then streamed into the mailbox on <code>proceed</code> and removed — memory use stays flat regardless of message size.</p>
+<p>Commands are read by <code>ImapServerLexer</code>, an incremental tokeniser over the connection's inbound ring buffer (<code>hopf_core::LoopBuf</code>). It reads the tag, then the verb, then each argument as a typed token (atom, quoted string, literal, parenthesis) the moment it is complete; the line is never accumulated as text and searched again. Every verb has a grammar machine that is fed the tokens as they arrive, refuses the command at the first token that cannot be right, and yields a typed request at the end of the line; a verb with no grammar is refused as soon as it is read. A literal is one token wherever a string may stand, so its contents can never change how the rest of the line is read; the grammar is asked before a synchronizing literal is accepted, so an unacceptable one is refused before the <code>+</code> continuation (a non-synchronizing <code>LITERAL-</code> literal sent after a refused command is skipped). Limits: command line 8192 bytes (<code>max_line</code>), literal 32 MiB, <code>LITERAL-</code> 4096 bytes. Pipelined commands run in order. The APPEND message literal is never buffered whole: it arrives as a series of chunk events, each APPEND gets its own bounded spool file, which is streamed into the mailbox on <code>proceed</code> and removed, so memory use stays flat regardless of message size.</p>
 <h2 id="handler-spi">Handler SPI</h2>
-<p>Gumdrop-style staged traits:</p>
+<p>Staged traits:</p>
 <ul>
 <li><code>ClientConnected</code> → greeting (<code>ImapConnectionMetadata</code>, including optional <code>traceparent</code>)</li>
 <li><code>NotAuthenticatedHandler</code> → LOGIN / AUTHENTICATE policy (<code>proceed</code> opens the store)</li>
@@ -193,10 +193,10 @@ let store = Arc::new(PasswordStore::new().with_user(&quot;alice&quot;, &quot;sec
 let config = ImapConfig::new(&quot;127.0.0.1:1143&quot;.parse()?, &quot;localhost&quot;, store, factory);
 let svc = ImapService::new(config, Arc::clone(&amp;rt));
 svc.start()?;</code></pre>
-<p><code>ImapConfig</code> knobs: <code>with_tls(acceptor)</code> (+ <code>implicit_tls()</code> for IMAPS), <code>with_greeting</code>, <code>with_quota_manager</code>, <code>with_server_id</code>, and per-extension <code>enable_*</code> flags (<code>idle</code>, <code>namespace</code>, <code>quota</code>, <code>move</code>, <code>condstore</code>, <code>qresync</code>, <code>enable</code>, <code>compress</code>, <code>utf8_accept</code>, <code>sort</code>, <code>thread_ordered_subject</code>, <code>thread_references</code>, <code>status_size</code>, <code>objectid</code>, <code>metadata</code>, <code>notify</code>) — all default to enabled.</p>
+<p><code>ImapConfig</code> knobs: <code>with_tls(acceptor)</code> (+ <code>implicit_tls()</code> for IMAPS), <code>with_greeting</code>, <code>with_preauth</code>, <code>with_quota_manager</code>, <code>with_server_id</code>, <code>max_line</code> (default 8192), <code>idle_max_duration</code> (default 29 minutes), <code>other_users_namespaces</code> / <code>shared_namespaces</code>, and per-extension <code>enable_*</code> flags (<code>idle</code>, <code>namespace</code>, <code>quota</code>, <code>move</code>, <code>condstore</code>, <code>qresync</code>, <code>enable</code>, <code>compress</code>, <code>utf8_accept</code>, <code>sort</code>, <code>thread_ordered_subject</code>, <code>thread_references</code>, <code>status_size</code>, <code>objectid</code>, <code>metadata</code>, <code>notify</code>); all default to enabled.</p>
 <p>Example binary: <code>cargo run -p imap -- 127.0.0.1:1143 localhost ./mail</code>.</p>
 <h2 id="client">Client</h2>
-<p>The high-level <code>ImapFetch</code> auto-pilot drives greeting → CAPABILITY → (STARTTLS → CAPABILITY) → LOGIN / AUTHENTICATE PLAIN → SELECT → FETCH → LOGOUT. <code>ImapIdle</code> drives the same preamble then IDLE, delivering unsolicited EXISTS/EXPUNGE/FLAGS through a <code>MailboxEventListener</code> until <code>DONE</code>.</p>
+<p>The high-level <code>ImapFetch</code> auto-pilot drives greeting → CAPABILITY → (STARTTLS → CAPABILITY) → LOGIN / AUTHENTICATE PLAIN (initial response sent only when the server advertises SASL-IR) → SELECT → FETCH → LOGOUT. Server responses are read with an incremental tokeniser; ENVELOPE, BODYSTRUCTURE, response codes and LIST / STATUS / SEARCH data are built token by token. <code>ImapIdle</code> drives the same preamble then IDLE, delivering unsolicited EXISTS/EXPUNGE/FLAGS through a <code>MailboxEventListener</code> until <code>DONE</code>.</p>
 <pre class="rust,ignore"><code>use std::sync::Arc;
 use hopf_core::{Runtime, RuntimeConfig};
 use hopf_imap::{ImapClient, ImapFetch};
@@ -271,18 +271,23 @@ conn_handle.poke();</code></pre>
 </tr>
 <tr>
 <td><code>.timeouts(ImapClientTimeouts)</code></td>
-<td>dns=5s, connect=30s, stage=60s, msg=600s</td>
+<td>dns=5s, connect=30s, stage=60s, message=600s</td>
 <td>Per-phase deadlines</td>
 </tr>
 <tr>
 <td><code>.max_pipeline(n)</code></td>
-<td>8</td>
+<td>16</td>
 <td>Cap outstanding tagged commands</td>
 </tr>
 <tr>
 <td><code>ImapFetch::credentials(user, pass)</code></td>
 <td>—</td>
 <td>LOGIN or AUTHENTICATE PLAIN</td>
+</tr>
+<tr>
+<td><code>.prefer_auth_plain(bool)</code></td>
+<td>true</td>
+<td>Use AUTHENTICATE PLAIN when advertised, else LOGIN</td>
 </tr>
 <tr>
 <td><code>.mailbox(name)</code></td>
@@ -348,12 +353,12 @@ conn_handle.poke();</code></pre>
 <div class="sourceCode" id="cb3"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test <span class="at">-p</span> hopf-imap <span class="at">--features</span> integration</span></code></pre></div>
 <p>They cover raw-socket LOGIN/SELECT/FETCH/APPEND, pipelined STATUS+LIST (in-order against the Hopf server and synthetic out-of-order against a scripted server), STARTTLS and implicit-TLS fetch, hostname dial, and IDLE (server DONE handling plus client EXISTS→DONE).</p>
 <h2 id="metrics">Metrics</h2>
-<p>Process-local <code>ImapServerMetrics</code> (in <code>hopf-imap</code>): connections, <code>auth_ok</code> / <code>auth_fail</code>, commands, and <code>starttls</code> via <code>ImapService::metrics()</code>.</p>
-<p>OTLP/JSONL export (when <code>ImapService::with_telemetry(&amp;pipeline)</code> is used): <code>hopf_otel::ImapServerMetrics</code> emits <code>imap.server.connections</code>, <code>imap.server.active_connections</code>, <code>imap.server.auth</code>, <code>imap.server.starttls</code>, <code>imap.server.commands</code> (verb/outcome), and <code>imap.server.command.duration</code> (ms).</p>
+<p>Process-local <code>ImapServerMetrics</code> (in <code>hopf-imap</code>): connections, <code>auth_ok</code> / <code>auth_fail</code>, commands, <code>starttls</code> and <code>compress</code> via <code>ImapService::metrics()</code>.</p>
+<p>OTLP/JSONL export (when <code>ImapService::with_telemetry(&amp;pipeline)</code> is used): <code>hopf_otel::ImapServerMetrics</code> emits <code>imap.server.connections</code>, <code>imap.server.active_connections</code>, <code>imap.server.auth</code>, <code>imap.server.starttls</code>, <code>imap.server.compress</code>, <code>imap.server.commands</code> (verb/outcome), and <code>imap.server.command.duration</code> (ms).</p>
 <p>With traces enabled on the pipeline, <code>ImapConnectionMetadata::traceparent</code> carries the active W3C <code>traceparent</code> for the connection or current tagged command. Handler SPI implementers can pass it to outbound HTTP with <code>hopf_otel::with_traceparent</code>.</p>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li>The <code>ImapFetch</code>/<code>ImapIdle</code> auto-pilots only drive AUTHENTICATE PLAIN themselves (same scope limit as hopf-pop3's auto-pilot) — a custom driver is needed to exercise SCRAM-SHA-256/OAUTHBEARER/EXTERNAL from the client side, though the underlying <code>authenticate(mechanism, initial)</code> + <code>ImapClientAuthExchange</code> API is mechanism-agnostic. EXTERNAL isn't reachable end-to-end yet on either side: the TLS layer doesn't plumb a peer certificate through to <code>SaslServerOptions</code>.</li>
+<li>The <code>ImapFetch</code>/<code>ImapIdle</code> auto-pilots only drive AUTHENTICATE PLAIN themselves (same scope limit as hopf-pop3's auto-pilot); a custom driver is needed to exercise SCRAM-SHA-256/OAUTHBEARER/EXTERNAL from the client side, though the underlying <code>authenticate(mechanism, initial)</code> + <code>ImapClientAuthExchange</code> API is mechanism-agnostic.</li>
 <li>QRESYNC does not fabricate <code>VANISHED (EARLIER)</code> history; clients fall back to full resync.</li>
 <li>mbox backend: no hierarchy / COPY / MOVE (see <a href="mailbox.html">Mailbox</a>); IDLE <code>refresh</code> is a no-op for mbox (Maildir rescans <code>new/</code>/<code>cur/</code> each poll).</li>
 <li>BODYSTRUCTURE body size/line counts reflect <code>rmimeparser</code>'s decoded body bytes; for <code>base64</code>/<code>quoted-printable</code>-encoded parts this differs from the RFC-mandated wire-encoded octet count (<code>7bit</code>/<code>8bit</code>/<code>binary</code> parts, including <code>message/rfc822</code>, are unaffected since decoded and wire bytes are identical there).</li>

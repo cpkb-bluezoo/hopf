@@ -77,7 +77,7 @@
     <main class="main">
       <header>
         <h1>LDAP</h1>
-        <p class="lead">Crate <code>hopf-ldap</code>: async <strong>LDAPv3 client</strong> (RFC&nbsp;4511) and <code>LdapCredentialStore</code> — Gumdrop <code>ldap</code> / <code>LDAPRealm</code> port. BER wire codec lives in <code>hopf_ldap::asn1</code>; the store implements <a href="auth.html"><code>CredentialStore</code></a> without putting LDAP types into <code>hopf-auth</code>.</p>
+        <p class="lead">Crate <code>hopf-ldap</code>: async <strong>LDAPv3 client</strong> (RFC&nbsp;4511) and <code>LdapCredentialStore</code>, a search-then-bind credential store. The BER wire codec is <code>hopf_core::asn1</code> (its types are re-exported from <code>hopf_ldap</code>); the store implements <a href="auth.html"><code>CredentialStore</code></a> without putting LDAP types into <code>hopf-auth</code>.</p>
       </header>
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
@@ -120,10 +120,10 @@ hopf-ldap::LdapClient  →  ProtocolHandler on Runtime
         ▼
 hopf-ldap::asn1 (BER)
 </code></pre>
-<p><code>CredentialStore</code> stays protocol-agnostic (same as Gumdrop <code>Realm</code>). LDAP lives only in <code>hopf-ldap</code>; system PAM is optional feature <code>pam</code> on <code>hopf-auth</code>.</p>
+<p><code>CredentialStore</code> stays protocol-agnostic. LDAP lives only in <code>hopf-ldap</code>; system PAM is optional feature <code>pam</code> on <code>hopf-auth</code>.</p>
 
 <h2 id="ber">BER codec</h2>
-<p>Module <code>hopf_ldap::asn1</code> ports Gumdrop’s definite-length BER stack: <code>BerEncoder</code>, <code>BerDecoder</code> (streaming <code>receive</code> / <code>next</code>), <code>Asn1Element</code>, tag helpers. Indefinite length is rejected. This is LDAP-oriented BER, not full DER/CER.</p>
+<p>Module <code>hopf_core::asn1</code> (shared with X.509 and PKCS#8 parsing; <code>BerEncoder</code>, <code>BerDecoder</code>, <code>Asn1Element</code>, <code>Asn1Type</code> and <code>Asn1Error</code> are re-exported from <code>hopf_ldap</code>) is a definite-length BER codec: <code>BerDecoder</code> is fed bytes incrementally (<code>push</code> into a <code>BerEventSink</code>, or <code>receive</code>) and keeps any partial element until the rest arrives. Indefinite length is rejected. This is LDAP-oriented BER, not full DER/CER.</p>
 
 <h2 id="client">Client</h2>
 <p><code>LdapClient</code> dials via <code>Runtime::connect</code> / <code>TcpConnectorConfig</code>. On ready it delivers an <code>LdapSession</code>:</p>
@@ -175,7 +175,7 @@ session.sync(
 </ul>
 
 <h2 id="store">LdapCredentialStore</h2>
-<p>Search-then-bind (Gumdrop <code>LDAPRealm.passwordMatch</code>):</p>
+<p>Search-then-bind:</p>
 <ol>
 <li>Service bind (<code>bind_dn</code> / <code>bind_password</code>) or anonymous</li>
 <li>Search <code>base_dn</code> with <code>user_filter</code> (<code>{0}</code> = RFC 4515–escaped username)</li>
@@ -212,7 +212,7 @@ session.sync(
 <ul>
 <li>No modify/add/delete/compare admin API (deferred)</li>
 <li>No SASL bind to the directory server (store uses simple bind only)</li>
-<li>No role / <code>memberOf</code> API — Gumdrop used that for servlet + FTP/mail admin; Hopf has no consumers yet (quota uses a separate lookup callback if needed)</li>
+<li>No role / <code>memberOf</code> API; nothing in Hopf consumes one yet (quota uses a separate lookup callback if needed)</li>
 <li>Hostname dial uses blocking <code>ToSocketAddrs</code>; prefer a resolved <code>SocketAddr</code> when possible</li>
 <li>Referral chase does not rewrite service credentials per URL; same bind DN/password is reused</li>
 </ul>

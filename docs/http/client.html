@@ -126,6 +126,7 @@
 <li><code>response_trailers</code> (H2/H3; default ignore — used by gRPC)</li>
 <li><code>response_complete</code></li>
 </ol>
+<p>Interim 1xx responses arrive through <code>informational_response</code>; a <code>101</code> goes to <code>switching_protocols</code> instead and ends HTTP framing for that request. <code>request_failed</code> fires if the connection fails or closes first; at most one of <code>response_complete</code> and <code>request_failed</code> fires per request.</p>
 <div class="sourceCode" id="cb1"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>ClientHandler<span class="op">,</span> ClientWriter<span class="op">,</span> Headers<span class="op">};</span></span>
 <span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> GetOnce <span class="op">{</span></span>
@@ -191,11 +192,41 @@
 <td><code>complete_request()</code></td>
 <td>Finish the request (flushes headers if no body was started)</td>
 </tr>
+<tr>
+<td><code>upgrade(handler)</code></td>
+<td>Install a <code>ProtocolUpgradeHandler</code> from <code>switching_protocols</code> (101 on H1, 2xx Extended CONNECT on H2/H3)</td>
+</tr>
+<tr>
+<td><code>version()</code></td>
+<td>Negotiated <code>HttpVersion</code> of this stream</td>
+</tr>
+<tr>
+<td><code>conn_handle()</code> / <code>request_handle()</code></td>
+<td>Wake the connection, or keep a <code>ClientRequestHandle</code> to write more of the body later from any thread (H2/H3)</td>
+</tr>
+<tr>
+<td><code>cancel()</code></td>
+<td>Abandon the request (<code>RST_STREAM(CANCEL)</code> on H2, stream reset on H3)</td>
+</tr>
 </tbody>
 </table>
 <p>For distributed tracing, wrap writers with <code>hopf_otel::with_traceparent</code> / <code>PropagatingClientWriter</code> when using <code>hopf-otel</code>.</p>
 <h2 id="httpclient-session-api">HttpClient session API</h2>
-<p>A second, higher-level client face (Gumdrop <code>HTTPClient</code>): <code>HttpClient</code> (builder + <code>connect</code>), <code>HttpConnectionHandler</code> (connection lifecycle), <code>HttpClientSessionHandle</code> (request factory: <code>get</code>/<code>post</code>/<code>put</code>/…), and <code>HttpRequest</code> (headers, deferred body). Version (H1/H1.1-negotiated-H2/H2-prior-knowledge) is transparent to application code.</p>
+<p>A second, higher-level client face, the dial-side counterpart of <a href="server.html#httpserver-facade"><code>HttpServer</code></a>: <code>HttpClient</code> (builder + <code>connect</code> / <code>fetch</code>), <code>HttpConnectionHandler</code> (connection lifecycle: <code>on_security_established</code>, <code>on_connected</code>, <code>on_disconnected</code>, <code>on_error</code>), <code>HttpClientSessionHandle</code> (request factory: <code>get</code>/<code>post</code>/<code>put</code>/<code>delete</code>/<code>head</code>/<code>options</code>/<code>patch</code>/<code>method</code>), and <code>HttpRequest</code> (headers, deferred body). The negotiated version (HTTP/1.1, HTTP/2 via ALPN or prior knowledge, HTTP/3 when configured) is transparent to application code; <code>HttpClientSessionHandle::version()</code> reports it.</p>
+<table>
+<colgroup><col style="width: 45%" /><col style="width: 54%" /></colgroup>
+<thead><tr><th>Builder method</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><code>new(host, port)</code> / <code>from_addr(addr)</code> / <code>from_unix_path(path)</code></td><td>Dial by name (resolved, every address tried), by socket address, or over a UNIX domain socket</td></tr>
+<tr><td><code>tls(connector, server_name)</code></td><td>TLS with ALPN <code>h2</code> / <code>http/1.1</code></td></tr>
+<tr><td><code>h2_prior_knowledge(bool)</code></td><td>Cleartext HTTP/2 without Upgrade</td></tr>
+<tr><td><code>limits(HttpLimits)</code> / <code>timeouts(HttpClientTimeouts)</code> / <code>resolver(Arc&lt;DnsResolver&gt;)</code></td><td>Limits, per-phase timeouts, shared resolver</td></tr>
+<tr><td><code>follow_redirects(RedirectPolicy)</code></td><td>Make <code>fetch</code> follow 301/302/303/307/308 up to <code>RedirectPolicy::new(max_redirects)</code> hops (relative <code>Location</code> values resolved per RFC 3986). Off by default; never affects <code>connect</code>.</td></tr>
+<tr><td><code>content_encoding</code> / <code>disable_content_encoding</code> / <code>coding_cache</code></td><td>See <a href="#content-encoding">Content-Encoding</a></td></tr>
+<tr><td><code>quic_client_config</code> / <code>disable_h3</code> / <code>h3_prior_knowledge</code> / <code>alt_svc_cache</code></td><td>HTTP/3 (feature <code>h3</code>); see <a href="#http3-negotiation">HTTP/3 negotiation</a></td></tr>
+</tbody>
+</table>
+<p><code>fetch(rt, method, path, headers, body, handler)</code> is the one-request shortcut: it connects, sends the request (the body, if any, is sent in one piece so it can be replayed on a 307/308) and delivers the response to an <code>HttpResponseHandler</code>. Use <code>connect</code> for streamed bodies or several requests on one connection.</p>
 <pre><code>use std::sync::Arc;
 use hopf_core::{Runtime, RuntimeConfig};
 use hopf_http::{HttpClient, HttpClientSessionHandle, HttpConnectionHandler, HttpResponseHandler};
@@ -256,7 +287,7 @@ conn_handle.poke();</code></pre>
 <p><code>ConnHandle::poke()</code> is the same primitive storage-offload completion callbacks already use to make a paused connection re-check its own state (<code>Endpoint::poke_handler</code>) — it re-invokes this connection's <code>receive</code> path with no new bytes, which is exactly where both the H1 and H2 session codecs already flush anything queued.</p>
 <h3 id="connection-and-request-failure">Connection and request failure</h3>
 <p><code>HttpConnectionHandler::on_error</code> fires for DNS failure, refused/reset connect, or a TLS handshake failure — anything that happens before <code>on_connected</code> could ever run. Once a request is in flight, its own <code>HttpResponseHandler::failed</code> fires instead (mid-connection resets/disconnects route through whichever of the two is still waiting to hear about it — never both, and never neither).</p>
-<p><code>HttpConnectionHandler::on_security_established</code> (Gumdrop <code>onSecurityEstablished</code>) fires once, right before <code>on_connected</code>, on TLS dials only — a plaintext <code>HttpClient</code> never calls it. Use it to inspect the negotiated <code>hopf_core::SecurityInfo</code> (ALPN, protocol version, cipher suite, and the server's certificate chain via <code>peer_certificate_chain()</code>) before the first request goes out; the default implementation is a no-op.</p>
+<p><code>HttpConnectionHandler::on_security_established</code> fires once, right before <code>on_connected</code>, on TLS dials only; a plaintext <code>HttpClient</code> never calls it. Use it to inspect the negotiated <code>hopf_core::SecurityInfo</code> (ALPN, protocol version, cipher suite, and the server's certificate chain via <code>peer_certificate_chain()</code>) before the first request goes out; the default implementation is a no-op.</p>
 <h3 id="httpclienttimeouts">HttpClientTimeouts</h3>
 <table>
 <colgroup><col style="width: 20%" /><col style="width: 20%" /><col style="width: 59%" /></colgroup>
@@ -265,8 +296,11 @@ conn_handle.poke();</code></pre>
 <tr><td><code>dns</code></td><td>5s</td><td>Hostname resolution, via the resolver's own query timeout — only when <code>HttpClient</code> created the resolver itself (not when the caller supplied one via <code>.resolver(...)</code>, which may be shared elsewhere)</td></tr>
 <tr><td><code>connect</code></td><td>30s</td><td>TCP connect handshake</td></tr>
 <tr><td><code>stage</code></td><td>60s</td><td>Budget for one request/response round trip once bytes are on the wire — renewed on outbound and inbound progress alike, so an actively-streaming request or response doesn't spuriously time out; a genuinely stalled peer fails the request via <code>HttpResponseHandler::failed</code> with <code>TimedOut</code>. <code>Duration::ZERO</code> disables it.</td></tr>
+<tr><td><code>attempt_delay</code></td><td>250 ms</td><td>When a name resolves to several addresses, how long one connection attempt may run before the next address is tried alongside it (RFC 8305 §5). A failed attempt starts the next at once.</td></tr>
 </tbody>
 </table>
+<h3 id="http3-negotiation">HTTP/3 negotiation</h3>
+<p>With feature <code>h3</code>, giving <code>HttpClient</code> a QUIC config (<code>quic_client_config</code>) makes <code>connect</code> choose the transport itself: a DNS HTTPS record (RFC 9460) advertising <code>h3</code> first, then an <code>Alt-Svc</code> entry cached from an earlier connection to the origin, then a TCP dial with ALPN <code>h2</code> / <code>http/1.1</code>. On that TCP connection the client watches for a fresh <code>Alt-Svc</code> header and moves later requests to HTTP/3 once the connection is idle. <code>disable_h3(true)</code> caps the client at h2/h1.1; <code>h3_prior_knowledge(true)</code> dials HTTP/3 directly with no fallback. HTTP/3 always uses TLS 1.3 inside QUIC; call <code>tls</code> as well if the TCP fallback should be secure. Redirect hops after the first always dial over TCP. The lower-level equivalents for the <code>ClientHandler</code> SPI are <code>connect_h3_by_name</code> and <code>connect_auto</code> (with an <code>HttpFallback</code> of <code>Tls</code>, <code>PlaintextH2c</code> or <code>PlaintextH1</code>).</p>
 <h2 id="content-encoding">Content-Encoding (br, gzip, deflate)</h2>
 <p><code>HttpClient</code> applies content coding <strong>by default</strong> on every request made through <code>connect</code> or <code>fetch</code>, on HTTP/1.1, HTTP/2 and HTTP/3. Turn it off with <code>HttpClient::disable_content_encoding()</code>, or tune it by passing a <code>ContentEncodingPolicy</code> to <code>HttpClient::content_encoding</code>, <code>HttpClientSessionHandle::content_encoding</code> or <code>HttpRequest::content_encoding</code>. The low-level <code>ClientHandler</code> SPI is unaffected and always sees the wire bytes.</p>
 <h3 id="ce-responses">Responses: always ask, always decode</h3>
@@ -290,46 +324,21 @@ conn_handle.poke();</code></pre>
 <p>Listen and dial are peers: the same Stream SPI runs under a <code>TcpConnectorConfig</code> factory or H3 <code>connect_h3</code>. Prefer <code>connect_http</code> when the peer is a hostname (async DNS + connect timeouts).</p>
 <h3 id="connect_http-hostname">connect_http (hostname or literal)</h3>
 <div class="sourceCode" id="cb2a"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2a-1"><a href="#cb2a-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
-<span id="cb2a-2"><a href="#cb2a-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>ClientHandlerFactory<span class="op">,</span> HttpLimits<span class="op">};</span></span>
-<span id="cb2a-3"><a href="#cb2a-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::client::</span><span class="op">{</span>connect_http<span class="op">,</span> HttpClientTimeouts<span class="op">};</span></span>
-<span id="cb2a-4"><a href="#cb2a-4" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb2a-5"><a href="#cb2a-5" aria-hidden="true" tabindex="-1"></a>connect_http(</span>
-<span id="cb2a-6"><a href="#cb2a-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">&amp;</span>rt<span class="op">,</span>                          <span class="co">// &amp;Arc&lt;Runtime&gt;</span></span>
-<span id="cb2a-7"><a href="#cb2a-7" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;example.com&quot;</span><span class="op">,</span>                 <span class="co">// hostname or IP / SocketAddr string</span></span>
-<span id="cb2a-8"><a href="#cb2a-8" aria-hidden="true" tabindex="-1"></a>    <span class="dv">80</span><span class="op">,</span></span>
-<span id="cb2a-9"><a href="#cb2a-9" aria-hidden="true" tabindex="-1"></a>    <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>factory)<span class="op">,</span></span>
-<span id="cb2a-10"><a href="#cb2a-10" aria-hidden="true" tabindex="-1"></a>    <span class="pp">HttpLimits::</span><span class="kw">default</span>()<span class="op">,</span></span>
-<span id="cb2a-11"><a href="#cb2a-11" aria-hidden="true" tabindex="-1"></a>    <span class="cn">false</span><span class="op">,</span>                         <span class="co">// true → H2 prior-knowledge</span></span>
-<span id="cb2a-12"><a href="#cb2a-12" aria-hidden="true" tabindex="-1"></a>    <span class="pp">HttpClientTimeouts::</span><span class="kw">default</span>()<span class="op">,</span> <span class="co">// dns / connect / stage</span></span>
-<span id="cb2a-13"><a href="#cb2a-13" aria-hidden="true" tabindex="-1"></a>    <span class="cn">None</span><span class="op">,</span>                          <span class="co">// optional DnsResolver</span></span>
-<span id="cb2a-14"><a href="#cb2a-14" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span></code></pre></div>
-<table>
-<thead>
-<tr>
-<th>Timeout</th>
-<th>Default</th>
-<th>Notes</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>HttpClientTimeouts::dns</code></td>
-<td>5s</td>
-<td>Ignored for literal IPs</td>
-</tr>
-<tr>
-<td><code>HttpClientTimeouts::connect</code></td>
-<td>30s</td>
-<td>Wired into <code>TcpConnectorConfig::connect_timeout</code></td>
-</tr>
-<tr>
-<td><code>HttpClientTimeouts::stage</code></td>
-<td>60s</td>
-<td>Response-stage budget (headers, etc.)</td>
-</tr>
-</tbody>
-</table>
-<p>Returns immediately; DNS and the TCP/protocol handshake run on a worker. Demo: <code>examples/http-get</code>.</p>
+<span id="cb2a-2"><a href="#cb2a-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>connect_http<span class="op">,</span> DialSettings<span class="op">,</span> HttpClientTimeouts<span class="op">,</span> HttpLimits<span class="op">};</span></span>
+<span id="cb2a-3"><a href="#cb2a-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2a-4"><a href="#cb2a-4" aria-hidden="true" tabindex="-1"></a>connect_http(</span>
+<span id="cb2a-5"><a href="#cb2a-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">&amp;</span>rt<span class="op">,</span>                <span class="co">// &amp;Arc&lt;Runtime&gt;</span></span>
+<span id="cb2a-6"><a href="#cb2a-6" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;example.com&quot;</span><span class="op">,</span>       <span class="co">// hostname or IP literal</span></span>
+<span id="cb2a-7"><a href="#cb2a-7" aria-hidden="true" tabindex="-1"></a>    <span class="dv">80</span><span class="op">,</span></span>
+<span id="cb2a-8"><a href="#cb2a-8" aria-hidden="true" tabindex="-1"></a>    <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>factory)<span class="op">,</span>  <span class="co">// Arc&lt;dyn ClientHandlerFactory&gt;</span></span>
+<span id="cb2a-9"><a href="#cb2a-9" aria-hidden="true" tabindex="-1"></a>    <span class="cn">false</span><span class="op">,</span>               <span class="co">// true: H2 prior-knowledge</span></span>
+<span id="cb2a-10"><a href="#cb2a-10" aria-hidden="true" tabindex="-1"></a>    DialSettings <span class="op">{</span></span>
+<span id="cb2a-11"><a href="#cb2a-11" aria-hidden="true" tabindex="-1"></a>        limits<span class="op">:</span> <span class="pp">HttpLimits::</span><span class="kw">default</span>()<span class="op">,</span></span>
+<span id="cb2a-12"><a href="#cb2a-12" aria-hidden="true" tabindex="-1"></a>        timeouts<span class="op">:</span> <span class="pp">HttpClientTimeouts::</span><span class="kw">default</span>()<span class="op">,</span></span>
+<span id="cb2a-13"><a href="#cb2a-13" aria-hidden="true" tabindex="-1"></a>        resolver<span class="op">:</span> <span class="cn">None</span><span class="op">,</span>   <span class="co">// or Some(Arc&lt;DnsResolver&gt;)</span></span>
+<span id="cb2a-14"><a href="#cb2a-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">},</span></span>
+<span id="cb2a-15"><a href="#cb2a-15" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span></code></pre></div>
+<p>Returns immediately; DNS and the TCP/protocol handshake run on a worker. The timeouts are those of <a href="#httpclienttimeouts"><code>HttpClientTimeouts</code></a>. When a name resolves to several addresses they are tried in RFC 8305 order (families alternating), each new attempt starting after <code>attempt_delay</code> or as soon as the previous one fails; the handler is created only for the connection that wins, and failure is reported only when every address has failed. <code>connect_https</code> takes the same <code>DialSettings</code> plus a TLS connector and server name. Demo: <code>examples/http-get</code>.</p>
 <h3 id="http1.1-cleartext">HTTP/1.1 cleartext (resolved addr)</h3>
 <div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>ProtocolHandler<span class="op">,</span> Runtime<span class="op">,</span> TcpConnectorConfig<span class="op">};</span></span>
 <span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>H1Endpoint<span class="op">,</span> HttpLimits<span class="op">};</span></span>
@@ -368,7 +377,7 @@ conn_handle.poke();</code></pre>
 <span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    <span class="pp">HttpLimits::</span><span class="kw">default</span>()<span class="op">,</span></span>
 <span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span></code></pre></div>
 <h3 id="dial-by-name">Dial by name</h3>
-<p><code>connect_http</code> resolves hostnames asynchronously (literal IPs skip DNS). Lower-level: <code>hopf_dns::RuntimeDnsExt::connect_by_name</code> on <code>Arc&lt;Runtime&gt;</code>. See <a href="../clients.html">clients.md</a> and <a href="../dns.html">dns.md</a>.</p>
+<p><code>connect_http</code> resolves hostnames asynchronously (literal IPs skip DNS). Lower-level: <code>hopf_dns::RuntimeDnsExt::connect_by_name</code> on <code>Arc&lt;Runtime&gt;</code>. See <a href="../clients.html">Clients</a> and <a href="../dns.html">DNS</a>.</p>
 <h2 id="http-get-flags">http-get flags</h2>
 <p>Demo binary: <code>examples/http-get</code> (crate <code>http-get</code>).</p>
 <pre class="text"><code>cargo run -p http-get -- [FLAGS] [ADDR] [PATH]</code></pre>
@@ -447,7 +456,8 @@ conn_handle.poke();</code></pre>
 </table>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li>Stage-0 <code>TcpConnectorConfig</code> dials expect a pre-resolved <code>SocketAddr</code>; prefer <code>connect_http</code> for hostnames.</li>
+<li>Raw <code>TcpConnectorConfig</code> dials expect a pre-resolved <code>SocketAddr</code>; prefer <code>connect_http</code> / <code>HttpClient</code> for hostnames.</li>
+<li>Outbound request trailers (<code>ClientWriter::trailers</code>) are sent on HTTP/3 only; HTTP/1.1 and HTTP/2 drop them.</li>
 <li>H3 client opens one request Stream after handshake in the stock <code>H3ClientConnection</code> path (suitable for the GET demo; not a pool).</li>
 <li>Response trailers are delivered only on H2/H3.</li>
 <li>One request body streams at a time per session; only bodyless requests overlap, and only on H2.</li>

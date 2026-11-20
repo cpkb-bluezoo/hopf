@@ -138,8 +138,36 @@
 <td>Extended CONNECT (H3)</td>
 </tr>
 <tr>
-<td>RFC 7616 (+ Basic)</td>
-<td>Digest / Basic auth factories</td>
+<td>RFC 7616 / 7617</td>
+<td>Digest (SHA-256 by default, MD5 opt-in) / Basic auth factories</td>
+</tr>
+<tr>
+<td>RFC 9110 §8.4, §12.5.3</td>
+<td>Content coding (<code>br</code>, <code>gzip</code>, <code>deflate</code>) on both roles</td>
+</tr>
+<tr>
+<td>RFC 9110 §13 / RFC 9111 §5.2</td>
+<td>Conditional requests, entity tags, <code>Cache-Control</code></td>
+</tr>
+<tr>
+<td>RFC 6797</td>
+<td>HSTS decorator (TLS listeners only, opt-in)</td>
+</tr>
+<tr>
+<td>RFC 9218</td>
+<td>Extensible Prioritization (<code>Priority</code>, <code>PRIORITY_UPDATE</code>)</td>
+</tr>
+<tr>
+<td>RFC 9297</td>
+<td>HTTP Datagrams and the Capsule Protocol (used by <a href="../masque.html">MASQUE</a>)</td>
+</tr>
+<tr>
+<td>RFC 8305</td>
+<td>Happy Eyeballs: the client tries every address a name resolves to</td>
+</tr>
+<tr>
+<td>RFC 7838 / RFC 9460</td>
+<td><code>Alt-Svc</code> and DNS HTTPS records for HTTP/3 discovery (feature <code>h3</code>)</td>
 </tr>
 <tr>
 <td>Bearer</td>
@@ -163,7 +191,7 @@
         └── ClientHandler  ↔  ClientWriter</code></pre>
 <p>Push event order on the server (with a body):</p>
 <p><code>headers</code> → <code>start_request_body</code> → <code>request_body_content</code>* → <code>end_request_body</code> → <code>request_complete</code></p>
-<p>Without a body: <code>headers</code> → <code>request_complete</code>.</p>
+<p>Without a body: <code>headers</code> → <code>request_complete</code>. Request trailers (H2/H3) arrive through <code>request_trailers</code>; <code>aborted</code> fires at most once if the peer resets the stream or the connection goes away before the response is finished.</p>
 <p>Client handlers write in <code>start</code>, then receive <code>response_headers</code> → body* → optional <code>response_trailers</code> → <code>response_complete</code>.</p>
 <p>Body chunks are zero-copy for the duration of each callback. Response bodies auto-chunk when applicable. Informational 1xx responses use <code>ServerWriter::send_informational</code>.</p>
 <h2 id="version-matrix">Version matrix</h2>
@@ -198,7 +226,7 @@
 <tr>
 <td>h2c</td>
 <td><code>CleartextHttpEndpoint</code></td>
-<td><code>H2Endpoint::client(..., secure: false)</code></td>
+<td><code>H2Endpoint::client(..., secure: false)</code>; <code>H2cUpgradeClientEndpoint</code> for the Upgrade path</td>
 <td>Prior-knowledge preface + Upgrade</td>
 </tr>
 <tr>
@@ -209,9 +237,10 @@
 </tr>
 </tbody>
 </table>
-<p>Cargo features: <code>default = []</code>, <code>h3 = ["dep:hopf-quic"]</code>, <code>integration = ["h3"]</code>.</p>
+<p>Cargo features: <code>default = []</code>, <code>h3 = ["dep:hopf-quic"]</code>, <code>integration = ["h3"]</code>. Through the <code>hopf</code> umbrella crate, <code>http</code> pulls in <code>hopf-http</code> and <code>h3</code> adds HTTP/3.</p>
+<p>Most applications do not pick an endpoint by hand: <a href="server.html#httpserver-facade"><code>HttpServer</code></a> binds cleartext (H1 + h2c) or TLS (ALPN h2 / http/1.1) listeners and installs the content-coding, conditional-request and HSTS decorators; <a href="client.html#httpclient-session-api"><code>HttpClient</code></a> dials by name, negotiates H1/H2 (and H3 when configured) and decodes content coding. Both faces share the same Stream SPI as the endpoints in the table.</p>
 <h2 id="httplimits">HttpLimits</h2>
-<p>Shared parser / connection limits (Gumdrop defaults):</p>
+<p>Shared parser and connection limits, passed to every endpoint constructor:</p>
 <table>
 <colgroup>
 <col style="width: 22%" />
@@ -251,6 +280,18 @@
 <td><code>usize</code></td>
 <td><code>16 MiB</code></td>
 <td>Max aggregate request body</td>
+</tr>
+<tr>
+<td><code>max_decoded_body</code></td>
+<td><code>usize</code></td>
+<td><code>64 MiB</code></td>
+<td>Max decoded size of one content-coded body, either role (decompression-bomb guard; fails closed)</td>
+</tr>
+<tr>
+<td><code>max_concurrent_streams</code></td>
+<td><code>u32</code></td>
+<td><code>100</code></td>
+<td>HTTP/2 streams a peer may have open; advertised in <code>SETTINGS_MAX_CONCURRENT_STREAMS</code> and enforced with <code>REFUSED_STREAM</code></td>
 </tr>
 </tbody>
 </table>
@@ -362,7 +403,7 @@
 <span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>)</span>
 <span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a><span class="op">.</span>with_tls(acceptor)<span class="op">;</span></span></code></pre></div>
 <h3 id="http3">HTTP/3</h3>
-<p>Enable feature <code>h3</code>. Build a QUIC server/client config with ALPN <code>h3</code> (<code>hopf_quic::ALPN_H3</code>), then call <code>listen_h3</code> / <code>connect_h3</code>. See <a href="../quic-h3.html">quic-h3.md</a>.</p>
+<p>Enable feature <code>h3</code>. Build a QUIC server/client config with ALPN <code>h3</code> (<code>hopf_quic::ALPN_H3</code>), then call <code>listen_h3</code> / <code>connect_h3</code>. See <a href="../quic-h3.html">QUIC / H3</a>.</p>
 <div class="sourceCode" id="cb5"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>listen_h3<span class="op">,</span> HttpLimits<span class="op">};</span></span>
 <span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_quic::</span><span class="op">{</span>server_config_self_signed<span class="op">,</span> ALPN_H3<span class="op">};</span></span>
 <span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
@@ -403,7 +444,7 @@
 </tr>
 </tbody>
 </table>
-<p>Outbound bytes are drained via <code>ProtocolUpgradeHandler::take_outbound</code>. Used by <code>hopf-websocket</code> (RFC 6455 / 8441 / 9220) and similar upgrades. Returns <code>false</code> if the transport cannot upgrade (already responded, wrong version, etc.).</p>
+<p>On the client side, <code>ClientWriter::upgrade(handler)</code> installs the same kind of handler from <code>ClientHandler::switching_protocols</code>, whichever HTTP version the connection negotiated. Outbound bytes are drained via <code>ProtocolUpgradeHandler::take_outbound</code>. Used by <code>hopf-websocket</code> (RFC 6455 / 8441 / 9220) and similar upgrades. Returns <code>false</code> if the transport cannot upgrade (already responded, wrong version, etc.).</p>
 <h2 id="shared-types">Shared types</h2>
 <table>
 <colgroup>
@@ -427,7 +468,7 @@
 </tr>
 <tr>
 <td><code>HttpVersion</code></td>
-<td><code>Http10</code> / <code>Http11</code> (H1 messaging)</td>
+<td><code>Http10</code> / <code>Http11</code> / <code>Http2</code> / <code>Http3</code> (e.g. <code>ClientWriter::version()</code>)</td>
 </tr>
 <tr>
 <td><code>HttpError</code> / <code>HttpResult</code></td>
@@ -439,7 +480,19 @@
 </tr>
 <tr>
 <td>Auth factories</td>
-<td><code>BasicAuthFactory</code>, <code>DigestAuthFactory</code>, <code>BearerAuthFactory</code> — see <a href="server.html">server.md</a></td>
+<td><code>BasicAuthFactory</code>, <code>DigestAuthFactory</code>, <code>BearerAuthFactory</code>; see <a href="server.html#authentication-factories">HTTP server</a></td>
+</tr>
+<tr>
+<td>Decorators</td>
+<td><code>ContentEncodingServerFactory</code>, <code>ConditionalServerFactory</code>, <code>HstsServerFactory</code>; see <a href="server.html">HTTP server</a></td>
+</tr>
+<tr>
+<td><code>EntityTag</code>, <code>CacheControl</code>, <code>evaluate_preconditions</code></td>
+<td>RFC 9110 / 9111 validator and freshness helpers</td>
+</tr>
+<tr>
+<td><code>Encoder</code>, <code>Decoder</code>, <code>ContentCoding</code></td>
+<td>Streaming <code>br</code> / <code>gzip</code> / <code>deflate</code> codecs</td>
 </tr>
 </tbody>
 </table>
@@ -475,9 +528,8 @@
 <ul>
 <li><strong>No HTTP/2 server push</strong> — <code>PUSH_PROMISE</code> is rejected (client: <code>RST_STREAM</code>; server: <code>GOAWAY</code>).</li>
 <li><strong>H2 PRIORITY frames</strong> (RFC 7540) are ignored; hopf uses RFC 9218 Extensible Prioritization (<code>Priority</code> header + <code>PRIORITY_UPDATE</code>) with urgency/incremental scheduling.</li>
-<li><strong>HTTP/1.1 trailers</strong> are ignored on the wire (parity gap with Gumdrop). H2/H3 trailers work as a second HEADERS frame (<code>ServerWriter::trailers</code> / <code>ClientHandler::response_trailers</code>).</li>
+<li><strong>HTTP/1.1 trailers</strong> are accepted on the wire but not delivered, and outbound H1 trailers are dropped. H2/H3 trailers work as a second HEADERS frame (<code>ServerWriter::trailers</code> / <code>ClientHandler::response_trailers</code>); outbound request trailers (<code>ClientWriter::trailers</code>) are sent on HTTP/3 only.</li>
 <li>UDP / QUIC for H3 lives in <code>hopf-quic</code> and is feature-gated (<code>h3</code>).</li>
-<li>Several declared deps (<code>tractrix</code>, <code>rjsonparser</code>, <code>rmimeparser</code>) support later protocol crates, not the Stream SPI itself.</li>
 </ul>
 <h2 id="see-also">See also</h2>
 <ul>
@@ -485,7 +537,7 @@
 <li><a href="client.html">HTTP client</a> — <code>ClientHandler</code>, dial patterns, <code>http-get</code></li>
 <li><a href="../quic-h3.html">QUIC / H3</a> — transport configs and PEM builders</li>
 <li><a href="../websocket.html">WebSocket</a> — upgrade consumer</li>
-<li><a href="../grpc.html">gRPC</a> — unary over Streams (needs trailers on H2/H3)</li>
+<li><a href="../grpc.html">gRPC</a> - unary and streaming RPCs over Streams (needs trailers on H2/H3)</li>
 </ul>
 
       <p class="footer">

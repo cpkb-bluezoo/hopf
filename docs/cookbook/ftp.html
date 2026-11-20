@@ -83,6 +83,7 @@
 <div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> /tmp/ftp-root</span>
 <span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> ftp-server <span class="at">--</span> 127.0.0.1:2121 /tmp/ftp-root</span>
 <span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co"># user=ftp pass=ftp</span></span></code></pre></div>
+<p>The default <a href="../ftp.html#failed-login-limits">failed-login limits</a> apply: each failed login is answered after a one-second delay, a connection is closed after three failures, and an address with ten failures in ten minutes is refused for ten minutes. Use <code>FtpConfig::with_login_limits(LoginLimits::unlimited())</code> when scripting tests against wrong passwords.</p>
 <h2 id="client">Client</h2>
 <div class="sourceCode" id="cb2"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> ftp-get <span class="at">--</span> 127.0.0.1:2121 /</span>
 <span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> ftp-get <span class="at">--</span> 127.0.0.1:2121 /hello.txt</span></code></pre></div>

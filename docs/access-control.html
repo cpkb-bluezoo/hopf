@@ -151,6 +151,8 @@
 </tbody>
 </table>
 <p>Rejection closes the accepted socket <strong>before</strong> <code>ProtocolHandler::connected</code>.</p>
+<h3 id="proxy-protocol">Behind a relay (PROXY protocol)</h3>
+<p><code>TcpListenerConfig::with_proxy_protocol()</code> expects every accepted connection to begin with a PROXY protocol v1/v2 header from an L4 relay (nginx, HAProxy, a cloud load balancer); <code>Endpoint::remote_addr</code> then reports the client address from the header, and <code>connected()</code> is deferred until the header has been parsed. A connection whose first bytes are not a valid header is closed. <code>acl</code> and <code>rate_limit</code> still apply to the real TCP peer, that is the relay: allow only your relays, since trusting a peer to speak for clients is the decision the ACL makes.</p>
 <h2 id="accept-rate-limits">Accept rate limits</h2>
 <p>Token-bucket style window counters:</p>
 <div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::time::</span>Duration<span class="op">;</span></span>
@@ -202,7 +204,7 @@
 </table>
 <p><code>AcceptRateLimit::new(per_source, window, global)</code>. Axis value <code>0</code> disables that limit.</p>
 <h2 id="quotas">Quotas</h2>
-<p>Application / protocol policy skeleton — <strong>not</strong> auto-enforced on every codec datapath yet.</p>
+<p>Two separate facilities live in <code>hopf_core::quota</code>. The per-connection traffic trackers below are a policy skeleton that no protocol enforces automatically. Per-user storage quotas (<code>QuotaManager</code>, <code>Quota</code>, <code>QuotaPolicy</code>, <code>MemoryQuotaManager</code>) are enforced by IMAP (RFC 9208 QUOTA) and FTP uploads; see <a href="quota.html">Quota</a>.</p>
 <table>
 <colgroup>
 <col style="width: 50%" />
@@ -287,19 +289,25 @@
 <td><code>max_net_in</code></td>
 <td><code>usize</code></td>
 <td><code>1 MiB</code> (<code>DEFAULT_MAX_NET_IN</code>)</td>
-<td>Buffer cap → close</td>
+<td>Sizes the fixed inbound ring (power of two, at least 32 KiB). When the ring is full and the handler consumes nothing, the connection stops reading (backpressure); a single token larger than the ring fails the connection</td>
 </tr>
 <tr>
 <td><code>max_net_out</code></td>
 <td><code>usize</code></td>
 <td><code>4 MiB</code> (<code>DEFAULT_MAX_NET_OUT</code>)</td>
-<td>Buffer cap → close</td>
+<td>Outbound buffer cap; a send that would overflow it closes the connection</td>
 </tr>
 <tr>
 <td><code>idle_timeout</code></td>
 <td><code>Option&lt;Duration&gt;</code></td>
 <td><code>None</code></td>
-<td>Partially wired (Tranche 1)</td>
+<td>Stored but not enforced</td>
+</tr>
+<tr>
+<td><code>proxy_protocol</code></td>
+<td><code>bool</code></td>
+<td><code>false</code></td>
+<td><code>.with_proxy_protocol()</code></td>
 </tr>
 </tbody>
 </table>
@@ -328,11 +336,11 @@
 <p>Pair with <a href="telemetry.html">Telemetry</a> to observe <code>on_error</code> for denials.</p>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li>Quotas are a <strong>skeleton</strong> — not automatically wired into every protocol codec.</li>
-<li><code>idle_timeout</code> is only <strong>partially wired</strong>.</li>
+<li>The traffic <code>QuotaTracker</code>s are a <strong>skeleton</strong>, not wired into any protocol codec.</li>
+<li><code>idle_timeout</code> is accepted and stored but not enforced on the datapath.</li>
 <li>ACL is IP-based only; user/role RBAC belongs in <a href="auth.html">Auth</a> / protocol <code>is_authorized</code> hooks (e.g. FTP).</li>
 <li>No distributed / cluster ACL store — process-local configuration.</li>
-<li>WebDAV has no in-crate ACL; put <code>PeerAcl</code> on the HTTP listener (<a href="webdav.html">WebDAV</a>).</li>
+<li>WebDAV has no IP ACL of its own (its RFC 3744 privileges are per user); put <code>PeerAcl</code> on the HTTP listener (<a href="webdav.html">WebDAV</a>).</li>
 </ul>
 
       <p class="footer">

@@ -77,13 +77,14 @@
     <main class="main">
       <header>
         <h1>AMQP 0-9-1</h1>
-        <p class="lead"><code>hopf-amqp</code> is an <strong>AMQP 0-9-1 async client</strong> (RabbitMQ wire protocol). Client-only: publish opaque bodies and consume via push <code>basic.consume</code> deliveries on the Hopf TPC runtime. There is no broker in this crate. For the unrelated AMQP 1.0 wire protocol, see <a href="amqp1.html">AMQP 1.0</a> (<code>hopf-amqp1</code>) — the two share only the <code>AMQP</code> magic bytes.</p>
+        <p class="lead"><code>hopf-amqp</code> is an <strong>AMQP 0-9-1 async client</strong> (RabbitMQ wire protocol). Client-only: publish opaque bodies and consume via push <code>basic.consume</code> deliveries on the Hopf TPC runtime. There is no broker in this crate. For the unrelated AMQP 1.0 wire protocol, see <a href="amqp1.html">AMQP 1.0</a> (<code>hopf-amqp1</code>); the two share only the <code>AMQP</code> magic bytes.</p>
       </header>
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
 <li><a href="#scope">Scope</a></li>
 <li><a href="#architecture">Architecture</a></li>
 <li><a href="#client">Client</a></li>
+<li><a href="#recovery">Automatic recovery</a></li>
 <li><a href="#messages">Messages</a></li>
 <li><a href="#examples">Examples</a></li>
 <li><a href="#limitations">Limitations</a></li>
@@ -95,10 +96,11 @@
 <tbody>
 <tr><td>Protocol</td><td>AMQP 0-9-1 only — see <a href="amqp1.html">AMQP 1.0</a> for the separate <code>hopf-amqp1</code> crate</td></tr>
 <tr><td>Role</td><td>Client only</td></tr>
-<tr><td>Auth</td><td><code>PLAIN</code> (via <code>hopf-auth</code>) or <code>AMQPLAIN</code></td></tr>
+<tr><td>Auth</td><td><code>PLAIN</code> (via <code>hopf-auth</code>), <code>AMQPLAIN</code> or <code>EXTERNAL</code> (TLS client certificate)</td></tr>
 <tr><td>Channels</td><td>Multi-channel; control methods take <code>channel_id</code></td></tr>
 <tr><td>Publish</td><td><code>basic.publish</code> + content frames, publisher confirms, <code>basic.return</code></td></tr>
-<tr><td>Consume</td><td><code>basic.consume</code> push deliveries (not <code>basic.get</code>)</td></tr>
+<tr><td>Consume</td><td><code>basic.consume</code> push deliveries, <code>basic.get</code> polling, <code>basic.qos</code>, ack/nack/reject, <code>basic.recover</code>, broker-initiated consumer cancel</td></tr>
+<tr><td>Other</td><td>Transactions (<code>tx.select</code>/<code>commit</code>/<code>rollback</code>), <code>channel.flow</code>, <code>connection.blocked</code>/<code>unblocked</code>, automatic reconnection with topology replay</td></tr>
 <tr><td>TLS</td><td>AMQPS via implicit TLS on dial</td></tr>
 </tbody>
 </table>
@@ -120,6 +122,22 @@
     .credentials("guest", "guest")
     .connect(&amp;rt, Arc::new(Factory))?;</code></pre>
 <p>On <code>on_connection_open</code>, open a channel (≥ 1), then declare topology, <code>confirm_select</code>, <code>basic_publish</code>, and/or <code>basic_consume</code>.</p>
+<table>
+<thead><tr><th>Builder method</th><th>Default</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>AmqpClient::new(host, port)</code> / <code>from_addr(addr)</code> / <code>from_unix_path(path)</code></td><td>-</td><td><code>new</code> resolves the host through <code>hopf-dns</code>; the others skip DNS</td></tr>
+<tr><td><code>.virtual_host(..)</code></td><td><code>/</code></td><td></td></tr>
+<tr><td><code>.credentials(user, pass)</code></td><td><code>guest</code> / <code>guest</code></td><td></td></tr>
+<tr><td><code>.mechanism(name)</code></td><td>PLAIN, then AMQPLAIN</td><td>Force <code>PLAIN</code>, <code>AMQPLAIN</code> or <code>EXTERNAL</code>; a mechanism the broker does not advertise fails the connection</td></tr>
+<tr><td><code>.heartbeat(secs)</code></td><td>60</td><td><code>0</code> disables; heartbeats are sent by a timer, and a missed broker heartbeat fails the connection</td></tr>
+<tr><td><code>.frame_max(n)</code>, <code>.channel_max(n)</code></td><td>0 (accept broker)</td><td>Caps on the negotiated values</td></tr>
+<tr><td><code>.timeouts(AmqpClientTimeouts)</code></td><td>dns=5s, connect=30s, handshake=30s, heartbeat=10s</td><td>Per-phase deadlines</td></tr>
+<tr><td><code>.implicit_tls(connector, name)</code></td><td>off</td><td>AMQPS, typically port 5671</td></tr>
+<tr><td><code>.resolver(Arc&lt;DnsResolver&gt;)</code></td><td>made on connect</td><td></td></tr>
+</tbody>
+</table>
+<h3 id="recovery">Automatic recovery</h3>
+<p><code>AmqpRecoveringClient::new(client, rt)</code> wraps an <code>AmqpClient</code> and reconnects whenever the connection drops, with exponential backoff (<code>RecoveryPolicy::exponential_backoff()</code>: 1 s doubling to 30 s, unlimited attempts; <code>with_initial_delay</code>, <code>with_max_delay</code>, <code>with_max_attempts</code>). On each reconnect it redeclares every exchange, queue and binding and re-registers every consumer in the order they were first issued. <code>on_connection_open</code> fires only on the first connection; later ones are reported to a <code>RecoveryListener</code> (<code>on_connection_lost</code>, <code>on_reconnecting</code>, <code>on_recovered</code>, <code>on_recovery_failed</code>). The broker's <code>*-ok</code> replies to the replay reach the driver again, so driver callbacks with side effects should be idempotent. <code>connect(factory)</code> returns an <code>AmqpRecoveringHandle</code>; dropping it or calling <code>close()</code> stops further reconnects but does not close a live connection (use <code>AmqpClientControl::connection_close</code> for that).</p>
 
       <h2 id="messages">Messages</h2>
 <p>Bodies are opaque octets. Basic properties (<code>content-type</code>, <code>content-encoding</code>, headers, delivery-mode, correlation-id, …) travel in the content header; MIME values are conventional, not enforced by the protocol.</p>
@@ -132,8 +150,8 @@ cargo run -p amqp-consume -- 127.0.0.1 5672 demo.queue</code></pre>
       <h2 id="limitations">Limitations</h2>
 <ul>
 <li>No broker / server module</li>
-<li>No <code>basic.get</code> or transactions (<code>tx.*</code>)</li>
-<li>No Composition/XML registration in v1</li>
+<li>No Composition/XML registration</li>
+<li>Recovery does not re-send publishes that were in flight when the connection dropped</li>
 </ul>
 
       <p class="footer">

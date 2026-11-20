@@ -150,7 +150,7 @@
 <ul>
 <li><strong>PTR</strong> <code>&lt;type&gt;.local</code> → <code>&lt;instance&gt;.&lt;type&gt;.local</code> — shared (not cache-flush; other instances share the same owner name, per §10.1).</li>
 <li><strong>SRV</strong> <code>&lt;instance&gt;.&lt;type&gt;.local</code> → this responder's own hostname, with the registered port (priority and weight are always 0) — cache-flush.</li>
-<li><strong>TXT</strong> on the same owner name, encoding the registration's key/value pairs as RFC 6763 §6.1 character-strings (a value over 255 bytes is dropped rather than silently truncated; no attributes still emits one required zero-length string) — cache-flush.</li>
+<li><strong>TXT</strong> on the same owner name, encoding the registration's key/value pairs as RFC 6763 §6.1 character-strings (a value over 255 bytes is dropped rather than silently truncated; no attributes, or none short enough to carry, still emits one required zero-length string) — cache-flush.</li>
 <li><strong>Meta-PTR</strong> (§9): <code>_services._dns-sd._udp.local</code> → <code>&lt;type&gt;.local</code>, so a client enumerating all advertised service <em>types</em> on the network finds this one — shared, not cache-flush.</li>
 </ul>
 <p>The target host is always this responder's own current name (already probed for conflicts), so registering a service republishes the current RRset rather than running a separate probe cycle for the new records — close enough to RFC 6763 §8.3's "adding a new instance" flow for a first version. Dropping the returned <code>ServiceHandle</code> (or calling <code>unregister()</code>) removes that instance's records and announces the change.</p>

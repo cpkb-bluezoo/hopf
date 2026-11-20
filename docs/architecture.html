@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Architecture — Hopf</title>
+  <title>Architecture - Hopf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
@@ -77,36 +77,41 @@
     <main class="main">
       <header>
         <h1>Architecture</h1>
-        <p class="lead">Hopf is a <strong>thread-per-core</strong> multi-protocol networking framework on <a href="https://github.com/tokio-rs/mio">mio</a>. Listen and dial are equal bindings on one <code>Runtime</code>. Protocol code sees plaintext handlers and Streams; TLS/QUIC, buffers, affinity, and backpressure stay below that line. It reimplements Gumdrop’s architectural contracts in Rust.</p>
+        <p class="lead">Hopf is a <strong>thread-per-core</strong> multi-protocol networking framework on <a href="https://github.com/tokio-rs/mio">mio</a>. Listen and dial are equal bindings on one <code>Runtime</code>, and server and client are equal roles in every protocol crate. Protocol code sees plaintext handlers and Streams; TLS, QUIC, buffers, affinity and backpressure stay below that line. Inbound bytes live in fixed-size <code>LoopBuf</code> ring buffers that handlers read in place.</p>
       </header>
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
 <li><a href="#purpose">Purpose</a></li>
 <li><a href="#thread-per-core">Thread-per-core</a></li>
 <li><a href="#io-substrate-mio">I/O substrate (mio)</a></li>
+<li><a href="#buffers-and-backpressure">Buffers and backpressure</a></li>
 <li><a href="#storage-and-dns">Storage and DNS</a></li>
 <li><a href="#layering">Layering</a></li>
 <li><a href="#endpoint-vs-protocolhandler">Endpoint vs ProtocolHandler</a></li>
 <li><a href="#listen-and-dial-are-peers">Listen and dial are peers</a></li>
 <li><a href="#module-layout-server-and-client-as-peers">Module layout: server and client as peers</a></li>
 <li><a href="#dynamic-bindings-and-composition">Dynamic bindings and composition</a></li>
+<li><a href="#lifecycle">Lifecycle: readiness and drain</a></li>
 <li><a href="#auth-vocabulary">Auth vocabulary</a></li>
 <li><a href="#codec-style">Codec style</a></li>
+<li><a href="#telemetry">Telemetry</a></li>
+<li><a href="#testing">Testing</a></li>
 <li><a href="#security-substrate">Security substrate</a></li>
 <li><a href="#dependencies">Dependencies</a></li>
 <li><a href="#non-goals">Non-goals</a></li>
 <li><a href="#further-reading">Further reading</a></li>
 </ul></div>
 <h2 id="purpose">Purpose</h2>
-<p>The default topology is a <strong>graph of endpoints</strong> on one Runtime: N listeners and M dialers in one process are normal (peer / P2P compositions), not a third stack. Clients routinely host multiple protocols together — at minimum <strong>DNS under dial</strong>.</p>
-<p>Many Internet application protocols share the same transport model: TLS/QUIC where appropriate, transport-level backpressure, worker/storage pools independent of connection count, and <strong>plain buffers</strong> (<code>&amp;[u8]</code> / pooled owned buffers) rather than a proprietary buffer world.</p>
-<p>Hopf is a re-implementation of Gumdrop’s <strong>techniques, protocol work, and architectural contracts</strong>, with Rust ownership and TPC execution — not a line-by-line port of Java types.</p>
+<p>The default topology is a <strong>graph of endpoints</strong> on one Runtime: N listeners and M dialers in one process are normal (peer / P2P compositions), not a third stack. A process may be a server, a client, a proxy or any mixture, and clients routinely host several protocols together - at minimum <strong>DNS under dial</strong>, so that a hostname can be resolved on the reactor that will own the connection.</p>
+<p>Many Internet application protocols share the same transport model: TLS or QUIC where appropriate, transport-level backpressure, worker and storage pools independent of connection count, and one buffer model. Hopf provides that model once, in <code>hopf-core</code>, and every protocol crate plugs into it from either side of a connection.</p>
+<p>The buffer model is the <a href="https://github.com/cpkb-bluezoo/loopbuf"><code>loopbuf</code></a> ring: a connection owns a fixed-size ring for its inbound bytes, the protocol handler reads it in place and consumes whole tokens, and what it leaves behind is presented again with the next arrival. Neither the framework nor a handler accumulates a stream of unbounded size. See <a href="#buffers-and-backpressure">Buffers and backpressure</a>.</p>
 <h2 id="thread-per-core">Thread-per-core</h2>
 <ul>
-<li>Each connection is owned by <strong>one reactor thread for its lifetime</strong> (affinity).</li>
-<li>I/O, TLS, and protocol byte handling stay on that thread.</li>
-<li>Application / blocking / storage work runs on a <strong>separate storage pool</strong>.</li>
-<li>Cross-core coordination is <strong>explicit</strong> (<code>ConnHandle</code>, <code>execute</code>, message passing) — not implicit task migration.</li>
+<li>Each connection is owned by <strong>one reactor thread for its lifetime</strong> (affinity), whether it was accepted or dialled.</li>
+<li>I/O, TLS and protocol byte handling stay on that thread.</li>
+<li>Application, blocking and storage work runs on a <strong>separate storage pool</strong>.</li>
+<li>Cross-core coordination is <strong>explicit</strong> (<code>ConnHandle</code>, <code>execute</code>, message passing), not implicit task migration.</li>
+<li>A panic in a handler is caught at the connection boundary: it is logged and that connection is closed; the reactor carries on.</li>
 </ul>
 <figure class="diagram" role="group" aria-labelledby="diagram-tpc-caption">
 <svg viewBox="0 0 640 420" width="640" height="420" role="img" aria-labelledby="diagram-tpc-title diagram-tpc-desc">
@@ -181,8 +186,8 @@
 </figure>
 <table>
 <colgroup>
-<col style="width: 53%" />
-<col style="width: 46%" />
+<col style="width: 30%" />
+<col style="width: 70%" />
 </colgroup>
 <thead>
 <tr>
@@ -193,46 +198,169 @@
 <tbody>
 <tr>
 <td><strong>Accept loop</strong></td>
-<td>Binds sockets, applies ACL / rate limits, round-robins accepts onto workers</td>
+<td>Binds TCP and UNIX sockets, applies ACL, peer-credential and rate-limit policy, round-robins accepts onto workers</td>
 </tr>
 <tr>
 <td><strong>Worker reactor</strong></td>
-<td>Owns connection affinity; timers, TLS I/O, UDP (DNS), <code>execute</code> hops</td>
+<td>Owns connection affinity; timers, TLS I/O, UDP datagram sockets, <code>execute</code> hops. Defaults to twice the available parallelism (minimum 2)</td>
 </tr>
 <tr>
 <td><strong>Dial RR</strong></td>
-<td>Separate round-robin for outbound connects</td>
+<td>Separate round-robin for outbound connects (<code>Runtime::connect</code>, <code>connect_unix</code>)</td>
 </tr>
 <tr>
 <td><strong>StorageExecutor</strong></td>
-<td>Bounded blocking pool; results hop back via <code>Endpoint::execute</code> / <code>ConnHandle</code></td>
+<td>Bounded blocking pool; results hop back via <code>Endpoint::execute</code> / <code>ConnHandle</code>; fails fast when full</td>
 </tr>
 <tr>
 <td><strong>QUIC driver</strong></td>
-<td>Dedicated <code>hopf-quic</code> thread; still exposes <code>Endpoint</code> per bi-stream. TLS 1.3 only, <strong>PQC-first</strong> hybrid ML-KEM KX</td>
+<td>A <code>hopf-quic</code> thread owning the UDP socket and the QUIC state machine; still exposes an <code>Endpoint</code> per bidirectional stream, so protocol handlers do not know they are on QUIC. TLS 1.3 only, <strong>PQC-first</strong> hybrid ML-KEM key exchange</td>
+</tr>
+<tr>
+<td><strong>Pool</strong></td>
+<td><code>hopf_core::Pool</code>: protocol-agnostic keyed reuse of live <code>ConnHandle</code>s for client facades that want keep-alive; whether to pool at all stays a per-protocol decision</td>
 </tr>
 </tbody>
 </table>
-<p><strong>Optional future:</strong> io_uring completion paths for Linux behind the same <code>Endpoint</code> / handler traits — evolution, not a day-one requirement.</p>
+<p><strong>Optional future:</strong> io_uring completion paths for Linux behind the same <code>Endpoint</code> / handler traits - an evolution, not a requirement.</p>
 <h2 id="io-substrate-mio">I/O substrate (mio)</h2>
-<p>Build on <a href="https://github.com/tokio-rs/mio">mio</a> (epoll / kqueue readiness) with an in-tree executor, timer, and registration model. Hopf uses <strong>mio only</strong>, not the Tokio runtime.</p>
-<p>This preserves the readiness mental model (interest ops, fill buffer, parse, write queue, backpressure), portable development (including macOS), and a near-zero dependency surface for the reactor.</p>
-<p>Accept loops, per-core reactors, timers, cross-thread queues, buffer pools, and listen/dial APIs are implemented in-tree. Reactor/callback pattern for all I/O.</p>
-<h2 id="storage-and-dns">Storage and DNS</h2>
-<p>mio covers <strong>sockets</strong>, not arbitrary filesystem I/O. Mail, FTP, WebDAV, and large body paths use an explicit <strong>storage executor</strong>: blocking or off-loop file work, <strong>never</strong> on the reactor thread.</p>
-<p>Name resolution is <strong>Runtime substrate</strong>, not a bolt-on product:</p>
+<p>Build on <a href="https://github.com/tokio-rs/mio">mio</a> (epoll / kqueue readiness) with an in-tree executor, timer and registration model. Hopf uses <strong>mio only</strong>, not the Tokio runtime.</p>
+<p>This preserves the readiness mental model (interest ops, fill a buffer, parse, write queue, backpressure), portable development (including macOS), and a near-zero dependency surface for the reactor.</p>
+<p>Accept loops, per-core reactors, timers, cross-thread queues, buffer pools and the listen/dial APIs are implemented in-tree. The pattern for all I/O is reactor and callback.</p>
+<h2 id="buffers-and-backpressure">Buffers and backpressure</h2>
+<p>There is one buffer model for every byte-stream protocol, defined in <code>hopf-core</code> and shared by TCP, TLS, QUIC streams and the HTTP adapters.</p>
+<figure class="diagram" role="group" aria-labelledby="diagram-buffers-caption">
+<svg viewBox="0 0 640 250" width="640" height="250" role="img" aria-labelledby="diagram-buffers-title diagram-buffers-desc">
+  <title id="diagram-buffers-title">Inbound and outbound buffers</title>
+  <desc id="diagram-buffers-desc">Inbound: the socket fills a fixed wire ring; with TLS a record engine decrypts into a fixed plaintext ring; the protocol handler reads the ring in place and advances past whole tokens. Outbound: the handler sends slices, TLS seals them, and a capped outbound buffer drains to the socket.</desc>
+  <defs>
+    <marker id="buf-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M1 1 L9 5 L1 9 Z" fill="var(--accent)"/>
+    </marker>
+  </defs>
+
+  <text x="10" y="20" font-family="var(--font)" font-size="12" font-weight="700" fill="var(--muted)">INBOUND</text>
+
+  <rect x="10" y="32" width="80" height="48" rx="8" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"/>
+  <text x="50" y="61" text-anchor="middle" font-family="var(--mono)" font-size="12" fill="var(--ink)">socket</text>
+
+  <path d="M90 56 H110" fill="none" stroke="var(--accent)" stroke-width="1.5" opacity="0.8" marker-end="url(#buf-arrow)"/>
+
+  <rect x="110" y="32" width="110" height="48" rx="8" fill="color-mix(in srgb, var(--accent) 14%, var(--surface))" stroke="var(--accent)" stroke-width="1.5"/>
+  <text x="165" y="53" text-anchor="middle" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">wire ring</text>
+  <text x="165" y="69" text-anchor="middle" font-family="var(--mono)" font-size="10" fill="var(--muted)">LoopBuf, fixed</text>
+
+  <path d="M220 56 H240" fill="none" stroke="var(--accent)" stroke-width="1.5" opacity="0.8" marker-end="url(#buf-arrow)"/>
+
+  <rect x="240" y="32" width="90" height="48" rx="8" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25" stroke-dasharray="4 3"/>
+  <text x="285" y="53" text-anchor="middle" font-family="var(--mono)" font-size="12" fill="var(--ink)">TLS</text>
+  <text x="285" y="69" text-anchor="middle" font-family="var(--mono)" font-size="10" fill="var(--muted)">records</text>
+
+  <path d="M330 56 H350" fill="none" stroke="var(--accent)" stroke-width="1.5" opacity="0.8" marker-end="url(#buf-arrow)"/>
+
+  <rect x="350" y="32" width="110" height="48" rx="8" fill="color-mix(in srgb, var(--accent) 14%, var(--surface))" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <text x="405" y="53" text-anchor="middle" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">plaintext ring</text>
+  <text x="405" y="69" text-anchor="middle" font-family="var(--mono)" font-size="10" fill="var(--muted)">TLS only, 64 KiB</text>
+
+  <path d="M460 56 H480" fill="none" stroke="var(--accent)" stroke-width="1.5" opacity="0.8" marker-end="url(#buf-arrow)"/>
+
+  <rect x="480" y="32" width="150" height="48" rx="8" fill="var(--surface)" stroke="var(--accent)" stroke-width="1.75"/>
+  <text x="555" y="53" text-anchor="middle" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">ProtocolHandler</text>
+  <text x="555" y="69" text-anchor="middle" font-family="var(--mono)" font-size="10" fill="var(--muted)">receive(&amp;mut LoopBuf)</text>
+
+  <text x="630" y="102" text-anchor="end" font-family="var(--font)" font-size="11" fill="var(--muted)">reads in place, advances over whole tokens;</text>
+  <text x="630" y="117" text-anchor="end" font-family="var(--font)" font-size="11" fill="var(--muted)">the rest waits in the ring</text>
+
+  <path d="M10 134 H630" fill="none" stroke="var(--border)" stroke-width="1" stroke-dasharray="2 4"/>
+  <text x="10" y="156" font-family="var(--font)" font-size="12" font-weight="700" fill="var(--muted)">OUTBOUND</text>
+
+  <rect x="480" y="168" width="150" height="48" rx="8" fill="var(--surface)" stroke="var(--accent)" stroke-width="1.75"/>
+  <text x="555" y="189" text-anchor="middle" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">ProtocolHandler</text>
+  <text x="555" y="205" text-anchor="middle" font-family="var(--mono)" font-size="10" fill="var(--muted)">send(&amp;[u8])</text>
+
+  <path d="M480 192 H460" fill="none" stroke="var(--accent)" stroke-width="1.5" opacity="0.8" marker-end="url(#buf-arrow)"/>
+
+  <rect x="350" y="168" width="110" height="48" rx="8" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25" stroke-dasharray="4 3"/>
+  <text x="405" y="189" text-anchor="middle" font-family="var(--mono)" font-size="12" fill="var(--ink)">TLS seal</text>
+  <text x="405" y="205" text-anchor="middle" font-family="var(--mono)" font-size="10" fill="var(--muted)">when secure</text>
+
+  <path d="M350 192 H330" fill="none" stroke="var(--accent)" stroke-width="1.5" opacity="0.8" marker-end="url(#buf-arrow)"/>
+
+  <rect x="220" y="168" width="110" height="48" rx="8" fill="color-mix(in srgb, var(--accent) 14%, var(--surface))" stroke="var(--accent)" stroke-width="1.5"/>
+  <text x="275" y="189" text-anchor="middle" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">net_out</text>
+  <text x="275" y="205" text-anchor="middle" font-family="var(--mono)" font-size="10" fill="var(--muted)">capped, pooled</text>
+
+  <path d="M220 192 H200" fill="none" stroke="var(--accent)" stroke-width="1.5" opacity="0.8" marker-end="url(#buf-arrow)"/>
+
+  <rect x="110" y="168" width="90" height="48" rx="8" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"/>
+  <text x="155" y="197" text-anchor="middle" font-family="var(--mono)" font-size="12" fill="var(--ink)">socket</text>
+
+  <text x="10" y="240" font-family="var(--font)" font-size="11" fill="var(--muted)">Ring full and nothing consumed: stop reading. net_out over its cap: close and tell the handler.</text>
+</svg>
+<figcaption id="diagram-buffers-caption">Inbound bytes sit in fixed rings that the handler reads in place; outbound bytes are appended with <code>send</code> and drained when the socket is writable.</figcaption>
+</figure>
+<table>
+<colgroup>
+<col style="width: 22%" />
+<col style="width: 78%" />
+</colgroup>
+<thead>
+<tr>
+<th>Buffer</th>
+<th>What it is</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Wire ring</strong> (<code>net_in</code>)</td>
+<td>A <code>LoopBuf</code> that the reactor reads the socket into. Its size is fixed for the life of the connection: <code>max_net_in</code> rounded up to a power of two, never less than 32 KiB (a TLS record is up to 16 KiB and must fit whole). Holds ciphertext when TLS is active, plaintext otherwise.</td>
+</tr>
+<tr>
+<td><strong>Plaintext ring</strong> (<code>app_in</code>)</td>
+<td>Only on a TLS connection: a 64 KiB <code>LoopBuf</code> that records are decrypted into. The reactor decrypts a record only when the ring has room for the plaintext it may hold, so a slow handler stalls the connection rather than growing memory.</td>
+</tr>
+<tr>
+<td><strong>Outbound buffer</strong> (<code>net_out</code>)</td>
+<td>A pooled byte buffer that <code>Endpoint::send(&amp;[u8])</code> appends to and the reactor drains when the socket is writable. It is capped by <code>max_net_out</code>; a connection that exceeds the cap is closed and the handler is told why.</td>
+</tr>
+<tr>
+<td><strong>Buffer pool</strong></td>
+<td><code>BufferPool</code> recycles rings and outbound buffers in power-of-two size classes so that connection churn does not hit the allocator.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="the-receive-contract">The receive contract</h3>
+<p><code>ProtocolHandler::receive</code> is handed the connection's ring itself, not a copy and not a borrowed slice cursor:</p>
+<pre><code>fn receive(&amp;mut self, endpoint: &amp;mut dyn Endpoint, buf: &amp;mut LoopBuf);</code></pre>
 <ul>
-<li>Per-reactor <code>DnsResolver</code> (sockets, pending queries, timers on that core).</li>
-<li>Process-shared config + TTL cache where appropriate.</li>
-<li>Dial-by-name resolves on the <strong>target reactor</strong>; callbacks run there, then dial TCP/QUIC.</li>
+<li><strong>Consume only whole tokens.</strong> Call <code>buf.advance(n)</code> for what you have fully processed. Anything left in the ring is presented again, at the front, on the next call once more bytes have arrived.</li>
+<li><strong>Hold none of the stream yourself.</strong> A handler keeps bounded parser state (a verb, a partially read number), never a growing copy of the input. Message bodies are passed on as they arrive, not collected.</li>
+<li><strong>The ring can wrap.</strong> <code>buf.readable_spans()</code> returns the readable bytes as up to two slices. <code>hopf_core::take_crlf_line</code> reads a CRLF-terminated line across the wrap, and <code>hopf_core::with_slice</code> lends a single contiguous slice to a parser that wants one (copying only if the ring has wrapped).</li>
+<li><strong>A token that can never fit is an error.</strong> If the ring is full and the handler consumed nothing, the token is larger than the ring will ever hold. Report it with <code>Endpoint::fail</code>; do not start buffering.</li>
+<li><strong>Backpressure is automatic.</strong> While the ring is full and the handler is not consuming, the reactor stops reading the socket. Handlers can also call <code>pause_read</code> / <code>resume_read</code> explicitly (for example while a storage operation is in flight) and use <code>on_write_ready</code> to wait for the outbound buffer to drain.</li>
+</ul>
+<pre><code>fn receive(&amp;mut self, endpoint: &amp;mut dyn Endpoint, buf: &amp;mut LoopBuf) {
+    // A partial line stays in the ring until its CRLF arrives.
+    while let Some(line) = hopf_core::take_crlf_line(buf) {
+        self.on_command(endpoint, &amp;line);
+    }
+}</code></pre>
+<p>Egress is deliberately simpler: <code>send(&amp;[u8])</code> copies into the outbound buffer, which is capped, so a handler that produces faster than the peer reads is stopped by the cap or by <code>on_write_ready</code>. Callbacks that deliver application payload to user code (an HTTP body chunk, a WebSocket message fragment) hand out slices of the ring or of a decoded frame; they are consumed during the call.</p>
+<h2 id="storage-and-dns">Storage and DNS</h2>
+<p>mio covers <strong>sockets</strong>, not arbitrary filesystem I/O. Mail, FTP, WebDAV and large body paths use an explicit <strong>storage executor</strong>: blocking or off-loop file work, <strong>never</strong> on the reactor thread. A handler pauses reads, submits the operation, and resumes from the completion callback, which runs back on the connection's own reactor.</p>
+<p>Name resolution is a <strong>substrate</strong> in <code>hopf-dns</code>, not a bolt-on product, and every dialling crate uses it:</p>
+<ul>
+<li>A reactor-affine <code>DnsResolver</code> (sockets, pending queries and timers on that core), with process-shared configuration and a TTL cache where appropriate.</li>
+<li>Dial-by-name resolves on the <strong>target reactor</strong>; the callback runs there, then dials TCP or QUIC.</li>
+<li>Upstreams may be UDP, TCP, DoT, DoQ or DoH, ranked by a capability cache; public WebPKI trust is built in for encrypted upstreams.</li>
 <li><strong>No</strong> blocking <code>getaddrinfo</code> on reactor threads.</li>
 </ul>
-<p>See <a href="dns.html">DNS</a>, <a href="runtime-options.html">runtime options</a>.</p>
+<p>See <a href="dns.html">DNS</a> and <a href="runtime-options.html">runtime options</a>.</p>
 <h2 id="layering">Layering</h2>
 <figure class="diagram" role="group" aria-labelledby="diagram-layers-caption">
-<svg viewBox="0 0 640 360" width="640" height="360" role="img" aria-labelledby="diagram-layers-title diagram-layers-desc">
+<svg viewBox="0 0 640 400" width="640" height="400" role="img" aria-labelledby="diagram-layers-title diagram-layers-desc">
   <title id="diagram-layers-title">Crate layering</title>
-  <desc id="diagram-layers-desc">Stack from hopf-core up through crypto transports, protocol services, HTTP Streams, and Stream consumers. hopf-auth sits beside core with no core dependency.</desc>
+  <desc id="diagram-layers-desc">Stack from hopf-core up through the TLS, DTLS and QUIC transports, protocol crates, HTTP Streams, Stream consumers and applications. hopf-auth, hopf-mailbox and hopf-dns sit beside the stack.</desc>
   <defs>
     <linearGradient id="layer-top" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.18"/>
@@ -244,47 +372,91 @@
     </linearGradient>
   </defs>
 
-  <!-- Layer 5: Stream consumers -->
-  <rect x="36" y="16" width="460" height="52" rx="10" fill="url(#layer-top)" stroke="var(--accent)" stroke-width="1.35"/>
-  <text x="52" y="38" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">hopf-webdav · hopf-websocket · hopf-grpc · hopf-otel</text>
-  <text x="52" y="56" font-family="var(--font)" font-size="12" fill="var(--muted)">Stream consumers</text>
-  <text x="520" y="48" font-family="var(--mono)" font-size="11" fill="var(--accent)">apps</text>
+  <!-- Applications -->
+  <rect x="12" y="12" width="452" height="52" rx="10" fill="url(#layer-top)" stroke="var(--accent)" stroke-width="1.35"/>
+  <text x="28" y="34" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">your main() · Composition (Rust builder or XML)</text>
+  <text x="28" y="52" font-family="var(--font)" font-size="12" fill="var(--muted)">Applications: servers, clients, proxies, any mixture</text>
 
-  <!-- Layer 4: HTTP -->
-  <rect x="48" y="78" width="436" height="52" rx="10" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"/>
-  <text x="64" y="100" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">hopf-http — ServerHandler / ClientHandler</text>
-  <text x="64" y="118" font-family="var(--font)" font-size="12" fill="var(--muted)">HTTP Streams · H1 / H2 / H3 adapters</text>
-  <text x="508" y="110" font-family="var(--mono)" font-size="11" fill="var(--muted)">streams</text>
+  <!-- Stream consumers -->
+  <rect x="12" y="74" width="452" height="52" rx="10" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"/>
+  <text x="28" y="96" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">hopf-webdav · hopf-websocket · hopf-grpc · hopf-masque</text>
+  <text x="28" y="114" font-family="var(--font)" font-size="12" fill="var(--muted)">Stream consumers (and hopf-otel exporters, hopf-mqtt WebSocket bridge)</text>
 
-  <!-- Layer 3: Protocol services -->
-  <rect x="60" y="140" width="412" height="52" rx="10" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"/>
-  <text x="76" y="162" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">hopf-ftp · hopf-smtp · hopf-mqtt · hopf-amqp · …</text>
-  <text x="76" y="180" font-family="var(--font)" font-size="12" fill="var(--muted)">Protocol services</text>
-  <text x="500" y="172" font-family="var(--mono)" font-size="11" fill="var(--muted)">wire</text>
+  <!-- HTTP -->
+  <rect x="12" y="136" width="452" height="52" rx="10" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"/>
+  <text x="28" y="158" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">hopf-http: ServerHandler / ClientHandler</text>
+  <text x="28" y="176" font-family="var(--font)" font-size="12" fill="var(--muted)">HTTP Streams · H1 / H2 / H3 adapters</text>
 
-  <!-- Layer 2: Crypto transports (split) -->
-  <rect x="72" y="202" width="194" height="52" rx="10" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"/>
-  <text x="169" y="224" text-anchor="middle" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">hopf-core::tls/dtls</text>
-  <text x="169" y="242" text-anchor="middle" font-family="var(--font)" font-size="11" fill="var(--muted)">TCP+UDP · in-tree, AWS-LC</text>
+  <!-- Protocol crates -->
+  <rect x="12" y="198" width="452" height="52" rx="10" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"/>
+  <text x="28" y="220" font-family="var(--mono)" font-size="11" font-weight="500" fill="var(--ink)">ftp · smtp · pop3 · imap · nntp · redis · mqtt · amqp · socks · ldap</text>
+  <text x="28" y="238" font-family="var(--font)" font-size="12" fill="var(--muted)">Protocol crates: each a ProtocolHandler, server and/or client</text>
 
-  <rect x="278" y="202" width="194" height="52" rx="10" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"/>
-  <text x="375" y="224" text-anchor="middle" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">hopf-quic</text>
-  <text x="375" y="242" text-anchor="middle" font-family="var(--font)" font-size="11" fill="var(--muted)">QUIC · in-tree, PQC-first TLS 1.3</text>
-  <text x="500" y="234" font-family="var(--mono)" font-size="11" fill="var(--muted)">crypto</text>
+  <!-- Transports -->
+  <rect x="12" y="260" width="218" height="52" rx="10" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"/>
+  <text x="121" y="282" text-anchor="middle" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">hopf-core::tls / dtls</text>
+  <text x="121" y="300" text-anchor="middle" font-family="var(--font)" font-size="11" fill="var(--muted)">TCP + UDP · in-tree, AWS-LC</text>
 
-  <!-- Layer 1: core -->
-  <rect x="84" y="264" width="388" height="56" rx="10" fill="url(#layer-core)" stroke="var(--accent)" stroke-width="1.5"/>
-  <text x="100" y="288" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">hopf-core</text>
-  <text x="100" y="306" font-family="var(--font)" font-size="11" fill="var(--muted)">Runtime · Endpoint · ProtocolHandler · Composition · Storage · ACL</text>
-  <text x="500" y="298" font-family="var(--mono)" font-size="11" fill="var(--accent)">core</text>
+  <rect x="246" y="260" width="218" height="52" rx="10" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"/>
+  <text x="355" y="282" text-anchor="middle" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">hopf-quic</text>
+  <text x="355" y="300" text-anchor="middle" font-family="var(--font)" font-size="11" fill="var(--muted)">QUIC · in-tree, PQC-first TLS 1.3</text>
 
-  <!-- hopf-auth aside -->
-  <path d="M278 320 V334" fill="none" stroke="var(--border)" stroke-width="1.25" stroke-dasharray="3 3"/>
-  <rect x="148" y="334" width="260" height="22" rx="11" fill="var(--surface)" stroke="var(--border)" stroke-dasharray="4 3"/>
-  <text x="278" y="349" text-anchor="middle" font-family="var(--mono)" font-size="10.5" fill="var(--muted)">hopf-auth · TrustPolicy / SASL · no core dep</text>
+  <!-- core -->
+  <rect x="12" y="322" width="452" height="62" rx="10" fill="url(#layer-core)" stroke="var(--accent)" stroke-width="1.5"/>
+  <text x="28" y="346" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">hopf-core</text>
+  <text x="28" y="364" font-family="var(--font)" font-size="11" fill="var(--muted)">Runtime · reactors · Endpoint · ProtocolHandler · LoopBuf rings</text>
+  <text x="28" y="378" font-family="var(--font)" font-size="11" fill="var(--muted)">Composition · storage executor · ACL · quota · telemetry seams</text>
+
+  <!-- Aside column -->
+  <text x="484" y="30" font-family="var(--font)" font-size="11" font-weight="700" fill="var(--muted)">BESIDE THE STACK</text>
+
+  <rect x="484" y="40" width="148" height="86" rx="10" fill="var(--surface)" stroke="var(--border)" stroke-dasharray="4 3"/>
+  <text x="558" y="62" text-anchor="middle" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">hopf-auth</text>
+  <text x="558" y="80" text-anchor="middle" font-family="var(--font)" font-size="11" fill="var(--muted)">TrustPolicy · SASL</text>
+  <text x="558" y="96" text-anchor="middle" font-family="var(--font)" font-size="11" fill="var(--muted)">credential stores</text>
+  <text x="558" y="112" text-anchor="middle" font-family="var(--font)" font-size="11" fill="var(--muted)">no core dependency</text>
+
+  <rect x="484" y="138" width="148" height="70" rx="10" fill="var(--surface)" stroke="var(--border)" stroke-dasharray="4 3"/>
+  <text x="558" y="160" text-anchor="middle" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">hopf-dns</text>
+  <text x="558" y="178" text-anchor="middle" font-family="var(--font)" font-size="11" fill="var(--muted)">resolver under every dial</text>
+  <text x="558" y="194" text-anchor="middle" font-family="var(--font)" font-size="11" fill="var(--muted)">DNS server · mDNS</text>
+
+  <rect x="484" y="220" width="148" height="70" rx="10" fill="var(--surface)" stroke="var(--border)" stroke-dasharray="4 3"/>
+  <text x="558" y="242" text-anchor="middle" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">hopf-mailbox</text>
+  <text x="558" y="260" text-anchor="middle" font-family="var(--font)" font-size="11" fill="var(--muted)">storage SPI for</text>
+  <text x="558" y="276" text-anchor="middle" font-family="var(--font)" font-size="11" fill="var(--muted)">smtp · pop3 · imap</text>
 </svg>
-<figcaption id="diagram-layers-caption">Protocol crates sit on crypto transports and <code>hopf-core</code>; Stream consumers ride HTTP Streams.</figcaption>
+<figcaption id="diagram-layers-caption">Protocol crates sit on the crypto transports and <code>hopf-core</code>; Stream consumers ride HTTP Streams. Every crate that dials resolves names through <code>hopf-dns</code>.</figcaption>
 </figure>
+<h3 id="crate-map">Crate map</h3>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 14%" />
+<col style="width: 66%" />
+</colgroup>
+<thead>
+<tr>
+<th>Crate</th>
+<th>Roles</th>
+<th>Contents</th>
+</tr>
+</thead>
+<tbody>
+<tr><td><code>hopf-core</code></td><td>both</td><td>Runtime, reactors, Endpoint, ProtocolHandler, Composition, storage executor, TLS 1.2/1.3 and DTLS 1.2/1.3 engines, crypto on AWS-LC, ACLs, quotas, retry policy, connection pool, telemetry seams, test harness</td></tr>
+<tr><td><code>hopf-quic</code></td><td>both</td><td>RFC 9000 transport and TLS 1.3 handshake, one Endpoint per stream</td></tr>
+<tr><td><code>hopf-http</code></td><td>both</td><td>HTTP/1.1, HTTP/2, HTTP/3 behind the version-agnostic Stream API; content coding, caching, HSTS</td></tr>
+<tr><td><code>hopf-webdav</code>, <code>hopf-websocket</code>, <code>hopf-grpc</code>, <code>hopf-masque</code></td><td>mixed</td><td>Built on HTTP Streams: WebDAV filesystem handler, WebSocket framing and upgrades, gRPC, CONNECT-UDP and CONNECT-IP</td></tr>
+<tr><td><code>hopf-dns</code>, <code>hopf-mdns</code></td><td>both</td><td>Resolver and forwarder, authoritative server, DoT/DoQ/DoH; multicast DNS and DNS-SD</td></tr>
+<tr><td><code>hopf-ftp</code>, <code>hopf-smtp</code>, <code>hopf-pop3</code>, <code>hopf-imap</code>, <code>hopf-mqtt</code></td><td>both</td><td>Server and client for each protocol</td></tr>
+<tr><td><code>hopf-socks</code></td><td>both</td><td>SOCKS4/4a/5 server and client</td></tr>
+<tr><td><code>hopf-nntp</code>, <code>hopf-redis</code>, <code>hopf-amqp</code>, <code>hopf-amqp1</code>, <code>hopf-ldap</code></td><td>client</td><td>Client-only crates</td></tr>
+<tr><td><code>hopf-mailbox</code></td><td>storage</td><td>Mailbox storage SPI (mbox, Maildir++) used by SMTP, POP3 and IMAP</td></tr>
+<tr><td><code>hopf-auth</code></td><td>both</td><td>TrustPolicy, IdentityMaterial, credential stores, SASL mechanisms; no dependency on <code>hopf-core</code></td></tr>
+<tr><td><code>hopf-otel</code></td><td>client</td><td>OTLP/HTTP and JSONL telemetry exporters, off the hot path</td></tr>
+<tr><td><code>hopf</code></td><td>-</td><td>Umbrella crate re-exporting the others behind Cargo features</td></tr>
+</tbody>
+</table>
 <h3 id="transport-vs-http-stream">Transport vs HTTP Stream</h3>
 <table>
 <colgroup>
@@ -299,21 +471,21 @@
 </thead>
 <tbody>
 <tr>
-<td><strong>A — Transport</strong> (<code>hopf-core</code> / <code>hopf-quic</code>)</td>
-<td><code>Endpoint</code> (byte stream); TCP; UDP datagrams; QUIC stream endpoint; multiplexed QUIC connection</td>
+<td><strong>A - Transport</strong> (<code>hopf-core</code> / <code>hopf-quic</code>)</td>
+<td><code>Endpoint</code> (byte stream); TCP; UNIX sockets; UDP datagrams; QUIC stream endpoint; multiplexed QUIC connection</td>
 </tr>
 <tr>
-<td><strong>B — HTTP Stream</strong> (<code>hopf-http</code>)</td>
-<td>One request/response exchange; <code>HttpStream</code> + <code>ServerHandler</code> / <code>ServerWriter</code>, <code>ClientHandler</code> / <code>ClientWriter</code> — <strong>version- and transport-agnostic</strong></td>
+<td><strong>B - HTTP Stream</strong> (<code>hopf-http</code>)</td>
+<td>One request/response exchange; <code>HttpStream</code> + <code>ServerHandler</code> / <code>ServerWriter</code>, <code>ClientHandler</code> / <code>ClientWriter</code> - <strong>version- and transport-agnostic</strong></td>
 </tr>
 </tbody>
 </table>
-<p>H1 adapts a TCP <code>Endpoint</code> into serialised Streams; H2 multiplexes Streams on one TCP <code>Endpoint</code>; H3 maps each request to a QUIC stream <code>Endpoint</code>. Bind vs dial only affects how the transport was born; server/client role is a separate axis. Terminology: HTTP Stream ≠ H2 stream id ≠ QUIC stream endpoint.</p>
+<p>H1 adapts a TCP <code>Endpoint</code> into serialised Streams; H2 multiplexes Streams on one TCP <code>Endpoint</code>; H3 maps each request to a QUIC stream <code>Endpoint</code>. Bind vs dial only affects how the transport was born; server/client role is a separate axis. Terminology: HTTP Stream is not an H2 stream id and not a QUIC stream endpoint.</p>
 <h2 id="endpoint-vs-protocolhandler">Endpoint vs ProtocolHandler</h2>
 <table>
 <colgroup>
-<col style="width: 50%" />
-<col style="width: 50%" />
+<col style="width: 24%" />
+<col style="width: 76%" />
 </colgroup>
 <thead>
 <tr>
@@ -324,15 +496,15 @@
 <tbody>
 <tr>
 <td><code>Endpoint</code></td>
-<td>Transport face: <code>send</code>, <code>close</code>, <code>start_tls</code>, pause/resume read, <code>on_write_ready</code>, <code>execute</code>, <code>schedule_timer</code>, <code>handle</code>, peer addrs, <code>security_info</code></td>
+<td>Transport face: <code>send</code>, <code>close</code>, <code>fail</code>, <code>start_tls</code> / <code>start_client_tls</code>, <code>pause_read</code> / <code>resume_read</code>, <code>on_write_ready</code>, <code>execute</code>, <code>schedule_timer</code>, <code>handle</code> (a cloneable <code>ConnHandle</code>), local and remote addresses, PROXY protocol TLVs, <code>security_info</code></td>
 </tr>
 <tr>
 <td><code>ProtocolHandler</code></td>
-<td>Protocol FSM: <code>connected</code>, <code>receive</code>, <code>disconnected</code>, <code>security_established</code>, <code>error</code></td>
+<td>Protocol state machine: <code>connected</code>, <code>receive(&amp;mut LoopBuf)</code>, <code>disconnected</code>, <code>security_established</code>, <code>drain</code>, <code>error</code>, plus <code>migrated</code> (QUIC path change) and <code>datagram_received</code> (QUIC / HTTP/3 datagrams) with default no-op bodies</td>
 </tr>
 </tbody>
 </table>
-<p>HTTP adapters (<code>H1Endpoint</code>, <code>H2Endpoint</code>, <code>CleartextHttpEndpoint</code>, <code>AlpnHttpEndpoint</code>, H3 handlers) are <code>ProtocolHandler</code>s that drive Stream handlers. <code>receive</code> uses NIO compact semantics: advance the <code>&amp;mut &amp;[u8]</code> cursor; unconsumed suffix is preserved.</p>
+<p>HTTP adapters (<code>H1Endpoint</code>, <code>H2Endpoint</code>, <code>CleartextHttpEndpoint</code>, <code>AlpnHttpEndpoint</code>, H3 handlers) are <code>ProtocolHandler</code>s that drive Stream handlers; H1 and H2 parse straight out of the connection ring, and H3 and QUIC streams read from fixed rings of their own. <code>connected</code> runs on the worker reactor once the socket is registered (and, on a PROXY protocol listener, once the header has been parsed); a protocol that must wait for TLS defers its greeting to <code>security_established</code>.</p>
 <h2 id="listen-and-dial-are-peers">Listen and dial are peers</h2>
 <table>
 <thead>
@@ -347,8 +519,12 @@
 <td><code>TcpConnectorConfig</code></td>
 </tr>
 <tr>
-<td><code>Runtime::add_tcp_listener</code></td>
-<td><code>Runtime::connect</code></td>
+<td><code>UnixListenerConfig</code></td>
+<td><code>UnixConnectorConfig</code></td>
+</tr>
+<tr>
+<td><code>Runtime::add_tcp_listener</code> / <code>add_unix_listener</code></td>
+<td><code>Runtime::connect</code> / <code>connect_unix</code></td>
 </tr>
 <tr>
 <td><code>Composition::listen_tcp</code></td>
@@ -364,9 +540,9 @@
 </tr>
 </tbody>
 </table>
-<p>Both reduce to registering a stream on a reactor with lifetime affinity.</p>
+<p>Both reduce to registering a stream on a reactor with lifetime affinity, and both share <code>TcpConnParams</code> (buffer caps, idle timeout, TLS). Listeners add what only a listener needs: ACLs, rate limits, PROXY protocol and peer-credential checks.</p>
 <h2 id="module-layout-server-and-client-as-peers">Module layout: server and client as peers</h2>
-<p>Gumdrop assumes server functionality by default, with client as a submodule. Hopf deliberately diverges: within a protocol crate, <strong>server (bind) and client (dial) are equal</strong>, not a default role plus an add-on. This is a module-layout axis distinct from the listen/dial API axis above — it governs where code <strong>lives</strong>, not how a socket was born. Three layouts are legitimate, chosen per crate by how tightly client and server share wire state:</p>
+<p>Within a protocol crate, <strong>server (bind) and client (dial) are equal</strong>: neither is the unmarked default with the other bolted on. This is a module-layout axis distinct from the listen/dial API axis above - it governs where code <strong>lives</strong>, not how a socket was born. Three layouts are legitimate, chosen per crate by how tightly client and server share wire state:</p>
 <table>
 <colgroup>
 <col style="width: 30%" />
@@ -381,21 +557,21 @@
 <tbody>
 <tr>
 <td><strong>Sibling modules</strong><br><code>client/</code>, <code>server/</code>, shared code at crate root</td>
-<td>Client and server are separate objects with separate state machines. Reference implementations: <code>hopf-dns</code> (<code>client/</code>, <code>server/</code>, shared <code>wire/</code>, <code>dnssec/</code>, <code>cache.rs</code>), <code>hopf-imap</code> (<code>client/</code>, <code>server/</code>, shared <code>capability.rs</code>, <code>idle.rs</code>, …).</td>
+<td>Client and server are separate objects with separate state machines. Examples: <code>hopf-dns</code> (<code>client/</code>, <code>server/</code>, shared <code>wire/</code>, <code>cache.rs</code>), <code>hopf-http</code>, <code>hopf-smtp</code>, <code>hopf-pop3</code>, <code>hopf-imap</code>, <code>hopf-ftp</code>, <code>hopf-mqtt</code>. Smaller crates use sibling files instead of directories (<code>hopf-grpc</code>'s <code>client.rs</code> and <code>server.rs</code>, <code>hopf-socks</code>, <code>hopf-masque</code>).</td>
 </tr>
 <tr>
 <td><strong>Role-parameterised file</strong><br>one type/file, constructed as either role</td>
-<td>Client and server share one wire FSM and splitting it would fragment that state machine. E.g. <code>hopf-core::tls</code> (<code>acceptor_from_pem</code> / <code>connector_from_pem</code>), <code>hopf-quic</code> (<code>listen_quic</code> / <code>connect_quic</code>), <code>hopf-http</code>'s <code>H1Endpoint::server()</code> / <code>::client()</code>, <code>hopf-websocket</code>'s <code>WsUpgradeHandler::server()</code> / <code>::client()</code>, and each <code>hopf-auth</code> SASL mechanism (<code>PlainServer</code> / <code>PlainClient</code> in one file — SASL client/server are wire roles, see <a href="auth.html">auth</a>).</td>
+<td>Client and server share one wire state machine and splitting it would fragment that machine. E.g. <code>hopf-core::tls</code> (<code>acceptor_from_pem</code> / <code>connector_from_pem</code>), <code>hopf-quic</code> (<code>listen_quic</code> / <code>connect_quic</code>), <code>hopf-http</code>'s <code>H1Endpoint::server()</code> / <code>::client()</code>, <code>hopf-websocket</code>'s <code>WsUpgradeHandler::server()</code> / <code>::client()</code>, and each <code>hopf-auth</code> SASL mechanism (<code>PlainServer</code> / <code>PlainClient</code> in one file; SASL client and server are wire roles, see <a href="auth.html">auth</a>).</td>
 </tr>
 <tr>
 <td><strong>Single role</strong><br>no split, one role only</td>
-<td>The protocol has no counterpart role in-tree: <code>hopf-webdav</code> (server-only filesystem handler), <code>hopf-otel</code> (client-only exporter; hopf does not run a collector), <code>hopf-mailbox</code> (storage backend, not a network protocol).</td>
+<td>The protocol has no counterpart role in-tree: client-only <code>hopf-nntp</code>, <code>hopf-redis</code>, <code>hopf-amqp</code>, <code>hopf-amqp1</code>, <code>hopf-ldap</code> and <code>hopf-otel</code> (an exporter; Hopf does not run a collector); server-only <code>hopf-webdav</code> (a filesystem handler); and <code>hopf-mailbox</code> (a storage backend, not a network protocol).</td>
 </tr>
 </tbody>
 </table>
-<p><strong>Anti-pattern:</strong> server code flat at crate root with no <code>server/</code> name, plus a <code>client/</code> submodule bolted on — server-as-unmarked-default is exactly the Gumdrop shape this axis exists to avoid. Crates in this shape get a <code>server/</code> module carved out of their root files, mirroring their existing <code>client/</code>.</p>
+<p>Because the roles are peers, the same crate can sit on both ends of one process: <code>hopf-smtp</code> accepts mail and relays it onward through its own client, <code>hopf-socks</code> and <code>hopf-masque</code> terminate a tunnel and dial the target, and <code>hopf-mqtt</code> runs a broker next to a client.</p>
 <h2 id="dynamic-bindings-and-composition">Dynamic bindings and composition</h2>
-<p><strong>All bindings are dynamic.</strong> Listen and dial are added/removed through Runtime APIs while the process is alive. Configuration is a <strong>script</strong> over those APIs (Rust <code>main</code> / builder, or XML). <code>Service</code> orchestrates lifecycle; it does <strong>not</strong> own an immutable listener list as source of truth.</p>
+<p><strong>All bindings are dynamic.</strong> Listen and dial are added and removed through Runtime APIs while the process is alive. Configuration is a <strong>script</strong> over those APIs (Rust <code>main</code> / builder, or XML). <code>Service</code> orchestrates lifecycle; it does <strong>not</strong> own an immutable listener list as source of truth.</p>
 <figure class="diagram" role="group" aria-labelledby="diagram-compose-caption">
 <svg viewBox="0 0 640 220" width="640" height="220" role="img" aria-labelledby="diagram-compose-title diagram-compose-desc">
   <title id="diagram-compose-title">Composition startup flow</title>
@@ -437,37 +613,57 @@
   <path d="M472 188 V200" fill="none" stroke="var(--border)" stroke-width="1.25"/>
   <text x="472" y="214" text-anchor="middle" font-family="var(--mono)" font-size="11" fill="var(--muted)">wait / shutdown</text>
 </svg>
-<figcaption id="diagram-compose-caption">Configuration is a script over Runtime APIs — Rust builder or XML via tractrix, same destination.</figcaption>
+<figcaption id="diagram-compose-caption">Configuration is a script over Runtime APIs: a Rust builder or XML via tractrix, same destination.</figcaption>
 </figure>
 <ul>
 <li><strong>Canonical:</strong> Rust <code>Composition</code> builder.</li>
-<li><strong>Declarative:</strong> XML via <strong>tractrix</strong> → same builder; closed registry of handler / trust names — <strong>no</strong> reflective DI.</li>
+<li><strong>Declarative:</strong> XML via <strong>tractrix</strong> to the same builder; closed registry of handler and trust names, <strong>no</strong> reflective DI.</li>
 <li>TOML/YAML are not primary composition formats.</li>
 </ul>
 <p>Details: <a href="composition.html">composition</a>, <a href="services.html">services</a>, <a href="clients.html">clients</a>.</p>
+<h2 id="lifecycle">Lifecycle: readiness and drain</h2>
+<ul>
+<li><code>Runtime::is_ready</code> is true while the runtime is not draining and every listener registered so far was bound; after a failed bind it stays false (<code>bind_failures</code> counts them), so a readiness probe can answer from it.</li>
+<li><code>Runtime::start_drain</code> stops accepting on every listener, makes <code>is_ready</code> false and calls <code>ProtocolHandler::drain</code> on every open connection, once each. A handler uses it to say goodbye in its own protocol (SMTP <code>421</code>, POP3 or IMAP <code>BYE</code>, HTTP <code>Connection: close</code> or <code>GOAWAY</code>) and close.</li>
+<li><code>Runtime::shutdown_graceful</code> drains, waits up to <code>RuntimeConfig::drain_timeout</code> (default 30 s) for connections to finish, returning as soon as none is left, then closes what remains by force and stops the threads.</li>
+</ul>
 <h2 id="auth-vocabulary">Auth vocabulary</h2>
 <p>Prefer <strong>TrustPolicy</strong> + <strong>IdentityMaterial</strong> over Realm-as-root naming. Attach to <strong>both</strong> listen and dial. SASL client/server are <strong>wire roles</strong>, independent of listen/dial. See <a href="auth.html">auth</a>.</p>
 <h2 id="codec-style">Codec style</h2>
-<p><strong>Grammar-driven incremental codecs:</strong> each protocol owns a self-contained parser (<code>H1Scanner</code>, <code>Pop3ServerLexer</code>, <code>SmtpServerLexer</code>, <code>FtpServerLexer</code>, <code>ImapServerLexer</code>, …) with its own token alphabet and bounded in-progress-token scratch state; update the parse FSM as each production completes; CRLF is one production, not the only event boundary. A parser consumes every byte it's handed in a single call and never asks the caller to retain or re-supply anything. Early <strong>parse</strong> state ≠ early <strong>app</strong> callbacks. Sibling incremental parsers (tractrix, rjsonparser, rmimeparser, rprotobuf) follow the same push model for XML/JSON/MIME/protobuf.</p>
+<p><strong>Grammar-driven incremental codecs:</strong> each protocol owns a self-contained push parser (<code>H1Scanner</code>, <code>Pop3ServerLexer</code>, <code>SmtpServerLexer</code>, <code>FtpServerLexer</code>, <code>ImapServerLexer</code>, the client-side reply lexers, the RESP parser in <code>hopf-redis</code>, and the frame parsers of H2, H3, WebSocket and MQTT) with its own token alphabet and bounded in-progress state.</p>
+<ul>
+<li><strong>One forward pass.</strong> Lexing and parsing happen together as the bytes arrive; there is no split-then-parse stage and no seeking back.</li>
+<li><strong>Tokens, not lines.</strong> A verb's argument is read according to its grammar as it arrives (SMTP paths and parameters, IMAP's per-verb grammar machines); CRLF is one production, not the only event boundary, and an argument is never held and searched again.</li>
+<li><strong>Bounded state.</strong> A parser keeps only what a token in progress needs, with a hard cap. What the parser has not consumed stays in the connection ring; it is never copied into a growing side buffer.</li>
+<li><strong>Semantic events out.</strong> Parsers push events to a handler as soon as they can be decided, and bodies stream through without being collected. Early <strong>parse</strong> state is not early <strong>application</strong> callbacks: a handler is told when a decision is due, not on every token.</li>
+</ul>
+<p>Sibling incremental parsers (tractrix, rjsonparser, rmimeparser, rprotobuf) follow the same push model for XML, JSON, MIME and protobuf, and use the same <code>loopbuf</code> crate.</p>
+<h2 id="telemetry">Telemetry</h2>
+<p><code>hopf-core</code> defines the <strong>seams</strong> and nothing heavier: a <code>TelemetryHook</code> that the runtime, reactors and protocol crates call, structured <code>LogRecord</code>s with a level axis, and the qlog event surface used by <code>hopf-quic</code>. A hook is installed per <code>Runtime</code> or process-wide. <code>hopf-otel</code> implements it with OTLP/HTTP and JSONL exporters, an access-log sink and a console sink on a batch worker that is off the reactor's hot path. See <a href="telemetry.html">telemetry</a>.</p>
+<h2 id="testing">Testing</h2>
+<ul>
+<li><code>hopf_core::testing::Peer</code> (Cargo feature <code>testing</code>) drives a <code>ProtocolHandler</code> in-process with no sockets and no reactor: it records what the handler sends, feeds it scripted input (text or binary), plays the part of the reactor for storage-pool and timer callbacks, and can make the connection secure or fail it.</li>
+<li>Unit tests are <strong>hermetic</strong>: no network, no filesystem writes, no clock waits. <code>scripts/check-hermetic-tests.sh</code> runs them in a sandbox that fails any test doing socket or file I/O, and CI runs it.</li>
+<li>Tests that need real sockets or files sit behind a per-crate <code>integration</code> feature, and interoperability is checked against independent peers (OpenSSL, GnuTLS, BIND, OpenLDAP, Redis and others) where one exists.</li>
+</ul>
 <h2 id="security-substrate">Security substrate</h2>
-<p>Encrypted transport and shared authentication crypto are part of <code>hopf-core</code>'s contract — not a bolt-on crate graph. Gumdrop treated TLS and DTLS as framework-transparent; Hopf follows the same idea with Rust ownership and TPC reactors.</p>
+<p>Encrypted transport and shared authentication crypto are part of <code>hopf-core</code>'s contract, not a bolt-on crate graph. Handlers see plaintext and a <code>SecurityInfo</code>; how the bytes were protected is below the line.</p>
 <h3 id="security-today">Today</h3>
 <ul>
-<li><strong>AWS-LC</strong> (BoringSSL lineage) is the native crypto library, reached through <code>aws-lc-rs</code> / <code>aws-lc-sys</code>.</li>
-<li><strong>TCP TLS / STARTTLS:</strong> in-tree TLS 1.2/1.3 in <code>hopf-core::tls</code> — <code>TlsVariant</code> (<code>V13</code> / <code>V12</code> / <code>Negotiating</code>) driven by <code>TcpConnection</code> through <code>TlsRecordSink</code>; PEM helpers return <code>SharedTlsAcceptor</code> / <code>SharedTlsConnector</code> wired with <code>TcpListenerConfig::with_tls</code>, <code>with_starttls_acceptor</code>, or <code>TcpConnectorConfig::with_tls</code>. Handlers see plaintext; metadata in <code>SecurityInfo</code> after handshake.</li>
-<li><strong>QUIC / HTTP/3:</strong> in-tree RFC 9000 transport and its TLS 1.3 handshake for RFC 9001, both in <code>hopf-quic</code> on AWS-LC directly — no <code>quinn-proto</code> or other external QUIC/TLS library dependency anywhere in the workspace; H3/QPACK in-tree in <code>hopf-http</code>.</li>
-<li><strong>Mail/DNS auth crypto:</strong> DKIM and DNSSEC verification call <code>aws-lc-rs</code> directly from protocol crates.</li>
-<li><strong>UDP:</strong> datagram handlers in core are <strong>cleartext</strong>; DTLS 1.2/1.3 sessions (<code>hopf-core::dtls</code>/<code>dtls12</code>) have a reactor-driven UDP driver and per-peer 1.3-vs-1.2 version negotiation (<code>DtlsVersionPolicy</code>, mirroring TCP's <code>TcpTlsVersionPolicy</code>). No protocol crate dials or listens over DTLS yet — see Direction.</li>
+<li><strong>AWS-LC</strong> (BoringSSL lineage) is the native crypto library, reached through <code>aws-lc-rs</code> / <code>aws-lc-sys</code>. The <code>fips</code> feature builds its FIPS module, and <code>RuntimeConfig::fips</code> refuses to start without it.</li>
+<li><strong>TCP TLS / STARTTLS:</strong> in-tree TLS 1.2 and 1.3 in <code>hopf-core::tls</code>, AEAD cipher suites only (AES-GCM, ChaCha20-Poly1305; no CBC). <code>TlsVariant</code> (<code>V13</code> / <code>V12</code> / <code>Negotiating</code>) is driven by <code>TcpConnection</code> through <code>TlsRecordSink</code>; PEM and builder helpers return <code>SharedTlsAcceptor</code> / <code>SharedTlsConnector</code> wired with <code>TcpListenerConfig::with_tls</code>, <code>with_starttls_acceptor</code> or <code>TcpConnectorConfig::with_tls</code>. Features include hybrid post-quantum key exchange, ML-DSA signatures, session tickets with key rotation, Extended Master Secret, ALPN, key updates, certificate compression and Encrypted Client Hello.</li>
+<li><strong>QUIC / HTTP/3:</strong> in-tree RFC 9000 transport and its TLS 1.3 handshake for RFC 9001, both in <code>hopf-quic</code> on AWS-LC directly; no external QUIC or TLS library anywhere in the production dependency graph. H3 and QPACK are in-tree in <code>hopf-http</code>.</li>
+<li><strong>Mail and DNS authentication crypto:</strong> DKIM, ARC and DNSSEC call <code>aws-lc-rs</code> directly from protocol crates.</li>
+<li><strong>UDP:</strong> datagram handlers in core are <strong>cleartext</strong>. DTLS 1.2 and 1.3 sessions (<code>hopf-core::dtls</code> / <code>dtls12</code>) have a reactor-driven UDP driver and per-peer 1.3-vs-1.2 negotiation (<code>DtlsVersionPolicy</code>, mirroring TCP's <code>TcpTlsVersionPolicy</code>). No protocol crate dials or listens over DTLS yet; see Direction.</li>
 </ul>
 <h3 id="security-direction">Direction</h3>
-<p>The AWS-LC consolidation and in-tree TCP TLS / QUIC work below are done. What remains:</p>
 <ul>
-<li><strong>DTLS:</strong> expose sessions through the same generic <code>Endpoint</code> contract TCP TLS uses, so protocol crates can dial/listen over DTLS without bespoke wiring — the handshake/record engine and version negotiation are already shipped; only this integration layer is outstanding.</li>
-<li><strong>Primitives:</strong> one trust/identity surface for X.509 (TLS/mTLS), DKIM/ARC signing, DNSSEC, and future host-key models (SSH).</li>
-<li><strong>Auth:</strong> optional GSSAPI/Kerberos SASL on <code>hopf-auth</code>, once the native foundation is settled — KDC work stays on <code>StorageExecutor</code>.</li>
+<li><strong>DTLS:</strong> expose sessions through the same generic <code>Endpoint</code> contract TCP TLS uses, so protocol crates can dial and listen over DTLS without bespoke wiring. The handshake and record engines and version negotiation are shipped; only this integration layer is outstanding.</li>
+<li><strong>Primitives:</strong> one trust and identity surface for X.509 (TLS/mTLS), DKIM/ARC signing, DNSSEC and future host-key models (SSH).</li>
+<li><strong>Auth:</strong> optional GSSAPI/Kerberos SASL on <code>hopf-auth</code>, once the native foundation is settled; KDC work stays on <code>StorageExecutor</code>.</li>
 </ul>
-<p>Other transports (SSH/SFTP, DNSCrypt, CoAP/OSCORE) share the <strong>primitive</strong> layer but bring their own framing and key exchange — they are not TLS handshakes.</p>
-<p>Status table: <a href="conformance.html#security-substrate">Conformance → Security substrate</a>.</p>
+<p>Other transports (SSH/SFTP, DNSCrypt, CoAP/OSCORE) share the <strong>primitive</strong> layer but bring their own framing and key exchange; they are not TLS handshakes.</p>
+<p>Status table: <a href="conformance.html#security-substrate">Conformance &rarr; Security substrate</a>.</p>
 <h2 id="dependencies">Dependencies</h2>
 <h3 id="allowed-hard">Allowed today (hard)</h3>
 <table>
@@ -486,18 +682,28 @@
 </tr>
 <tr>
 <td><strong>aws-lc-rs</strong> / <strong>aws-lc-sys</strong></td>
-<td>Native crypto (AWS-LC / BoringSSL lineage) — TCP TLS, DTLS, and QUIC all use it directly</td>
-<td>Keep — centralised through <code>hopf-core</code> / <code>hopf-quic</code></td>
+<td>Native crypto (AWS-LC / BoringSSL lineage); TCP TLS, DTLS and QUIC all use it directly</td>
+<td>Keep; centralised through <code>hopf-core</code> / <code>hopf-quic</code></td>
 </tr>
 <tr>
-<td><strong>rustls-native-certs</strong></td>
-<td>OS trust store loading for X.509 verification</td>
+<td><a href="https://crates.io/crates/loopbuf"><strong>loopbuf</strong></a></td>
+<td>The ring buffer behind every connection's inbound bytes; also used by the sibling parsers</td>
 <td>Keep</td>
 </tr>
 <tr>
-<td><strong>rustls</strong></td>
-<td>Workspace dev-dependency only: socket-level TCP TLS interop tests against <code>hopf-core::tls</code> (independent peer implementation)</td>
-<td>Keep for test coverage</td>
+<td><strong>rustls-native-certs</strong>, <strong>webpki-roots</strong></td>
+<td>OS and bundled public trust anchors for X.509 verification</td>
+<td>Keep</td>
+</tr>
+<tr>
+<td><strong>brotli</strong>, <strong>flate2</strong></td>
+<td>Content codings (HTTP, IMAP COMPRESS) and TLS certificate compression</td>
+<td>Keep</td>
+</tr>
+<tr>
+<td><strong>bytes</strong>, <strong>getrandom</strong>, <strong>libc</strong>, <strong>socket2</strong></td>
+<td>Shared buffers, OS randomness, system calls, multicast and UDP socket options</td>
+<td>Keep</td>
 </tr>
 </tbody>
 </table>
@@ -516,7 +722,7 @@
 <tbody>
 <tr>
 <td><a href="https://crates.io/crates/tractrix">tractrix</a></td>
-<td>Incremental XML (WebDAV + composition)</td>
+<td>Incremental XML (WebDAV, composition)</td>
 </tr>
 <tr>
 <td><a href="https://crates.io/crates/rjsonparser">rjsonparser</a></td>
@@ -524,26 +730,28 @@
 </tr>
 <tr>
 <td><a href="https://crates.io/crates/rmimeparser">rmimeparser</a></td>
-<td>Incremental MIME / RFC 5322</td>
+<td>Incremental MIME / RFC 5322 (SMTP, POP3, IMAP, mailbox)</td>
 </tr>
 <tr>
 <td><a href="https://crates.io/crates/rprotobuf">rprotobuf</a></td>
-<td>Incremental protobuf (e.g. OTLP)</td>
+<td>Incremental protobuf (gRPC, OTLP)</td>
 </tr>
 </tbody>
 </table>
 <h3 id="explicit-non-dependencies">Explicit non-dependencies</h3>
-<p>Async app runtimes (Tokio et al.), Hyper, Axum, Tower, serde as architecture, the <code>quinn</code>/<code>quinn-proto</code> crates (fully replaced by <code>hopf-quic</code>'s in-tree RFC 9000 transport), servlet/JSP/Java EE APIs, reflective XML DI, TOML/YAML as primary composition formats.</p>
+<p>Async app runtimes (Tokio et al.), Hyper, Axum, Tower, serde as architecture, the <code>quinn</code> / <code>quinn-proto</code> crates (fully replaced by <code>hopf-quic</code>'s in-tree RFC 9000 transport), servlet/JSP/Java EE APIs, reflective XML DI, TOML/YAML as primary composition formats.</p>
 <h2 id="non-goals">Non-goals</h2>
 <ul>
-<li>Replacing AWS-LC with multiple competing pure-Rust crypto stacks for TLS, DTLS, and QUIC.</li>
-<li>Servlet container or Java EE APIs (Gumdrop had these; Hopf does not).</li>
+<li>Replacing AWS-LC with multiple competing pure-Rust crypto stacks for TLS, DTLS and QUIC.</li>
+<li>CBC cipher suites, ever: TLS 1.2 is AEAD-only.</li>
+<li>OCSP stapling and revocation policy inside the handshake engine: certificate validation policy belongs to the caller, not to a synchronous handshake state machine.</li>
+<li>A servlet container or Java EE APIs.</li>
 </ul>
 <h2 id="further-reading">Further reading</h2>
 <ul>
-<li><a href="services.html">Services</a> · <a href="clients.html">Clients</a> · <a href="runtime-options.html">Runtime options</a></li>
-<li><a href="http/overview.html">HTTP overview</a> · <a href="quic-h3.html">QUIC / H3</a> · <a href="tls.html">TLS</a> · <a href="amqp.html">AMQP</a></li>
-<li><a href="auth.html">Auth</a> · <a href="access-control.html">Access control</a> · <a href="telemetry.html">Telemetry</a></li>
+<li><a href="getting-started.html">Getting started</a> &middot; <a href="services.html">Services</a> &middot; <a href="clients.html">Clients</a> &middot; <a href="runtime-options.html">Runtime options</a></li>
+<li><a href="http/overview.html">HTTP overview</a> &middot; <a href="quic-h3.html">QUIC / H3</a> &middot; <a href="tls.html">TLS</a> &middot; <a href="amqp.html">AMQP</a></li>
+<li><a href="auth.html">Auth</a> &middot; <a href="access-control.html">Access control</a> &middot; <a href="telemetry.html">Telemetry</a></li>
 </ul>
 
       <p class="footer">

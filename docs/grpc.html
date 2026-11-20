@@ -131,11 +131,23 @@
 </tr>
 <tr>
 <td>Status codes</td>
-<td>e.g. <code>12</code> UNIMPLEMENTED, <code>13</code> INTERNAL</td>
+<td>e.g. <code>4</code> DEADLINE_EXCEEDED, <code>8</code> RESOURCE_EXHAUSTED, <code>12</code> UNIMPLEMENTED, <code>13</code> INTERNAL</td>
+</tr>
+<tr>
+<td>Compression</td>
+<td>Per-message, named by <code>grpc-encoding</code>, advertised in <code>grpc-accept-encoding</code>: <code>gzip</code> and <code>deflate</code> by default, <code>br</code> opt-in</td>
+</tr>
+<tr>
+<td>Deadlines</td>
+<td><code>grpc-timeout</code> sent by the client and enforced on both sides</td>
+</tr>
+<tr>
+<td>Metadata</td>
+<td>Custom headers and trailers, including <code>-bin</code> (base64) keys</td>
 </tr>
 </tbody>
 </table>
-<p>Content-types accepted: <code>application/grpc</code>, <code>application/grpc+proto</code>, and <code>application/grpc+json</code> (optional <code>;</code> parameters). Other subtypes (<code>+thrift</code>, <code>grpc-web*</code>, …) return HTTP 415. JSON payloads use the proto3 JSON mapping via <code>rjsonparser</code>; framing stays 5-byte length-prefixed.</p>
+<p>Content-types accepted: <code>application/grpc</code>, <code>application/grpc+proto</code>, and <code>application/grpc+json</code> (optional <code>;</code> parameters). Other subtypes (<code>+thrift</code>, <code>grpc-web*</code>, …) return HTTP 415. JSON payloads use the proto3 JSON mapping via <code>rjsonparser</code>, including nested, repeated and map fields and the well-known types (<code>Timestamp</code>, <code>Duration</code>, <code>FieldMask</code>, the wrappers, <code>Struct</code>/<code>Value</code>/<code>ListValue</code>); framing stays 5-byte length-prefixed.</p>
 <h2 id="architecture">Architecture</h2>
 <pre><code>HTTP Stream
     │ POST /pkg.Service/Method  content-type: application/grpc
@@ -143,9 +155,9 @@
 GrpcHandlerFactory  (ServerHandlerFactory)
     │ ProtoFile::get_rpc_by_path
     ▼
-GrpcService::start_unary_call → ProtoMessageHandler
+GrpcService::start_call (or start_unary_call) → GrpcCallHandler
     │
-    └── GrpcResponseChannel → framed response + grpc-status trailers</code></pre>
+    └── GrpcCall (GrpcResponseChannel) → framed responses + grpc-status trailers</code></pre>
 <p>Client path: <code>GrpcClient::unary_call</code> → <code>GrpcUnaryCall</code> as <code>ClientHandlerFactory</code> for an HTTP client endpoint. For a streaming method, <code>GrpcClient::streaming_call</code> returns the factory and a <code>GrpcClientCall</code> whose <code>send</code> / <code>half_close</code> / <code>cancel</code> drive the request side from any thread; each response message arrives through <code>GrpcResponseHandler::start_message</code>, and <code>on_complete</code> reports the call's final status once.</p>
 <h2 id="framing">Framing</h2>
 <table>
@@ -178,11 +190,11 @@ GrpcService::start_unary_call → ProtoMessageHandler
 </tr>
 <tr>
 <td><code>GrpcFramingError</code></td>
-<td>Oversized / compressed / partial</td>
+<td>Oversized / invalid flag / partial</td>
 </tr>
 </tbody>
 </table>
-<p>Compressed frames (flag ≠ 0) are <strong>rejected</strong>. Split-feed safe. <code>0</code> max size uses the default 4 MiB (not unlimited); pass <code>u64::MAX</code> only for an explicit no-cap.</p>
+<p>Flag <code>1</code> marks a message compressed with the call's <code>grpc-encoding</code>; <code>frame_compressed</code> writes one. The parser passes the flag on and the server and client decode with the negotiated algorithm (a flag above 1 is not gRPC and fails the call). Split-feed safe. <code>0</code> max size uses the default 4 MiB (not unlimited); pass <code>u64::MAX</code> only for an explicit no-cap.</p>
 <div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_grpc::</span><span class="op">{</span>frame<span class="op">,</span> GrpcFrameParser<span class="op">};</span></span>
 <span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> bytes <span class="op">=</span> frame(<span class="st">b&quot;protobuf-payload&quot;</span>)<span class="op">;</span></span>
@@ -258,6 +270,32 @@ GrpcService::start_unary_call → ProtoMessageHandler
 <span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="co">// Factory implements ServerHandlerFactory:</span></span>
 <span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="pp">GrpcHandlerFactory::</span>new(proto_file<span class="op">,</span> <span class="pp">Arc::</span>new(service))</span>
 <span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>factory<span class="op">.</span>set_max_message_size(<span class="dv">4</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span>)<span class="op">;</span></span></code></pre></div>
+<h3 id="streaming-rpcs">Streaming RPCs</h3>
+<p>A unary-only service implements <code>start_unary_call</code>. A service that serves client-, server- or bidirectional-streaming methods implements <code>start_call</code> and returns <code>true</code> from <code>streaming_supported</code> (otherwise a streaming method is answered <code>UNIMPLEMENTED</code>):</p>
+<pre class="sourceCode rust"><code>pub trait GrpcService: Send + Sync {
+    fn start_unary_call(&amp;self, path: &amp;str, response: GrpcResponseChannel)
+        -&gt; Option&lt;Box&lt;dyn ProtoMessageHandler&gt;&gt; { None }
+    fn start_call(&amp;self, path: &amp;str, call: GrpcCall)
+        -&gt; Option&lt;Box&lt;dyn GrpcCallHandler&gt;&gt;;   // default: wraps start_unary_call
+    fn streaming_supported(&amp;self) -&gt; bool { false }
+}
+
+pub trait GrpcCallHandler: ProtoMessageHandler {
+    fn end_requests(&amp;mut self) {}   // client half-closed
+    fn cancelled(&amp;mut self) {}      // stream reset, connection gone, or deadline passed
+}</code></pre>
+<p>Request messages arrive as <code>ProtoMessageHandler</code> events, one <code>start_message</code> / <code>end_message</code> pair each. <code>GrpcCall</code> is the <code>GrpcResponseChannel</code> for the call; it is <code>Clone</code> and may be used from any thread. Send any number of messages with <code>open_message</code> … <code>complete</code>, then end the call with <code>close()</code> (status 0) or <code>close_with(status, message)</code>. <code>pause_requests</code> / <code>resume_requests</code> apply read backpressure.</p>
+<h3 id="metadata-and-deadlines">Metadata, peer and deadlines</h3>
+<table>
+<thead><tr><th><code>GrpcResponseChannel</code> method</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td><code>request_metadata()</code></td><td><code>GrpcMetadata</code> the client sent (protocol headers excluded)</td></tr>
+<tr><td><code>with_response_metadata(|m| ...)</code> / <code>with_trailing_metadata(|m| ...)</code></td><td>Set initial (header) and trailing metadata</td></tr>
+<tr><td><code>deadline()</code></td><td>Client deadline from <code>grpc-timeout</code>, if any</td></tr>
+<tr><td><code>connection_info()</code></td><td>Peer address and TLS details (<code>hopf_http::ConnectionInfo</code>)</td></tr>
+</tbody>
+</table>
+<p><code>GrpcMetadata</code> keeps keys in order; <code>add</code> / <code>get</code> / <code>get_all</code> handle text values and <code>add_binary</code> / <code>get_binary</code> handle <code>-bin</code> keys (base64 on the wire). Reserved protocol keys are refused with <code>MetadataError</code>. When a request's deadline passes before the call ends, the server closes it with <code>DEADLINE_EXCEEDED</code> and calls <code>cancelled</code>.</p>
 <h3 id="responding">Responding</h3>
 <div class="sourceCode" id="cb5"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Inside handler after decoding request fields:</span></span>
 <span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> msg <span class="op">=</span> channel<span class="op">.</span>open_message(<span class="cn">None</span>)<span class="op">?;</span> <span class="co">// content-type optional</span></span>
@@ -268,7 +306,7 @@ GrpcService::start_unary_call → ProtoMessageHandler
 <span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="co">// Errors:</span></span>
 <span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>channel<span class="op">.</span>send_error(<span class="dv">12</span><span class="op">,</span> <span class="st">&quot;UNIMPLEMENTED&quot;</span>)<span class="op">;</span></span>
 <span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>channel<span class="op">.</span>send_error_cause(<span class="op">&amp;</span>err)<span class="op">;</span></span></code></pre></div>
-<p>Server maps protocol problems to HTTP <strong>415</strong> / <strong>404</strong> / <strong>400</strong>, or gRPC status in trailers. One response message per unary call (<code>response already sent</code> if repeated).</p>
+<p>Server maps protocol problems to HTTP <strong>415</strong> / <strong>404</strong> / <strong>400</strong>, or gRPC status in trailers. A unary call takes one response message (<code>response already sent</code> if repeated); a streaming call takes any number until it is closed.</p>
 <h2 id="client">Client</h2>
 <div class="sourceCode" id="cb6"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_grpc::</span>GrpcClient<span class="op">;</span></span>
 <span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a></span>
@@ -306,7 +344,17 @@ GrpcService::start_unary_call → ProtoMessageHandler
 </tr>
 </tbody>
 </table>
-<p>Surfaces <code>grpc-status</code> from headers or trailers.</p>
+<p><code>GrpcResponseHandler</code> receives <code>start_message</code> per response message, <code>on_initial_metadata</code> / <code>on_trailing_metadata</code>, <code>on_grpc_status</code> from headers or trailers, and <code>on_complete(status, message)</code> exactly once per call, including when the call fails locally (<code>UNAVAILABLE</code>, <code>INTERNAL</code>, <code>RESOURCE_EXHAUSTED</code>, <code>DEADLINE_EXCEEDED</code>).</p>
+<table>
+<thead><tr><th>Builder / call option</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><code>GrpcClient::authority(host_port)</code></td><td><code>:authority</code> for every call (servers built on gRPC core refuse a call without one)</td></tr>
+<tr><td><code>GrpcClient::compression(ContentCoding)</code></td><td>Compress request messages (default none); a message that would not shrink is sent as is</td></tr>
+<tr><td><code>GrpcClient::encodings(&amp;[ContentCoding])</code></td><td>Codings decoded in responses and offered in <code>grpc-accept-encoding</code> (default <code>gzip</code>, <code>deflate</code>)</td></tr>
+<tr><td><code>unary_call_with_options(path, req, handler, GrpcCallOptions)</code></td><td><code>GrpcCallOptions::new().timeout(d)</code> or <code>.deadline(t)</code> sends <code>grpc-timeout</code> and ends the call locally with <code>DEADLINE_EXCEEDED</code>; <code>metadata_mut()</code> adds request metadata</td></tr>
+<tr><td><code>streaming_call(path, handler)</code></td><td>Returns <code>(GrpcStreamingCall, GrpcClientCall)</code>; the handle's <code>send</code> / <code>half_close</code> / <code>cancel</code> work from any thread, before or after the request starts</td></tr>
+</tbody>
+</table>
 <h2 id="configuration">Configuration</h2>
 <table>
 <colgroup>
@@ -355,17 +403,17 @@ GrpcService::start_unary_call → ProtoMessageHandler
 <tbody>
 <tr>
 <td>(default)</td>
-<td>Unary gRPC</td>
+<td>Unary and streaming gRPC, compression, metadata, deadlines</td>
 </tr>
 <tr>
 <td><code>integration</code></td>
-<td>Integration tests</td>
+<td>Interoperability tests against grpcio in a container (<code>cargo test -p hopf-grpc --features integration --test grpcio_interop</code>)</td>
 </tr>
 </tbody>
 </table>
 <h2 id="examples">Examples</h2>
 <p>See <a href="cookbook/grpc.html">Cookbook: gRPC</a>.</p>
-<div class="sourceCode" id="cb7"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> grpc <span class="at">--</span> 127.0.0.1:8080</span></code></pre></div>
+<div class="sourceCode" id="cb7"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> grpc-echo <span class="at">--</span> 127.0.0.1:8080</span></code></pre></div>
 <table>
 <thead>
 <tr>
@@ -377,7 +425,7 @@ GrpcService::start_unary_call → ProtoMessageHandler
 <tbody>
 <tr>
 <td><code>examples/grpc</code></td>
-<td>Unary server demo</td>
+<td>Unary echo server (HTTP/2 cleartext)</td>
 <td>arg1 = listen addr</td>
 </tr>
 </tbody>
@@ -385,10 +433,10 @@ GrpcService::start_unary_call → ProtoMessageHandler
 <p>No environment variables.</p>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li><strong>No message compression</strong> — compressed frames rejected.</li>
 <li><strong>No generated stubs</strong> — runtime <code>.proto</code> model only.</li>
 <li>H1 trailer support is limited (inherited from <code>hopf-http</code>); prefer H2/H3.</li>
 <li>One message per unary response enforced.</li>
+<li><code>br</code> message compression is a non-standard extension; it is only offered or used when both peers enable it.</li>
 <li>Not a full Google gRPC stack (no interceptors, load balancing, etc.).</li>
 </ul>
 

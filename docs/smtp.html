@@ -77,9 +77,9 @@
     <main class="main">
       <header>
         <h1>SMTP</h1>
-        <p class="lead">Crate <code>hopf-smtp</code>: SMTP <strong>server</strong> and callback-driven <strong>client</strong>, a port of Gumdrop <code>org.bluezoo.gumdrop.smtp</code>. The server speaks RFC 5321 with a wide ESMTP extension set on the Hopf reactor. Authentication uses the full <a href="auth.html"><code>hopf-auth</code></a> SASL mechanism set (PLAIN/LOGIN/DIGEST-MD5/SCRAM-SHA-256/OAUTHBEARER/EXTERNAL) via a <code>CredentialStore</code>, same pattern as <a href="pop3.html">POP3</a>/<a href="imap.html">IMAP</a>. TLS-from-accept, implicit TLS, and STARTTLS via <code>SmtpConfig::with_tls</code> / <code>implicit_tls</code> and <code>SharedTlsAcceptor</code> / <code>SharedTlsConnector</code> from <a href="tls.html"><code>hopf-core::tls</code></a>. Stock services: accept-all, open-relay MX (<a href="dns.html"><code>hopf-dns</code></a>), and local mailbox delivery (<a href="mailbox.html"><code>hopf-mailbox</code></a>).</p>
+        <p class="lead">Crate <code>hopf-smtp</code>: SMTP <strong>server</strong> and callback-driven <strong>client</strong>, peer roles in one crate. The server speaks RFC 5321 with a wide ESMTP extension set on the Hopf reactor. Authentication uses the <a href="auth.html"><code>hopf-auth</code></a> SASL mechanisms (PLAIN, LOGIN, SCRAM-SHA-256, OAUTHBEARER, XOAUTH2, EXTERNAL; SCRAM-SHA-256-PLUS when the store opts in) via a <code>CredentialStore</code>, same pattern as <a href="pop3.html">POP3</a>/<a href="imap.html">IMAP</a>. TLS-from-accept, implicit TLS, and STARTTLS via <code>SmtpConfig::with_tls</code> / <code>implicit_tls</code> and <code>SharedTlsAcceptor</code> / <code>SharedTlsConnector</code> from <a href="tls.html"><code>hopf-core::tls</code></a>. Stock services: accept-all, a queueing open-relay MX forwarder (<a href="dns.html"><code>hopf-dns</code></a>), and local mailbox delivery (<a href="mailbox.html"><code>hopf-mailbox</code></a>).</p>
       </header>
-      <p>Local delivery lives in <code>hopf_smtp::mailbox</code> as <code>LocalDeliveryService</code> — the Gumdrop-shaped counterpart to <code>SimpleRelayService</code>.</p>
+      <p>Local delivery is <code>LocalDeliveryService</code>, the counterpart to the relaying <code>SimpleRelayService</code>.</p>
 <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
 <li><a href="#standards">Standards</a></li>
@@ -146,8 +146,12 @@
 <td>REQUIRETLS</td>
 </tr>
 <tr>
-<td>—</td>
-<td>SMTPUTF8, PIPELINING, SIZE, STARTTLS, AUTH (full SASL mechanism set), FUTURERELEASE, MT-PRIORITY</td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc9422">RFC 9422</a></td>
+<td>LIMITS (<code>RCPTMAX</code>, <code>MAILMAX</code>)</td>
+</tr>
+<tr>
+<td>-</td>
+<td>SMTPUTF8, PIPELINING, SIZE, STARTTLS, AUTH, MT-PRIORITY; FUTURERELEASE <code>HOLDFOR</code>/<code>HOLDUNTIL</code> are parsed but the extension is not advertised</td>
 </tr>
 </tbody>
 </table>
@@ -159,8 +163,9 @@
                    │ DATA/BDAT → MessageDataHandler (streamed)
                    │
                    └── optional SmtpPipeline per transaction</code></pre>
+<p>Commands are read by <code>SmtpServerLexer</code>, an incremental push parser over the connection's inbound ring buffer (<code>hopf_core::LoopBuf</code>): arguments are parsed as the bytes arrive, a command line is bounded by <code>MAX_COMMAND_LINE</code> (8192 bytes), and pipelined commands are answered in order with each recipient's own reply.</p>
 <h3 id="protocol-stages">Protocol stages</h3>
-<p>Each connection advances through a staged SPI (Gumdrop-style), not a single monolithic callback:</p>
+<p>Each connection advances through a staged SPI, not a single monolithic callback:</p>
 <ol type="1">
 <li><code>SmtpClientConnected</code> — accept/reject on connect</li>
 <li><code>HelloHandler</code> — HELO/EHLO, STARTTLS notice, AUTH result</li>
@@ -169,7 +174,7 @@
 <li><code>MessageDataHandler</code> — content chunks + complete/abort</li>
 </ol>
 <h3 id="non-blocking-data">Non-blocking DATA</h3>
-<p>Message content is streamed: <code>DotUnstuffer</code> handles RFC 5321 dot-unstuffing incrementally; <code>BdatAccumulator</code> handles CHUNKING. Handlers receive chunks without requiring the full message in one buffer (subject to <code>max_message_size</code>).</p>
+<p>Message content is streamed: <code>DotUnstuffer</code> handles RFC 5321 dot-unstuffing incrementally; <code>BdatAccumulator</code> handles CHUNKING. Handlers receive chunks without requiring the full message in one buffer. A message that exceeds <code>max_message_size</code> is read to its end and then refused, so the session stays in step.</p>
 <h2 id="commands">Commands</h2>
 <table>
 <thead>
@@ -225,7 +230,7 @@
 </tr>
 <tr>
 <td>ETRN</td>
-<td><code>458</code> unsuitable</td>
+<td><code>458</code> unable to queue (<code>502</code> before EHLO)</td>
 </tr>
 <tr>
 <td>STARTTLS</td>
@@ -252,12 +257,17 @@
 <li>CHUNKING</li>
 <li>BINARYMIME</li>
 <li>DSN</li>
+<li>DELIVERBY</li>
+<li>MT-PRIORITY</li>
+<li>REQUIRETLS</li>
+<li>LIMITS RCPTMAX=<em>max_recipients</em> MAILMAX=<em>max_mail_transactions</em></li>
 <li>HELP</li>
 </ul>
 <p>Conditional:</p>
 <ul>
-<li><strong>STARTTLS</strong> — when <code>tls_acceptor</code> is set and the session is not yet TLS</li>
-<li><strong>AUTH &lt;mechanisms&gt;</strong> — when <code>store</code> is set; lists each mechanism <code>store.supported_mechanisms()</code> returns, filtered to drop TLS-only mechanisms (PLAIN, LOGIN, OAUTHBEARER, EXTERNAL) until the session is TLS-protected</li>
+<li><strong>STARTTLS</strong> - when <code>tls_acceptor</code> is set, the listener is not implicit TLS, and the session is not yet TLS</li>
+<li><strong>AUTH &lt;mechanisms&gt;</strong> - when <code>store</code> is set; lists each mechanism <code>store.supported_mechanisms()</code> returns, filtered to drop TLS-only mechanisms (PLAIN, LOGIN, OAUTHBEARER, XOAUTH2, EXTERNAL) until the session is TLS-protected</li>
+<li><strong>XCLIENT</strong> - only to a TCP peer inside <code>xclient_allow</code></li>
 </ul>
 <h2 id="mail-rcpt-parameters">MAIL / RCPT parameters</h2>
 <p><strong>MAIL FROM</strong> parsed: SIZE, BODY, SMTPUTF8, REQUIRETLS, MT-PRIORITY, RET, ENVID, HOLDFOR, HOLDUNTIL, BY.</p>
@@ -290,7 +300,7 @@
 </tr>
 </tbody>
 </table>
-<p>AUTH is only advertised once TLS is up for mechanisms that require it (PLAIN, LOGIN, OAUTHBEARER, EXTERNAL); TLS-independent mechanisms (SCRAM-SHA-256) are advertised as soon as a store is configured, even pre-TLS.</p>
+<p>AUTH is only advertised once TLS is up for mechanisms that require it (PLAIN, LOGIN, OAUTHBEARER, XOAUTH2, EXTERNAL); TLS-independent mechanisms (SCRAM-SHA-256) are advertised as soon as a store is configured, even pre-TLS.</p>
 <h2 id="authentication">Authentication</h2>
 <div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_auth::</span>PasswordStore<span class="op">;</span></span>
 <span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_smtp::</span><span class="op">{</span>SmtpConfig<span class="op">,</span> SmtpService<span class="op">};</span></span>
@@ -301,8 +311,8 @@
 <span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_store(store)</span>
 <span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>auth_required(<span class="cn">true</span>)<span class="op">;</span></span></code></pre></div>
 <ul>
-<li><code>auth_required</code> — reject MAIL until AUTH succeeds.</li>
-<li>Mechanisms: whatever the store advertises via <code>supported_mechanisms()</code> — <code>PasswordStore</code> offers PLAIN, LOGIN, SCRAM-SHA-256, OAUTHBEARER, EXTERNAL. Same pattern as <a href="pop3.html">POP3</a>/<a href="imap.html">IMAP</a>.</li>
+<li><code>auth_required</code> - reject MAIL until AUTH succeeds. This is the default; services that accept unauthenticated mail (an MX, local delivery) must call <code>.auth_required(false)</code>.</li>
+<li>Mechanisms: whatever the store advertises via <code>supported_mechanisms()</code>; the default set is PLAIN, LOGIN, SCRAM-SHA-256, OAUTHBEARER, XOAUTH2, EXTERNAL. Same pattern as <a href="pop3.html">POP3</a>/<a href="imap.html">IMAP</a>.</li>
 </ul>
 <h2 id="handler-spi">Handler SPI</h2>
 <div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> SmtpHandlerFactory<span class="op">:</span> <span class="bu">Send</span> <span class="op">+</span> <span class="bu">Sync</span> <span class="op">{</span></span>
@@ -400,11 +410,11 @@
 </tr>
 <tr>
 <td><code>DiscardPipeline</code></td>
-<td>Discard-oriented</td>
+<td>Alias of <code>NullPipeline</code></td>
 </tr>
 <tr>
-<td><code>MessageBufferPipeline</code></td>
-<td>General-purpose in-memory buffer, for apps that want the whole message at once</td>
+<td><code>MimeAnalysisPipeline</code></td>
+<td>Tees content to an <code>rmimeparser</code> message handler: RFC 5322 header events once the header block completes, then the raw top-level body chunk by chunk (headers buffered, body never; no per-part multipart events)</td>
 </tr>
 <tr>
 <td><code>AuthPipeline</code></td>
@@ -412,9 +422,9 @@
 </tr>
 </tbody>
 </table>
-<p>Return a pipeline from <code>MailFromHandler::pipeline()</code>. The stock <code>LocalDeliveryHandler</code> and <code>SimpleRelayHandler</code> (below) use an internal streaming pipeline rather than <code>MessageBufferPipeline</code>, so neither one ever holds a whole message in memory.</p>
+<p>Return a pipeline from <code>MailFromHandler::pipeline()</code>. The stock <code>LocalDeliveryHandler</code> and <code>SimpleRelayHandler</code> (below) spool content to disk as it arrives, so neither one ever holds a whole message in memory.</p>
 <h2 id="email-authentication">Email authentication (SPF/DKIM/DMARC/ARC)</h2>
-<p><code>hopf_smtp::auth</code> is a from-scratch port of Gumdrop's <code>org.bluezoo.gumdrop.smtp.auth</code> package: SPF (RFC 7208), DKIM verify + sign (RFC 6376, Ed25519 per RFC 8463), and DMARC (RFC 7489), plus a Public Suffix List for organizational-domain resolution and DMARC aggregate/forensic report rendering. See the <a href="conformance.html#smtp">conformance audit</a> for the full RFC-by-RFC breakdown, including the couple of deliberately-deferred DMARCbis extras.</p>
+<p><code>hopf_smtp::auth</code> implements SPF (RFC 7208), DKIM verify + sign (RFC 6376, Ed25519 per RFC 8463), DMARC (RFC 7489, plus DMARCbis <code>np=</code>, and <code>psd=</code> parsed), and ARC (RFC 8617), with a Public Suffix List for organizational-domain resolution (DMARC falls back to the organizational domain's record when the From domain has none) and DMARC aggregate/forensic report rendering. See the <a href="conformance.html#smtp">conformance audit</a> for the full RFC-by-RFC breakdown.</p>
 <p><code>AuthPipeline</code> implements <code>SmtpPipeline</code> and can be returned from <code>MailFromHandler::pipeline()</code>. SPF starts at <code>MAIL FROM</code>; DKIM verification and DMARC evaluation start once the message finishes at end-of-DATA. All three depend on DNS, so none of them complete synchronously — observe results via the <code>on_spf</code>/<code>on_dkim</code>/<code>on_dmarc</code> callbacks and/or a cloneable, pollable <code>AuthVerdictHandle</code>:</p>
 <pre><code>use hopf_smtp::{AuthPipeline, MessageEndState};
 
@@ -446,7 +456,7 @@ fn message_complete(&amp;mut self, state: &amp;mut dyn MessageEndState) {
     }
 }</code></pre>
 <p>This deferred-reply path — proven in <code>hopf-smtp</code>'s integration tests against a real loopback DNS stub and the real control-handler state machine — is the normal case, not an edge case: <code>message_complete()</code> always runs synchronously right after <code>end_data()</code> fires off DNS lookups, so the verdict is essentially never ready yet when the app has to decide.</p>
-<p><code>DkimSigner</code> (outbound) and the standalone <code>SpfResult</code>/<code>DkimResult</code>/<code>DmarcResult</code> validators are also usable directly, without the pipeline, for apps that want to check or sign a message themselves. <code>DmarcAggregateReport</code>/<code>DmarcForensicReport</code> render the RFC 7489 Appendix&nbsp;C XML and RFC 5965 ARF documents respectively — sending/scheduling them is left to the app, matching Gumdrop.</p>
+<p><code>DkimSigner</code> (outbound) and the standalone <code>SpfResult</code>/<code>DkimResult</code>/<code>DmarcResult</code> validators are also usable directly, without the pipeline, for apps that want to check or sign a message themselves. <code>DmarcAggregateReport</code>/<code>DmarcForensicReport</code> render the RFC 7489 Appendix&nbsp;C XML and RFC 5965 ARF documents respectively; sending and scheduling them is left to the app.</p>
 <h3 id="authpipeline-memory-model">AuthPipeline memory model</h3>
 <p>Only message <strong>headers</strong> are ever buffered in full (typically a few KB, bounded regardless of message size). The <strong>body</strong> — what actually dominates memory for large mail — is never retained: each <code>message_content</code> chunk streams straight into one incremental SHA-256 canonicalizer per distinct DKIM body canonicalization the message's signature(s) actually use (almost always 0 or 1), so peak <code>AuthPipeline</code> memory is <code>O(headers)</code>, not <code>O(message size)</code> — matching the streaming design used throughout <code>hopf-mailbox</code>/<code>hopf-smtp</code> delivery (see <a href="mailbox.html#mailbox-api">Mailbox</a>).</p>
 <h3 id="authentication-results-header">Authentication-Results header</h3>
@@ -468,18 +478,51 @@ self.auth_results = p.authentication_results(); // stash alongside p.verdict()</
 <div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_smtp::</span>SimpleRelayService<span class="op">;</span></span>
 <span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> relay <span class="op">=</span> <span class="pp">SimpleRelayService::</span>new(config<span class="op">,</span> <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>rt))<span class="op">?;</span></span>
-<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="co">// optional: .with_dns_timeout(Duration::from_secs(5))</span></span>
-<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="co">// optional: .with_resolver(resolver, outbound_port)  // default outbound 25</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="co">// or: SimpleRelayService::with_options(config, rt, dns_timeout, RelayOptions::default().with_queue_dir(&quot;/var/spool/hopf&quot;))</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="co">// or: SimpleRelayService::with_resolver(config, rt, resolver, outbound_port)  // default outbound 25</span></span>
 <span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> bound <span class="op">=</span> relay<span class="op">.</span>start(rt)<span class="op">?;</span></span></code></pre></div>
-<p>Resolves recipient MX with <a href="dns.html"><code>hopf-dns</code></a> and forwards with <code>SmtpClient</code>. Intended for development — open relay, incomplete STARTTLS to arbitrary MX (may bounce).</p>
-<p><strong>Streaming, not buffering:</strong> since RCPT TO is always fully known before DATA/BDAT starts, <code>SimpleRelayHandler</code> resolves every recipient domain's MX up front and opens one outbound <code>SmtpClient</code> connection per domain before the inbound message body arrives. Inbound message bytes are written to a small bounded per-transaction temp file as they stream in (never a growing in-memory buffer), and each outbound connection streams its DATA directly from that file via <code>SmtpSend::message_file</code> — the file is deleted once every domain has finished. If <strong>any</strong> destination domain fails, the whole inbound transaction is rejected with a 4xx even if other domains already succeeded: there is no cross-domain retry bookkeeping, so a rejected client retry may cause duplicate delivery to the domains that already succeeded. This trades a small chance of duplicate delivery for not having to build spool/custody infrastructure — a deliberate simplification for this example relay, not something a production MTA would do.</p>
+<p>Resolves recipient MX with <a href="dns.html"><code>hopf-dns</code></a> and forwards with <code>SmtpClient</code>. It is an <strong>open relay</strong>: intended for development, testing and closed networks (set <code>SmtpConfig::acl</code>).</p>
+<p><strong>On-disk queue.</strong> A message is accepted (250 to the client) only once it is in the <code>RelayQueue</code>: the content as spooled while it was received (<code>&lt;id&gt;.msg</code>) plus a text envelope recording every recipient's state (<code>&lt;id&gt;.env</code>, written last and renamed into place, so a crash leaves no message or a complete one). Delivery then runs from the queue, per recipient (RFC 5321 section 4.5.4.1): recipients are grouped by domain, each domain's MX hosts are tried in order, and each recipient ends an attempt <em>delivered</em>, <em>temporary</em> (a 4xx, or no reply at all; it stays queued and is retried with backoff) or <em>permanent</em> (a 5xx; it is bounced at once with a failure DSN). A recipient still queued after the delay interval makes the relay send the sender one <code>Action: delayed</code> DSN; one still undelivered when the queue lifetime ends is bounced. DSNs are queued like any other message. With a queue directory configured, messages found there at start-up are delivered, so accepted mail survives a restart.</p>
+<p><strong>Outbound TLS.</strong> For each MX host the relay looks up TLSA records: when they are DNSSEC-secure, STARTTLS is mandatory and the certificate is checked against them (DANE, RFC 7672); otherwise STARTTLS is opportunistic. A REQUIRETLS message uses the configured trusted connector with mandatory STARTTLS.</p>
+<table>
+<thead>
+<tr>
+<th><code>RelayOptions</code></th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>with_queue_dir(dir)</code></td>
+<td>private temporary directory, not kept across restarts</td>
+<td>Where the queue lives</td>
+</tr>
+<tr>
+<td><code>with_retry_policy(RetryPolicy)</code></td>
+<td><code>smtp_retry_policy()</code>: 30 min first retry, doubling to a 4 h cap, 10% jitter</td>
+<td>Backoff between attempts (only the delays are used)</td>
+</tr>
+<tr>
+<td><code>with_max_queue_lifetime(d)</code></td>
+<td>5 days</td>
+<td>When a still-temporary recipient is bounced</td>
+</tr>
+<tr>
+<td><code>with_delay_notice_after(d)</code></td>
+<td>4 hours</td>
+<td>When the sender is told once that delivery is delayed</td>
+</tr>
+</tbody>
+</table>
+<p><code>RelayQueue</code> (<code>open</code>, <code>enqueue</code>, <code>update</code>, <code>remove</code>, <code>scan</code>) and its <code>QueuedMessage</code> / <code>QueuedRecipient</code> / <code>RecipientStatus</code> records are public for applications that want to inspect or build on the queue. Its file I/O is blocking; call it from the storage pool, not a reactor thread.</p>
 <h2 id="local-delivery">Local delivery</h2>
-<p>Gumdrop <code>LocalDeliveryService</code> / <code>LocalDeliveryHandler</code>: accept mail only for one local domain; APPEND each message to the recipient's INBOX on the Runtime storage pool.</p>
+<p><code>LocalDeliveryService</code> / <code>LocalDeliveryHandler</code>: accept mail only for one local domain; APPEND each message to the recipient's INBOX on the Runtime storage pool.</p>
 <div class="sourceCode" id="cb4b"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4b-1"><a href="#cb4b-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_mailbox::</span>MaildirFactory<span class="op">;</span></span>
 <span id="cb4b-2"><a href="#cb4b-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_smtp::</span><span class="op">{</span>LocalDeliveryService<span class="op">,</span> SmtpConfig<span class="op">};</span></span>
 <span id="cb4b-3"><a href="#cb4b-3" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb4b-4"><a href="#cb4b-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> factory <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">MaildirFactory::</span>new(<span class="st">&quot;/var/mail&quot;</span>))<span class="op">;</span></span>
-<span id="cb4b-5"><a href="#cb4b-5" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> config <span class="op">=</span> <span class="pp">SmtpConfig::</span>new(listen<span class="op">,</span> <span class="st">&quot;mail.example.com&quot;</span>)<span class="op">;</span></span>
+<span id="cb4b-5"><a href="#cb4b-5" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> config <span class="op">=</span> <span class="pp">SmtpConfig::</span>new(listen<span class="op">,</span> <span class="st">&quot;mail.example.com&quot;</span>)<span class="op">.</span>auth_required(<span class="cn">false</span>)<span class="op">;</span></span>
 <span id="cb4b-6"><a href="#cb4b-6" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> svc <span class="op">=</span> <span class="pp">LocalDeliveryService::</span>new(</span>
 <span id="cb4b-7"><a href="#cb4b-7" aria-hidden="true" tabindex="-1"></a>    config<span class="op">,</span> <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>rt)<span class="op">,</span> factory<span class="op">,</span> <span class="st">&quot;example.com&quot;</span><span class="op">,</span></span>
 <span id="cb4b-8"><a href="#cb4b-8" aria-hidden="true" tabindex="-1"></a>)<span class="op">;</span></span>
@@ -498,7 +541,7 @@ self.auth_results = p.authentication_results(); // stash alongside p.verdict()</
 <td><code>local_domain</code></td>
 <td><code>String</code></td>
 <td>yes</td>
-<td>Only RCPT TO in this domain (case-insensitive); else 551 relay denied</td>
+<td>Only RCPT TO in this domain (case-insensitive); else <code>551 5.7.1 Relay denied</code></td>
 </tr>
 <tr>
 <td><code>hostname</code></td>
@@ -520,7 +563,7 @@ self.auth_results = p.authentication_results(); // stash alongside p.verdict()</
 </tr>
 </tbody>
 </table>
-<p>Username is the RCPT <strong>local-part</strong>. Delivery opens <code>INBOX</code>, APPENDs on <code>StorageExecutor</code>, and replies 250 or 450. See <a href="mailbox.html">Mailbox</a> and <code>examples/smtp-local</code>.</p>
+<p>Username is the RCPT <strong>local-part</strong>. Delivery opens <code>INBOX</code>, APPENDs on <code>StorageExecutor</code>, and replies 250 (when at least one recipient succeeded) or 450. Requested DSNs are delivered locally when the reverse-path is local, otherwise sent via MX. See <a href="mailbox.html">Mailbox</a> and <code>examples/smtp-local</code>.</p>
 <p>Inbound message bytes are streamed to a small bounded per-transaction temp file as they arrive rather than an in-memory buffer; at <code>message_complete</code> that file is streamed into each recipient's <code>INBOX</code> in fixed-size chunks via the <a href="mailbox.html#mailbox-api">Mailbox streaming append API</a> and then removed — memory use stays flat regardless of message size.</p>
 <h2 id="configuration">Configuration</h2>
 <h3 id="smtpconfig"><code>SmtpConfig</code></h3>
@@ -565,9 +608,15 @@ self.auth_results = p.authentication_results(); // stash alongside p.verdict()</
 <td>Per transaction</td>
 </tr>
 <tr>
+<td><code>max_mail_transactions</code></td>
+<td><code>u32</code></td>
+<td><code>100</code></td>
+<td>MAIL commands per session (LIMITS MAILMAX), counted whether or not they succeed</td>
+</tr>
+<tr>
 <td><code>auth_required</code></td>
 <td><code>bool</code></td>
-<td><code>false</code></td>
+<td><code>true</code></td>
 <td>MAIL needs AUTH</td>
 </tr>
 <tr>
@@ -586,12 +635,30 @@ self.auth_results = p.authentication_results(); // stash alongside p.verdict()</
 <td><code>store</code></td>
 <td><code>Option&lt;Arc&lt;dyn CredentialStore&gt;&gt;</code></td>
 <td><code>None</code></td>
-<td>AUTH — full SASL mechanism set</td>
+<td>AUTH; the store's SASL mechanisms</td>
+</tr>
+<tr>
+<td><code>xclient_allow</code></td>
+<td><code>Vec&lt;IpNet&gt;</code></td>
+<td>empty (XCLIENT off)</td>
+<td>Real TCP peers allowed to issue XCLIENT</td>
+</tr>
+<tr>
+<td><code>acl</code></td>
+<td><code>PeerAcl</code></td>
+<td>open</td>
+<td>CIDR allow/deny at accept</td>
+</tr>
+<tr>
+<td><code>rate_limit</code></td>
+<td><code>Option&lt;AcceptRateLimit&gt;</code></td>
+<td><code>None</code></td>
+<td>Accept-rate limit per source / global</td>
 </tr>
 </tbody>
 </table>
-<p><strong>Constants:</strong> <code>DEFAULT_MAX_MESSAGE_SIZE</code> = 35 MiB; <code>DEFAULT_MAX_RECIPIENTS</code> = 100.</p>
-<p><strong>Builders:</strong> <code>SmtpConfig::new(listen, hostname)</code>, <code>.with_tls</code>, <code>.implicit_tls()</code>, <code>.auth_required(bool)</code>, <code>.with_store</code>.</p>
+<p><strong>Constants:</strong> <code>DEFAULT_MAX_MESSAGE_SIZE</code> = 35 MiB; <code>DEFAULT_MAX_RECIPIENTS</code> = 100; <code>DEFAULT_MAX_MAIL_TRANSACTIONS</code> = 100.</p>
+<p><strong>Builders:</strong> <code>SmtpConfig::new(listen, hostname)</code>, <code>.with_tls</code>, <code>.implicit_tls()</code>, <code>.auth_required(bool)</code>, <code>.with_store</code>, <code>.with_max_mail_transactions</code>, <code>.with_xclient_allow</code>, <code>.with_acl</code>, <code>.with_rate_limit</code>.</p>
 <h3 id="smtpservice"><code>SmtpService</code></h3>
 <table>
 <thead>
@@ -618,13 +685,17 @@ self.auth_results = p.authentication_results(); // stash alongside p.verdict()</
 <td>Bind + register</td>
 </tr>
 <tr>
-<td><code>metrics()</code></td>
-<td><code>SmtpServerMetrics</code></td>
+<td><code>metrics()</code> / <code>config()</code></td>
+<td><code>SmtpServerMetrics</code> / the <code>SmtpConfig</code></td>
+</tr>
+<tr>
+<td><code>with_telemetry(&amp;pipeline)</code></td>
+<td>OTLP/JSONL metrics and traces (see <a href="#metrics">Metrics</a>)</td>
 </tr>
 </tbody>
 </table>
 <h2 id="client">Client</h2>
-<p>Callback-driven <code>SmtpClient</code> on an <code>Arc&lt;Runtime&gt;</code>. DNS (when needed) and the SMTP session run on worker reactors; <code>connect</code> returns immediately. Stock auto-pilot pipeline: <code>SmtpSend</code> (greeting → EHLO → optional STARTTLS/AUTH → MAIL → RCPT → DATA → QUIT).</p>
+<p>Callback-driven <code>SmtpClient</code> on an <code>Arc&lt;Runtime&gt;</code>. DNS (when needed) and the SMTP session run on worker reactors; <code>connect</code> returns immediately. Stock auto-pilots: <code>SmtpSend</code> (greeting → EHLO → optional STARTTLS/AUTH → MAIL → RCPT → DATA → QUIT), <code>SmtpVerify</code> (greeting → EHLO → optional STARTTLS/AUTH → QUIT; checks account settings and reports the server's capabilities as <code>SmtpVerifyOutcome</code>) and <code>RetryingSend</code> (below). Server replies are read by <code>SmtpReplyLexer</code>, an incremental parser over the connection's inbound ring.</p>
 <h3 id="smtpclienttimeouts"><code>SmtpClientTimeouts</code></h3>
 <table>
 <thead>
@@ -712,7 +783,7 @@ self.auth_results = p.authentication_results(); // stash alongside p.verdict()</
 <span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> send <span class="op">=</span> <span class="pp">SmtpSend::</span>new(<span class="st">&quot;smtp-send.local&quot;</span>)</span>
 <span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>mail_from(<span class="st">&quot;alice@example.com&quot;</span>)</span>
 <span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>rcpt_to(<span class="st">&quot;bob@example.com&quot;</span>)</span>
-<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>message(<span class="st">b&quot;Subject: hi</span><span class="sc">\r\n\r\n</span><span class="st">Hello</span><span class="sc">\r\n</span><span class="st">&quot;</span><span class="op">.</span>to_vec())</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>message_with({ <span class="kw">let</span> <span class="kw">mut</span> m <span class="op">=</span> <span class="cn">Some</span>(<span class="st">b&quot;Subject: hi</span><span class="sc">\r\n\r\n</span><span class="st">Hello</span><span class="sc">\r\n</span><span class="st">&quot;</span><span class="op">.</span>to_vec()); <span class="kw">move</span> <span class="op">||</span> m<span class="op">.</span>take() })</span>
 <span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>on_complete(<span class="dt">Box</span><span class="pp">::</span>new(<span class="op">|</span>ok<span class="op">|</span> <span class="pp">eprintln!</span>(<span class="st">&quot;delivery: {ok}&quot;</span>)))</span>
 <span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="op">;</span></span>
 <span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="pp">SmtpClient::</span>from_addr(addr)</span>
@@ -723,7 +794,9 @@ self.auth_results = p.authentication_results(); // stash alongside p.verdict()</
 <span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>        <span class="op">..</span><span class="kw">Default</span><span class="op">::</span><span class="kw">default</span>()</span>
 <span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>)</span>
 <span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>connect(<span class="op">&amp;</span>rt<span class="op">,</span> <span class="pp">Arc::</span>new(send))<span class="op">?;</span></span></code></pre></div>
-<p><code>SmtpSend</code> builders: <code>mail_from</code>, <code>rcpt_to</code> / <code>recipients</code>, <code>message</code> (in-memory <code>Vec&lt;u8&gt;</code>) or <code>message_file(path)</code> (stream DATA straight from a file, dot-stuffing on the fly, without ever materializing the whole body in memory), <code>require_starttls</code>, <code>auth_plain</code>, <code>on_complete</code>. Custom drivers implement <code>SmtpClientHandlerFactory</code> / <code>SmtpClientDriver</code>. Helpers: <code>dot_stuff</code> (whole-buffer) and <code>DotStuffer</code> (streaming, chunk-at-a-time — used internally by <code>message_file</code>).</p>
+<p><code>SmtpSend</code> builders: <code>mail_from</code> / <code>mail_from_params</code>, <code>rcpt_to</code> / <code>rcpt_to_with</code> / <code>recipients</code> / <code>recipients_with</code> (with per-recipient DSN parameters), a body from <code>message_with(next_chunk)</code> (pulled one chunk at a time), <code>message_file(path)</code> / <code>message_file_with_prefix</code> (streamed from a file, dot-stuffing on the fly, never materialising the whole body) or <code>message_empty</code>; <code>require_starttls</code> / <code>opportunistic_starttls</code>, <code>auth_plain</code> / <code>auth_bearer</code> (XOAUTH2 when advertised, else OAUTHBEARER); <code>on_complete(bool)</code>, <code>on_result(SmtpSendOutcome)</code> (carries the reply code: <code>Delivered</code>, <code>Rejected { code, message }</code>, <code>Failed</code>) and <code>on_recipients(Vec&lt;RecipientOutcome&gt;)</code> (what happened to each recipient, including ones refused at RCPT TO in a transaction that otherwise succeeded).</p>
+<p><code>RetryingSend::new(client, rt, policy, build)</code> redials and rebuilds a fresh <code>SmtpSend</code> after each transient failure (4xx or no reply), never after a 5xx, and reports exactly one terminal outcome to <code>on_final</code>. <code>smtp_retry_policy()</code> is the RFC 5321 section 4.5.4 default: first retry after 30 minutes, doubling to a 4-hour cap, giving up after 5 days, with 10% jitter.</p>
+<p> Custom drivers implement <code>SmtpClientHandlerFactory</code> / <code>SmtpClientDriver</code>. Helpers: <code>dot_stuff</code> (whole-buffer) and <code>client::DotStuffer</code> (streaming, chunk at a time; used internally by <code>message_file</code>).</p>
 <h2 id="metrics">Metrics</h2>
 <p>Process-local <code>SmtpServerMetrics</code> (in <code>hopf-smtp</code>): connections, messages, bytes, <code>auth_ok</code> / <code>auth_fail</code>, <code>starttls</code> counts via <code>SmtpService::metrics()</code>.</p>
 <p>OTLP/JSONL export (when <code>SmtpService::with_telemetry(&amp;pipeline)</code> is used): <code>hopf_otel::SmtpServerMetrics</code> emits <code>smtp.server.connections</code>, <code>smtp.server.messages</code> (outcome), <code>smtp.server.transaction.duration</code> (ms, MAIL→DATA/RSET), <code>smtp.server.message.size</code>, <code>smtp.server.auth</code>, <code>smtp.server.starttls</code>, and <code>smtp.server.active_connections</code>.</p>
@@ -769,10 +842,10 @@ self.auth_results = p.authentication_results(); // stash alongside p.verdict()</
 </table>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li>Local delivery is final APPEND only (no outbound queue/retry); wrong-domain RCPT is relay-denied.</li>
-<li>Relay is open MX only; STARTTLS to arbitrary MX is incomplete.</li>
+<li>Local delivery is final APPEND only (no queue or retry); wrong-domain RCPT is relay-denied.</li>
+<li><code>SimpleRelayService</code> is an open relay with no per-sender policy; restrict it with <code>SmtpConfig::acl</code>.</li>
 <li>EXPN / ETRN not useful; VRFY always <code>252</code>.</li>
-<li>SPF's <code>%{p}</code> macro always resolves to <code>"unknown"</code> rather than doing the discouraged PTR-then-forward-confirm lookup; DMARCbis <code>np=</code> is parsed but not enforced, <code>psd=</code> isn't parsed (see <a href="conformance.html#smtp">conformance</a>).</li>
+<li>SPF's <code>%{p}</code> macro always resolves to <code>"unknown"</code> rather than doing the discouraged PTR-then-forward-confirm lookup; DMARCbis <code>psd=</code> is parsed and exposed but does not change evaluation (see <a href="conformance.html#smtp">conformance</a>).</li>
 <li>Client completion is callback-driven — callers wait on their own signalling (see <code>examples/smtp-send</code>).</li>
 </ul>
 

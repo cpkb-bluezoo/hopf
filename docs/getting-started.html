@@ -133,9 +133,11 @@ CompositionRegistry ───────┘  (handler=&quot;echo&quot; → fact
 <span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> Echo<span class="op">;</span></span>
 <span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> ProtocolHandler <span class="cf">for</span> Echo <span class="op">{</span></span>
 <span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> connected(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> _<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> <span class="pp">hopf_core::</span>Endpoint) <span class="op">{}</span></span>
-<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> receive(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> endpoint<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> <span class="pp">hopf_core::</span>Endpoint<span class="op">,</span> data<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="op">&amp;</span>[<span class="dt">u8</span>]) <span class="op">{</span></span>
-<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>        endpoint<span class="op">.</span>send(data)<span class="op">;</span></span>
-<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>        <span class="op">*</span>data <span class="op">=</span> <span class="op">&amp;</span>[]<span class="op">;</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> receive(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> endpoint<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> <span class="pp">hopf_core::</span>Endpoint<span class="op">,</span> buf<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="pp">hopf_core::</span>LoopBuf) <span class="op">{</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> (first<span class="op">,</span> second) <span class="op">=</span> buf<span class="op">.</span>readable_spans()<span class="op">;</span></span>
+<span id="cb6-8a"><a href="#cb6-8a" aria-hidden="true" tabindex="-1"></a>        endpoint<span class="op">.</span>send(first)<span class="op">;</span></span>
+<span id="cb6-8b"><a href="#cb6-8b" aria-hidden="true" tabindex="-1"></a>        endpoint<span class="op">.</span>send(second)<span class="op">;</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>        buf<span class="op">.</span>advance(buf<span class="op">.</span>len())<span class="op">;</span> <span class="co">// consume everything</span></span>
 <span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
 <span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> disconnected(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> _<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> <span class="pp">hopf_core::</span>Endpoint) <span class="op">{}</span></span>
 <span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> error(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> _<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> <span class="pp">hopf_core::</span>Endpoint<span class="op">,</span> _<span class="op">:</span> <span class="op">&amp;</span><span class="pp">std::io::</span><span class="bu">Error</span>) <span class="op">{}</span></span>
@@ -302,7 +304,7 @@ CompositionRegistry ───────┘  (handler=&quot;echo&quot; → fact
 <td><code>usize</code> bytes</td>
 <td style="text-align: center;">no</td>
 <td>1 MiB</td>
-<td>inbound buffer cap</td>
+<td>inbound ring size</td>
 </tr>
 <tr>
 <td><code>max-net-out</code></td>

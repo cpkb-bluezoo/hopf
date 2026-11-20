@@ -102,15 +102,15 @@
 </tr>
 <tr>
 <td>Commands</td>
-<td>Typed helpers for <code>LIST ACTIVE [wildmat]</code>, <code>GROUP</code>, <code>OVER</code>, <code>ARTICLE</code>, <code>HEAD</code>, <code>POST</code>, <code>QUIT</code>; <code>NntpSession::command</code> for anything else</td>
+<td>Typed helpers for <code>LIST ACTIVE [wildmat]</code>, <code>GROUP</code>, <code>STAT</code>, <code>OVER</code>, <code>ARTICLE</code>, <code>HEAD</code>, <code>BODY</code>, <code>POST</code>, <code>QUIT</code>; <code>NntpSession::command</code> for anything else</td>
 </tr>
 <tr>
 <td>Multi-line replies</td>
-<td>Delivered line by line, dot-unstuffed, as the bytes arrive; <code>POST</code> bodies are dot-stuffed and terminated for you</td>
+<td>Read from the connection's inbound ring buffer and delivered line by line, dot-unstuffed, as the bytes arrive (<code>LIST ACTIVE</code> and <code>OVER</code> lines arrive parsed as <code>NewsgroupEntry</code> / <code>OverviewEntry</code>); <code>POST</code> bodies are dot-stuffed and terminated for you</td>
 </tr>
 <tr>
 <td>Timeouts</td>
-<td>DNS, connect, and a per-command quiet-time budget reset on every reply line</td>
+<td><code>NntpClientTimeouts</code>: DNS (5 s), connect (30 s), and a per-command quiet-time budget (120 s) reset on every reply line</td>
 </tr>
 </tbody>
 </table>

@@ -90,7 +90,7 @@
 <li><a href="#live-and-dead-properties">Live and dead properties</a></li>
 <li><a href="#configuration">Configuration</a></li>
 <li><a href="#wiring">Wiring</a></li>
-<li><a href="#parser--multistatus-apis">Parser / multistatus APIs</a></li>
+<li><a href="#parser-multistatus-apis">Parser / multistatus APIs</a></li>
 <li><a href="#examples">Examples</a></li>
 <li><a href="#limitations">Limitations</a></li>
 </ul></div>
@@ -113,7 +113,11 @@
 </tr>
 <tr>
 <td><a href="https://www.rfc-editor.org/rfc/rfc9110">RFC 9110</a></td>
-<td>GET / HEAD file serving semantics</td>
+<td>GET / HEAD file serving semantics; conditional requests (§13)</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc3744">RFC 3744</a></td>
+<td>Access-control properties and privilege enforcement (role based); see <a href="#access-control-rfc-3744">Access control</a></td>
 </tr>
 <tr>
 <td>DAV:</td>
@@ -130,7 +134,7 @@ WebDavFactory → WebDavHandler (ServerHandler)
         ├── StorageExecutor  (FS read/write off reactor)
         ├── WebDavLockManager (in-memory, or file-backed under lock_root)
         └── DeadPropertyStore (xattr | sidecar [next to resource | under sidecar_root] | none)</code></pre>
-<p>Auth is <strong>not</strong> implemented in this crate. Put HTTP Basic/Digest/Bearer (<a href="auth.html">Auth</a> / <code>hopf-http</code> auth factories) or ACL (<a href="access-control.html">Access control</a>) around the listener.</p>
+<p>Auth is <strong>not</strong> implemented in this crate. Put HTTP Basic/Digest/Bearer (<a href="auth.html">Auth</a> / <code>hopf-http</code> auth factories) or ACL (<a href="access-control.html">Access control</a>) around the listener. The <code>hopf-http</code> auth factories pass the authenticated username on to this crate, which is what RFC 3744 privilege checks use.</p>
 <h2 id="access-control-rfc-3744">Access control (RFC 3744)</h2>
 <p>Set <code>WebDavConfig::role_policy</code> (with <code>webdav_enabled</code>) and the crate reports <code>DAV:current-user-privilege-set</code> and the other RFC 3744 properties and <strong>enforces</strong> privileges. A privilege is a role named <code>webdav:</code> plus the privilege, such as <code>webdav:read</code> or <code>webdav:bind</code>; <code>webdav:all</code> and <code>webdav:write</code> hold the privileges below them in the supported-privilege-set. The user is the one the authentication wrapper in front of the factory has set; a request without one holds nothing.</p>
 <p>Before a method does anything, the user must hold the privileges RFC 3744 appendix B names for it, or the response is <code>403</code> with the <code>DAV:need-privileges</code> precondition naming the resource and privilege.</p>
@@ -357,7 +361,25 @@ WebDavFactory → WebDavHandler (ServerHandler)
 <td><code>allow_unauthenticated_access</code></td>
 <td><code>bool</code></td>
 <td><code>false</code></td>
-<td>Required when write/WebDAV enabled without acknowledging no built-in auth</td>
+<td><code>WebDavFactory::new</code> fails when <code>allow_write</code> or <code>webdav_enabled</code> is set and this is <code>false</code>: set it to acknowledge that authentication is arranged in front of the factory (or for a deliberate unauthenticated demo)</td>
+</tr>
+<tr>
+<td><code>role_policy</code></td>
+<td><code>Option&lt;Arc&lt;dyn RolePolicy&gt;&gt;</code></td>
+<td><code>None</code></td>
+<td>RFC 3744 properties and privilege enforcement; see <code>with_role_policy</code></td>
+</tr>
+<tr>
+<td><code>cache_control</code></td>
+<td><code>Option&lt;CacheControl&gt;</code></td>
+<td><code>None</code></td>
+<td><code>Cache-Control</code> on file GET/HEAD and their 304s; see <code>with_cache_control</code></td>
+</tr>
+<tr>
+<td><code>content_language</code></td>
+<td><code>Option&lt;String&gt;</code></td>
+<td><code>None</code></td>
+<td>Default <code>DAV:getcontentlanguage</code></td>
 </tr>
 <tr>
 <td><code>lock_root</code></td>
@@ -397,40 +419,31 @@ WebDavFactory → WebDavHandler (ServerHandler)
 </tbody>
 </table>
 <h2 id="wiring">Wiring</h2>
-<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
-<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>Runtime<span class="op">,</span> RuntimeConfig<span class="op">,</span> StorageConfig<span class="op">,</span> TcpListenerConfig<span class="op">};</span></span>
-<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>CleartextHttpEndpoint<span class="op">,</span> HttpLimits<span class="op">};</span></span>
-<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_webdav::</span><span class="op">{</span>WebDavConfig<span class="op">,</span> WebDavFactory<span class="op">,</span> DeadPropMode<span class="op">};</span></span>
-<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> rt <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">Runtime::</span>start(RuntimeConfig <span class="op">{</span></span>
-<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    storage<span class="op">:</span> <span class="pp">StorageConfig::</span><span class="kw">default</span>()<span class="op">,</span></span>
-<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">..</span><span class="pp">RuntimeConfig::</span><span class="kw">default</span>()</span>
-<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>)<span class="op">?</span>)<span class="op">;</span></span>
-<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> cfg <span class="op">=</span> WebDavConfig <span class="op">{</span></span>
-<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    root_path<span class="op">:</span> <span class="st">&quot;/var/webdav&quot;</span><span class="op">.</span>into()<span class="op">,</span></span>
-<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    allow_write<span class="op">:</span> <span class="cn">true</span><span class="op">,</span></span>
-<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>    webdav_enabled<span class="op">:</span> <span class="cn">true</span><span class="op">,</span></span>
-<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    welcome_file<span class="op">:</span> <span class="st">&quot;index.html&quot;</span><span class="op">.</span>into()<span class="op">,</span></span>
-<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    dead_property_storage<span class="op">:</span> <span class="pp">DeadPropMode::</span>Auto<span class="op">,</span></span>
-<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
-<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> factory <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">WebDavFactory::</span>new(cfg<span class="op">,</span> <span class="pp">Arc::</span>clone(rt<span class="op">.</span>storage()))<span class="op">?</span>)<span class="op">;</span></span>
-<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> limits <span class="op">=</span> <span class="pp">HttpLimits::</span><span class="kw">default</span>()<span class="op">;</span></span>
-<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> endpoint_factory <span class="op">=</span> <span class="op">{</span></span>
-<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> f <span class="op">=</span> <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>factory)<span class="op">;</span></span>
-<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>    <span class="pp">Arc::</span>new(<span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
-<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>        <span class="dt">Box</span><span class="pp">::</span>new(<span class="pp">CleartextHttpEndpoint::</span>new(</span>
-<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>            <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>f) <span class="kw">as</span> Arc<span class="op">&lt;</span><span class="kw">dyn</span> <span class="pp">hopf_http::</span>ServerHandlerFactory<span class="op">&gt;,</span></span>
-<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>            limits<span class="op">,</span></span>
-<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>        )) <span class="kw">as</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> <span class="pp">hopf_core::</span>ProtocolHandler<span class="op">&gt;</span></span>
-<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>)</span>
-<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
-<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a>rt<span class="op">.</span>add_tcp_listener(<span class="pp">TcpListenerConfig::</span>new(</span>
-<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;127.0.0.1:8080&quot;</span><span class="op">.</span>parse()<span class="op">?,</span></span>
-<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>    endpoint_factory<span class="op">,</span></span>
-<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a>))<span class="op">?;</span></span></code></pre></div>
+<pre class="sourceCode rust"><code>use std::sync::Arc;
+use hopf_core::{ProtocolHandler, Runtime, RuntimeConfig, TcpListenerConfig};
+use hopf_http::{BasicAuthConfig, BasicAuthFactory, CleartextHttpEndpoint, HttpLimits, ServerHandlerFactory};
+use hopf_webdav::{DeadPropMode, WebDavConfig, WebDavFactory};
+
+let rt = Runtime::start(RuntimeConfig::default())?;
+
+let cfg = WebDavConfig {
+    root_path: "/var/webdav".into(),
+    allow_write: true,
+    webdav_enabled: true,
+    dead_property_storage: DeadPropMode::Auto,
+    // Authentication is supplied by the wrapper below, not by this crate:
+    allow_unauthenticated_access: true,
+    ..WebDavConfig::default()
+};
+let dav: Arc&lt;dyn ServerHandlerFactory&gt; =
+    Arc::new(WebDavFactory::new(cfg, Arc::clone(rt.storage()))?);
+let factory: Arc&lt;dyn ServerHandlerFactory&gt; =
+    Arc::new(BasicAuthFactory::new(dav, trust_policy /* Arc&lt;dyn hopf_auth::TrustPolicy&gt; */, BasicAuthConfig::new("dav")));
+
+let limits = HttpLimits::default();
+rt.add_tcp_listener(TcpListenerConfig::new("127.0.0.1:8080".parse()?, move || {
+    Box::new(CleartextHttpEndpoint::new(Arc::clone(&amp;factory), limits)) as Box&lt;dyn ProtocolHandler&gt;
+}))?;</code></pre>
 <p>For HTTPS, use the same stack as <a href="http/overview.html#tls-alpn-h1-h2">HTTP TLS + ALPN</a>: <code>acceptor_from_pem</code> with <code>&amp;[b"h2", b"http/1.1"]</code>, <code>AlpnHttpEndpoint</code> as the handler factory, <code>TcpListenerConfig::with_tls(acceptor)</code>. See <a href="http/server.html">HTTP server</a> and <a href="tls.html#wiring-listeners-and-connectors">TLS → Wiring</a>.</p>
 <p><code>WebDavFactory::new</code> creates the root directory if needed, builds the Allow header from flags, installs a default MIME map, and shares one lock manager + dead-prop store across handlers from that factory.</p>
 <h2 id="parser-multistatus-apis">Parser / multistatus APIs</h2>
@@ -465,7 +478,7 @@ WebDavFactory → WebDavHandler (ServerHandler)
 </tr>
 <tr>
 <td><code>MultiStatusParser</code> / <code>parse_multistatus</code></td>
-<td>Client-side 207</td>
+<td>Client-side 207, parsed incrementally as the document arrives (<code>MultiStatusHandler</code> events); <code>parse_multistatus</code> for a complete document</td>
 </tr>
 <tr>
 <td><code>canonicalize_path</code> / <code>resolve_path_lexical</code></td>
@@ -475,7 +488,7 @@ WebDavFactory → WebDavHandler (ServerHandler)
 </table>
 <h2 id="examples">Examples</h2>
 <p>See <a href="cookbook/webdav.html">Cookbook: WebDAV</a>.</p>
-<div class="sourceCode" id="cb3"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Cleartext WebDAV+write (example forces webdav_enabled; write default true in example)</span></span>
+<div class="sourceCode" id="cb3"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Cleartext WebDAV+write (the example always sets webdav_enabled; write is off unless WEBDAV_WRITE is set)</span></span>
 <span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="va">WEBDAV_ROOT</span><span class="op">=</span>/tmp/dav <span class="va">WEBDAV_WRITE</span><span class="op">=</span>1 <span class="dt">\</span></span>
 <span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>  <span class="ex">cargo</span> run <span class="at">-p</span> webdav <span class="at">--</span> 127.0.0.1:8080 /tmp/dav</span></code></pre></div>
 <table>
@@ -499,14 +512,13 @@ WebDavFactory → WebDavHandler (ServerHandler)
 </tr>
 </tbody>
 </table>
-<p>Note: the example defaults <code>WEBDAV_WRITE</code> to <strong>true</strong>, while <code>WebDavConfig</code> defaults <code>allow_write</code> to <strong>false</strong>.</p>
+<p>The example runs with <code>allow_unauthenticated_access</code> set and no authentication wrapper; it is a local demo only.</p>
 <h2 id="limitations">Limitations</h2>
 <ul>
 <li>Locks are <strong>in-memory per factory</strong> by default (not clustered); set <code>WebDavConfig::lock_root</code> to share file-backed lock records across handlers pointed at the same content, but only on a filesystem with atomic create-new and immediately-visible writes (a local disk, not NFS).</li>
 <li>No in-crate authentication — compose with HTTP auth / <code>PeerAcl</code>. RFC 3744 privileges are enforced as roles held on every resource; no per-resource ACLs.</li>
 <li>Feature <code>xattr</code> required for real xattrs; <code>Auto</code> falls back to sidecar.</li>
 <li>Not a standalone service crate; always behind HTTP.</li>
-<li>No Gumdrop-style separate WebDAV RBAC surface in this crate.</li>
 </ul>
 
       <p class="footer">

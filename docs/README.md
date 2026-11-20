@@ -8,7 +8,7 @@ Static **HTML** reference for [GitHub Pages](https://docs.github.com/en/pages)
 - Logo: [`assets/hopf.png`](assets/hopf.png)
 - [`.nojekyll`](.nojekyll) so Pages serves assets as-is
 
-Protocol and crate pages are **feature manuals** in the Gumdrop style: RFCs,
+Protocol and crate pages are **feature manuals**: RFCs,
 supported capabilities, configuration tables for every knob, handler SPIs,
 code examples, and limitations. Cookbook pages stay short and point at
 `examples/`.

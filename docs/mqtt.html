@@ -77,7 +77,7 @@
     <main class="main">
       <header>
         <h1>MQTT</h1>
-        <p class="lead"><code>hopf-mqtt</code> is an MQTT <strong>broker and async client</strong> (Gumdrop <code>mqtt</code> port): MQTT 3.1.1 full semantics plus a useful 5.0 core, with an optional MQTT-over-WebSocket bridge sharing the same broker state as the TCP listener.</p>
+        <p class="lead"><code>hopf-mqtt</code> is an MQTT <strong>broker and async client</strong> covering MQTT 3.1.1 full semantics plus a useful 5.0 core, with an optional MQTT-over-WebSocket bridge sharing the same broker state as the TCP listener.</p>
       </header>
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
@@ -106,7 +106,7 @@
 <tbody>
 <tr>
 <td>MQTT 3.1.1</td>
-<td>Full semantics — CONNECT/CONNACK, PUBLISH QoS 0/1/2, SUBSCRIBE/SUBACK, UNSUBSCRIBE/UNSUBACK, PINGREQ/PINGRESP, DISCONNECT, retained messages, Will messages, topic wildcards (<code>+</code> / <code>#</code>), session takeover</td>
+<td>Full semantics - CONNECT/CONNACK, PUBLISH QoS 0/1/2, SUBSCRIBE/SUBACK, UNSUBSCRIBE/UNSUBACK, PINGREQ/PINGRESP, DISCONNECT, retained messages, Will messages, topic wildcards (<code>+</code> / <code>#</code>), session takeover, persistent sessions (CleanSession 0 keeps subscriptions and queued QoS 1/2 messages across disconnects)</td>
 </tr>
 <tr>
 <td>MQTT 5.0 (useful core)</td>
@@ -174,7 +174,7 @@ WebSocket (mqtt) ───┘                                                   
 </tbody>
 </table>
 <h2 id="connect-handler-spi">Handler SPI</h2>
-<p>CONNECT, PUBLISH, and SUBSCRIBE are staged (Gumdrop parity). Default handlers accept all traffic, or require CONNECT username/password to match a <code>CredentialStore</code> when one is configured. Enhanced AUTH (MQTT 5.0) is driven when CONNECT carries Authentication Method and credentials are configured.</p>
+<p>CONNECT, PUBLISH, and SUBSCRIBE are authorised in separate stages, each by its own handler. Default handlers accept all traffic, or require CONNECT username/password to match a <code>CredentialStore</code> when one is configured. Enhanced AUTH (MQTT 5.0) is driven when CONNECT carries Authentication Method and credentials are configured.</p>
 <div class="sourceCode"><pre class="sourceCode rust"><code class="sourceCode rust"><span class="kw">pub</span> <span class="kw">trait</span> ConnectHandler: Send {
     <span class="kw">fn</span> authorize(&amp;mut self, packet: &amp;ConnectPacket, meta: &amp;MqttConnectionMetadata) -&gt; ConnectDecision;
 }
@@ -188,7 +188,7 @@ WebSocket (mqtt) ───┘                                                   
 }</code></pre></div>
 <p><code>MqttConnectionMetadata</code> carries peer/local/tls, optional <code>client_id</code>, and (when OTel traces are enabled) a W3C <code>traceparent</code>. Swap in custom policy with <code>MqttService::with_handler_factory</code>. Offline / inflight message storage is pluggable via <code>BrokerState::with_store</code> (<code>InMemoryMessageStore</code> default, <code>FileBackedMessageStore</code> optional).</p>
 <h2 id="client">Client</h2>
-<p>Async, non-blocking client on the <code>hopf-core</code> <code>Runtime</code> / <code>ProtocolHandler</code> SPI, with DNS resolution via <code>hopf-dns</code>. Unlike the staged POP3/IMAP client drivers, MQTT has only one phase once CONNACK arrives, so <code>MqttClientDriver</code> is a flat set of callbacks over <code>MqttClientControl</code> (publish/subscribe/unsubscribe/disconnect) — QoS 1/2 acknowledgment of incoming messages and the PUBREC→PUBREL leg of the client's own QoS 2 publishes are handled automatically by the endpoint.</p>
+<p>Async, non-blocking client on the <code>hopf-core</code> <code>Runtime</code> / <code>ProtocolHandler</code> SPI, with DNS resolution via <code>hopf-dns</code>. Unlike the staged POP3/IMAP client drivers, MQTT has only one phase once CONNACK arrives, so <code>MqttClientDriver</code> is a flat set of callbacks over <code>MqttClientControl</code> (publish/subscribe/unsubscribe/disconnect). QoS 1/2 acknowledgement of incoming messages and the PUBREC→PUBREL leg of the client's own QoS 2 publishes are handled automatically by the endpoint. A QoS 1/2 publish of the client's own ends in exactly one of <code>on_publish_acked</code> (PUBACK, or PUBCOMP for QoS 2) or <code>on_publish_failed(client, packet_id, reason_code, properties)</code>, which MQTT 5.0 brokers trigger by refusing it with a reason code of 0x80 or more in PUBACK, PUBREC or PUBCOMP (no PUBREL follows a refusing PUBREC). <code>disconnect()</code> sends DISCONNECT on 3.1.1 as well as 5.0, so a clean close never makes the broker publish the Will. The keep-alive timer sends PINGREQ on its own and fails the connection only when a PINGRESP does not arrive in time.</p>
 <div class="sourceCode"><pre class="sourceCode rust"><code class="sourceCode rust"><span class="kw">use</span> std::sync::Arc;
 <span class="kw">use</span> hopf_core::{Runtime, RuntimeConfig};
 <span class="kw">use</span> hopf_mqtt::client::MqttClient;
@@ -215,6 +215,16 @@ MqttClient::new(<span class="st">&quot;broker.example.com&quot;</span>, <span cl
 <td><code>MqttClient::from_addr(addr, client_id)</code></td>
 <td>—</td>
 <td>Pre-resolved, skips DNS</td>
+</tr>
+<tr>
+<td><code>MqttClient::from_unix_path(path, client_id)</code></td>
+<td>-</td>
+<td>Dials a UNIX domain socket, skips DNS</td>
+</tr>
+<tr>
+<td><code>.resolver(Arc&lt;DnsResolver&gt;)</code></td>
+<td>made on connect</td>
+<td>The resolver used for a host name</td>
 </tr>
 <tr>
 <td><code>.v3_1_1()</code></td>

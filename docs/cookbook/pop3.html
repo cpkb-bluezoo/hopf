@@ -83,7 +83,9 @@
 <p>Default demo credentials: <code>alice</code> / <code>secret</code>. Deliver mail first with <code>smtp-local</code> into the same maildir root, then retrieve with any POP3 client:</p>
 <div class="sourceCode" id="cb2"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># after smtp-local has APPENDed to ./mail/alice/</span></span>
 <span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="bu">printf</span> <span class="st">&#39;USER alice\r\nPASS secret\r\nSTAT\r\nQUIT\r\n&#39;</span> <span class="kw">|</span> <span class="ex">nc</span> 127.0.0.1 1110</span></code></pre></div>
-<p>See <a href="../pop3.html">POP3</a> for the handler SPI and CAPA surface.</p>
+<p>Or retrieve with the Hopf client (<code>Pop3Fetch</code>); add <code>--delete</code> to DELE each message after RETR:</p>
+<pre class="sourceCode bash"><code>cargo run -p pop3-fetch -- 127.0.0.1 1110 alice secret</code></pre>
+<p>See <a href="../pop3.html">POP3</a> for the handler SPI, CAPA surface and client.</p>
 
       <p class="footer">
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>

@@ -142,6 +142,10 @@
 <td><code>primary_addr()</code> / <code>remove_binding(BindingId)</code> / <code>shutdown(self)</code></td>
 <td>Inspect / tear down the running composition</td>
 </tr>
+<tr>
+<td><code>shutdown_graceful(self)</code></td>
+<td>Stop accepting, tell every open connection's handler (<code>ProtocolHandler::drain</code>), wait up to <code>RuntimeConfig::drain_timeout</code> (default 30 s) for them to finish, then <code>shutdown</code></td>
+</tr>
 </tbody>
 </table>
 <p>There is no separate <code>build()</code> step — a <code>Composition</code> is running as soon as it's constructed (<code>Runtime::start</code> before the script runs). This is also what lets a registered listener close over <code>Arc&lt;Runtime&gt;</code> — required by any protocol service that offloads work to the storage pool (SMTP local delivery, POP3, IMAP, ...).</p>
@@ -265,13 +269,13 @@
 <tr>
 <td><code>max-net-in</code></td>
 <td><code>usize</code></td>
-<td>buffer cap</td>
+<td>inbound cap; sizes the connection's inbound ring (power of two, at least 32 KiB)</td>
 <td><code>1 MiB</code></td>
 </tr>
 <tr>
 <td><code>max-net-out</code></td>
 <td><code>usize</code></td>
-<td>buffer cap</td>
+<td>outbound buffer cap</td>
 <td><code>4 MiB</code></td>
 </tr>
 <tr>
@@ -320,7 +324,15 @@
 </tr>
 </tbody>
 </table>
-<p>TLS / <code>secure</code> attributes are <strong>rejected in v1</strong>. Wire TLS inside the registered factory or use the Rust builder (<code>TcpListenerConfig::with_tls</code>).</p>
+<p>TLS / <code>secure</code> attributes are <strong>rejected in v1</strong>. Wire TLS inside the registered factory or use the Rust builder: build a <code>SharedTlsAcceptor</code> with <code>ServerTlsBuilder</code> (credentials or a per-handshake <code>ServerCredentialsResolver</code>, ALPN, client-certificate policy and trust that can change while the server runs) and pass it to <code>TcpListenerConfig::with_tls</code>. PROXY protocol v1/v2 on a listener is likewise Rust-only (<code>TcpListenerConfig::with_proxy_protocol</code>).</p>
+<pre class="rust,ignore"><code>use std::path::Path;
+use hopf_core::{ServerTlsBuilder, TcpListenerConfig};
+
+let acceptor = ServerTlsBuilder::new()
+    .credentials_from_pem(Path::new(&quot;cert.pem&quot;), Path::new(&quot;key.pem&quot;))?
+    .alpn(&amp;[b&quot;imap&quot;])
+    .build()?;
+comp.listen_tcp(TcpListenerConfig::new(listen_addr, factory).with_tls(acceptor))?;</code></pre>
 <p>Telemetry is <strong>not</strong> expressed in XML v1 — pass it to <code>Composition::from_xml_with_telemetry</code> / <code>from_xml_str_with_telemetry</code> / <code>from_xml_path_with_telemetry</code> instead of the plain <code>from_xml*</code> entry points, since it must be known before the Runtime starts.</p>
 <h2 id="binding-lifecycle">Binding lifecycle</h2>
 <ol type="1">
@@ -328,7 +340,7 @@
 <li><strong>Add</strong> — <code>Composition::listen_tcp</code> / <code>Runtime::add_tcp_listener</code> → <code>(SocketAddr, BindingId)</code>, applied immediately against the live Runtime. Port <code>0</code> yields an ephemeral local address.</li>
 <li><strong>Run</strong> — accept loop registers the mio listener; each accept round-robins onto a worker reactor (affinity for life).</li>
 <li><strong>Remove</strong> — <code>Composition::remove_binding</code> / <code>Runtime::remove_binding</code>. The accept loop deregisters the listener; <strong>existing connections keep affinity until close</strong>.</li>
-<li><strong>Shutdown</strong> — <code>Composition::shutdown</code> / <code>Runtime::shutdown</code> tears down workers, accept loop, and storage. Best-effort on <code>Composition</code>: if a registered service factory kept its own <code>Arc&lt;Runtime&gt;</code> clone (from <code>runtime()</code>), that clone keeps the Runtime alive past this call — same as the standalone protocol examples, which never call <code>Runtime::shutdown</code> and just drop their <code>Arc&lt;Runtime&gt;</code> at process exit.</li>
+<li><strong>Shutdown</strong> - <code>Composition::shutdown</code> / <code>Runtime::shutdown</code> tears down workers, accept loop, and storage. Best-effort on <code>Composition</code>: if a registered service factory kept its own <code>Arc&lt;Runtime&gt;</code> clone (from <code>runtime()</code>), that clone keeps the Runtime alive past this call, as with the standalone protocol examples, which never call <code>Runtime::shutdown</code> and just drop their <code>Arc&lt;Runtime&gt;</code> at process exit. <code>Composition::shutdown_graceful</code> drains first: the drain happens even while services hold clones; the threads stop once the last clone is dropped.</li>
 </ol>
 <p>Trust policies and DNS caches attach at the protocol layer (e.g. HTTP <code>BasicAuthFactory</code>, <code>DnsResolver</code>), not as core Composition fields — core stays free of HTTP/auth types.</p>
 <h2 id="telemetry">Telemetry</h2>
@@ -341,7 +353,7 @@
 <ul>
 <li>Closed registry only — no dynamic plugin loading.</li>
 <li>Registry factories can't depend on <code>Arc&lt;Runtime&gt;</code> — they're resolved before <code>from_xml*</code> starts the Runtime. Storage-offloading protocol services (SMTP local delivery, POP3, IMAP, ...) compose via the Rust builder instead.</li>
-<li>XML v1 has no TLS / secure / telemetry attributes.</li>
+<li>XML v1 has no TLS / secure / PROXY protocol / telemetry attributes.</li>
 <li><code>idle_timeout</code> is accepted and stored but not yet enforced on the datapath — see <a href="runtime-options.html">runtime-options.md</a>.</li>
 <li>QUIC / H3 bindings are not Composition XML elements; use <code>listen_h3</code> / <code>RuntimeQuicExt</code> in Rust.</li>
 </ul>

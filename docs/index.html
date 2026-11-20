@@ -77,7 +77,7 @@
     <main class="main">
       <header>
         <h1>Hopf</h1>
-        <p class="lead">Native, asynchronous, non-blocking, event-driven <strong>multi-protocol networking framework</strong> in Rust. Successor to <a href="https://github.com/cpkb-bluezoo/gumdrop">Gumdrop</a> without the servlet container — same architectural contracts, TPC execution, plain buffers, and in-tree protocol work.</p>
+        <p class="lead">Native, asynchronous, non-blocking, event-driven <strong>multi-protocol networking framework</strong> in Rust. Servers and clients are equal peers: thread-per-core execution, fixed <code>loopbuf</code> ring buffers read in place, incremental push codecs, and in-tree protocol work for each protocol.</p>
       </header>
       <p>Hopf is <strong>not</strong> a server-only product. The default topology is a <strong>graph of endpoints</strong> on one Runtime: <strong>listen and dial are equal</strong>. Peer compositions (N listeners + M dialers) are normal. Clients routinely host multiple protocols in one process (at minimum DNS under dial).</p>
 <div class="toc"><h2 id="contents">Contents</h2>
@@ -117,7 +117,7 @@
 <li>mio readiness loops; each connection stays on one reactor for life</li>
 <li>I/O, TLS, and protocol bytes never migrate mid-connection</li>
 <li>storage / blocking work on a separate pool, independent of connection count</li>
-<li>transport-level backpressure and plain <code>&amp;[u8]</code> / pooled buffers</li>
+<li>transport-level backpressure on fixed-size <code>LoopBuf</code> rings: handlers read the ring in place and consume whole tokens, so nothing accumulates a message or a stream</li>
 </ul></li>
 <li><strong>Equal listen and dial</strong>
 <ul>
@@ -150,7 +150,7 @@
 <h2 id="full-feature-list">Full feature list</h2>
 <h3 id="framework-substrate-hopf-core">Framework substrate (<code>hopf-core</code>)</h3>
 <ul>
-<li>TPC Runtime with accept loop, per-core reactors, timers, buffer pools</li>
+<li>TPC Runtime with accept loop, per-core reactors, timers, pooled <code>LoopBuf</code> rings, readiness and graceful drain (<code>is_ready</code>, <code>start_drain</code>, <code>shutdown_graceful</code>)</li>
 <li><code>Endpoint</code> / <code>ProtocolHandler</code> / <code>Service</code> / <code>Listener</code> / <code>Connector</code> seams</li>
 <li>Dynamic TCP listen and dial (<code>add_tcp_listener</code>, <code>connect</code>, remove bindings)</li>
 <li>STARTTLS and TLS-from-accept/dial via in-tree <code>hopf-core::tls</code> (<code>acceptor_from_pem</code>, <code>connector_from_pem</code>, and related helpers on AWS-LC)</li>
@@ -158,7 +158,8 @@
 <li><code>StorageExecutor</code> for blocking filesystem / heavy work with fail-fast backpressure</li>
 <li>Panic isolation at the connection boundary</li>
 <li>Composition builder (canonical) + XML loader via tractrix (closed registry, no DI)</li>
-<li>Peer ACL (CIDR allow/deny), accept rate limits, quota tracker seam</li>
+<li>Peer ACL (CIDR allow/deny), accept rate limits, PROXY protocol, UNIX-socket listen and dial with peer-credential checks, quota tracker, retry policy, keyed connection pool</li>
+<li>In-process test harness (<code>hopf_core::testing::Peer</code>) for driving handlers without sockets</li>
 <li>Telemetry hook seam (implementations in <code>hopf-otel</code>)</li>
 </ul>
 <h3 id="tls-hopf-core">TLS (<code>hopf-core::tls</code>)</h3>
@@ -208,7 +209,7 @@
 </ul>
 <h3 id="grpc-hopf-grpc">gRPC (<code>hopf-grpc</code>)</h3>
 <ul>
-<li>Unary gRPC over Hopf HTTP Streams</li>
+<li>Unary and streaming gRPC over Hopf HTTP Streams, with metadata, deadlines and message compression</li>
 <li>Length-prefixed framing; <code>application/grpc</code></li>
 <li>Runtime <code>.proto</code> model (no generated stubs) via rprotobuf</li>
 <li>Server <code>GrpcService</code> + client <code>GrpcClient::unary_call</code></li>
@@ -221,7 +222,7 @@
 <li><code>DnsClientTransport</code> (DoT/DoQ/DoH) also usable standalone for an app that wants to speak one specific encrypted transport directly, outside the resolver</li>
 <li><code>connect_by_name</code> for async dial-by-hostname on <code>Arc&lt;Runtime&gt;</code></li>
 <li>Examples: UDP caching forwarder (<code>dns-proxy</code>) and authoritative server (<code>dns-authoritative</code>)</li>
-<li><strong>Planned:</strong> DNS over DTLS (Gumdrop parity) when DTLS lands in <code>hopf-core</code></li>
+<li><strong>Planned:</strong> DNS over DTLS, once DTLS has a generic <code>Endpoint</code> integration in <code>hopf-core</code></li>
 </ul>
 <h3 id="mdns-hopf-mdns">mDNS / DNS-SD (<code>hopf-mdns</code>)</h3>
 <ul>
@@ -234,7 +235,7 @@
 <h3 id="masque-hopf-masque">MASQUE (<code>hopf-masque</code>)</h3>
 <ul>
 <li>RFC 9298 CONNECT-UDP (full server relay + client) and RFC 9484 CONNECT-IP (accept/capsule plumbing; app supplies IP forwarding) over HTTP/1.1, HTTP/2, and HTTP/3</li>
-<li>Standalone crate; optional umbrella feature <code>masque</code>, <code>masque-h3</code> (client dial helpers only need <code>h3</code>)</li>
+<li>Standalone crate; optional umbrella feature <code>masque</code> and <code>masque-h3</code></li>
 </ul>
 <h3 id="socks-hopf-socks">SOCKS (<code>hopf-socks</code>)</h3>
 <ul>
@@ -331,7 +332,7 @@
 <ul>
 <li>TrustPolicy / IdentityMaterial for listen and dial</li>
 <li>SASL: PLAIN, LOGIN, SCRAM-SHA-256, OAUTHBEARER, EXTERNAL</li>
-<li><strong>Planned:</strong> GSSAPI/Kerberos SASL (RFC 4752, Gumdrop parity) as optional feature</li>
+<li><strong>Planned:</strong> GSSAPI/Kerberos SASL (RFC 4752) as an optional feature</li>
 <li>HTTP Digest helpers (SHA-256 by default); password / token / certificate stores for demos and wiring</li>
 </ul>
 <h3 id="telemetry-hopf-otel">Telemetry (<code>hopf-otel</code>)</h3>
@@ -388,11 +389,11 @@
 <td>H1/H2/H3 upgrade</td>
 </tr>
 <tr>
-<td>gRPC (unary)</td>
+<td>gRPC</td>
 <td><code>hopf-grpc</code></td>
 <td style="text-align: center;">✓</td>
 <td style="text-align: center;">✓</td>
-<td>on HTTP Streams</td>
+<td>unary and streaming, on HTTP Streams</td>
 </tr>
 <tr>
 <td>DNS</td>

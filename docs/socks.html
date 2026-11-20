@@ -231,7 +231,7 @@ impl SocksAuthenticator for FixedCredential {
 }</code></pre>
 <p>There is no built-in <code>CredentialStore</code>/<code>TrustPolicy</code> integration (unlike the mail and directory protocol crates) — <code>SocksAuthenticator</code> is a single-method seam an application implements directly, typically backed by whatever credential source it already has.</p>
 <p>On the client side, <code>SocksClientConfig::with_credentials(username, password)</code> offers <code>0x02</code> alongside no-auth in the SOCKS5 greeting and drives the RFC 1929 sub-negotiation automatically if the proxy selects it. SOCKS4/4a has no credential field; a configured credential is silently unused when <code>SocksClientVersion::Socks4</code> is selected.</p>
-<p><strong>RFC 1961 GSSAPI authentication is not implemented.</strong> There is no GSSAPI method byte, sub-negotiation, or per-message protection in <code>wire</code>, <code>handler</code>, or either client handler. It is planned together with optional GSSAPI/Kerberos SASL in <code>hopf-auth</code>; until then, deployments needing enterprise authentication can terminate TLS in front of the proxy (see <a href="#tls">SOCKS over TLS</a>) and use RFC 1929 username/password instead.</p>
+<p><strong>RFC 1961 GSSAPI authentication is not implemented.</strong> There is no GSSAPI method byte, sub-negotiation, or per-message protection in <code>wire</code>, <code>handler</code>, or either client handler. <code>hopf-auth</code> has no GSSAPI SASL mechanism either. Deployments needing enterprise authentication can terminate TLS in front of the proxy (see <a href="#tls">SOCKS over TLS</a>) and use RFC 1929 username/password instead.</p>
       <h2 id="destination-policy">Destination policy</h2>
 <p><code>SocksPolicy</code> approves or denies a relay target and has <strong>no permissive default anywhere in this crate</strong> — an open SOCKS proxy is not something an application should get by omission:</p>
 <pre class="rust,ignore"><code>use std::net::IpAddr;
@@ -427,7 +427,7 @@ rt.connect(cfg)?;</code></pre>
 <p>There is no OTLP/JSONL exporter for these counters in <code>hopf-otel</code> yet (unlike the mail and directory protocol crates' <code>*ServerMetrics</code> types) — applications that need centralized telemetry currently read the atomics directly.</p>
       <h2 id="limitations">Limitations</h2>
 <ul>
-<li>RFC 1961 GSSAPI authentication is not implemented — see <a href="#authentication">Authentication</a>.</li>
+<li>RFC 1961 GSSAPI authentication is not implemented; see <a href="#authentication">Authentication</a>.</li>
 <li>No RFC 1928 §7 UDP fragment reassembly — only standalone datagrams are relayed, matching near-universal real-world practice, but a client relying on fragmentation will not work.</li>
 <li>No built-in <code>CredentialStore</code>/<code>TrustPolicy</code> integration — <code>SocksAuthenticator</code> is a standalone single-method trait, not wired to this workspace's shared credential-store abstraction.</li>
 <li>No OTLP/JSONL metrics export via <code>hopf-otel</code> — only the in-process atomic counters.</li>

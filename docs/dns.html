@@ -167,6 +167,22 @@
 <td><a href="https://www.rfc-editor.org/rfc/rfc2308">RFC 2308</a>, <a href="https://www.rfc-editor.org/rfc/rfc4592">4592</a>, <a href="https://www.rfc-editor.org/rfc/rfc8020">8020</a>, <a href="https://www.rfc-editor.org/rfc/rfc8482">8482</a></td>
 <td>Authoritative negative answers, wildcards, empty non-terminals, minimal <code>ANY</code></td>
 </tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc10029">RFC 10029</a></td>
+<td>Multiple QTYPEs: client (<code>query_batch</code>) and server (<code>DnsService::set_max_multi_qtypes</code>)</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc9462">RFC 9462</a> / <a href="https://www.rfc-editor.org/rfc/rfc9460">9460</a></td>
+<td>Discovery of Designated Resolvers over SVCB, feeding <a href="#auto-transport">automatic DoQ/DoT selection</a>; HTTPS records for <a href="#ech-dane">ECH bootstrap</a></td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc8767">RFC 8767</a>, <a href="https://www.rfc-editor.org/rfc/rfc8198">8198</a></td>
+<td>Forwarder serve-stale and aggressive use of validated NSEC/NSEC3</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc6698">RFC 6698</a> / <a href="https://www.rfc-editor.org/rfc/rfc7672">7672</a></td>
+<td>DANE certificate matching (feature <code>dane</code>)</td>
+</tr>
 </tbody>
 </table>
 <p>See <a href="#dnssec">DNSSEC</a> below for algorithm support and trust anchors.</p>
@@ -193,9 +209,10 @@
          └── listen_dns_doq  (+doq)</code></pre>
 <p><code>RuntimeDnsExt::connect_by_name</code> — async resolve then <code>Runtime::connect</code> on <code>Arc&lt;Runtime&gt;</code> (returns immediately; dial runs from the DNS callback).</p>
 <h2 id="resolver">Resolver</h2>
-<p><code>DnsResolver</code> — async stub on a reactor, and (since issue #90) multi-protocol: each configured upstream server carries its own transport (UDP+TCP-fallback by default, or DoT/DoQ/DoH), selected per-server via <code>add_server_dot</code>/<code>add_server_doq</code>/<code>add_server_doh</code> rather than globally — a resolver can mix a fast plaintext server with an encrypted fallback. Every query helper (<code>query_a</code>, <code>resolve</code>, …), retry/failover across configured servers, CNAME chase, response caching, and DNSSEC validation work identically regardless of which transport actually carried the query — they all run in the same transport-agnostic completion path the wire bytes land in once decoded. RFC 7873 cookies stay UDP-only (the anti-spoofing defence they exist for doesn't apply to a TLS/QUIC/HTTPS-authenticated transport).</p>
-<p><strong>Query helpers:</strong> <code>query_a</code>, <code>query_aaaa</code>, <code>query_mx</code>, <code>query_txt</code>, <code>query_ptr</code>, <code>query_srv</code>, generic <code>query(DnsQuestion, …)</code>.</p>
-<p><strong>Happy Eyeballs:</strong> <code>resolve(host, port, ResolveCallback)</code> — parallel A+AAAA, IPv6-first ordering.</p>
+<p><code>DnsResolver</code> is an async stub on a reactor, and multi-protocol: each configured upstream server carries its own transport (UDP+TCP-fallback by default, or DoT/DoQ/DoH), selected per-server via <code>add_server_dot</code>/<code>add_server_doq</code>/<code>add_server_doh</code> rather than globally — a resolver can mix a fast plaintext server with an encrypted fallback. Every query helper (<code>query_a</code>, <code>resolve</code>, …), retry/failover across configured servers, CNAME chase, response caching, and DNSSEC validation work identically regardless of which transport actually carried the query — they all run in the same transport-agnostic completion path the wire bytes land in once decoded. RFC 7873 cookies stay UDP-only (the anti-spoofing defence they exist for doesn't apply to a TLS/QUIC/HTTPS-authenticated transport).</p>
+<p><strong>Query helpers:</strong> <code>query_a</code>, <code>query_aaaa</code>, <code>query_mx</code>, <code>query_txt</code>, <code>query_ptr</code>, <code>query_srv</code>, generic <code>query(DnsQuestion, …)</code>, <code>query_with_cd</code>.</p>
+<p><strong>Several types at once (RFC 10029):</strong> <code>query_batch(name, &amp;[types], on_result, on_complete)</code> sends the first type as the QTYPE and asks for the rest in an MQTYPE-Query EDNS option on the same query. Types the server does not cover in its MQTYPE-Response (all of them, for a server without support) are resolved with ordinary queries, so every type gets exactly one <code>on_result(type, result)</code>, followed by one <code>on_complete()</code>. A server that turns out not to support the option is remembered for a while (<code>MultiQTypeCache</code>) and sent plain queries meanwhile.</p>
+<p><strong>Happy Eyeballs:</strong> <code>resolve(host, port, ResolveCallback)</code>: parallel A+AAAA, IPv6-first ordering.</p>
 <p><strong>Helpers:</strong> <code>HostsFile</code>, <code>parse_literal_ip</code>, <code>DnsCache</code>, <code>DnsCookie</code>, bailiwick filters (<code>filter_answers_in_bailiwick</code>, <code>is_within_bailiwick</code>, <code>names_equal</code>).</p>
 <p>Wire types: <code>DnsMessage</code>, <code>DnsQuestion</code>, <code>DnsResourceRecord</code>, <code>SoaData</code>, <code>DnsType</code>, <code>DnsClass</code>, <code>DnsQueryIdGenerator</code>, <code>DnsFormatError</code>, plus <code>FLAG_*</code> / <code>RCODE_*</code> (including <code>RCODE_BADVERS</code>) / <code>OPCODE_QUERY</code> / <code>EDNS_FLAG_DO</code> / <code>OPT_UDP_PAYLOAD</code> / <code>EDNS_OPTION_PADDING</code> constants.</p>
 <p>Every standard record type has a matching constructor and decode accessor on <code>DnsResourceRecord</code>: <code>a()</code>/<code>as_a()</code>, <code>aaaa()</code>/<code>as_aaaa()</code>, <code>cname()</code>/<code>ns()</code>/<code>ptr()</code> via <code>as_domain_name()</code>, <code>mx()</code>/<code>as_mx()</code>, <code>txt()</code>/<code>as_txt()</code>, <code>soa()</code>/<code>as_soa() -&gt; Option&lt;SoaData&gt;</code>, <code>srv()</code>/<code>as_srv() -&gt; Option&lt;(u16, u16, u16, String)&gt;</code>.</p>
@@ -446,7 +463,7 @@ listen_dns_tcp(&amp;rt, addr, handle)?;</code></pre>
 </tr>
 </tbody>
 </table>
-<p>Traits: <code>DnsClientTransport</code>, <code>DnsClientTransportHandler</code>. Each <code>send_query</code> schedules I/O and returns immediately; responses arrive via the handler callback — there is no blocking query API. These aren't just standalone building blocks: <code>DnsResolver::add_server_doq</code>/<code>add_server_doh</code> construct and drive them directly as part of the resolver's own query pipeline (see <a href="#resolver">Resolver</a>), keeping the transport instance alive for exactly as long as one query is outstanding.</p>
+<p>Traits: <code>DnsClientTransport</code>, <code>DnsClientTransportHandler</code>. Each <code>send_query</code> schedules I/O and returns immediately; responses arrive via the handler callback — there is no blocking query API. The resolver uses them itself (see <a href="#resolver">Resolver</a>): <code>add_server_doh</code> builds a <code>DohClientTransport</code> for each query and keeps it alive while that query is outstanding, and <code>add_server_doq</code> sends through a <code>DoqConnectionPool</code>, which keeps one QUIC connection per server and opens a stream per query.</p>
 <p>DoH (<code>DohClientTransport</code>) and DoQ (<code>DoqClientTransport</code>) are <code>DnsClientTransport</code> implementations: DoH dials HTTP/1.1 (POST by default, or GET via <code>with_get(true)</code>) on a shared <code>Arc&lt;Runtime&gt;</code>; DoQ dials via <code>hopf-quic</code>, zeroing the DNS message ID both directions (RFC 9250 §4.2.1). Neither waits on the caller thread.</p>
 <p><code>TcpDnsConnectionPool</code> (plain TCP, used for the retry of a truncated UDP answer) reuses a live connection per destination server across queries, transparently reconnecting if a reused connection turns out to be stale. It is blocking, so the resolver runs its queries on a dedicated thread. <strong>DoT does not use it any more:</strong> <code>DnsResolver::add_server_dot</code> goes through <code>UpstreamClient</code>, below.</p>
 <h4 id="upstream-client">Encrypted upstreams: <code>UpstreamClient</code></h4>
@@ -459,7 +476,7 @@ listen_dns_tcp(&amp;rt, addr, handle)?;</code></pre>
 <li><strong>Counters</strong> from <code>UpstreamClient::metrics()</code>: queries, responses, timeouts, failures, retries, connects, connect failures, reconnects, connections open (the pool size), in flight, and latency (total and maximum). <code>DnsResolver::dot_upstream_metrics()</code> reports them for the DoT upstreams a resolver has opened. They are exported over OTLP/JSONL with <code>set_telemetry</code> (see <a href="#telemetry">Telemetry</a>).</li>
 </ul>
 <p>A <code>ForwarderHandler</code> needs nothing extra: <code>add_server_dot</code> (or <code>add_server_upstream(client)</code> for a client you built, with your own TLS settings, pins and tuning) makes the resolver's DoT upstream this client, and the forwarder's callback is completed when the upstream answers. A slow upstream query does not delay another on the same listener, and concurrent queries share one connection. Resolver features (caching, failover to the next server, CNAME chasing, DNSSEC validation, the RFC 10029 option) work unchanged on top.</p>
-<p><strong>DoQ limitations:</strong> every query still dials a brand-new QUIC connection — no session-ticket caching, 0-RTT, or cross-query connection reuse (RFC 9250 §4.5/§5.5.1) — and EDNS Padding (<code>encode_edns_padding</code>, RFC 7830/RFC 9250 §5.4) isn't automatically applied to DoQ/DoT queries, though the codec is available for a caller to compose in.</p>
+<p><strong>DoQ limitations:</strong> connections are reused across queries (RFC 9250 §5.5.1), but a fresh dial after a pooled connection has gone does not resume a session or use 0-RTT (no session-ticket cache is wired through), and EDNS Padding (<code>encode_edns_padding</code>, RFC 7830/RFC 9250 §5.4) isn't automatically applied to DoQ/DoT queries, though the codec is available for a caller to compose in.</p>
 <h2 id="dnssec">DNSSEC</h2>
 <p>Feature <code>dnssec</code> (+ <code>aws-lc-rs</code> and <code>ed448-goldilocks-plus</code>):</p>
 <table>
@@ -546,6 +563,16 @@ listen_dns_tcp(&amp;rt, addr, handle)?;</code></pre>
 <h3 id="resolver-setters">Resolver setters</h3>
 <p><code>set_timeout</code>, <code>set_cache</code> / <code>cache</code>, <code>add_server</code> / <code>add_server_str</code> (UDP+TCP-fallback), <code>add_server_dot</code> (<code>dot</code> feature), <code>add_server_doq</code> (<code>doq</code> feature), <code>add_server_upstream</code> (a client you built), <code>dot_upstream_metrics</code>, <code>add_server_doh</code> (<code>doh</code> feature), <code>use_public_resolvers</code> (Cloudflare, Quad9 and Google over IPv6 and IPv4 - see <a href="#public-fallbacks">below</a>), <code>use_system_resolvers</code>, <code>set_dnssec_enabled</code>, <code>set_dnssec_validator</code>.</p>
 <p><strong>Note:</strong> addresses passed to any <code>add_server*</code> method must be <strong>pre-resolved</strong>. <code>add_server_dot</code> takes a TLS SNI name + <code>SharedTlsConnector</code>; <code>add_server_doq</code> takes a TLS SNI name + <code>Arc&lt;QuicClientConfig&gt;</code> (ALPN <code>doq</code>); <code>add_server_doh</code> takes an <code>Arc&lt;Runtime&gt;</code> (needed to dial), host/path, a <code>SharedTlsConnector</code>, and a GET-vs-POST flag.</p>
+<h3 id="auto-transport">Automatic encrypted transports and discovery (RFC 9462)</h3>
+<p>A server added the plain way (<code>add_server</code>, <code>add_server_str</code>, <code>use_system_resolvers</code>, <code>use_public_resolvers</code>) is in <em>auto mode</em>: the resolver keeps a per-server capability cache of the encrypted transports it is known to offer and, when the cache has one, sends the query over it instead of plain UDP, preferring DoQ, then DoT (only the transports compiled in, with features <code>doq</code> and <code>dot</code>). With nothing known it uses UDP with TCP fallback as before, and a transport that errors or times out is demoted so the next query does not pay for it again. A server pinned with <code>add_server_dot</code>, <code>add_server_doq</code>, <code>add_server_doh</code> or <code>add_server_upstream</code> never consults or fills the cache.</p>
+<ul>
+<li><strong>Prior knowledge.</strong> The well-known public resolvers (Cloudflare, Quad9, Google) are seeded with the transports their operators offer, provisionally, whenever their addresses are added.</li>
+<li><strong>Discovery of Designated Resolvers.</strong> For an auto-mode server with nothing on record, the first real query also sends one <code>_dns.resolver.arpa</code> SVCB query over the plain channel. NXDOMAIN, NODATA, FORMERR or NOTIMP is cached as "no encrypted transport". Each DoT or DoQ candidate in a real answer is dialled and its certificate validated before it is used, since the discovery answer itself travelled in clear; only a candidate that completes a validated handshake is recorded.</li>
+<li><strong>Trust.</strong> Discovered and seeded endpoints have no caller-supplied trust anchors, so they are validated against the public WebPKI (<code>hopf_core::public_trust_connector</code> for DoT, a public-trust QUIC client configuration for DoQ), built once per resolver.</li>
+</ul>
+<h3 id="ech-dane">ECH bootstrap and DANE</h3>
+<p><code>hopf_dns::ech</code> fetches a server's Encrypted Client Hello configuration from its HTTPS/SVCB record without blocking: <code>resolve_ech(&amp;resolver, &amp;cache, host, port, callback)</code> stores what it finds in an <code>EchConfigCache</code>, and <code>connector_with_ech_cache(connector, cache)</code> wraps a TLS connector so each connection offers ECH when the cache holds a configuration for the host, and an ordinary ClientHello otherwise. <code>EchConfigCache::set_static</code> pins a configuration and bypasses DNS. A configuration from DNS is only as trustworthy as the path it came over, so use an encrypted or DNSSEC-validating resolver, a static configuration, or <code>EchClientConfig::require()</code> where a downgrade to cleartext SNI is unacceptable.</p>
+<p>Feature <code>dane</code> adds <code>verify_dane_chain(&amp;tlsa_records, &amp;chain, server_name)</code>, which matches a DER certificate chain against TLSA records (usages DANE-TA and DANE-EE; PKIX-TA and PKIX-EE never match, following RFC 7672). It does not look the records up or validate them: pass only TLSA records already proved Secure, for example with <code>validate_chain_of_trust</code>.</p>
 <h3 id="public-fallbacks">Public fallback resolvers and IPv6</h3>
 <p>When the host has no nameserver configured (<code>/etc/resolv.conf</code> missing or empty), <code>use_system_resolvers</code> falls back to the well-known public resolvers, as does an explicit <code>use_public_resolvers()</code>. Nameservers from <code>resolv.conf</code>, and anything added with <code>add_server*</code>, are used exactly as configured and are never subject to what follows.</p>
 <p>The list is Cloudflare, Quad9, then Google (Google last, having no DNS over QUIC), each provider's IPv6 address placed just ahead of its IPv4 one, primaries then secondaries:</p>
@@ -576,7 +603,7 @@ listen_dns_tcp(&amp;rt, addr, handle)?;</code></pre>
 </tr>
 <tr>
 <td><code>server</code></td>
-<td>Caching forwarder + UDP listen</td>
+<td><code>DnsService</code>, handlers (forwarder, authoritative zones, NOTIFY/UPDATE, AXFR/IXFR), TSIG, UDP and TCP listeners; with <code>dot</code>/<code>doq</code> also the DoT/DoQ listeners</td>
 </tr>
 <tr>
 <td><code>dot</code></td>
@@ -593,6 +620,10 @@ listen_dns_tcp(&amp;rt, addr, handle)?;</code></pre>
 <tr>
 <td><code>dnssec</code></td>
 <td>Validation (+ <code>aws-lc-rs</code> + goldilocks)</td>
+</tr>
+<tr>
+<td><code>dane</code></td>
+<td><code>verify_dane_chain</code>: match a certificate chain against TLSA records (DANE-TA and DANE-EE only), for use as a TLS verification override</td>
 </tr>
 <tr>
 <td><code>integration</code></td>
@@ -683,10 +714,11 @@ printf 'server 127.0.0.1 5353\nzone example.com\nupdate add new.example.com 60 A
 <p>Other:</p>
 <ul>
 <li>A QUIC client that opens several streams in the instant its handshake completes can leave the connection unable to carry any of them while it still looks alive (observed with two or more concurrent first queries, in the QUIC transport of <code>hopf-quic</code>). <code>UpstreamClient</code> avoids it by proving a new DoQ connection with one query first; <code>DnsResolver::add_server_doq</code> and an auto-selected DoQ upstream do not, so concurrent first queries to them can time out.</li>
-<li>Plain UDP/TCP upstreams are answered by the resolver's own UDP socket, and DoT/DoQ by <code>UpstreamClient</code>; a DoH upstream still needs a <code>Runtime</code> to dial and keeps one transport instance alive per query.</li>
+<li>Plain UDP/TCP upstreams are answered by the resolver's own UDP socket, DoT by <code>UpstreamClient</code>, and DoQ by a <code>DoqConnectionPool</code> (or an <code>UpstreamClient</code> given to <code>add_server_upstream</code>); a DoH upstream still needs a <code>Runtime</code> to dial and keeps one transport instance alive per query.</li>
 <li>Server addresses must be pre-resolved IPs.</li>
 <li>No W3C Trace Context on the DNS wire (see <a href="#telemetry">Telemetry</a>).</li>
-<li><strong>DNS over DTLS (DoDTLS)</strong> — not implemented; Gumdrop had transparent DTLS on UDP. Planned when DTLS lands in <code>hopf-core</code> (see <a href="conformance.html#security-planned">conformance → Security substrate</a>).</li>
+<li><strong>DNS over DTLS (DoDTLS)</strong>: not implemented in <code>hopf-dns</code>, although <code>hopf-core</code> has DTLS 1.2 and 1.3 engines.</li>
+<li>Automatic transport selection never chooses DoH, and RFC 9462 discovery does not promote a DoH endpoint it finds (DoH needs a <code>Runtime</code> to dial); pin DoH explicitly with <code>add_server_doh</code>.</li>
 </ul>
 
       <p class="footer">

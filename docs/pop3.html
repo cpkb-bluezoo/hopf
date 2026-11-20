@@ -77,7 +77,7 @@
     <main class="main">
       <header>
         <h1>POP3</h1>
-        <p class="lead"><code>hopf-pop3</code> is a POP3 / POP3S <strong>server and async client</strong> (Gumdrop <code>pop3</code> port). Use <code>Pop3Fetch</code> for auto-pilot message retrieval or implement <code>Pop3ClientDriver</code> for custom pipelines.</p>
+        <p class="lead"><code>hopf-pop3</code> is a POP3 / POP3S <strong>server and async client</strong> . Server and client are peer roles in the one crate. Use <code>Pop3Fetch</code> for auto-pilot message retrieval or implement <code>Pop3ClientDriver</code> for custom pipelines.</p>
       </header>
       <h2 id="features">Features</h2>
 <table>
@@ -98,7 +98,7 @@
 </tr>
 <tr>
 <td>Auth</td>
-<td><code>CredentialStore</code> — USER/PASS, PLAIN, LOGIN, SCRAM-SHA-256, OAUTHBEARER, EXTERNAL</td>
+<td><code>CredentialStore</code>: USER/PASS plus whichever SASL mechanisms the store supports (PLAIN, LOGIN, SCRAM-SHA-256, SCRAM-SHA-256-PLUS, OAUTHBEARER, XOAUTH2, EXTERNAL); mechanisms that require TLS are not advertised before it. Optional <code>login_delay</code> after a failed attempt</td>
 </tr>
 <tr>
 <td>TLS</td>
@@ -114,9 +114,57 @@
 </tr>
 </tbody>
 </table>
-<p>Control commands are lexed incrementally by <code>Pop3ServerLexer</code> (<code>KEYWORD [SP TEXT] CRLF</code>) — a small self-contained state machine that consumes every byte it's given and owns its own bounded verb/arg scratch buffers, never requiring the caller to retain or re-supply anything. Not “buffer until CRLF then re-parse”.</p>
+<p>Control commands are lexed incrementally by <code>Pop3ServerLexer</code> (<code>KEYWORD [SP TEXT] CRLF</code>), a push parser fed from the connection's inbound ring buffer (<code>hopf_core::LoopBuf</code>). It reads arguments (including message numbers) as the bytes arrive, keeps only bounded verb/argument scratch state (a command line is limited to <code>MAX_COMMAND_LINE</code> = 512 bytes) and never re-parses a buffered line. Pipelined commands are answered in order.</p>
+<h2 id="configuration">Configuration</h2>
+<p><code>Pop3Config::new(listen, hostname, store, mailbox_factory)</code> sets the defaults below; the fields are public.</p>
+<table>
+<thead>
+<tr>
+<th>Field / builder</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>with_tls(acceptor)</code> / <code>implicit_tls()</code></td>
+<td>none / off</td>
+<td>STLS acceptor; implicit TLS from accept (POP3S)</td>
+</tr>
+<tr>
+<td><code>with_greeting(text)</code></td>
+<td>built-in</td>
+<td>Greeting text after <code>+OK</code></td>
+</tr>
+<tr>
+<td><code>enable_utf8</code></td>
+<td><code>true</code></td>
+<td>Advertise and accept UTF8 (RFC 6856); without it, messages needing UTF-8 are refused with <code>[UTF8]</code></td>
+</tr>
+<tr>
+<td><code>enable_pipelining</code></td>
+<td><code>false</code></td>
+<td>Advertise PIPELINING in CAPA (pipelined commands are always processed)</td>
+</tr>
+<tr>
+<td><code>login_delay</code></td>
+<td><code>0</code></td>
+<td>Refuse further authentication attempts for this long after a failure; advertised as <code>LOGIN-DELAY</code></td>
+</tr>
+<tr>
+<td><code>expire_days</code></td>
+<td><code>None</code></td>
+<td>CAPA <code>EXPIRE</code> value</td>
+</tr>
+<tr>
+<td><code>transaction_timeout</code></td>
+<td>600 s (<code>DEFAULT_TRANSACTION_TIMEOUT</code>)</td>
+<td>Idle timeout in TRANSACTION state</td>
+</tr>
+</tbody>
+</table>
 <h2 id="handler-spi">Handler SPI</h2>
-<p>Gumdrop-style staged traits:</p>
+<p>Staged traits:</p>
 <ul>
 <li><code>ClientConnected</code> → greeting (<code>Pop3ConnectionMetadata</code>, including optional <code>traceparent</code>)</li>
 <li><code>AuthorizationHandler</code> → post-credential policy (<code>proceed_open</code> opens INBOX)</li>
@@ -139,7 +187,7 @@ let svc = Pop3Service::new(config, Arc::clone(&amp;rt));
 svc.start()?;</code></pre>
 <p>Example binary: <code>cargo run -p pop3 -- 127.0.0.1:1110 localhost ./mail</code>.</p>
 <h2 id="composition">Composition</h2>
-<p>Register a <code>"pop3"</code> handler factory on <code>CompositionRegistry</code> that builds a <code>Pop3ControlHandler</code> (or use <code>Pop3Service::start</code> programmatically).</p>
+<p><code>Pop3Service::start</code> binds the listener on the service's runtime. To add it to a running <a href="composition.html"><code>Composition</code></a> instead, construct the service with <code>Composition::runtime()</code> and pass <code>Pop3Service::control_listener()</code> to <code>Composition::listen_tcp</code>. The service opens mailboxes on the storage pool, so it needs the runtime and cannot be named from composition XML.</p>
 <h2 id="client">Client</h2>
 <p>The <code>hopf-pop3</code> crate ships a full async client. The high-level <code>Pop3Fetch</code> auto-pilot handles CAPA negotiation, optional STLS upgrade, USER/PASS or SASL authentication, STAT + RETR for every message, optional DELE, and QUIT.</p>
 <h3 id="pop3fetch-quick-start">Pop3Fetch quick start</h3>
@@ -192,7 +240,7 @@ Pop3Client::new(&quot;mail.example.com&quot;, 110)
 </tr>
 <tr>
 <td><code>.timeouts(Pop3ClientTimeouts)</code></td>
-<td>dns=5s, connect=30s, stage=60s, msg=600s</td>
+<td>dns=5s, connect=30s, stage=60s, message=600s</td>
 <td>Per-phase deadlines</td>
 </tr>
 <tr>
@@ -212,7 +260,7 @@ Pop3Client::new(&quot;mail.example.com&quot;, 110)
 </tr>
 </tbody>
 </table>
-<p>Example binary: <code>cargo run -p pop3-fetch -- mail.example.com alice secret</code>.</p>
+<p>Example binary: <code>cargo run -p pop3-fetch -- mail.example.com 110 alice secret [--delete]</code>.</p>
 <h2 id="metrics">Metrics</h2>
 <p>Process-local <code>Pop3ServerMetrics</code> (in <code>hopf-pop3</code>): connections, <code>auth_ok</code> / <code>auth_fail</code>, <code>retr</code>, <code>dele</code>, and <code>stls</code> via <code>Pop3Service::metrics()</code>.</p>
 <p>OTLP/JSONL export (when <code>Pop3Service::with_telemetry(&amp;pipeline)</code> is used): <code>hopf_otel::Pop3ServerMetrics</code> emits <code>pop3.server.connections</code>, <code>pop3.server.active_connections</code>, <code>pop3.server.auth</code>, <code>pop3.server.stls</code>, <code>pop3.server.dele</code>, <code>pop3.server.retrieves</code> (kind/outcome), <code>pop3.server.retrieve.duration</code> (ms), and <code>pop3.server.retrieve.size</code>.</p>

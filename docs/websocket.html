@@ -79,7 +79,7 @@
         <h1>WebSocket</h1>
         <p class="lead">Crate <code>hopf-websocket</code>: RFC 6455 framing and HTTP upgrade helpers on top of <a href="http/overview.html"><code>hopf-http</code></a> upgrade seams. Supports HTTP/1.1 <code>101</code> Upgrade, HTTP/2 Extended CONNECT (<a href="https://www.rfc-editor.org/rfc/rfc8441">RFC 8441</a>), and HTTP/3 Extended CONNECT (<a href="https://www.rfc-editor.org/rfc/rfc9220">RFC 9220</a>).</p>
       </header>
-      <p>The crate is <strong>server-centric</strong> (factory as <code>ServerHandlerFactory</code>); handshake helpers also exist for clients. Framing is push-incremental and split-feed safe.</p>
+      <p>Both roles share one framing engine (<code>WsFrameParser</code>, role-aware masking) and one event SPI (<code>WsEventHandler</code>). The accepting side plugs in as an HTTP <code>ServerHandlerFactory</code> (<code>WebSocketFactory</code>); the dialling side uses <code>WebSocketOpening</code> from a <code>ClientHandler</code> and installs <code>WsUpgradeHandler::client</code> through <code>ClientWriter::upgrade</code> (see <a href="#client-role">Client role</a>). Framing is push-incremental and split-feed safe.</p>
 <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
 <li><a href="#standards">Standards</a></li>
@@ -145,6 +145,26 @@ WsUpgradeHandler  (ProtocolUpgradeHandler)
 <p><code>is_extended_connect_websocket</code> / <code>websocket_connect_response_headers</code> — successful Extended CONNECT yields <strong>200</strong> and then WebSocket frames on the stream.</p>
 <p>Optional <code>WebSocketConfig.subprotocol</code> is echoed only when that token appears in the client's <code>Sec-WebSocket-Protocol</code> offer; otherwise it is omitted.</p>
 <p><code>Origin</code> (RFC 6455 §10.2): default <code>OriginPolicy::AllowList([])</code> rejects any present <code>Origin</code> with <code>403</code> (browsers always send it). Missing <code>Origin</code> is allowed for native clients. Configure with <code>WebSocketConfig::with_allowed_origins([...])</code> or <code>allow_any_origin()</code> for demos.</p>
+<h3 id="client-role">Client role</h3>
+<p>A dialling application writes an ordinary <code>ClientHandler</code> and dials with <code>connect_http</code> (or <code>connect_https</code> offering only <code>http/1.1</code>, since the request is an HTTP/1.1 <code>Upgrade</code>). <code>WebSocketOpening</code> generates the key, writes the request and validates the <code>101</code>; the WebSocket session then starts on the same connection:</p>
+<pre class="sourceCode rust"><code>struct WsDial { opening: WebSocketOpening, events: Option&lt;Box&lt;dyn WsEventHandler&gt;&gt; }
+
+impl ClientHandler for WsDial {
+    fn start(&amp;mut self, request: &amp;mut dyn ClientWriter) {
+        self.opening.write_request(request, "/chat", "example.com");
+    }
+    fn switching_protocols(&amp;mut self, request: &amp;mut dyn ClientWriter, headers: &amp;Headers) {
+        if self.opening.validate_response(headers).is_err() {
+            return; // not a valid RFC 6455 opening: do not enter the session
+        }
+        let conn = request.conn_handle();
+        let events = self.events.take().unwrap();
+        request.upgrade(Box::new(WsUpgradeHandler::client(events, 1 &lt;&lt; 20, conn)));
+    }
+    fn response_headers(&amp;mut self, _: &amp;mut dyn ClientWriter, _: &amp;Headers) { /* refused: no 101 */ }
+    fn response_complete(&amp;mut self, _: &amp;mut dyn ClientWriter) {}
+}</code></pre>
+<p>Outbound frames from the client are masked with a fresh random key per frame; inbound frames must be unmasked.</p>
 <h2 id="framing">Framing</h2>
 <table>
 <colgroup>
@@ -238,12 +258,12 @@ WsUpgradeHandler  (ProtocolUpgradeHandler)
 </thead>
 <tbody>
 <tr>
-<td><code>WsUpgradeHandler::server(event, max_payload)</code></td>
-<td>Server role</td>
+<td><code>WsUpgradeHandler::server(event, max_payload, conn)</code></td>
+<td>Accepting role (installed by <code>WebSocketFactory</code>)</td>
 </tr>
 <tr>
-<td><code>WsUpgradeHandler::client(event, max_payload)</code></td>
-<td>Client role</td>
+<td><code>WsUpgradeHandler::client(event, max_payload, conn)</code></td>
+<td>Dialling role; <code>conn</code> from <code>ClientWriter::conn_handle()</code></td>
 </tr>
 </tbody>
 </table>
@@ -267,19 +287,24 @@ WsUpgradeHandler  (ProtocolUpgradeHandler)
 </tbody>
 </table>
 <h2 id="event-handler-spi">Event handler SPI</h2>
-<div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> WsEventHandlerFactory <span class="op">{</span></span>
-<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> create(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> path<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span><span class="op">,</span> req<span class="op">:</span> <span class="op">&amp;</span>Headers<span class="op">,</span> conn<span class="op">:</span> ConnHandle) <span class="op">-&gt;</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> WsEventHandler<span class="op">&gt;;</span></span>
-<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
-<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> WsEventHandler <span class="op">{</span></span>
-<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> opened(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> session<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> WsSession<span class="op">,</span> conn<span class="op">:</span> <span class="op">&amp;</span>ConnHandle)<span class="op">;</span></span>
-<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> text_message(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> session<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> WsSession<span class="op">,</span> text<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span>)<span class="op">;</span></span>
-<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> binary_message(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> session<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> WsSession<span class="op">,</span> data<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">u8</span>])<span class="op">;</span></span>
-<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> ping(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> session<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> WsSession<span class="op">,</span> payload<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">u8</span>])<span class="op">;</span> <span class="co">// default auto-pong</span></span>
-<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> pong(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> session<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> WsSession<span class="op">,</span> payload<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">u8</span>])<span class="op">;</span></span>
-<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> closed(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> code<span class="op">:</span> <span class="dt">Option</span><span class="op">&lt;</span><span class="dt">u16</span><span class="op">&gt;,</span> reason<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span>)<span class="op">;</span></span>
-<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> error(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> err<span class="op">:</span> WsFrameError)<span class="op">;</span></span>
-<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<pre class="sourceCode rust"><code>pub trait WsEventHandlerFactory: Send + Sync {
+    fn create(&amp;self, path: &amp;str, request_headers: &amp;Headers, conn: ConnHandle) -&gt; Box&lt;dyn WsEventHandler&gt;;
+}
+
+pub trait WsEventHandler: Send {
+    fn opened(&amp;mut self, session: &amp;mut WsSession&lt;'_&gt;, conn: &amp;ConnHandle);
+    fn poke(&amp;mut self, session: &amp;mut WsSession&lt;'_&gt;) {}   // re-entry after off-thread work
+    fn wants_streaming(&amp;self) -&gt; bool { false }
+    fn text_message(&amp;mut self, session: &amp;mut WsSession&lt;'_&gt;, text: &amp;str) {}
+    fn binary_message(&amp;mut self, session: &amp;mut WsSession&lt;'_&gt;, data: &amp;[u8]) {}
+    fn text_chunk(&amp;mut self, session: &amp;mut WsSession&lt;'_&gt;, chunk: &amp;str, is_final: bool) {}
+    fn binary_chunk(&amp;mut self, session: &amp;mut WsSession&lt;'_&gt;, chunk: &amp;[u8], is_final: bool) {}
+    fn ping(&amp;mut self, session: &amp;mut WsSession&lt;'_&gt;, payload: &amp;[u8]); // default auto-pong
+    fn pong(&amp;mut self, session: &amp;mut WsSession&lt;'_&gt;, payload: &amp;[u8]) {}
+    fn closed(&amp;mut self, session: &amp;mut WsSession&lt;'_&gt;, code: u16, reason: &amp;str) {}
+    fn error(&amp;mut self, err: WsFrameError) {}
+}</code></pre>
+<p>By default a fragmented message (RFC 6455 §5.4) is reassembled and delivered once through <code>text_message</code> / <code>binary_message</code>, so it must fit <code>max_payload</code>. A handler that returns <code>true</code> from <code>wants_streaming</code> instead receives <code>text_chunk</code> / <code>binary_chunk</code> as bytes arrive, without the message ever being held whole; text chunks never split a UTF-8 code point. <code>poke</code> is the WebSocket-layer counterpart of <code>ConnHandle::poke</code>: it gives a handler that offloaded work a chance to finish and reply through <code>session</code>.</p>
 <p><code>WebSocketFactory&lt;F&gt;</code> implements <code>ServerHandlerFactory</code> for any <code>F: WsEventHandlerFactory</code>.</p>
 <p><code>conn</code> is a cloneable <a href="architecture.html"><code>hopf_core::ConnHandle</code></a> for this connection, handed to both <code>create</code> and <code>opened</code> — capture it to hop work back onto this connection's reactor from another thread (e.g. a pub/sub fan-out delivering a message published on a different connection; see <code>hopf-mqtt</code>'s <a href="mqtt.html#websocket-bridge">WebSocket bridge</a> for a worked example). <strong>A plain <code>ConnHandle::send</code> writes straight to the raw transport, bypassing WS framing</strong> — wrap the handle with <code>framed_ws_conn_handle</code> (below) before handing it to code that delivers asynchronously; synchronous replies from within a callback should keep using <code>WsSession::send_*</code> instead.</p>
 <h2 id="session-send-api">Session send API</h2>
@@ -290,7 +315,7 @@ WsUpgradeHandler  (ProtocolUpgradeHandler)
 <span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> send_pong(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> payload<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">u8</span>])<span class="op">;</span></span>
 <span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> send_close(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> code<span class="op">:</span> <span class="dt">u16</span><span class="op">,</span> reason<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span>)<span class="op">;</span></span>
 <span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
-<p>Free helpers: <code>write_text</code>, <code>write_binary</code>, <code>write_ping</code>, <code>write_pong</code>, <code>write_close</code> (encode into buffers).</p>
+<p><code>send_close_empty()</code> sends a Close frame with no status code. Free helpers: <code>write_text</code>, <code>write_binary</code>, <code>write_ping</code>, <code>write_pong</code>, <code>write_close</code>, <code>write_close_empty</code> (encode into a <code>Vec&lt;u8&gt;</code> for a given <code>WsRole</code>).</p>
 <h3 id="framed-conn-handle">Framing a <code>ConnHandle</code> for async delivery</h3>
 <div class="sourceCode"><pre class="sourceCode rust"><code class="sourceCode rust"><span class="kw">pub</span> <span class="kw">fn</span> framed_ws_conn_handle(conn: &amp;ConnHandle, role: WsRole) -&gt; ConnHandle;</code></pre></div>
 <p>Wraps <code>conn</code> so every <code>ConnHandle::send</code> first frames the payload as a WebSocket binary message for <code>role</code>, using <a href="architecture.html"><code>hopf_core::ConnHandle::framed</code></a> (a small additive transform seam on <code>ConnHandle</code> for exactly this case — a protocol layered on top of the raw transport that still needs asynchronous, cross-connection deliveries framed correctly). Use the wrapped handle — not the raw one from <code>create</code> / <code>opened</code> — anywhere a <code>ConnHandle</code> is handed to code that delivers from another connection or thread.</p>
@@ -316,7 +341,7 @@ WsUpgradeHandler  (ProtocolUpgradeHandler)
 <p>Used by <code>examples/websocket</code>.</p>
 <h2 id="examples">Examples</h2>
 <p>See <a href="cookbook/websocket.html">Cookbook: WebSocket</a>.</p>
-<div class="sourceCode" id="cb5"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> websocket <span class="at">--</span> 127.0.0.1:8080</span></code></pre></div>
+<div class="sourceCode" id="cb5"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> websocket-echo <span class="at">--</span> 127.0.0.1:8080</span></code></pre></div>
 <table>
 <thead>
 <tr>
@@ -338,7 +363,7 @@ WsUpgradeHandler  (ProtocolUpgradeHandler)
 <ul>
 <li>No <code>permessage-deflate</code> or other extensions (RSV must be zero).</li>
 <li>Close handling sends a close and marks the session dead; protocol errors emit Close 1002/1007/1009 then tear down the transport/stream.</li>
-<li>Client opening helpers (<code>WebSocketOpening</code>, <code>validate_upgrade_response</code>) cover RFC 6455 §4.1 step 5; the stock factory path remains server-oriented.</li>
+<li>The dialling side has no one-call connect function: a <code>ClientHandler</code> drives <code>WebSocketOpening</code> as shown in <a href="#client-role">Client role</a>, over HTTP/1.1 <code>Upgrade</code> (<code>create_upgrade_request</code> builds the RFC 6455 §4.1 headers). Accepting over H2/H3 Extended CONNECT is supported.</li>
 <li>Relies on HTTP trailers / Extended CONNECT behaviour of <code>hopf-http</code> for H2/H3.</li>
 </ul>
 

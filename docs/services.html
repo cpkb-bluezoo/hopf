@@ -124,7 +124,7 @@ Worker reactor (affinity for life)</code></pre>
 </tr>
 <tr>
 <td><code>receive</code></td>
-<td>Plaintext bytes; advance the cursor (<code>*data = &amp;data[n..]</code>); suffix preserved</td>
+<td>Plaintext bytes, as the connection's <code>&amp;mut LoopBuf</code> ring read in place. <code>advance</code> over whole tokens; what is left is presented again, at the front, with the next arrival. A token larger than the ring is an error (<code>Endpoint::fail</code>); a full ring that is not consumed stops reads (backpressure). See <a href="architecture.html#buffers-and-backpressure">Buffers and backpressure</a></td>
 </tr>
 <tr>
 <td><code>disconnected</code></td>
@@ -135,12 +135,16 @@ Worker reactor (affinity for life)</code></pre>
 <td>TLS/QUIC active (ALPN / cipher in <code>SecurityInfo</code>); default no-op</td>
 </tr>
 <tr>
+<td><code>drain</code></td>
+<td>The runtime is draining (<code>start_drain</code> / <code>shutdown_graceful</code>): say goodbye in the protocol and close; default no-op</td>
+</tr>
+<tr>
 <td><code>error</code></td>
-<td>Unrecoverable I/O or protocol error. On QUIC, also used for abnormal teardown (peer CONNECTION_CLOSE, idle timeout, STOP_SENDING) with typed sources such as <code>hopf_quic::QuicConnectionCloseError</code> — not in addition to <code>disconnected</code></td>
+<td>Unrecoverable I/O or protocol error. On QUIC, also used for abnormal teardown (peer CONNECTION_CLOSE, idle timeout, STOP_SENDING) with typed sources such as <code>hopf_quic::QuicConnectionCloseError</code>; not in addition to <code>disconnected</code></td>
 </tr>
 </tbody>
 </table>
-<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>Endpoint<span class="op">,</span> ProtocolHandler<span class="op">};</span></span>
+<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>Endpoint<span class="op">,</span> LoopBuf<span class="op">,</span> ProtocolHandler<span class="op">};</span></span>
 <span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::</span>io<span class="op">;</span></span>
 <span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> Echo<span class="op">;</span></span>
@@ -148,9 +152,11 @@ Worker reactor (affinity for life)</code></pre>
 <span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> ProtocolHandler <span class="cf">for</span> Echo <span class="op">{</span></span>
 <span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> connected(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> _endpoint<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> Endpoint) <span class="op">{}</span></span>
 <span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> receive(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> endpoint<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> Endpoint<span class="op">,</span> data<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="op">&amp;</span>[<span class="dt">u8</span>]) <span class="op">{</span></span>
-<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>        endpoint<span class="op">.</span>send(data)<span class="op">;</span></span>
-<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>        <span class="op">*</span>data <span class="op">=</span> <span class="op">&amp;</span>[]<span class="op">;</span> <span class="co">// consume</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> receive(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> endpoint<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> Endpoint<span class="op">,</span> buf<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> LoopBuf) <span class="op">{</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> (first<span class="op">,</span> second) <span class="op">=</span> buf<span class="op">.</span>readable_spans()<span class="op">;</span></span>
+<span id="cb2-10a"><a href="#cb2-10a" aria-hidden="true" tabindex="-1"></a>        endpoint<span class="op">.</span>send(first)<span class="op">;</span></span>
+<span id="cb2-10b"><a href="#cb2-10b" aria-hidden="true" tabindex="-1"></a>        endpoint<span class="op">.</span>send(second)<span class="op">;</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>        buf<span class="op">.</span>advance(buf<span class="op">.</span>len())<span class="op">;</span> <span class="co">// consume whole tokens; the rest stays in the ring</span></span>
 <span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
 <span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> disconnected(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> _endpoint<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> Endpoint) <span class="op">{}</span></span>

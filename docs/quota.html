@@ -77,7 +77,7 @@
     <main class="main">
       <header>
         <h1>Quota</h1>
-        <p class="lead">Per-user storage quota tracking in <code>hopf_core::quota</code> (Gumdrop <code>org.bluezoo.gumdrop.quota</code> parity). Tracks how much storage — and, optionally, how many messages — a <em>user</em> has accumulated, independent of which protocol or connection touched their data. The same <code>QuotaManager</code> can back an FTP file store (<a href="ftp.html"><code>hopf-ftp</code></a>) and an IMAP mailbox (<a href="imap.html"><code>hopf-imap</code></a>) at once.</p>
+        <p class="lead">Per-user storage quota tracking in <code>hopf_core::quota</code>. Tracks how much storage (and, optionally how many messages) a <em>user</em> has accumulated, independent of which protocol or connection touched their data. The same <code>QuotaManager</code> can back an FTP file store (<a href="ftp.html"><code>hopf-ftp</code></a>) and an IMAP mailbox (<a href="imap.html"><code>hopf-imap</code></a>) at once.</p>
       </header>
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
@@ -111,7 +111,7 @@
 </tr>
 <tr>
 <td><code>QuotaManager</code></td>
-<td>Resolve/check/update by username</td>
+<td>Resolve/check/update by username: <code>get_quota</code>, <code>can_store</code> / <code>can_store_message</code>, <code>record_bytes_added</code> / <code>record_bytes_removed</code>, <code>record_message_added</code> / <code>record_message_removed</code>, <code>set_user_quota</code> / <code>clear_user_quota</code> / <code>has_user_quota</code>, <code>recalculate_usage</code></td>
 </tr>
 <tr>
 <td><code>QuotaPolicy</code></td>
@@ -120,7 +120,7 @@
 </tbody>
 </table>
 <h2 id="resolution-order">Resolution order</h2>
-<p><code>QuotaManager::get_quota</code> resolves a user's effective quota with the same priority as Gumdrop's <code>QuotaManager</code>: <strong>user-specific</strong> (<code>set_user_quota</code>) → <strong>role-based</strong> → <strong>system default</strong> → <strong>unlimited</strong>. When a user matches more than one role policy, the most generous storage limit wins.</p>
+<p><code>QuotaManager::get_quota</code> resolves a user's effective quota in this order: <strong>user-specific</strong> (<code>set_user_quota</code>) → <strong>role-based</strong> → <strong>system default</strong> → <strong>unlimited</strong>. When a user matches more than one role policy, the most generous storage limit wins.</p>
 <h2 id="stock-managers">Stock managers</h2>
 <table>
 <thead>
@@ -142,8 +142,8 @@
 </table>
 <p>Usage isn't persisted across restarts by either stock manager. <code>QuotaManager::save_usage_data</code>/<code>load_usage_data</code> are no-op-by-default hooks for an implementation that needs to flush/restore usage explicitly.</p>
 <h2 id="ftp-integration">FTP integration</h2>
-<p><code>FtpConnectionHandler</code> (<a href="ftp.html"><code>hopf-ftp</code></a>) has <code>quota_manager()</code>/<code>can_store</code>/<code>quota</code>/<code>record_bytes_added</code>/<code>record_bytes_removed</code> default methods delegating to whatever <code>quota_manager()</code> returns — matching Gumdrop's <code>FTPConnectionHandler</code>. The stock <code>FilesystemFtpHandler</code>/<code>FilesystemFtpHandlerFactory</code> take an optional manager via <code>with_quota(Arc&lt;dyn QuotaManager&gt;)</code>.</p>
-<p>STOR/APPE/STOU are gated on <code>Quota::is_storage_exceeded</code> before the data connection opens — FTP has no declared-size-ahead-of-time (no <code>ALLO</code> tracking), so this can only reject a user who's <em>already</em> over quota, not pre-empt a specific upload that would push them over. Usage is recorded via the same <code>TransferObserver</code>-carried manager handle once the upload actually completes (see <a href="ftp.html#handler-spi">FTP: Handler SPI</a>), and on <code>DELE</code>.</p>
+<p><code>FtpConnectionHandler</code> (<a href="ftp.html"><code>hopf-ftp</code></a>) has <code>quota_manager()</code>/<code>can_store</code>/<code>quota</code>/<code>record_bytes_added</code>/<code>record_bytes_removed</code> default methods delegating to whatever <code>quota_manager()</code> returns. The stock <code>FilesystemFtpHandler</code>/<code>FilesystemFtpHandlerFactory</code> take an optional manager via <code>with_quota(Arc&lt;dyn QuotaManager&gt;)</code>.</p>
+<p>STOR/APPE/STOU are gated on <code>Quota::is_storage_exceeded</code> before the data connection opens. The size an <code>ALLO</code> declares is not fed into this check, so it can only reject a user who's <em>already</em> over quota, not pre-empt a specific upload that would push them over. Usage is recorded via the same <code>TransferObserver</code>-carried manager handle once the upload actually completes (see <a href="ftp.html#handler-spi">FTP: Handler SPI</a>), and on <code>DELE</code>.</p>
 <h2 id="imap-integration">IMAP integration</h2>
 <p><code>hopf_imap::server::quota::MemoryQuotaManager</code> is an adapter over a shared <code>hopf_core::QuotaManager</code>, translating to/from RFC 9208's <code>STORAGE</code> (KiB)/<code>MESSAGE</code> resource view for GETQUOTA/SETQUOTA. It replaces what used to be IMAP's own independent in-memory tracker — see <a href="imap.html">IMAP</a>.</p>
 <h2 id="sharing-one-quota-across-protocols">Sharing one quota across protocols</h2>
@@ -160,9 +160,9 @@ let imap_quota = hopf_imap::server::quota::MemoryQuotaManager::new(backend);
 <p>An upload through FTP and an APPEND through IMAP for the same user now draw down the same limit.</p>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li>No persistence backend is shipped — <code>MemoryQuotaManager</code> is in-process only; wrap or replace <code>QuotaManager</code> for a database/file-backed one.</li>
-<li>No role-membership source is shipped either — <code>MemoryQuotaManager::with_roles</code> takes a plain <code>Fn(&amp;str) -&gt; Vec&lt;String&gt;</code> lookup, since Hopf has no built-in role/group concept (<a href="auth.html"><code>hopf-auth</code></a>'s <code>TrustPolicy</code> is accept/reject only, no roles).</li>
-<li>FTP's quota gate can't check a specific upload's size ahead of time (no <code>ALLO</code> tracking) — see <a href="#ftp-integration">FTP integration</a> above.</li>
+<li>No persistence backend is shipped: <code>MemoryQuotaManager</code> is in-process only; wrap or replace <code>QuotaManager</code> for a database/file-backed one.</li>
+<li><code>MemoryQuotaManager::with_roles</code> takes a plain <code>Fn(&amp;str) -&gt; Vec&lt;String&gt;</code> lookup listing a user's roles. <a href="auth.html"><code>hopf-auth</code></a>'s <code>RolePolicy</code> only answers membership (<code>is_user_in_role</code>), so it cannot be passed in directly.</li>
+<li>FTP's quota gate can't check a specific upload's size ahead of time (ALLO's declared size is not used); see <a href="#ftp-integration">FTP integration</a> above.</li>
 </ul>
 
       <p class="footer">

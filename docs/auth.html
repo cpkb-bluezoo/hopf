@@ -77,7 +77,7 @@
     <main class="main">
       <header>
         <h1>Auth</h1>
-        <p class="lead">Crate <code>hopf-auth</code>: <strong>TrustPolicy</strong>, credential stores, and <strong>SASL</strong> mechanisms (Gumdrop parity except GSSAPI, which is planned). Independent of <code>hopf-core</code> (own <code>VERSION</code>). HTTP Basic / Digest / Bearer <strong>factories</strong> live in <code>hopf-http</code> and consume these types; FTP uses <code>TrustPolicy</code> directly, while POP3/IMAP/SMTP drive the full SASL mechanism set from a <code>CredentialStore</code>.</p>
+        <p class="lead">Crate <code>hopf-auth</code>: <strong>TrustPolicy</strong>, credential stores, and <strong>SASL</strong> mechanisms (client and server for each). Independent of <code>hopf-core</code> (own <code>VERSION</code>). HTTP Basic / Digest / Bearer <strong>factories</strong> live in <code>hopf-http</code> and consume these types; FTP uses <code>TrustPolicy</code> directly, while POP3/IMAP/SMTP drive the full SASL mechanism set from a <code>CredentialStore</code>.</p>
       </header>
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
@@ -121,7 +121,7 @@
 </tr>
 <tr>
 <td>SCRAM-SHA-256-PLUS</td>
-<td>RFC 5802bis / <a href="https://www.rfc-editor.org/rfc/rfc5929">RFC 5929</a> <code>tls-server-end-point</code> channel binding — not part of Gumdrop's original mechanism set; excluded from <code>SaslMechanism::all()</code> since no protocol crate wires real channel-binding data through yet (see Limitations)</td>
+<td>RFC 5802bis / <a href="https://www.rfc-editor.org/rfc/rfc5929">RFC 5929</a> <code>tls-server-end-point</code> channel binding; excluded from <code>SaslMechanism::all()</code> since no protocol crate wires real channel-binding data through yet (see Limitations)</td>
 </tr>
 <tr>
 <td>OAUTHBEARER</td>
@@ -177,11 +177,15 @@
 </tr>
 <tr>
 <td><code>PeerContext</code></td>
-<td>Optional peer <code>SocketAddr</code></td>
+<td>Optional peer <code>SocketAddr</code> (<code>unknown()</code> / <code>from_addr</code>)</td>
 </tr>
 <tr>
 <td><code>PasswordTrustPolicy</code></td>
-<td>In-memory username/password map</td>
+<td>In-memory username → SCRAM-hashed password map (<code>with_user</code>, <code>into_store</code>, <code>shared</code>)</td>
+</tr>
+<tr>
+<td><code>RolePolicy</code> / <code>RoleMembership</code></td>
+<td>Role membership after authentication (<code>is_user_in_role</code>), e.g. WebDAV privileges; <code>PasswordStore::with_role</code> also answers it</td>
 </tr>
 </tbody>
 </table>
@@ -190,7 +194,7 @@
 <span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> evaluate(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> id<span class="op">:</span> <span class="op">&amp;</span>IdentityMaterial<span class="op">,</span> peer<span class="op">:</span> <span class="op">&amp;</span>PeerContext) <span class="op">-&gt;</span> TrustDecision <span class="op">{</span></span>
 <span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// …</span></span>
 <span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
-<p>FTP stock handler and SMTP AUTH PLAIN call this layer. See <a href="ftp.html">FTP</a>, <a href="smtp.html">SMTP</a>.</p>
+<p>The FTP stock handler and the HTTP Basic / Bearer factories call this layer; the mail protocols use a <code>CredentialStore</code> instead. See <a href="ftp.html">FTP</a>.</p>
 <h2 id="credential-stores">Credential stores</h2>
 <table>
 <thead>
@@ -202,7 +206,7 @@
 <tbody>
 <tr>
 <td><code>CredentialStore</code></td>
-<td>Trait backend (Gumdrop Realm-like)</td>
+<td>Trait backend for SASL, HTTP Digest and Bearer</td>
 </tr>
 <tr>
 <td><code>PasswordStore</code></td>
@@ -230,7 +234,7 @@
 </tr>
 </tbody>
 </table>
-<p><code>CredentialStore</code> overridable methods: <code>password_match</code>, <code>digest_ha1</code> (per <code>DigestAlgorithm</code>), <code>scram_credentials</code>, <code>validate_bearer</code>, <code>authenticate_certificate</code>, <code>authorize_as</code>, <code>supported_mechanisms</code>.</p>
+<p><code>CredentialStore</code> overridable methods: <code>password_match</code>, <code>digest_ha1</code> (per <code>DigestAlgorithm</code>), <code>scram_credentials</code>, <code>validate_bearer</code> (callback-based: <code>validate_bearer(token, cb)</code>, so a remote check need not block), <code>authenticate_certificate</code>, <code>authorize_as</code>, <code>supported_mechanisms</code> (default <code>SaslMechanism::all()</code>).</p>
 <div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_auth::</span>PasswordStore<span class="op">;</span></span>
 <span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> store <span class="op">=</span> <span class="pp">PasswordStore::</span>new()</span>
@@ -243,11 +247,13 @@
 <div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">enum</span> SaslMechanism <span class="op">{</span></span>
 <span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>    Plain<span class="op">,</span></span>
 <span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    Login<span class="op">,</span></span>
-<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    ScramSha256<span class="op">,</span></span>
-<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    OauthBearer<span class="op">,</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    ScramSha256<span class="op">,</span>
+    ScramSha256Plus<span class="op">,</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    OauthBearer<span class="op">,</span>
+    XOauth2<span class="op">,</span></span>
 <span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    External<span class="op">,</span></span>
 <span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
-<p>Helpers on the enum: <code>name</code>, <code>from_name</code>, <code>is_challenge_response</code>, <code>requires_tls</code>, <code>all</code>.</p>
+<p>Helpers on the enum: <code>name</code>, <code>from_name</code>, <code>is_challenge_response</code>, <code>requires_tls</code> (PLAIN, LOGIN, OAUTHBEARER, XOAUTH2, EXTERNAL), <code>all</code> (every mechanism except <code>ScramSha256Plus</code>).</p>
 <table>
 <colgroup>
 <col style="width: 50%" />
@@ -274,7 +280,7 @@
 </tr>
 <tr>
 <td><code>SaslServerOptions</code></td>
-<td>hostname, realm, peer_certificate, channel_binding</td>
+<td><code>peer_certificate</code>, <code>channel_binding</code></td>
 </tr>
 <tr>
 <td><code>create_server</code> / <code>create_client</code></td>
@@ -287,17 +293,12 @@
 <span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> server <span class="op">=</span> create_server(</span>
 <span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="pp">SaslMechanism::</span>ScramSha256<span class="op">,</span></span>
 <span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    store<span class="op">,</span></span>
-<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    SaslServerOptions <span class="op">{</span></span>
-<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>        hostname<span class="op">:</span> <span class="st">&quot;localhost&quot;</span><span class="op">.</span>into()<span class="op">,</span></span>
-<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>        realm<span class="op">:</span> <span class="st">&quot;hopf&quot;</span><span class="op">.</span>into()<span class="op">,</span></span>
-<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>        peer_certificate<span class="op">:</span> <span class="cn">None</span><span class="op">,</span></span>
-<span id="cb5-9b"><a href="#cb5-9b" aria-hidden="true" tabindex="-1"></a>        channel_binding<span class="op">:</span> <span class="cn">None</span><span class="op">,</span></span>
-<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">},</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    SaslServerOptions<span class="op">::</span><span class="kw">default</span>()<span class="op">,</span> <span class="co">// peer_certificate / channel_binding: None</span></span>
 <span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>)<span class="op">;</span></span>
-<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> client <span class="op">=</span> create_client(<span class="pp">SaslMechanism::</span>ScramSha256<span class="op">,</span> <span class="st">&quot;alice&quot;</span><span class="op">,</span> <span class="st">&quot;secret&quot;</span><span class="op">,</span> <span class="st">&quot;localhost&quot;</span><span class="op">,</span> <span class="cn">None</span>)<span class="op">;</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> client <span class="op">=</span> create_client(<span class="pp">SaslMechanism::</span>ScramSha256<span class="op">,</span> <span class="st">&quot;alice&quot;</span><span class="op">,</span> <span class="st">&quot;secret&quot;</span><span class="op">,</span> <span class="cn">None</span>)<span class="op">;</span></span>
 <span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="co">// Alternate challenge/response via server.step / client.evaluate</span></span></code></pre></div>
-<p>Symmetric client + server exchanges for all <strong>five</strong> mechanisms, plus SCRAM-SHA-256-PLUS. <code>requires_tls</code> guides operators (e.g. PLAIN should be under TLS).</p>
+<p>Symmetric client + server exchanges for all <strong>seven</strong> mechanisms (including SCRAM-SHA-256-PLUS). <code>requires_tls</code> guides operators (e.g. PLAIN should be under TLS).</p>
 <h3 id="scram-channel-binding">SCRAM channel binding</h3>
 <p><code>ScramSha256Client::new_plus(username, password, channel_binding)</code> / <code>ScramSha256Server::with_channel_binding(channel_binding)</code> add real <code>tls-server-end-point</code> (RFC 5929 section 4) channel binding: the caller supplies this connection's channel-binding bytes (a hash of the server's TLS certificate — <code>hopf-auth</code> has no TLS awareness of its own, the same pattern <code>ExternalServer::with_peer_certificate</code> already uses). The server independently recomputes the expected <code>c=</code> value from the GS2 header the client actually sent plus its own channel-binding data and rejects a mismatch — the property that defeats a MITM relaying the SASL exchange across two different TLS connections. Not implemented: cross-mechanism downgrade detection (noticing a MITM stripped PLUS from the advertised mechanism list) — that needs the session/capability-advertisement layer, not this mechanism module.</p>
 <h2 id="http-digest-helpers">HTTP Digest helpers</h2>
@@ -308,7 +309,7 @@
 <ul>
 <li><code>IntrospectionRequest::to_form_body()</code> — the <code>application/x-www-form-urlencoded</code> <code>token</code> + <code>token_type_hint</code> body per section 2.1.</li>
 <li><code>IntrospectionResponse::parse(json)</code> — reads <code>active</code> / <code>username</code> / <code>scope</code> / <code>exp</code> from a section 2.2 response via a small purpose-built JSON reader (no JSON crate dependency); unknown/nested fields (<code>aud</code>, <code>iss</code>, <code>client_id</code>, ...) are structurally skipped, not rejected.</li>
-<li><code>IntrospectionTransport</code> — the caller supplies the actual HTTP POST (<code>hopf-auth</code> has no network I/O of its own; <code>hopf-http</code>, which does, already depends on <code>hopf-auth</code>, so the dependency can't run the other way). Wire it to <code>hopf-http</code>'s client, run off the reactor thread the same way other blocking work in this workspace is.</li>
+<li><code>IntrospectionTransport</code> - the caller supplies the actual HTTP POST (<code>hopf-auth</code> has no network I/O of its own; <code>hopf-http</code>, which does, already depends on <code>hopf-auth</code>, so the dependency can't run the other way). <code>introspect(form_body, cb)</code> is callback-based, so it can be wired to <code>hopf-http</code>'s non-blocking client; it must not re-enter the storage pool its caller may be running on.</li>
 <li><code>IntrospectionCredentialStore::new(inner, transport)</code> — a <code>CredentialStore</code> that delegates every method to <code>inner</code> except <code>validate_bearer</code>, which calls the introspection endpoint and requires <code>active: true</code> (plus a local <code>exp</code> check as defence in depth against a stale cached response, even though the RFC doesn't require it).</li>
 </ul>
 <h2 id="configuration">Configuration</h2>
@@ -324,28 +325,16 @@
 </thead>
 <tbody>
 <tr>
-<td><code>hostname</code></td>
-<td>string</td>
-<td><code>"localhost"</code></td>
-<td>SCRAM / Digest host</td>
-</tr>
-<tr>
-<td><code>realm</code></td>
-<td>string</td>
-<td><code>"hopf"</code></td>
-<td>Digest realm</td>
-</tr>
-<tr>
 <td><code>peer_certificate</code></td>
-<td>optional</td>
+<td><code>Option&lt;String&gt;</code></td>
 <td><code>None</code></td>
-<td>EXTERNAL</td>
+<td>EXTERNAL; the mail servers pass the SHA-256 fingerprint of the mTLS client certificate</td>
 </tr>
 <tr>
 <td><code>channel_binding</code></td>
-<td>optional bytes</td>
+<td><code>Option&lt;Vec&lt;u8&gt;&gt;</code></td>
 <td><code>None</code></td>
-<td>SCRAM-SHA-256-PLUS — this connection's <code>tls-server-end-point</code> data</td>
+<td>SCRAM-SHA-256-PLUS: this connection's <code>tls-server-end-point</code> data</td>
 </tr>
 </tbody>
 </table>
@@ -371,8 +360,8 @@
 </tr>
 <tr>
 <td>Builders</td>
-<td>—</td>
-<td><code>with_digest_realm</code> (before users, for the HTTP Digest SHA-256 HA1), <code>with_md5_digest</code> (also the legacy MD5 HA1, off by default), <code>with_scram_iterations</code>, <code>with_user</code> (enroll then discard password), <code>with_scram</code> / <code>insert_scram</code>, <code>with_token</code>, <code>with_certificate</code>, <code>shared</code></td>
+<td>-</td>
+<td><code>with_digest_realm</code> (before users, for the HTTP Digest SHA-256 HA1), <code>with_md5_digest</code> (also the legacy MD5 HA1, off by default), <code>with_scram_iterations</code>, <code>with_user</code> (enroll then discard password), <code>with_scram</code> / <code>insert_scram</code>, <code>with_token</code>, <code>with_certificate</code>, <code>with_role</code>, <code>shared</code></td>
 </tr>
 </tbody>
 </table>
@@ -396,7 +385,7 @@
 <p><strong>FTP:</strong></p>
 <div class="sourceCode" id="cb6"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> policy <span class="op">=</span> <span class="pp">PasswordTrustPolicy::</span><span class="kw">default</span>()<span class="op">.</span>with_user(<span class="st">&quot;ftp&quot;</span><span class="op">,</span> <span class="st">&quot;ftp&quot;</span>)<span class="op">.</span>shared()<span class="op">;</span></span>
 <span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="pp">FtpConfig::</span>new(addr<span class="op">,</span> root<span class="op">,</span> policy)<span class="op">;</span></span></code></pre></div>
-<p><strong>SMTP</strong> (full SASL mechanism set via <code>CredentialStore</code>, same as POP3/IMAP below):</p>
+<p><strong>SMTP</strong> (the store's SASL mechanisms via <code>CredentialStore</code>; POP3 and IMAP take the store in <code>Pop3Config::new</code> / <code>ImapConfig::new</code>):</p>
 <div class="sourceCode" id="cb7"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="pp">SmtpConfig::</span>new(addr<span class="op">,</span> hostname)</span>
 <span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_tls(acceptor)</span>
 <span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_store(store)</span>
@@ -412,14 +401,13 @@
 </ul>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li><strong>GSSAPI / Kerberos</strong> (RFC 4752) — not implemented today; planned as an optional <code>gssapi</code> feature with KDC/keytab work on <code>StorageExecutor</code> (Gumdrop parity). Would also unlock RFC 1961 GSSAPI auth for <a href="index.html#socks-hopf-socks">SOCKS</a>.</li>
+<li><strong>GSSAPI / Kerberos</strong> (RFC 4752) is not implemented (so neither is RFC 1961 GSSAPI auth for <a href="socks.html">SOCKS</a>).</li>
 <li>DIGEST-MD5, CRAM-MD5 and POP3 APOP are gone: they rest on MD5 (DIGEST-MD5 is also historic, RFC 6331).</li>
 <li>OAUTHBEARER and XOAUTH2 carry the token in the client “password” slot.</li>
 <li><code>PasswordStore</code> is <strong>in-memory</strong> (demo-grade): enrolls from a password then keeps SCRAM (+ optional Digest HA1) only. For production password AUTH, use <a href="ldap.html"><code>LdapCredentialStore</code></a> or feature <code>pam</code>’s <code>PamCredentialStore</code>.</li>
-<li>SMTP wire currently advertises <strong>AUTH PLAIN</strong> only (<a href="smtp.html">SMTP</a>), even though the auth crate supports more mechanisms.</li>
 <li>SCRAM-SHA-256-PLUS has no cross-mechanism downgrade detection — see the <a href="#scram-channel-binding">channel binding</a> section.</li>
 <li>No protocol crate in this workspace wires real <code>tls-server-end-point</code> channel-binding data through to <code>create_server</code> yet, which is why <code>ScramSha256Plus</code> is excluded from <code>SaslMechanism::all()</code> (and so isn't advertised by any store's default <code>supported_mechanisms()</code>) even though the mechanism itself is fully implemented and tested.</li>
-<li><code>IntrospectionCredentialStore</code> (RFC 7662) needs a caller-supplied <code>IntrospectionTransport</code> for the actual HTTP call — <code>hopf-auth</code> has no network I/O of its own, so nothing in this workspace wires one up by default; <code>PasswordStore::validate_bearer</code> (the default) is still a local static token map.</li>
+<li><code>IntrospectionCredentialStore</code> (RFC 7662) needs a caller-supplied <code>IntrospectionTransport</code> for the actual HTTP call; <code>hopf-auth</code> has no network I/O of its own, so nothing in this workspace wires one up by default; <code>PasswordStore::validate_bearer</code> (the default) is still a local static token map.</li>
 </ul>
 
       <p class="footer">

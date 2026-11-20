@@ -212,13 +212,13 @@
 <td><code>max_net_in</code></td>
 <td><code>usize</code></td>
 <td><code>DEFAULT_MAX_NET_IN</code> (<code>1 MiB</code>)</td>
-<td>Close if inbound buffer exceeds</td>
+<td>Size of the connection's inbound <code>LoopBuf</code> ring (rounded up to a power of two, never below 32 KiB); a full ring that is not consumed stops reads, and a token that cannot fit fails the connection</td>
 </tr>
 <tr>
 <td><code>max_net_out</code></td>
 <td><code>usize</code></td>
 <td><code>DEFAULT_MAX_NET_OUT</code> (<code>4 MiB</code>)</td>
-<td>Close if outbound buffer exceeds</td>
+<td>Cap on the outbound buffer; a connection that exceeds it is closed and its handler told why</td>
 </tr>
 <tr>
 <td><code>idle_timeout</code></td>
@@ -252,7 +252,7 @@
 </tr>
 </tbody>
 </table>
-<p>Constants: <code>DEFAULT_BUFFER_SIZE = 8 KiB</code> (read chunk / initial buffer).</p>
+<p>Constants: <code>DEFAULT_BUFFER_SIZE = 8 KiB</code> (initial outbound buffer). A TLS connection also has a 64 KiB plaintext ring. See <a href="architecture.html#buffers-and-backpressure">Buffers and backpressure</a>.</p>
 <h3 id="builders">Builders</h3>
 <table>
 <colgroup>

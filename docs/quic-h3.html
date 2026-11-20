@@ -84,13 +84,14 @@
 <li><a href="#architecture">Architecture</a></li>
 <li><a href="#pqc-first-tls-13">TLS 1.3 on QUIC</a></li>
 <li><a href="#standards">Standards</a></li>
-<li><a href="#quiclisten--quicconnect-configs">QuicListen / QuicConnect configs</a></li>
+<li><a href="#quiclisten-quicconnect-configs">QuicListen / QuicConnect configs</a></li>
 <li><a href="#pem-builders">PEM builders</a></li>
-<li><a href="#listen_h3--connect_h3">listen_h3 / connect_h3</a></li>
-<li><a href="#alpn-and-tls-13">ALPN and TLS 1.3</a></li>
+<li><a href="#listen_h3-connect_h3">listen_h3 / connect_h3</a></li>
+<li><a href="#alpn-and-tls-1.3">ALPN and TLS 1.3</a></li>
 <li><a href="#runtime-extension">Runtime extension</a></li>
 <li><a href="#examples">Examples</a></li>
 <li><a href="#quic-versions">QUIC versions</a></li>
+<li><a href="#qlog">qlog and key logging</a></li>
 <li><a href="#quic-lb">QUIC-LB connection IDs</a></li>
 <li><a href="#limitations">Limitations</a></li>
 <li><a href="#implementation-status">Implementation status</a></li>
@@ -135,7 +136,27 @@
 </tr>
 <tr>
 <td>TLS 1.3 only</td>
-<td>In-tree handshake engine (shared with TCP TLS); no TLS 1.2 mode on QUIC. Key exchange is classical X25519 only — not PQC-first, unlike TCP TLS 1.3</td>
+<td>In-tree handshake engine (shared with TCP TLS); no TLS 1.2 mode on QUIC. Key exchange is classical X25519 by default; hybrid ML-KEM is opt-in (<code>QuicTlsOptions::with_pqc</code>). FIPS profile via <code>QuicTlsOptions::with_fips</code></td>
+</tr>
+<tr>
+<td>RFC 9002 / 9438 / 9406</td>
+<td>Loss recovery; CUBIC congestion control (default, NewReno selectable) with HyStart++ in slow start; send pacing (RFC 9002 §7.7)</td>
+</tr>
+<tr>
+<td>RFC 9000 §8-9</td>
+<td>Path validation, server-side migration after validation (NAT rebinding), client move to a server's <code>preferred_address</code>, spare connection IDs (<code>NEW_CONNECTION_ID</code> up to the peer's <code>active_connection_id_limit</code>)</td>
+</tr>
+<tr>
+<td>RFC 9369 / 9368</td>
+<td>QUIC version 2 and Version Negotiation with <code>version_information</code>; see <a href="#quic-versions">QUIC versions</a></td>
+</tr>
+<tr>
+<td>RFC 9221 / RFC 9297</td>
+<td>Unreliable DATAGRAM frames; HTTP Datagrams over H3 (used by <a href="masque.html">MASQUE</a>)</td>
+</tr>
+<tr>
+<td>draft-ietf-quic-qlog</td>
+<td>qlog event surface (<code>QlogSink</code>, <code>QlogJson</code>); see <a href="#qlog">qlog and key logging</a></td>
 </tr>
 <tr>
 <td>ALPN <code>h3</code></td>
@@ -185,7 +206,7 @@
 <tr>
 <td><code>QuicListenHardening</code></td>
 <td><code>require_address_validation</code>, Incoming caps, Retry/NEW_TOKEN lifetimes, <code>migration</code></td>
-<td>RFC 9000 §8 listen hardening. <code>high_security()</code> (default) requires a Retry round trip before accept, caps unfinished handshakes, disables migration; <code>permissive()</code> accepts without Retry</td>
+<td>RFC 9000 §8 listen hardening. <code>high_security()</code> (default) requires a Retry round trip before accept, caps unfinished handshakes; <code>permissive()</code> accepts without Retry. The <code>migration</code> knob is recorded on the server config but not yet consulted by the transport (see <a href="#limitations">Limitations</a>)</td>
 </tr>
 </tbody>
 </table>
@@ -197,7 +218,7 @@
 <span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_hardening(<span class="pp">QuicListenHardening::</span>permissive())<span class="op">;</span> <span class="co">// lab / trusted path</span></span>
 <span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="pp">QuicConnectConfig::</span>new(addr<span class="op">,</span> client_cfg<span class="op">,</span> <span class="st">&quot;localhost&quot;</span><span class="op">,</span> factory)<span class="op">;</span></span>
 <span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="pp">QuicListenHooksConfig::</span>new(addr<span class="op">,</span> server_cfg<span class="op">,</span> connection_factory)<span class="op">;</span></span></code></pre></div>
-<p>Port <code>0</code> binds an ephemeral UDP port. Addresses must be pre-resolved (<code>SocketAddr</code>) — Stage 0. Listeners apply <code>apply_listen_hardening</code> to the server config at bind time; with the default high-security policy, unvalidated Initials receive a Retry packet before any TLS handshake state is allocated.</p>
+<p>Port <code>0</code> binds an ephemeral UDP port. Addresses must be pre-resolved (<code>SocketAddr</code>). Listeners apply <code>apply_listen_hardening</code> to the server config at bind time; with the default high-security policy, unvalidated Initials receive a Retry packet before any TLS handshake state is allocated.</p>
 <h3 id="driver-apis">Driver APIs</h3>
 <table>
 <colgroup>
@@ -229,7 +250,22 @@
 </tr>
 </tbody>
 </table>
-<p><code>QuicDriverHandle</code> exposes <code>local_addr</code> and <code>shutdown(self)</code>. Drop or shut down explicitly — the driver thread is independent of <code>Runtime</code> lifetime.</p>
+<p><code>QuicDriverHandle</code> exposes <code>local_addr</code>, <code>is_active</code>, <code>open_bi</code> (another stream on a live client connection) and <code>shutdown(self)</code>, which flushes queued writes and sends <code>CONNECTION_CLOSE</code> on every open connection before stopping. Drop or shut down explicitly; the driver thread is independent of <code>Runtime</code> lifetime. The <code>*_with_path</code> variants run a connection over a <code>QuicDatagramPath</code> instead of a UDP socket (an in-memory pipe, or QUIC tunnelled inside CONNECT-UDP), fed through <code>QuicDriverHandle::receive_path_datagram</code>.</p>
+<h3 id="transport-options">Transport options</h3>
+<p><code>QuicTransportOptions</code> is applied with <code>apply_server_transport_options(&amp;mut Arc&lt;QuicServerConfig&gt;, &amp;opts)</code> or <code>apply_client_transport_options</code>:</p>
+<table>
+<thead><tr><th>Method</th><th>Default</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>max_idle_timeout</code> / <code>keep_alive_interval</code></td><td>30 s / off</td><td>Idle close and keep-alive PINGs</td></tr>
+<tr><td><code>stream_receive_window</code> / <code>stream_receive_window_ceiling</code></td><td>1 MiB / 16 MiB</td><td>Per-stream receive window; raised as the application reads and doubled for a stream that fills it quickly, up to the ceiling</td></tr>
+<tr><td><code>receive_window</code> / <code>receive_window_ceiling</code></td><td>10 MiB / 24 MiB</td><td>Connection receive window and its ceiling</td></tr>
+<tr><td><code>send_window</code></td><td>unbounded</td><td>Cap on stream bytes queued but not yet sent; writes past it are cut short and retried as data leaves</td></tr>
+<tr><td><code>congestion_control</code></td><td><code>CongestionAlgorithm::Cubic</code></td><td>CUBIC (RFC 9438) or <code>NewReno</code> (RFC 9002); both use HyStart++. Stream data is paced over the round trip</td></tr>
+<tr><td><code>max_concurrent_bidi_streams</code> / <code>max_concurrent_uni_streams</code></td><td>100 / 100</td><td>Streams the peer may open</td></tr>
+<tr><td><code>datagram_receive_buffer_size</code> / <code>datagram_send_buffer_size</code></td><td></td><td>DATAGRAM frame support (RFC 9221)</td></tr>
+</tbody>
+</table>
+<p>Each QUIC stream's inbound bytes are presented to its <code>ProtocolHandler</code> from a fixed 64 KiB ring (<code>hopf_core::LoopBuf</code>), as on TCP: the driver reads from the transport only as far as the ring has room, so QUIC flow control pushes back on a slow handler, and a stream whose ring fills with a token the handler cannot use is failed.</p>
 <h3 id="hooks-traits">Hooks traits</h3>
 <table>
 <colgroup>
@@ -258,7 +294,7 @@
 </tbody>
 </table>
 <h2 id="pem-builders">PEM builders</h2>
-<p>All builders pin <strong>TLS 1.3 only</strong> and take an ALPN list. Crypto is always the shared aws-lc-rs provider with <strong>hybrid-first PQC KX</strong> (<code>X25519MLKEM768</code>) — see <a href="#pqc-first-tls-13">PQC-first TLS 1.3</a>.</p>
+<p>All builders pin <strong>TLS 1.3 only</strong> and take an ALPN list. Key exchange defaults to classical X25519; the <code>*_with</code> variants take <code>QuicTlsOptions</code> for hybrid PQC, early data or the FIPS profile (see <a href="#pqc-first-tls-13">TLS 1.3 on QUIC</a>).</p>
 <table>
 <colgroup>
 <col style="width: 55%" />
@@ -282,6 +318,14 @@
 <tr>
 <td><code>server_config_self_signed(&amp;[names], alpn)</code></td>
 <td><code>(Arc&lt;QuicServerConfig&gt;, leaf_pem: String)</code></td>
+</tr>
+<tr>
+<td><code>client_config_public_trust(alpn)</code></td>
+<td><code>Arc&lt;QuicClientConfig&gt;</code> trusting the public WebPKI roots</td>
+</tr>
+<tr>
+<td><code>server_config_from_tls_builder(&amp;ServerTlsBuilder)</code></td>
+<td><code>Arc&lt;QuicServerConfig&gt;</code> sharing credentials, SNI and client-auth settings with a TCP listener (see <a href="tls.html">TLS</a>)</td>
 </tr>
 <tr>
 <td><code>client_config_for_certified_pem</code> / <code>client_config_for_pem_bytes</code></td>
@@ -325,7 +369,7 @@
 <span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span></code></pre></div>
 <p>On connect, the H3 client opens control + QPACK uni streams, then one bi-stream for the application request (<code>ClientHandler::start</code>). The control-stream SETTINGS frame advertises <code>SETTINGS_QPACK_MAX_TABLE_CAPACITY</code> (4096), <code>SETTINGS_QPACK_BLOCKED_STREAMS</code> (0), and Extended CONNECT; the encoder stays at capacity 0 until the peer's SETTINGS arrive, then grows to at most that advertised ceiling.</p>
 <p>Each H3 request maps to a QUIC-stream <code>Endpoint</code> driving the same <code>ServerHandler</code> / <code>ClientHandler</code> API as H1/H2.</p>
-<p>QUIC connection and stream teardown mirrors Gumdrop: a peer application or transport <code>CONNECTION_CLOSE</code>, idle timeout, or inbound <code>STOP_SENDING</code> reaches the stream's <code>ProtocolHandler::error</code> with <code>QuicConnectionCloseError</code> / <code>QuicStreamStoppedError</code> (downcast helpers <code>connection_close_error</code> / <code>stream_stopped_error</code>). Clean local shutdown and graceful stream FIN still call <code>disconnected</code>.</p>
+<p>QUIC connection and stream teardown: a peer application or transport <code>CONNECTION_CLOSE</code>, idle timeout, or inbound <code>STOP_SENDING</code> reaches the stream's <code>ProtocolHandler::error</code> with <code>QuicConnectionCloseError</code> / <code>QuicStreamStoppedError</code> (downcast helpers <code>connection_close_error</code> / <code>stream_stopped_error</code>). Clean local shutdown and graceful stream FIN still call <code>disconnected</code>.</p>
 <h2 id="alpn-and-tls-1.3">ALPN and TLS 1.3</h2>
 <table>
 <thead>
@@ -345,7 +389,7 @@
 </tr>
 <tr>
 <td>Key exchange</td>
-<td>Classical <code>X25519</code> only today — not PQC-first, unlike TCP TLS 1.3 (see <a href="conformance.html#quic">Conformance → QUIC</a>)</td>
+<td>Classical <code>X25519</code> by default; hybrid PQC opt-in with <code>QuicTlsOptions::with_pqc()</code> (see <a href="conformance.html#quic">Conformance → QUIC</a>)</td>
 </tr>
 <tr>
 <td>Early data</td>
@@ -404,6 +448,9 @@ client_cfg.versions(&amp;[V2, V1]);
 <li><strong>Tickets.</strong> Session tickets (and so 0-RTT) are per version: a ticket earned over v1 is never offered on a v2 connection and vice versa.</li>
 <li><strong>Not implemented.</strong> Compatible version negotiation (RFC 9368 section 2.3), where a server upgrades a v1 first flight to v2 without a round trip. A client that wants v2 should ask for it in its first flight.</li>
 </ul>
+<h2 id="qlog">qlog and key logging</h2>
+<p>Every connection reports qlog events (draft-ietf-quic-qlog, QUIC event schema) to a per-connection <code>QlogSink</code>. By default the sink forwards to the process telemetry pipeline when qlog export is enabled there; with no pipeline it is a no-op (<code>NopQlogSink</code>). Starting a <code>hopf_otel::TelemetryPipeline</code> with <code>OtelConfig::with_qlog_dir(dir)</code> (or the <code>QLOGDIR</code> environment variable when nothing else is configured) writes one <code>{group_id}_{vantage}.sqlog</code> JSON-SEQ file per connection through <code>hopf_otel::QlogFileSink</code>. A listener or dial can supply its own sink factory with <code>with_qlog_sink_factory</code>. See <a href="telemetry.html">Telemetry</a>.</p>
+<p>For Wireshark, TLS secrets can be written in NSS key log format: <code>hopf_core::tls::set_default_key_log(KeyLogFile::from_environment()?)</code> honours <code>SSLKEYLOGFILE</code> for every handshake, TCP and QUIC alike. Key logging is refused under the FIPS profile.</p>
 <h2 id="quic-lb">QUIC-LB connection IDs</h2>
 <p>A load balancer that forwards UDP by Destination Connection ID needs to find the owning backend from the CID alone, so a datagram keeps reaching the same server when the client's address changes. <code>hopf-quic</code> can issue such IDs following <a href="https://www.ietf.org/archive/id/draft-ietf-quic-load-balancers-21.html">draft-ietf-quic-load-balancers-21</a> (revision 21; the encoder lives in one module, <code>transport/quic_lb.rs</code>, so a later revision touches only that file).</p>
 <pre><code>use hopf_quic::{apply_server_quic_lb, QuicLbConfig};
@@ -419,10 +466,10 @@ listen_h3(addr, server_cfg, factory, limits)?;   // HTTP/3 takes the same Arc&lt
 </code></pre>
 <ul>
 <li><strong>Encodings.</strong> Without a key the server ID is sent in the clear (linkable across migration). With a 16-octet AES-128 key it is encrypted: one AES block when server ID and nonce total exactly 16 octets, otherwise the draft's four-round Feistel network. Server ID (at least 1 octet) and nonce (at least 4) total at most 19 octets, so the CID is at most 20. Optional length self-description (<code>with_length_self_description</code>) fills the first octet's low bits with the CID length; otherwise they are random.</li>
-<li><strong>Where it applies.</strong> The Initial response's source CID and the Retry source CID (Retry is on by default under <code>QuicListenHardening::high_security</code>). Nonces count up from a random start and are never reused; on exhaustion the server falls back to the reserved unroutable <code>0b111</code> codepoint, as the draft requires. In plaintext mode the nonce is random, and the endpoint redraws on a clash with a live connection and refuses an accept whose fixed post-Retry CID clashes.</li>
+<li><strong>Where it applies.</strong> The Initial response's source CID, the Retry source CID (Retry is on by default under <code>QuicListenHardening::high_security</code>) and the spare IDs issued later in <code>NEW_CONNECTION_ID</code> frames, which come from the same generator. Nonces count up from a random start and are never reused; on exhaustion the server falls back to the reserved unroutable <code>0b111</code> codepoint, as the draft requires. In plaintext mode the nonce is random, and the endpoint redraws on a clash with a live connection and refuses an accept whose fixed post-Retry CID clashes.</li>
 <li><strong>Shared state.</strong> None beyond the config: the balancer decodes the server ID with <code>QuicLbConfig::decode_server_id</code>'s logic and forwards; backends keep their own connection tables. Clones of a server config share one nonce sequence.</li>
 <li><strong>Default.</strong> Without <code>quic_lb</code>, connection IDs remain 8 random octets. <code>connection_id_generator</code> accepts any custom <code>ConnectionIdGenerator</code>.</li>
-<li><strong>Not covered.</strong> Terminating QUIC or TLS at the balancer; the draft's optional extra server-owned CID octets; <code>NEW_CONNECTION_ID</code> issuance, because this stack does not issue additional CIDs yet (connection migration itself is still structurally inert, see <a href="conformance.html#quic">Conformance</a>), so only the Initial and Retry source CIDs are QUIC-LB encoded.</li>
+<li><strong>Not covered.</strong> Terminating QUIC or TLS at the balancer; the draft's optional extra server-owned CID octets.</li>
 </ul>
 <h2 id="limitations">Limitations</h2>
 <ul>
@@ -430,14 +477,15 @@ listen_h3(addr, server_cfg, factory, limits)?;   // HTTP/3 takes the same Arc&lt
 <li>Driver thread is <strong>not</strong> a TCP worker reactor; shut down / drop <code>QuicDriverHandle</code> independently of <code>Runtime</code>.</li>
 <li>Addresses must be pre-resolved (no DNS inside <code>connect_quic</code> / <code>connect_h3</code>).</li>
 <li>Plain (non-hooks) server mode installs <code>NopHandler</code> on accepted unidirectional streams.</li>
-<li>No HTTP/2-style server push; no WebTransport / CONNECT-UDP product API yet (RFC 9297 HTTP Datagrams + Capsule Protocol plumbing is present).</li>
+<li>No HTTP/2-style server push and no WebTransport. CONNECT-UDP and CONNECT-IP are provided by <a href="masque.html"><code>hopf-masque</code></a> on top of the RFC 9297 HTTP Datagram and Capsule plumbing here.</li>
 <li>0-RTT is off by default; enable via <code>QuicTlsOptions::with_early_data</code> (replay risk — see SECURITY.md). Plain <code>connect_quic</code> opens the first stream before <code>Event::Connected</code> when a session ticket makes <code>has_0rtt()</code> true; H3 hooks-mode still starts after the full handshake.</li>
 <li>Locally-initiated connection close (<code>LocallyClosed</code>) still calls <code>ProtocolHandler::disconnected</code> on this endpoint's streams; only the peer sees <code>QuicConnectionCloseError</code> via <code>error</code>. Use the return value of <code>close_connection</code> locally if you need the code you just sent.</li>
-<li>Connection migration (RFC 9000 §9) is not implemented — a connection keeps the remote address it was created with for its whole lifetime, and there's no <code>NEW_TOKEN</code> (§8.1.3) support either, only Retry-based address validation (§8.1.2). See <a href="conformance.html#quic">Conformance → QUIC</a> for the specifics.</li>
+<li>Migration is partial (RFC 9000 §9). A server validates a client's new address with <code>PATH_CHALLENGE</code> and moves to it once answered (NAT rebinding survives), resetting congestion state and switching to a spare connection ID; a client follows a server's <code>preferred_address</code>. A client moving of its own accord to a new local address is not implemented, the server always advertises <code>disable_active_migration</code>, there is no API to offer a <code>preferred_address</code>, and the <code>migration</code> hardening knob is not consulted.</li>
+<li>No <code>NEW_TOKEN</code> (§8.1.3): address validation is Retry-based only (§8.1.2); a client ignores tokens it receives.</li>
 </ul>
 <h2 id="implementation-status">Implementation status</h2>
-<p><strong>Shipped:</strong> QUIC transport (RFC 9000 loss recovery and congestion control, RFC 9001 packet protection) and the TLS 1.3 handshake are both in-tree, with no external QUIC or TLS library dependency — the handshake is driven by the same engine TCP TLS 1.3 uses. HTTP/3 codecs and QPACK in <code>hopf-http</code> (feature <code>h3</code>) are Hopf-owned. Hopf adds the mio UDP driver, stream-as-<code>Endpoint</code> model, and hooks-mode connection API for H3.</p>
-<p><strong>Known gaps:</strong> connection migration and <code>NEW_TOKEN</code> address validation aren't implemented. Hybrid PQC key exchange is opt-in rather than default — see <a href="conformance.html#quic">Conformance → QUIC</a> for the full, row-by-row detail.</p>
+<p><strong>Shipped:</strong> QUIC transport (RFC 9002 loss recovery, CUBIC with HyStart++ or NewReno, pacing; RFC 9001 packet protection; path validation, server-side migration and spare connection IDs; QUIC v1 and v2; qlog) and the TLS 1.3 handshake are both in-tree, with no external QUIC or TLS library dependency; the handshake is driven by the same engine TCP TLS 1.3 uses. HTTP/3 codecs and QPACK in <code>hopf-http</code> (feature <code>h3</code>) are Hopf-owned. Hopf adds the mio UDP driver, stream-as-<code>Endpoint</code> model, and hooks-mode connection API for H3. <code>examples/quic-interop</code> is an endpoint for the quic-interop-runner.</p>
+<p><strong>Known gaps:</strong> client-initiated active migration, <code>NEW_TOKEN</code> address validation and compatible version negotiation aren't implemented. Hybrid PQC key exchange is opt-in rather than default. See <a href="conformance.html#quic">Conformance → QUIC</a> for the full, row-by-row detail.</p>
 <p><strong>MASQUE:</strong> RFC 9298 CONNECT-UDP (full server relay + client) and RFC 9484 CONNECT-IP (accept/capsule plumbing; the application supplies IP forwarding) live in <code>hopf-masque</code>, over HTTP/1.1, HTTP/2, and HTTP/3 alike — not H3-only. See <a href="masque.html">masque.html</a> and <a href="conformance.html#masque">Conformance → MASQUE</a>.</p>
 <h2 id="see-also">See also</h2>
 <ul>

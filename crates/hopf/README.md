@@ -16,5 +16,7 @@ Or pick crates individually:
 hopf = { version = "0.7.0", default-features = false, features = ["http", "tls"] }
 ```
 
-`hopf-core` is always included. Pass-through features: `h3`, `dns-server`,
-`dot`, `doq`, `doh`, `dnssec`, `webdav-xattr`, `mdns`, `masque`, `masque-h3`, `socks`.
+`hopf-core` is always included. Default features enable every crate. Further
+features: `h3`, `dns-server`, `dot`, `doq`, `doh`, `dnssec`, `webdav-xattr`,
+`mqtt-ws`, `masque-h3`, `pam` (links libpam) and `fips` (builds AWS-LC's FIPS
+module).
