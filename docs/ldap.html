@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>LDAP — Hopf</title>
+  <title>LDAP - Hopf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
@@ -191,7 +191,7 @@ session.sync(
 <tr><td>digest / SCRAM / bearer</td><td>unsupported</td></tr>
 </tbody>
 </table>
-<p><strong>Reactor rule:</strong> <code>password_match</code> blocks on a Condvar + timeout completed from LDAP callbacks. Call it only from a storage/worker pool — never on a reactor thread.</p>
+<p><strong>Reactor rule:</strong> <code>password_match</code> blocks on a Condvar + timeout completed from LDAP callbacks. Call it only from a storage/worker pool - never on a reactor thread.</p>
 
 <h2 id="wiring">Wiring mail services</h2>
 <p>Same <code>with_store</code> surface as <code>PasswordStore</code>:</p>

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AMQP 1.0 — Hopf</title>
+  <title>AMQP 1.0 - Hopf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
@@ -76,7 +76,7 @@
     <main class="main">
       <header>
         <h1>AMQP 1.0</h1>
-        <p class="lead"><code>hopf-amqp1</code> is an <strong>AMQP 1.0 async client</strong> (ISO/IEC 19464) targeting brokers with native AMQP 1.0 support (RabbitMQ 4's native AMQP 1.0 listener, ActiveMQ Artemis). Client-only: no broker in this crate. AMQP 1.0 shares only the four-byte <code>AMQP</code> magic with <a href="amqp.html"><code>hopf-amqp</code></a>'s AMQP 0-9-1 (RabbitMQ classic protocol) — framing, the type system, and the connection/session/link model are unrelated.</p>
+        <p class="lead"><code>hopf-amqp1</code> is an <strong>AMQP 1.0 async client</strong> (ISO/IEC 19464) targeting brokers with native AMQP 1.0 support (RabbitMQ 4's native AMQP 1.0 listener, ActiveMQ Artemis). Client-only: no broker in this crate. AMQP 1.0 shares only the four-byte <code>AMQP</code> magic with <a href="amqp.html"><code>hopf-amqp</code></a>'s AMQP 0-9-1 (RabbitMQ classic protocol) - framing, the type system, and the connection/session/link model are unrelated.</p>
       </header>
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
@@ -94,7 +94,7 @@
 <table>
 <thead><tr><th>Area</th><th>Support</th></tr></thead>
 <tbody>
-<tr><td>Protocol</td><td>AMQP 1.0 (ISO/IEC 19464) only — see <a href="amqp.html">AMQP 0-9-1</a> for the separate <code>hopf-amqp</code> crate</td></tr>
+<tr><td>Protocol</td><td>AMQP 1.0 (ISO/IEC 19464) only - see <a href="amqp.html">AMQP 0-9-1</a> for the separate <code>hopf-amqp</code> crate</td></tr>
 <tr><td>Role</td><td>Client only</td></tr>
 <tr><td>Auth</td><td>SASL <code>PLAIN</code> (when credentials are configured) or <code>ANONYMOUS</code>, auto-negotiated against what the peer advertises</td></tr>
 <tr><td>Sessions / links</td><td>Multiple sessions per connection, multiple sender/receiver links per session</td></tr>
@@ -116,13 +116,13 @@
          → begin_session / attach_sender / attach_receiver via Amqp1ClientControl
          ← transfer (streamed) → on_message_header/properties/application_properties/data
          ← disposition → on_delivery_outcome</code></pre>
-<p>Inbound is reactor-driven: socket readable → <code>receive</code> → <code>Amqp1FrameParser</code> → <code>MessageParser</code> for transfer payloads → driver callbacks. There is no application poll loop. The frame parser and message-section parser are both genuinely incremental push parsers — a large message body streams to the driver as bytes arrive rather than being buffered whole first.</p>
+<p>Inbound is reactor-driven: socket readable → <code>receive</code> → <code>Amqp1FrameParser</code> → <code>MessageParser</code> for transfer payloads → driver callbacks. There is no application poll loop. The frame parser and message-section parser are both genuinely incremental push parsers - a large message body streams to the driver as bytes arrive rather than being buffered whole first.</p>
 
       <h2 id="sasl">SASL handshake</h2>
-<p>On connect, the client sends the AMQP protocol header for the SASL sub-protocol first. If the peer advertises <code>PLAIN</code> and credentials are configured, <code>PLAIN</code> is used; otherwise the client falls back to <code>ANONYMOUS</code>. After a successful <code>sasl-outcome</code>, the connection re-arms to expect the AMQP (non-SASL) protocol header, then proceeds with <code>open</code>. This re-arming happens correctly even when a peer pipelines the SASL outcome and the following AMQP header into the same TCP read — a real broker commonly does this, and the frame parser handles it within a single <code>feed()</code> call rather than needing a second read to notice the mode switch.</p>
+<p>On connect, the client sends the AMQP protocol header for the SASL sub-protocol first. If the peer advertises <code>PLAIN</code> and credentials are configured, <code>PLAIN</code> is used; otherwise the client falls back to <code>ANONYMOUS</code>. After a successful <code>sasl-outcome</code>, the connection re-arms to expect the AMQP (non-SASL) protocol header, then proceeds with <code>open</code>. This re-arming happens correctly even when a peer pipelines the SASL outcome and the following AMQP header into the same TCP read - a real broker commonly does this, and the frame parser handles it within a single <code>feed()</code> call rather than needing a second read to notice the mode switch.</p>
 
       <h2 id="sessions-and-links">Sessions and links</h2>
-<p>AMQP 1.0 layers <strong>sessions</strong> (RFC-1982 serial-numbered transfer windows over one connection) and <strong>links</strong> (named, unidirectional, credit-flow-controlled sender or receiver attachments within a session) on top of the connection — a structure AMQP 0-9-1 doesn't have. <code>Amqp1ClientControl::begin_session</code> opens a session on a channel; <code>attach_sender</code>/<code>attach_receiver</code> attach named links with a <code>Source</code>/<code>Target</code> address. A receiver must be given link credit (<code>add_credit</code>) before the peer will send it any deliveries.</p>
+<p>AMQP 1.0 layers <strong>sessions</strong> (RFC-1982 serial-numbered transfer windows over one connection) and <strong>links</strong> (named, unidirectional, credit-flow-controlled sender or receiver attachments within a session) on top of the connection - a structure AMQP 0-9-1 doesn't have. <code>Amqp1ClientControl::begin_session</code> opens a session on a channel; <code>attach_sender</code>/<code>attach_receiver</code> attach named links with a <code>Source</code>/<code>Target</code> address. A receiver must be given link credit (<code>add_credit</code>) before the peer will send it any deliveries.</p>
 
       <h2 id="client">Client</h2>
 <p>SPI mirrors the other Hopf async clients: <code>Amqp1Client</code> facade, <code>Amqp1ClientHandlerFactory</code>, flat <code>Amqp1ClientDriver</code> / <code>Amqp1ClientControl</code>.</p>
@@ -138,7 +138,7 @@
       <h2 id="examples">Examples</h2>
 <pre><code>cargo test -p hopf-amqp1 --lib client::tests
 cargo test -p hopf-amqp1 --features integration</code></pre>
-<p>No standalone <code>cargo run</code> example binary ships yet (unlike <code>hopf-amqp</code>'s <code>amqp-pub</code>/<code>amqp-consume</code>) — see the <a href="https://docs.rs/hopf-amqp1"><code>client</code> module docs</a> for a full quick-start (connect, begin a session, attach a sender, send a message). The opt-in integration test targets a broker with native AMQP 1.0 support; defaults to <code>127.0.0.1:5672</code> / <code>guest</code>/<code>guest</code> (RabbitMQ 4 node addressing, <code>/queues/&lt;name&gt;</code>), overridable with <code>HOPF_AMQP1_HOST</code>, <code>HOPF_AMQP1_PORT</code>, <code>HOPF_AMQP1_USER</code>, <code>HOPF_AMQP1_PASS</code>, and <code>HOPF_AMQP1_ADDRESS_STYLE=artemis</code> for a plain queue-name address instead. <code>HOPF_AMQP1_TLS_PORT</code> / <code>HOPF_AMQP1_TLS_CA</code> configure the amqps (implicit TLS) test; it's skipped if no CA cert is found.</p>
+<p>No standalone <code>cargo run</code> example binary ships yet (unlike <code>hopf-amqp</code>'s <code>amqp-pub</code>/<code>amqp-consume</code>) - see the <a href="https://docs.rs/hopf-amqp1"><code>client</code> module docs</a> for a full quick-start (connect, begin a session, attach a sender, send a message). The opt-in integration test targets a broker with native AMQP 1.0 support; defaults to <code>127.0.0.1:5672</code> / <code>guest</code>/<code>guest</code> (RabbitMQ 4 node addressing, <code>/queues/&lt;name&gt;</code>), overridable with <code>HOPF_AMQP1_HOST</code>, <code>HOPF_AMQP1_PORT</code>, <code>HOPF_AMQP1_USER</code>, <code>HOPF_AMQP1_PASS</code>, and <code>HOPF_AMQP1_ADDRESS_STYLE=artemis</code> for a plain queue-name address instead. <code>HOPF_AMQP1_TLS_PORT</code> / <code>HOPF_AMQP1_TLS_CA</code> configure the amqps (implicit TLS) test; it's skipped if no CA cert is found.</p>
 
       <h2 id="limitations">Limitations</h2>
 <ul>

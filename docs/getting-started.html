@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Getting started — Hopf</title>
+  <title>Getting started - Hopf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
@@ -77,7 +77,7 @@
     <main class="main">
       <header>
         <h1>Getting started</h1>
-        <p class="lead">Build the workspace, then run the demos in order. Prefer <a href="composition.html"><code>Composition</code></a> over ad-hoc <code>Runtime::add_tcp_listener</code> calls — either the Rust builder or declarative XML that desugars into the same builder.</p>
+        <p class="lead">Build the workspace, then run the demos in order. Prefer <a href="composition.html"><code>Composition</code></a> over ad-hoc <code>Runtime::add_tcp_listener</code> calls - either the Rust builder or declarative XML that desugars into the same builder.</p>
       </header>
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
@@ -113,7 +113,7 @@
 <span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>comp<span class="op">.</span>shutdown()<span class="op">;</span></span></code></pre></div>
 <p>XML (below) produces the same builder; pick whichever fits the deployment.</p>
 <h2 id="xml-composition">XML composition</h2>
-<p>Declarative composition files are <strong>elements and attributes only</strong> — no text content between tags. Parsing is via <a href="https://crates.io/crates/tractrix">tractrix</a>. The document desugars into <code>Composition::new(…)</code> + <code>listen_tcp</code> / <code>dial_tcp</code>; handler names resolve through a closed <a href="composition.html#compositionregistry"><code>CompositionRegistry</code></a>, not reflection or classpath scanning.</p>
+<p>Declarative composition files are <strong>elements and attributes only</strong> - no text content between tags. Parsing is via <a href="https://crates.io/crates/tractrix">tractrix</a>. The document desugars into <code>Composition::new(…)</code> + <code>listen_tcp</code> / <code>dial_tcp</code>; handler names resolve through a closed <a href="composition.html#compositionregistry"><code>CompositionRegistry</code></a>, not reflection or classpath scanning.</p>
 <h3 id="mental-model">Mental model</h3>
 <pre class="text"><code>XML file  ──parse──►  Runtime starts, bindings applied
                            │
@@ -123,10 +123,10 @@ CompositionRegistry ───────┘  (handler=&quot;echo&quot; → fact
 <ol type="1">
 <li>In Rust, register every <code>handler</code> name you will mention in XML.</li>
 <li>Optionally use the <code>_with_telemetry</code> load variant (telemetry is <strong>not</strong> in XML v1, and must be known before the Runtime starts).</li>
-<li>Load with <code>Composition::from_xml_str</code> / <code>from_xml</code> / <code>from_xml_path</code> (or their <code>_with_telemetry</code> siblings) — this starts the Runtime and applies every binding immediately. There is no separate build step.</li>
+<li>Load with <code>Composition::from_xml_str</code> / <code>from_xml</code> / <code>from_xml_path</code> (or their <code>_with_telemetry</code> siblings) - this starts the Runtime and applies every binding immediately. There is no separate build step.</li>
 </ol>
 <h3 id="register-handlers-then-load">Register handlers, then load</h3>
-<p><code>handler="…"</code> is a <strong>connection-level</strong> <code>ProtocolHandler</code> factory (<code>Fn() -&gt; Box&lt;dyn ProtocolHandler&gt;</code>). For HTTP you typically register a <code>CleartextHttpEndpoint</code> / <code>AlpnHttpEndpoint</code> factory under a short name — not an application Stream handler name.</p>
+<p><code>handler="…"</code> is a <strong>connection-level</strong> <code>ProtocolHandler</code> factory (<code>Fn() -&gt; Box&lt;dyn ProtocolHandler&gt;</code>). For HTTP you typically register a <code>CleartextHttpEndpoint</code> / <code>AlpnHttpEndpoint</code> factory under a short name - not an application Stream handler name.</p>
 <div class="sourceCode" id="cb6"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
 <span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>Composition<span class="op">,</span> CompositionRegistry<span class="op">,</span> ProtocolHandler<span class="op">};</span></span>
 <span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a></span>
@@ -289,14 +289,14 @@ CompositionRegistry ───────┘  (handler=&quot;echo&quot; → fact
 <td><code>addr</code></td>
 <td>socket address (<code>host:port</code>)</td>
 <td style="text-align: center;">yes</td>
-<td>—</td>
+<td>-</td>
 <td>bind / peer</td>
 </tr>
 <tr>
 <td><code>handler</code></td>
 <td>registry name</td>
 <td style="text-align: center;">yes</td>
-<td>—</td>
+<td>-</td>
 <td><code>HandlerFactory</code></td>
 </tr>
 <tr>
@@ -329,7 +329,7 @@ CompositionRegistry ───────┘  (handler=&quot;echo&quot; → fact
 </tr>
 </tbody>
 </table>
-<p><code>addr</code> must parse as a <code>SocketAddr</code> (e.g. <code>127.0.0.1:8080</code>, <code>[::1]:8080</code>). Hostnames are <strong>not</strong> resolved here — use numeric addresses (or dial-by-name APIs outside this XML schema).</p>
+<p><code>addr</code> must parse as a <code>SocketAddr</code> (e.g. <code>127.0.0.1:8080</code>, <code>[::1]:8080</code>). Hostnames are <strong>not</strong> resolved here - use numeric addresses (or dial-by-name APIs outside this XML schema).</p>
 <h3 id="listen-only-children">Listen-only children</h3>
 <table>
 <colgroup>
@@ -380,7 +380,7 @@ CompositionRegistry ───────┘  (handler=&quot;echo&quot; → fact
 <tbody>
 <tr>
 <td>TLS / <code>secure</code> / cert paths</td>
-<td><strong>Rejected</strong> if present — wire TLS inside the registered factory or use <code>TcpListenerConfig::with_tls</code> in Rust</td>
+<td><strong>Rejected</strong> if present - wire TLS inside the registered factory or use <code>TcpListenerConfig::with_tls</code> in Rust</td>
 </tr>
 <tr>
 <td>Telemetry</td>
@@ -388,7 +388,7 @@ CompositionRegistry ───────┘  (handler=&quot;echo&quot; → fact
 </tr>
 <tr>
 <td>QUIC / HTTP/3</td>
-<td>No XML elements — use <code>listen_h3</code> / <code>RuntimeQuicExt</code> in Rust</td>
+<td>No XML elements - use <code>listen_h3</code> / <code>RuntimeQuicExt</code> in Rust</td>
 </tr>
 <tr>
 <td>TrustPolicy / DNS</td>
@@ -452,9 +452,9 @@ CompositionRegistry ───────┘  (handler=&quot;echo&quot; → fact
 <p>Full attribute reference and binding lifecycle: <a href="composition.html">Composition</a>.</p>
 <h2 id="next-steps">Next steps</h2>
 <ul>
-<li><a href="architecture.html">Architecture</a> — TPC, mio, layering</li>
-<li><a href="services.html">Services</a> / <a href="clients.html">Clients</a> — protocol roles</li>
-<li><a href="runtime-options.html">Runtime options</a> — knobs behind the XML attributes</li>
+<li><a href="architecture.html">Architecture</a> - TPC, mio, layering</li>
+<li><a href="services.html">Services</a> / <a href="clients.html">Clients</a> - protocol roles</li>
+<li><a href="runtime-options.html">Runtime options</a> - knobs behind the XML attributes</li>
 <li>Protocol demos: <a href="webdav.html">WebDAV</a>, <a href="websocket.html">WebSocket</a>, <a href="grpc.html">gRPC</a>, <a href="ftp.html">FTP</a>, <a href="smtp.html">SMTP</a>, <a href="mqtt.html">MQTT</a>, <a href="amqp.html">AMQP</a>, <a href="quic-h3.html">QUIC / H3</a>, <a href="mailbox.html">Mailbox</a> (see Cookbook)</li>
 </ul>
 

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Clients — Hopf</title>
+  <title>Clients - Hopf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
@@ -102,7 +102,7 @@ TCP connect → optional TLS-from-dial
         │
         ▼
 ProtocolHandler::connected / receive / …</code></pre>
-<p>Listen and dial share <code>TcpConnParams</code> (buffer caps, idle, TLS). Affinity is chosen at dial time and held for the connection’s life — same as accept.</p>
+<p>Listen and dial share <code>TcpConnParams</code> (buffer caps, idle, TLS). Affinity is chosen at dial time and held for the connection’s life - same as accept.</p>
 <div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>ProtocolHandler<span class="op">,</span> Runtime<span class="op">,</span> TcpConnectorConfig<span class="op">};</span></span>
 <span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>rt<span class="op">.</span>connect(<span class="pp">TcpConnectorConfig::</span>new(addr<span class="op">,</span> <span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
@@ -142,7 +142,7 @@ ProtocolHandler::connected / receive / …</code></pre>
 <tr>
 <td><code>idle_timeout</code></td>
 <td><code>None</code></td>
-<td>Partially wired — see <a href="runtime-options.html">runtime-options.md</a></td>
+<td>Partially wired - see <a href="runtime-options.html">runtime-options.md</a></td>
 </tr>
 <tr>
 <td><code>secure</code> + <code>tls</code></td>
@@ -348,7 +348,7 @@ ProtocolHandler::connected / receive / …</code></pre>
 <li><a href="http/client.html">HTTP client</a></li>
 <li><a href="dns.html">DNS</a></li>
 <li><a href="quic-h3.html">QUIC / H3</a></li>
-<li><a href="composition.html">Composition</a> — <code>&lt;dial-tcp&gt;</code></li>
+<li><a href="composition.html">Composition</a> - <code>&lt;dial-tcp&gt;</code></li>
 </ul>
 
       <p class="footer">

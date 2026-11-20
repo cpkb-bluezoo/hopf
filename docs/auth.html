@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Auth — Hopf</title>
+  <title>Auth - Hopf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
@@ -129,7 +129,7 @@
 </tr>
 <tr>
 <td>XOAUTH2</td>
-<td>Google's pre-standard bearer mechanism (<a href="https://developers.google.com/gmail/imap/xoauth2-protocol">XOAUTH2</a>) — what Gmail and Microsoft 365 advertise on IMAP, POP3 and SMTP submission; the client answers an error challenge with the empty response the mechanism requires</td>
+<td>Google's pre-standard bearer mechanism (<a href="https://developers.google.com/gmail/imap/xoauth2-protocol">XOAUTH2</a>) - what Gmail and Microsoft 365 advertise on IMAP, POP3 and SMTP submission; the client answers an error challenge with the empty response the mechanism requires</td>
 </tr>
 <tr>
 <td>EXTERNAL</td>
@@ -218,7 +218,7 @@
 </tr>
 <tr>
 <td><code>PamCredentialStore</code> (feature <code>pam</code>)</td>
-<td>System PAM password check (PLAIN/LOGIN); Unix; blocking — off-reactor only</td>
+<td>System PAM password check (PLAIN/LOGIN); Unix; blocking - off-reactor only</td>
 </tr>
 <tr>
 <td><code>ScramCredentials</code></td>
@@ -300,17 +300,17 @@
 <span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="co">// Alternate challenge/response via server.step / client.evaluate</span></span></code></pre></div>
 <p>Symmetric client + server exchanges for all <strong>seven</strong> mechanisms (including SCRAM-SHA-256-PLUS). <code>requires_tls</code> guides operators (e.g. PLAIN should be under TLS).</p>
 <h3 id="scram-channel-binding">SCRAM channel binding</h3>
-<p><code>ScramSha256Client::new_plus(username, password, channel_binding)</code> / <code>ScramSha256Server::with_channel_binding(channel_binding)</code> add real <code>tls-server-end-point</code> (RFC 5929 section 4) channel binding: the caller supplies this connection's channel-binding bytes (a hash of the server's TLS certificate — <code>hopf-auth</code> has no TLS awareness of its own, the same pattern <code>ExternalServer::with_peer_certificate</code> already uses). The server independently recomputes the expected <code>c=</code> value from the GS2 header the client actually sent plus its own channel-binding data and rejects a mismatch — the property that defeats a MITM relaying the SASL exchange across two different TLS connections. Not implemented: cross-mechanism downgrade detection (noticing a MITM stripped PLUS from the advertised mechanism list) — that needs the session/capability-advertisement layer, not this mechanism module.</p>
+<p><code>ScramSha256Client::new_plus(username, password, channel_binding)</code> / <code>ScramSha256Server::with_channel_binding(channel_binding)</code> add real <code>tls-server-end-point</code> (RFC 5929 section 4) channel binding: the caller supplies this connection's channel-binding bytes (a hash of the server's TLS certificate - <code>hopf-auth</code> has no TLS awareness of its own, the same pattern <code>ExternalServer::with_peer_certificate</code> already uses). The server independently recomputes the expected <code>c=</code> value from the GS2 header the client actually sent plus its own channel-binding data and rejects a mismatch - the property that defeats a MITM relaying the SASL exchange across two different TLS connections. Not implemented: cross-mechanism downgrade detection (noticing a MITM stripped PLUS from the advertised mechanism list) - that needs the session/capability-advertisement layer, not this mechanism module.</p>
 <h2 id="http-digest-helpers">HTTP Digest helpers</h2>
-<p>Module <code>http_digest</code>: <code>DigestAlgorithm</code> (SHA-256 and MD5), <code>challenge_header</code>, <code>new_nonce</code>, <code>verify_authorization</code>, <code>client_authorization</code>, <code>parse_challenge</code> / <code>preferred_challenge</code> (client side: pick the SHA-256 challenge when several are offered). SHA-256 is the default: <code>DigestAuthFactory</code> challenges for SHA-256 alone and accepts only it, unless <code>DigestAuthConfig::with_md5(true)</code> also offers MD5 (a second challenge, with its own nonce, which answers only MD5 - a SHA-256 nonce cannot be traded down). Credentials with an absent or unknown <code>algorithm</code>, or a <code>-sess</code> one, are refused when not on offer; SHA-256 requires <code>qop=auth</code>. <code>verify_authorization</code> takes an <code>expected_nonce: Option&lt;&amp;str&gt;</code> — real replay protection requires the caller to track issued nonces and pass the specific one being redeemed (single-use, with expiry), which <code>hopf-http</code>'s <code>DigestAuthFactory</code>/<code>DigestAuthHandler</code> now does: each challenge nonce is tracked in a map, consumed (removed) on first use, and pruned after <code>DigestAuthConfig::nonce_ttl</code> (default 5 minutes, overridable via <code>with_nonce_ttl</code>) if never used — so a captured, cryptographically-valid <code>Authorization: Digest</code> header can't be replayed, even verbatim.</p>
-<p>HTTP <strong>Basic / Digest / Bearer</strong> request wrappers are in <code>hopf-http</code> (<code>BasicAuthFactory</code>, <code>DigestAuthFactory</code>, <code>BearerAuthFactory</code>) and call into trust / digest helpers — see <a href="http/server.html">HTTP server</a>.</p>
+<p>Module <code>http_digest</code>: <code>DigestAlgorithm</code> (SHA-256 and MD5), <code>challenge_header</code>, <code>new_nonce</code>, <code>verify_authorization</code>, <code>client_authorization</code>, <code>parse_challenge</code> / <code>preferred_challenge</code> (client side: pick the SHA-256 challenge when several are offered). SHA-256 is the default: <code>DigestAuthFactory</code> challenges for SHA-256 alone and accepts only it, unless <code>DigestAuthConfig::with_md5(true)</code> also offers MD5 (a second challenge, with its own nonce, which answers only MD5 - a SHA-256 nonce cannot be traded down). Credentials with an absent or unknown <code>algorithm</code>, or a <code>-sess</code> one, are refused when not on offer; SHA-256 requires <code>qop=auth</code>. <code>verify_authorization</code> takes an <code>expected_nonce: Option&lt;&amp;str&gt;</code> - real replay protection requires the caller to track issued nonces and pass the specific one being redeemed (single-use, with expiry), which <code>hopf-http</code>'s <code>DigestAuthFactory</code>/<code>DigestAuthHandler</code> now does: each challenge nonce is tracked in a map, consumed (removed) on first use, and pruned after <code>DigestAuthConfig::nonce_ttl</code> (default 5 minutes, overridable via <code>with_nonce_ttl</code>) if never used - so a captured, cryptographically-valid <code>Authorization: Digest</code> header can't be replayed, even verbatim.</p>
+<p>HTTP <strong>Basic / Digest / Bearer</strong> request wrappers are in <code>hopf-http</code> (<code>BasicAuthFactory</code>, <code>DigestAuthFactory</code>, <code>BearerAuthFactory</code>) and call into trust / digest helpers - see <a href="http/server.html">HTTP server</a>.</p>
 <h2 id="oauth-introspection">OAuth 2.0 token introspection</h2>
 <p>Module <code>oauth_introspection</code> implements RFC 7662 for real, replacing the local static token map <code>PasswordStore::validate_bearer</code> uses by default:</p>
 <ul>
-<li><code>IntrospectionRequest::to_form_body()</code> — the <code>application/x-www-form-urlencoded</code> <code>token</code> + <code>token_type_hint</code> body per section 2.1.</li>
-<li><code>IntrospectionResponse::parse(json)</code> — reads <code>active</code> / <code>username</code> / <code>scope</code> / <code>exp</code> from a section 2.2 response via a small purpose-built JSON reader (no JSON crate dependency); unknown/nested fields (<code>aud</code>, <code>iss</code>, <code>client_id</code>, ...) are structurally skipped, not rejected.</li>
+<li><code>IntrospectionRequest::to_form_body()</code> - the <code>application/x-www-form-urlencoded</code> <code>token</code> + <code>token_type_hint</code> body per section 2.1.</li>
+<li><code>IntrospectionResponse::parse(json)</code> - reads <code>active</code> / <code>username</code> / <code>scope</code> / <code>exp</code> from a section 2.2 response via a small purpose-built JSON reader (no JSON crate dependency); unknown/nested fields (<code>aud</code>, <code>iss</code>, <code>client_id</code>, ...) are structurally skipped, not rejected.</li>
 <li><code>IntrospectionTransport</code> - the caller supplies the actual HTTP POST (<code>hopf-auth</code> has no network I/O of its own; <code>hopf-http</code>, which does, already depends on <code>hopf-auth</code>, so the dependency can't run the other way). <code>introspect(form_body, cb)</code> is callback-based, so it can be wired to <code>hopf-http</code>'s non-blocking client; it must not re-enter the storage pool its caller may be running on.</li>
-<li><code>IntrospectionCredentialStore::new(inner, transport)</code> — a <code>CredentialStore</code> that delegates every method to <code>inner</code> except <code>validate_bearer</code>, which calls the introspection endpoint and requires <code>active: true</code> (plus a local <code>exp</code> check as defence in depth against a stale cached response, even though the RFC doesn't require it).</li>
+<li><code>IntrospectionCredentialStore::new(inner, transport)</code> - a <code>CredentialStore</code> that delegates every method to <code>inner</code> except <code>validate_bearer</code>, which calls the introspection endpoint and requires <code>active: true</code> (plus a local <code>exp</code> check as defence in depth against a stale cached response, even though the RFC doesn't require it).</li>
 </ul>
 <h2 id="configuration">Configuration</h2>
 <h3 id="saslserveroptions"><code>SaslServerOptions</code></h3>
@@ -378,7 +378,7 @@
 </code></pre></div>
 <ul>
 <li>Mechanisms: PLAIN, LOGIN only (no digest/SCRAM/bearer).</li>
-<li><code>password_match</code> is blocking — call from a storage/worker pool, never a reactor thread.</li>
+<li><code>password_match</code> is blocking - call from a storage/worker pool, never a reactor thread.</li>
 <li>Default service name: <code>login</code> (<code>DEFAULT_PAM_SERVICE</code>). Point at a custom PAM stack (e.g. <code>/etc/pam.d/hopf</code>) when deploying.</li>
 </ul>
 <h2 id="wiring">Wiring</h2>
@@ -394,9 +394,9 @@
 <h2 id="examples">Examples</h2>
 <p>No dedicated <code>examples/auth</code> crate. Consumed by:</p>
 <ul>
-<li><a href="cookbook/ftp.html">Cookbook: FTP</a> — <code>FTP_USER</code> / <code>FTP_PASS</code></li>
+<li><a href="cookbook/ftp.html">Cookbook: FTP</a> - <code>FTP_USER</code> / <code>FTP_PASS</code></li>
 <li><a href="cookbook/smtp.html">Cookbook: SMTP</a></li>
-<li><code>examples/smtp-ldap</code> — <a href="ldap.html"><code>LdapCredentialStore</code></a> + <code>SmtpConfig::with_store</code></li>
+<li><code>examples/smtp-ldap</code> - <a href="ldap.html"><code>LdapCredentialStore</code></a> + <code>SmtpConfig::with_store</code></li>
 <li>HTTP hello examples with auth factories when configured</li>
 </ul>
 <h2 id="limitations">Limitations</h2>
@@ -405,7 +405,7 @@
 <li>DIGEST-MD5, CRAM-MD5 and POP3 APOP are gone: they rest on MD5 (DIGEST-MD5 is also historic, RFC 6331).</li>
 <li>OAUTHBEARER and XOAUTH2 carry the token in the client “password” slot.</li>
 <li><code>PasswordStore</code> is <strong>in-memory</strong> (demo-grade): enrolls from a password then keeps SCRAM (+ optional Digest HA1) only. For production password AUTH, use <a href="ldap.html"><code>LdapCredentialStore</code></a> or feature <code>pam</code>’s <code>PamCredentialStore</code>.</li>
-<li>SCRAM-SHA-256-PLUS has no cross-mechanism downgrade detection — see the <a href="#scram-channel-binding">channel binding</a> section.</li>
+<li>SCRAM-SHA-256-PLUS has no cross-mechanism downgrade detection - see the <a href="#scram-channel-binding">channel binding</a> section.</li>
 <li>No protocol crate in this workspace wires real <code>tls-server-end-point</code> channel-binding data through to <code>create_server</code> yet, which is why <code>ScramSha256Plus</code> is excluded from <code>SaslMechanism::all()</code> (and so isn't advertised by any store's default <code>supported_mechanisms()</code>) even though the mechanism itself is fully implemented and tested.</li>
 <li><code>IntrospectionCredentialStore</code> (RFC 7662) needs a caller-supplied <code>IntrospectionTransport</code> for the actual HTTP call; <code>hopf-auth</code> has no network I/O of its own, so nothing in this workspace wires one up by default; <code>PasswordStore::validate_bearer</code> (the default) is still a local static token map.</li>
 </ul>

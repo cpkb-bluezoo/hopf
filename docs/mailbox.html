@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Mailbox — Hopf</title>
+  <title>Mailbox - Hopf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
@@ -79,7 +79,7 @@
         <h1>Mailbox</h1>
         <p class="lead">Crate <code>hopf-mailbox</code>: <strong>mailbox storage SPI</strong>: Maildir++ and mbox backends with SEARCH, flags, and optional <code>.gidx</code> indexing. This is <strong>not</strong> an IMAP wire server; <a href="imap.html"><code>hopf-imap</code></a> sits on top of these traits.</p>
       </header>
-      <p>SMTP local delivery is wired stock via <a href="smtp.html#local-delivery"><code>LocalDeliveryService</code></a>, which APPENDs each accepted message to the recipient's <code>INBOX</code> through this crate's <code>MailboxFactory</code> on the Runtime storage pool. POP3 and IMAP (<code>hopf-pop3</code>, <code>hopf-imap</code>) read from and write to mailboxes the same way, so all three protocols can share one backend in a single composed process — see <a href="composition.html">Composition</a>.</p>
+      <p>SMTP local delivery is wired stock via <a href="smtp.html#local-delivery"><code>LocalDeliveryService</code></a>, which APPENDs each accepted message to the recipient's <code>INBOX</code> through this crate's <code>MailboxFactory</code> on the Runtime storage pool. POP3 and IMAP (<code>hopf-pop3</code>, <code>hopf-imap</code>) read from and write to mailboxes the same way, so all three protocols can share one backend in a single composed process - see <a href="composition.html">Composition</a>.</p>
 <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
 <li><a href="#standards-and-layouts">Standards and layouts</a></li>
@@ -192,7 +192,7 @@ MailboxFactory → MailboxStore → Mailbox
 </tr>
 </tbody>
 </table>
-<p>Both backends track a real, persisted, monotonic CONDSTORE mod-sequence per message (bumped on append and on any flag/keyword change, never decreasing even across expunge) — QRESYNC's VANISHED (EARLIER) history is the one CONDSTORE-adjacent piece still out of scope (see Limitations).</p>
+<p>Both backends track a real, persisted, monotonic CONDSTORE mod-sequence per message (bumped on append and on any flag/keyword change, never decreasing even across expunge) - QRESYNC's VANISHED (EARLIER) history is the one CONDSTORE-adjacent piece still out of scope (see Limitations).</p>
 <p>Factories:</p>
 <ul>
 <li><code>MboxFactory::new(root).with_index_config(cfg)</code> → path <code>{root}/{user}</code></li>
@@ -306,7 +306,7 @@ append<span class="op">.</span>append_content(rfc822_bytes)<span class="op">?;</
 <span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> hits <span class="op">=</span> mb<span class="op">.</span>search(<span class="op">&amp;</span><span class="pp">SearchCriteria::</span>text(<span class="st">&quot;needle&quot;</span>))<span class="op">?;</span></span>
 <span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>mb<span class="op">.</span>close(<span class="cn">true</span>)<span class="op">?;</span> <span class="co">// expunge when true</span></span></code></pre></div>
 <p>Operations (trait surface): <code>close(expunge)</code>, counts/size, <code>messages</code>, <code>read_message</code>, UID / uidvalidity / uidnext, flags / keywords, set/replace flags, streaming append (<code>start_append</code> / <code>append_content</code> / <code>end_append</code> / <code>abort_append</code>, or <code>AppendGuard</code>), <code>search</code>, <code>with_message_context</code> (SORT/THREAD keys), <code>refresh</code>, <code>copy_messages</code> / <code>move_messages</code> (Maildir). Maildir's <code>refresh</code> picks up other writers' changes without discarding the session's own pending flag changes.</p>
-<p><strong>Streaming reads:</strong> <code>read_message</code> is a default method built on a lower-level <code>start_read</code> / <code>read_chunk</code> / <code>end_read</code> triad — callers that don't want a whole message pulled into memory (POP3 RETR/TOP, IMAP FETCH) can drive the triad directly and process fixed-size chunks as they arrive. <code>append_content</code> is likewise chunk-fed rather than taking one whole buffer, so SMTP delivery and IMAP APPEND can stream message bytes straight through to storage. Maildir implements both ends as true streaming (bounded memory regardless of message size); mbox's <code>start_read</code> materializes the one requested message (not the whole mailbox) because its <code>&gt;From</code>-line unescaping is stateful and unsafe to chunk naively — see <a href="#limitations">Limitations</a>.</p>
+<p><strong>Streaming reads:</strong> <code>read_message</code> is a default method built on a lower-level <code>start_read</code> / <code>read_chunk</code> / <code>end_read</code> triad - callers that don't want a whole message pulled into memory (POP3 RETR/TOP, IMAP FETCH) can drive the triad directly and process fixed-size chunks as they arrive. <code>append_content</code> is likewise chunk-fed rather than taking one whole buffer, so SMTP delivery and IMAP APPEND can stream message bytes straight through to storage. Maildir implements both ends as true streaming (bounded memory regardless of message size); mbox's <code>start_read</code> materializes the one requested message (not the whole mailbox) because its <code>&gt;From</code>-line unescaping is stateful and unsafe to chunk naively - see <a href="#limitations">Limitations</a>.</p>
 <h2 id="search">SEARCH</h2>
 <p>Criteria include: ALL, system flags, NEW/OLD, KEYWORD, LARGER/SMALLER, BEFORE/ON/SINCE, SENT*, HEADER, BODY, TEXT, UID / sequence sets, MODSEQ, AND / OR / NOT.</p>
 <p><strong>BODY / TEXT:</strong> use the <code>.gidx</code> body index when <code>body_indexing</code> is enabled; otherwise parse message content on demand.</p>
@@ -352,10 +352,10 @@ append<span class="op">.</span>append_content(rfc822_bytes)<span class="op">?;</
 <h2 id="limitations">Limitations</h2>
 <ul>
 <li><strong>Not an IMAP server</strong>: storage SPI only; <a href="imap.html"><code>hopf-imap</code></a> provides the wire server (use <a href="smtp.html#local-delivery"><code>LocalDeliveryService</code></a> for SMTP → INBOX).</li>
-<li>mbox: no hierarchy / COPY / MOVE. <code>start_read</code> streams in fixed-size chunks but still materializes the one target message up front (not the whole mailbox) — safe re-chunking of the stateful <code>&gt;From</code>-line unescaping across arbitrary chunk boundaries isn't implemented; <code>open()</code>'s full-mailbox scan and append internals are unchanged.</li>
+<li>mbox: no hierarchy / COPY / MOVE. <code>start_read</code> streams in fixed-size chunks but still materializes the one target message up front (not the whole mailbox) - safe re-chunking of the stateful <code>&gt;From</code>-line unescaping across arbitrary chunk boundaries isn't implemented; <code>open()</code>'s full-mailbox scan and append internals are unchanged.</li>
 <li>Body indexing off by default.</li>
 <li>Must keep search/index off the reactor (use <code>StorageExecutor</code>).</li>
-<li><code>Mailbox::expunged_since</code> (QRESYNC VANISHED (EARLIER) history) always returns empty — CONDSTORE's HIGHESTMODSEQ/MODSEQ/CHANGEDSINCE are backed by real per-message tracking, but no backend keeps a tombstone log of past expunges, so a QRESYNC client always falls back to a full resync rather than an incremental one after messages were expunged elsewhere.</li>
+<li><code>Mailbox::expunged_since</code> (QRESYNC VANISHED (EARLIER) history) always returns empty - CONDSTORE's HIGHESTMODSEQ/MODSEQ/CHANGEDSINCE are backed by real per-message tracking, but no backend keeps a tombstone log of past expunges, so a QRESYNC client always falls back to a full resync rather than an incremental one after messages were expunged elsewhere.</li>
 </ul>
 
       <p class="footer">

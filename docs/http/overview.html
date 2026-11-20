@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>HTTP overview — Hopf</title>
+  <title>HTTP overview - Hopf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
@@ -131,7 +131,7 @@
 </tr>
 <tr>
 <td>RFC 8441</td>
-<td>Extended CONNECT (H2) — WebSocket / upgrade</td>
+<td>Extended CONNECT (H2) - WebSocket / upgrade</td>
 </tr>
 <tr>
 <td>RFC 9220</td>
@@ -415,7 +415,7 @@
 <span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    factory<span class="op">,</span></span>
 <span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="pp">HttpLimits::</span><span class="kw">default</span>()<span class="op">,</span></span>
 <span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span>
-<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="co">// QuicDriverHandle owns the UDP driver thread — shut down or drop explicitly.</span></span></code></pre></div>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="co">// QuicDriverHandle owns the UDP driver thread - shut down or drop explicitly.</span></span></code></pre></div>
 <h2 id="upgrade-seams">Upgrade seams</h2>
 <p><code>ServerWriter::upgrade(headers, handler)</code> hands the connection (H1) or stream (H2/H3) to a <code>ProtocolUpgradeHandler</code> after a successful switch:</p>
 <table>
@@ -526,17 +526,17 @@
 <p>Smoke: <code>cargo test -p hopf-http --features h3 h3_get_hello</code>.</p>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li><strong>No HTTP/2 server push</strong> — <code>PUSH_PROMISE</code> is rejected (client: <code>RST_STREAM</code>; server: <code>GOAWAY</code>).</li>
+<li><strong>No HTTP/2 server push</strong> - <code>PUSH_PROMISE</code> is rejected (client: <code>RST_STREAM</code>; server: <code>GOAWAY</code>).</li>
 <li><strong>H2 PRIORITY frames</strong> (RFC 7540) are ignored; hopf uses RFC 9218 Extensible Prioritization (<code>Priority</code> header + <code>PRIORITY_UPDATE</code>) with urgency/incremental scheduling.</li>
 <li><strong>HTTP/1.1 trailers</strong> are accepted on the wire but not delivered, and outbound H1 trailers are dropped. H2/H3 trailers work as a second HEADERS frame (<code>ServerWriter::trailers</code> / <code>ClientHandler::response_trailers</code>); outbound request trailers (<code>ClientWriter::trailers</code>) are sent on HTTP/3 only.</li>
 <li>UDP / QUIC for H3 lives in <code>hopf-quic</code> and is feature-gated (<code>h3</code>).</li>
 </ul>
 <h2 id="see-also">See also</h2>
 <ul>
-<li><a href="server.html">HTTP server</a> — <code>ServerHandler</code>, writers, auth, deferred responses</li>
-<li><a href="client.html">HTTP client</a> — <code>ClientHandler</code>, dial patterns, <code>http-get</code></li>
-<li><a href="../quic-h3.html">QUIC / H3</a> — transport configs and PEM builders</li>
-<li><a href="../websocket.html">WebSocket</a> — upgrade consumer</li>
+<li><a href="server.html">HTTP server</a> - <code>ServerHandler</code>, writers, auth, deferred responses</li>
+<li><a href="client.html">HTTP client</a> - <code>ClientHandler</code>, dial patterns, <code>http-get</code></li>
+<li><a href="../quic-h3.html">QUIC / H3</a> - transport configs and PEM builders</li>
+<li><a href="../websocket.html">WebSocket</a> - upgrade consumer</li>
 <li><a href="../grpc.html">gRPC</a> - unary and streaming RPCs over Streams (needs trailers on H2/H3)</li>
 </ul>
 

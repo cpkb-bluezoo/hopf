@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Telemetry — Hopf</title>
+  <title>Telemetry - Hopf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
@@ -160,7 +160,7 @@ TelemetryHook enqueue    InstrumentedServerFactory
 <p><strong>Implementations must not perform I/O on accept or reactor threads.</strong></p>
 <p>Events: <code>TelemetryEvent</code> / <code>EventKind::{Accept,Dial,Close,Error}</code>.</p>
 <h2 id="http-instrumentation">HTTP instrumentation</h2>
-<p>Instrument at the <strong>Stream handler</strong> layer — not at TCP accept:</p>
+<p>Instrument at the <strong>Stream handler</strong> layer - not at TCP accept:</p>
 <table>
 <thead>
 <tr>
@@ -371,10 +371,10 @@ TelemetryHook enqueue    InstrumentedServerFactory
 </table>
 <p>HTTP writers may also expose <code>traceparent()</code> for response continuation (<a href="http/overview.html">HTTP overview</a>).</p>
 <h2 id="dns">DNS</h2>
-<p>DNS is deliberately <strong>not</strong> part of Hopf’s W3C Trace Context chaining. Unlike HTTP (and SMTP/FTP/POP3/IMAP/MQTT control paths), there is no IETF standard for carrying <code>traceparent</code> on DNS queries — PowerDNS’s experimental TRACEPARENT EDNS option is out of scope.</p>
+<p>DNS is deliberately <strong>not</strong> part of Hopf’s W3C Trace Context chaining. Unlike HTTP (and SMTP/FTP/POP3/IMAP/MQTT control paths), there is no IETF standard for carrying <code>traceparent</code> on DNS queries - PowerDNS’s experimental TRACEPARENT EDNS option is out of scope.</p>
 <p>What people usually do instead:</p>
 <ul>
-<li>Time a client lookup as a <strong>local child span</strong> under the application request (duration/error only — nothing propagates on the DNS wire).</li>
+<li>Time a client lookup as a <strong>local child span</strong> under the application request (duration/error only - nothing propagates on the DNS wire).</li>
 <li>Export <strong>resolver/server ops metrics</strong> (qps, NXDOMAIN, cache hits). Hopf does: <code>pipeline.dns_metrics()</code> and <code>pipeline.dns_upstream_metrics()</code> are OTLP/JSONL instrument sets for the server and the encrypted upstream client (below). <code>DnsService::metrics()</code> still returns the process-local snapshot counters.</li>
 <li>Still get Accept/Dial/Close via <code>TelemetryHook</code> when the runtime uses a pipeline.</li>
 </ul>
@@ -434,7 +434,7 @@ TelemetryHook enqueue    InstrumentedServerFactory
 <li>POP3 retrieve duration histograms and handler <code>traceparent</code>: <code>Pop3Service::with_telemetry</code> (see <a href="pop3.html#metrics">POP3 metrics</a>).</li>
 <li>IMAP command duration histograms and handler <code>traceparent</code>: <code>ImapService::with_telemetry</code> (see <a href="imap.html#metrics">IMAP metrics</a>).</li>
 <li>MQTT publish duration histograms and handler <code>traceparent</code>: <code>MqttService::with_telemetry</code> / <code>MqttWsFactory::with_telemetry</code> (see <a href="mqtt.html#metrics">MQTT metrics</a>).</li>
-<li>DNS is not instrumented for Trace Context propagation (no IETF standard; experimental EDNS TRACEPARENT out of scope). Client lookups may still be timed as local child spans; <code>DnsService::metrics()</code> stays process-local — see <a href="#dns">DNS</a> and <a href="dns.html#telemetry">DNS docs</a>.</li>
+<li>DNS is not instrumented for Trace Context propagation (no IETF standard; experimental EDNS TRACEPARENT out of scope). Client lookups may still be timed as local child spans; <code>DnsService::metrics()</code> stays process-local - see <a href="#dns">DNS</a> and <a href="dns.html#telemetry">DNS docs</a>.</li>
 <li>Bounded queue <strong>drops</strong> on overflow.</li>
 <li><code>flush()</code> blocks until the worker has drained what was queued, up to <code>flush_timeout</code>.</li>
 <li>OTLP is <strong>HTTP/protobuf only</strong> (no gRPC OTLP exporter).</li>

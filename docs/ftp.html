@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>FTP — Hopf</title>
+  <title>FTP - Hopf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
@@ -143,9 +143,9 @@
                     └── PORT/EPRT → outbound data connect (bounce guard)</code></pre>
 <ul>
 <li><strong>Control connection</strong> - one <code>FtpControlHandler</code> per accept; commands are lexed incrementally by <code>FtpServerLexer</code>, a push parser over the connection's inbound ring buffer (<code>hopf_core::LoopBuf</code>) that reads arguments as they arrive. Commands received while a transfer is being set up are held and answered in order; a client that sends too many without waiting for replies is closed with <code>421</code>.</li>
-<li><strong>Data connection</strong> — active (<code>PORT</code>/<code>EPRT</code>) or passive (<code>PASV</code>/<code>EPSV</code>). Passive binds allocate a short-lived listener on the same <code>Runtime</code>.</li>
-<li><strong>Filesystem</strong> — stock path is chrooted <code>BasicFtpFileSystem</code>; apps can supply any <code>FtpFileSystem</code>. Blocking FS work should stay off the reactor (storage pool).</li>
-<li><strong>TLS</strong> — cleartext, explicit <code>AUTH TLS</code>, or implicit FTPS (<code>secure</code> from first byte). Optional <code>PROT P</code> for data channels.</li>
+<li><strong>Data connection</strong> - active (<code>PORT</code>/<code>EPRT</code>) or passive (<code>PASV</code>/<code>EPSV</code>). Passive binds allocate a short-lived listener on the same <code>Runtime</code>.</li>
+<li><strong>Filesystem</strong> - stock path is chrooted <code>BasicFtpFileSystem</code>; apps can supply any <code>FtpFileSystem</code>. Blocking FS work should stay off the reactor (storage pool).</li>
+<li><strong>TLS</strong> - cleartext, explicit <code>AUTH TLS</code>, or implicit FTPS (<code>secure</code> from first byte). Optional <code>PROT P</code> for data channels.</li>
 </ul>
 <h2 id="supported-commands">Supported commands</h2>
 <h3 id="access-control">Access control</h3>
@@ -200,8 +200,8 @@
 <p><strong>Rejected / not implemented:</strong> CCC, SMNT (appropriate error replies).</p>
 <h3 id="data-connection-modes">Data connection modes</h3>
 <ul>
-<li><strong>Active (PORT / EPRT)</strong> — server connects to the client-specified address. Bounce protection rejects PORT targets that are not the control peer unless <code>allow_active_bounce</code> is set.</li>
-<li><strong>Passive (PASV / EPSV)</strong> — client connects to a server-advertised address. Prefer EPSV for IPv6 and NAT. Optional <code>pasv_advertised</code> IP and <code>pasv_port_min</code> / <code>pasv_port_max</code> for firewall/NAT deployments.</li>
+<li><strong>Active (PORT / EPRT)</strong> - server connects to the client-specified address. Bounce protection rejects PORT targets that are not the control peer unless <code>allow_active_bounce</code> is set.</li>
+<li><strong>Passive (PASV / EPSV)</strong> - client connects to a server-advertised address. Prefer EPSV for IPv6 and NAT. Optional <code>pasv_advertised</code> IP and <code>pasv_port_min</code> / <code>pasv_port_max</code> for firewall/NAT deployments.</li>
 </ul>
 <h2 id="feat-advertisement">FEAT advertisement</h2>
 <p>When FEAT is issued, the server advertises (among others):</p>
@@ -223,7 +223,7 @@ S: 234 AUTH TLS successful
 [TLS handshake]
 C: USER alice
 …</code></pre>
-<p>Configure with <code>FtpConfig::with_tls(acceptor)</code> (explicit) — the control listener uses <code>with_starttls_acceptor</code> so the first bytes remain cleartext until AUTH TLS.</p>
+<p>Configure with <code>FtpConfig::with_tls(acceptor)</code> (explicit) - the control listener uses <code>with_starttls_acceptor</code> so the first bytes remain cleartext until AUTH TLS.</p>
 <h3 id="implicit-ftps">Implicit FTPS</h3>
 <p><code>FtpConfig::implicit_ftps()</code> (or <code>implicit_tls = true</code>) expects TLS from connection establishment. Wire the listener with <code>with_tls</code> (TLS-from-accept). Conventionally listen on port 990 when not overridden.</p>
 <h3 id="data-protection">Data protection</h3>
@@ -232,12 +232,12 @@ S: 200 PBSZ=0
 C: PROT P
 S: 200 Protection level set to P</code></pre>
 <ul>
-<li><code>PROT P</code> — encrypt data connections. Passive-mode (PASV/EPSV) connections use the same TLS acceptor as the control channel (<code>FtpConfig::with_tls</code>); active-mode (PORT/EPRT) connections need a separate client-role connector, since there the server dials out — set one with <code>FtpConfig::with_data_tls_connector(connector, server_name)</code>. Without a connector configured, <code>PROT P</code> transfers only work in passive mode; an active-mode transfer attempted under <code>PROT P</code> with no connector configured is refused (<code>425</code>) rather than silently falling back to cleartext.</li>
-<li><code>PROT C</code> — clear data.</li>
-<li><code>require_tls_for_data</code> / <code>require_data_tls()</code> — reject (<code>522</code>) a PASV/EPSV/PORT/EPRT attempt made without <code>PROT P</code> already in effect, rather than silently upgrading the connection.</li>
+<li><code>PROT P</code> - encrypt data connections. Passive-mode (PASV/EPSV) connections use the same TLS acceptor as the control channel (<code>FtpConfig::with_tls</code>); active-mode (PORT/EPRT) connections need a separate client-role connector, since there the server dials out - set one with <code>FtpConfig::with_data_tls_connector(connector, server_name)</code>. Without a connector configured, <code>PROT P</code> transfers only work in passive mode; an active-mode transfer attempted under <code>PROT P</code> with no connector configured is refused (<code>425</code>) rather than silently falling back to cleartext.</li>
+<li><code>PROT C</code> - clear data.</li>
+<li><code>require_tls_for_data</code> / <code>require_data_tls()</code> - reject (<code>522</code>) a PASV/EPSV/PORT/EPRT attempt made without <code>PROT P</code> already in effect, rather than silently upgrading the connection.</li>
 </ul>
 <h3 id="same-ip-data-check">Same-IP data check</h3>
-<p>Incoming PASV/EPSV data connections are checked against the control connection's remote address as they connect — a peer other than the control connection's own IP is refused outright, regardless of transfer mode or TLS. Active PORT/EPRT bounce to a non-peer address is rejected at the PORT/EPRT command itself unless <code>allow_active_bounce</code> is enabled.</p>
+<p>Incoming PASV/EPSV data connections are checked against the control connection's remote address as they connect - a peer other than the control connection's own IP is refused outright, regardless of transfer mode or TLS. Active PORT/EPRT bounce to a non-peer address is rejected at the PORT/EPRT command itself unless <code>allow_active_bounce</code> is enabled.</p>
 <h2 id="authentication">Authentication</h2>
 <p>Stock <code>FilesystemFtpHandler</code> evaluates <code>TrustPolicy</code> with <code>IdentityMaterial::UsernamePassword</code> after USER/PASS.</p>
 <div class="sourceCode" id="cb5"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
@@ -378,7 +378,7 @@ S: 200 Protection level set to P</code></pre>
 <td><code>data_tls_connector</code></td>
 <td><code>Option&lt;SharedTlsConnector&gt;</code></td>
 <td><code>None</code></td>
-<td>Protects active-mode (PORT/EPRT) <code>PROT P</code> data connections — the server dials out, so it needs a connector, not an acceptor</td>
+<td>Protects active-mode (PORT/EPRT) <code>PROT P</code> data connections - the server dials out, so it needs a connector, not an acceptor</td>
 </tr>
 <tr>
 <td><code>data_tls_server_name</code></td>
@@ -632,7 +632,7 @@ S: 200 Protection level set to P</code></pre>
 <h2 id="metrics">Metrics</h2>
 <p>Process-local <code>FtpServerMetrics</code> (in <code>hopf-ftp</code>): connections, <code>auth_ok</code> / <code>auth_fail</code>, commands, <code>bytes_in</code> / <code>bytes_out</code>, and <code>pasv_binds</code> via <code>FtpService::metrics()</code>.</p>
 <p>OTLP/JSONL export (when <code>FtpService::with_telemetry(&amp;pipeline)</code> is used): <code>hopf_otel::FtpServerMetrics</code> emits <code>ftp.server.connections</code>, <code>ftp.server.active_connections</code>, <code>ftp.server.auth</code>, <code>ftp.server.commands</code>, <code>ftp.server.pasv_binds</code>, <code>ftp.server.transfers</code> (direction/outcome), <code>ftp.server.transfer.duration</code> (ms), and <code>ftp.server.transfer.size</code>.</p>
-<p>With traces enabled on the pipeline, <code>FtpConnectionMetadata::traceparent</code> carries the active W3C <code>traceparent</code> for the connection or current data transfer (RETR/STOR/LIST/MLSD). Handler SPI implementers can pass it to outbound HTTP with <code>hopf_otel::with_traceparent</code>. Connection duration is not duplicated on metadata — use telemetry Accept→Close timestamps.</p>
+<p>With traces enabled on the pipeline, <code>FtpConnectionMetadata::traceparent</code> carries the active W3C <code>traceparent</code> for the connection or current data transfer (RETR/STOR/LIST/MLSD). Handler SPI implementers can pass it to outbound HTTP with <code>hopf_otel::with_traceparent</code>. Connection duration is not duplicated on metadata - use telemetry Accept→Close timestamps.</p>
 <h2 id="examples">Examples</h2>
 <p>See <a href="cookbook/ftp.html">Cookbook: FTP</a>.</p>
 <div class="sourceCode" id="cb8"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Cleartext stock server (user/pass ftp/ftp)</span></span>
@@ -668,10 +668,10 @@ S: 200 Protection level set to P</code></pre>
 </table>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li>CCC and SMNT are not implemented (rejected); SITE is dispatched to the application (<code>FtpConnectionHandler::handle_site_command</code>, <code>502</code> by default — no subcommands are built in).</li>
+<li>CCC and SMNT are not implemented (rejected); SITE is dispatched to the application (<code>FtpConnectionHandler::handle_site_command</code>, <code>502</code> by default - no subcommands are built in).</li>
 <li>Stock examples are cleartext; FTPS is available via the API (see <a href="tls.html">TLS</a>) but not wired in the demo binaries.</li>
-<li>The quota gate can only check "is the user already over quota" before a STOR/APPE/STOU, not "would this specific upload push them over" — <code>ALLO</code> reaches <code>FtpFileSystem::allocate_space</code> (so a backend can reject an unreasonable declared size there), but that call isn't automatically wired into the STOR/APPE/STOU quota check that follows it; a backend wanting precise pre-emption would need to correlate the two itself. See <a href="quota.html">Quota</a>.</li>
-<li>Client completion is callback-driven — callers wait on their own signalling (see <code>examples/ftp-get</code>).</li>
+<li>The quota gate can only check "is the user already over quota" before a STOR/APPE/STOU, not "would this specific upload push them over" - <code>ALLO</code> reaches <code>FtpFileSystem::allocate_space</code> (so a backend can reject an unreasonable declared size there), but that call isn't automatically wired into the STOR/APPE/STOU quota check that follows it; a backend wanting precise pre-emption would need to correlate the two itself. See <a href="quota.html">Quota</a>.</li>
+<li>Client completion is callback-driven - callers wait on their own signalling (see <code>examples/ftp-get</code>).</li>
 </ul>
 
       <p class="footer">

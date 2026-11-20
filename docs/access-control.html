@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Access control — Hopf</title>
+  <title>Access control - Hopf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
@@ -77,7 +77,7 @@
     <main class="main">
       <header>
         <h1>Access control</h1>
-        <p class="lead">Peer <strong>ACL</strong>, <strong>accept rate limits</strong>, and <strong>quota</strong> trackers in <code>hopf-core</code>. These sit on <code>TcpListenerConfig</code> (and related accept paths) so unwanted peers never reach <code>ProtocolHandler::connected</code>. Authentication (identity) is separate — see <a href="auth.html">Auth</a>.</p>
+        <p class="lead">Peer <strong>ACL</strong>, <strong>accept rate limits</strong>, and <strong>quota</strong> trackers in <code>hopf-core</code>. These sit on <code>TcpListenerConfig</code> (and related accept paths) so unwanted peers never reach <code>ProtocolHandler::connected</code>. Authentication (identity) is separate - see <a href="auth.html">Auth</a>.</p>
       </header>
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
@@ -332,14 +332,14 @@
 <span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_rate_limit(<span class="pp">AcceptRateLimit::</span>new(<span class="dv">50</span><span class="op">,</span> <span class="pp">Duration::</span>from_secs(<span class="dv">1</span>)<span class="op">,</span> <span class="dv">500</span>))<span class="op">;</span></span>
 <span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>rt<span class="op">.</span>add_tcp_listener(listener)<span class="op">?;</span></span></code></pre></div>
-<p>FTP/SMTP services build a <code>TcpListenerConfig</code> internally — prefer their config builders where available, or obtain <code>control_listener</code> and layer ACL before <code>Runtime::add_tcp_listener</code> when the service exposes that path (<a href="ftp.html">FTP</a>, <a href="smtp.html">SMTP</a>).</p>
+<p>FTP/SMTP services build a <code>TcpListenerConfig</code> internally - prefer their config builders where available, or obtain <code>control_listener</code> and layer ACL before <code>Runtime::add_tcp_listener</code> when the service exposes that path (<a href="ftp.html">FTP</a>, <a href="smtp.html">SMTP</a>).</p>
 <p>Pair with <a href="telemetry.html">Telemetry</a> to observe <code>on_error</code> for denials.</p>
 <h2 id="limitations">Limitations</h2>
 <ul>
 <li>The traffic <code>QuotaTracker</code>s are a <strong>skeleton</strong>, not wired into any protocol codec.</li>
 <li><code>idle_timeout</code> is accepted and stored but not enforced on the datapath.</li>
 <li>ACL is IP-based only; user/role RBAC belongs in <a href="auth.html">Auth</a> / protocol <code>is_authorized</code> hooks (e.g. FTP).</li>
-<li>No distributed / cluster ACL store — process-local configuration.</li>
+<li>No distributed / cluster ACL store - process-local configuration.</li>
 <li>WebDAV has no IP ACL of its own (its RFC 3744 privileges are per user); put <code>PeerAcl</code> on the HTTP listener (<a href="webdav.html">WebDAV</a>).</li>
 </ul>
 

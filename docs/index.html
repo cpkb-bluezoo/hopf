@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Hopf — Hopf</title>
+  <title>Hopf - Hopf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
@@ -143,7 +143,7 @@
 </ul></li>
 <li><strong>Protocol depth, not a thin HTTP façade</strong>
 <ul>
-<li>HTTP is one peer among many — mail, DNS, FTP, WebDAV, WebSocket, gRPC share the same substrate</li>
+<li>HTTP is one peer among many - mail, DNS, FTP, WebDAV, WebSocket, gRPC share the same substrate</li>
 <li><a href="mqtt.html">MQTT</a> broker and client; <a href="amqp.html">AMQP 0-9-1</a> client (<code>hopf-amqp</code>, RabbitMQ wire protocol)</li>
 </ul></li>
 </ul>
@@ -173,7 +173,7 @@
 </ul>
 <h3 id="quic-and-http3-hopf-quic-hopf-http">QUIC and HTTP/3 (<code>hopf-quic</code>, <code>hopf-http</code>)</h3>
 <ul>
-<li>In-tree RFC 9000 transport and RFC 9001 TLS 1.3 handshake, both in <code>hopf-quic</code> on AWS-LC directly — no <code>quinn-proto</code> or other external QUIC/TLS library dependency, plus a dedicated mio UDP driver</li>
+<li>In-tree RFC 9000 transport and RFC 9001 TLS 1.3 handshake, both in <code>hopf-quic</code> on AWS-LC directly - no <code>quinn-proto</code> or other external QUIC/TLS library dependency, plus a dedicated mio UDP driver</li>
 <li>Each bidirectional QUIC stream is an <code>Endpoint</code></li>
 <li>HTTP/3 server and client (RFC 9114) with in-tree QPACK (RFC 9204)</li>
 <li>ALPN <code>h3</code></li>
@@ -182,10 +182,10 @@
 </ul>
 <h3 id="http-hopf-http">HTTP (<code>hopf-http</code>)</h3>
 <ul>
-<li>Unified <strong>HTTP Stream</strong> API — version- and transport-agnostic</li>
-<li>HTTP/1.0 and 1.1 — chunked TE, persistent connections, h2c Upgrade</li>
-<li>HTTP/2 — HPACK, multiplexing, cleartext prior-knowledge and h2c, ALPN <code>h2</code></li>
-<li>HTTP/3 — see above</li>
+<li>Unified <strong>HTTP Stream</strong> API - version- and transport-agnostic</li>
+<li>HTTP/1.0 and 1.1 - chunked TE, persistent connections, h2c Upgrade</li>
+<li>HTTP/2 - HPACK, multiplexing, cleartext prior-knowledge and h2c, ALPN <code>h2</code></li>
+<li>HTTP/3 - see above</li>
 <li>Server and client handler SPIs (<code>ServerHandler</code> / <code>ClientHandler</code>)</li>
 <li>Deferred / offloaded responses via <code>ServerResponseHandle</code> + storage pool</li>
 <li>Protocol upgrade seam (101 / Extended CONNECT) for WebSocket and related</li>
@@ -216,7 +216,7 @@
 </ul>
 <h3 id="dns-hopf-dns">DNS (<code>hopf-dns</code>)</h3>
 <ul>
-<li>Resolver: a stub resolver in the RFC 1034 §5.3.1 sense (relies on configured upstreams for recursion) but full-featured otherwise: response caching, EDNS0, RFC 7873 cookies, bailiwick filtering, cache-poisoning resilience (RFC 5452), automatic UDP→TCP truncation fallback, and optional DNSSEC chain-of-trust validation — <strong>multi-protocol per upstream server</strong> (<code>add_server_dot</code>/<code>add_server_doq</code>/<code>add_server_doh</code>, <code>dot</code>/<code>doq</code>/<code>doh</code> features): every query helper, retry/failover across a mixed-transport server list, CNAME chase, caching, and DNSSEC validation work the same regardless of which transport actually carried the query</li>
+<li>Resolver: a stub resolver in the RFC 1034 §5.3.1 sense (relies on configured upstreams for recursion) but full-featured otherwise: response caching, EDNS0, RFC 7873 cookies, bailiwick filtering, cache-poisoning resilience (RFC 5452), automatic UDP→TCP truncation fallback, and optional DNSSEC chain-of-trust validation - <strong>multi-protocol per upstream server</strong> (<code>add_server_dot</code>/<code>add_server_doq</code>/<code>add_server_doh</code>, <code>dot</code>/<code>doq</code>/<code>doh</code> features): every query helper, retry/failover across a mixed-transport server list, CNAME chase, caching, and DNSSEC validation work the same regardless of which transport actually carried the query</li>
 <li>Server (<code>DnsService</code>, <code>server</code> feature): a no-op protocol shell (cookies, TSIG, UDP/TCP/DoT/DoQ framing) with pluggable <code>DnsQueryHandler</code>s: a caching <code>ForwarderHandler</code>, an <code>AuthoritativeZoneHandler</code>, closures and chains of them (split-horizon)</li>
 <li>Authoritative zones: BIND-style zone files (<code>$INCLUDE</code>, <code>$GENERATE</code>), RFC 2136 dynamic update, NOTIFY, AXFR/IXFR, TSIG, secondaries that refresh on NOTIFY and the SOA timers, atomic write-back to the zone file (verified against BIND <code>dig</code> and <code>nsupdate</code>)</li>
 <li><code>DnsClientTransport</code> (DoT/DoQ/DoH) also usable standalone for an app that wants to speak one specific encrypted transport directly, outside the resolver</li>
@@ -228,7 +228,7 @@
 <ul>
 <li>Multicast DNS responder (RFC 6762): probing with simultaneous-probe tie-break and automatic rename on conflict, announcing with cache-flush, known-answer suppression, unicast (QU) reply support, goodbye on shutdown/drop</li>
 <li>Multicast DNS querier: one-shot and periodic queries backed by an active TTL-fraction-refresh cache (RFC 6762 §5.2) with cache-flush and goodbye grace-period handling (§10.1/§10.2)</li>
-<li>DNS-SD (RFC 6763): <code>register_service</code>/<code>browse</code> push-based API — PTR/SRV/TXT publication, the <code>_services._dns-sd._udp</code> meta-query, TXT attribute codec</li>
+<li>DNS-SD (RFC 6763): <code>register_service</code>/<code>browse</code> push-based API - PTR/SRV/TXT publication, the <code>_services._dns-sd._udp</code> meta-query, TXT attribute codec</li>
 <li>Reuses <code>hopf-dns</code>'s wire types directly (no parallel DNS codec); IPv4 only (no <code>ff02::fb</code>)</li>
 <li>Standalone crate; optional umbrella feature <code>mdns</code> (pulls in <code>dns</code>)</li>
 </ul>
@@ -242,7 +242,7 @@
 <li>SOCKS4, SOCKS4a, SOCKS5 (RFC 1928): CONNECT, BIND, UDP ASSOCIATE</li>
 <li>Server and client for all three commands (BIND and UDP ASSOCIATE clients go beyond SOCKS's usual CONNECT-only client scope, added for symmetry with the server)</li>
 <li>RFC 1929 username/password auth, server and client</li>
-<li>RFC 1961 GSSAPI auth not implemented — planned with optional GSSAPI in <code>hopf-auth</code></li>
+<li>RFC 1961 GSSAPI auth not implemented - planned with optional GSSAPI in <code>hopf-auth</code></li>
 <li>Optional umbrella feature <code>socks</code></li>
 </ul>
 <h3 id="ldap-hopf-ldap">LDAP (<code>hopf-ldap</code>)</h3>
@@ -266,7 +266,7 @@
 <li>STARTTLS, AUTH PLAIN, PIPELINING, 8BITMIME, SMTPUTF8, CHUNKING/BDAT, SIZE, DSN, …</li>
 <li>Staged connection-handler SPI (hello → mail → rcpt → data)</li>
 <li>Stock accept-all (discard) handler; <strong>SimpleRelayService</strong> open MX relay (lab use)</li>
-<li><strong>LocalDeliveryService</strong> — APPEND to local INBOX via <code>hopf-mailbox</code> (mbox / Maildir++)</li>
+<li><strong>LocalDeliveryService</strong> - APPEND to local INBOX via <code>hopf-mailbox</code> (mbox / Maildir++)</li>
 </ul>
 <h3 id="pop3-hopf-pop3">POP3 (<code>hopf-pop3</code>)</h3>
 <ul>
@@ -304,7 +304,7 @@
 </ul>
 <h3 id="amqp-hopf-amqp">AMQP 0-9-1 (<code>hopf-amqp</code>)</h3>
 <ul>
-<li>AMQP 0-9-1 async client (RabbitMQ wire protocol); client-only — no broker in this crate</li>
+<li>AMQP 0-9-1 async client (RabbitMQ wire protocol); client-only - no broker in this crate</li>
 <li>Connection handshake (<code>PLAIN</code> / <code>AMQPLAIN</code>), tune negotiation, heartbeats</li>
 <li>Multi-channel open/close; exchange / queue declare, bind, unbind, purge, delete</li>
 <li><code>basic.publish</code> with streamed content frames; publisher confirms and <code>basic.return</code></li>
@@ -314,7 +314,7 @@
 </ul>
 <h3 id="amqp1-hopf-amqp1">AMQP 1.0 (<code>hopf-amqp1</code>)</h3>
 <ul>
-<li>AMQP 1.0 (ISO/IEC 19464) async client; separate crate from <code>hopf-amqp</code> — shares only the <code>AMQP</code> wire magic, framing/types/session model are unrelated. Client-only — no broker</li>
+<li>AMQP 1.0 (ISO/IEC 19464) async client; separate crate from <code>hopf-amqp</code> - shares only the <code>AMQP</code> wire magic, framing/types/session model are unrelated. Client-only - no broker</li>
 <li>SASL PLAIN (when credentials configured) or ANONYMOUS, auto-negotiated</li>
 <li>Connection open, sessions (begin/end), sender/receiver links (attach/detach); session flow control and link credit</li>
 <li>Sending header/properties/application-properties/data, auto-split across <code>transfer</code> frames for large messages; receiving streamed incrementally as transfers arrive</li>
@@ -378,7 +378,7 @@
 <td>WebDAV</td>
 <td><code>hopf-webdav</code></td>
 <td style="text-align: center;">✓</td>
-<td style="text-align: center;">—</td>
+<td style="text-align: center;">-</td>
 <td>on HTTP</td>
 </tr>
 <tr>
@@ -426,14 +426,14 @@
 <tr>
 <td>NNTP / NNTPS</td>
 <td><code>hopf-nntp</code></td>
-<td style="text-align: center;">—</td>
+<td style="text-align: center;">-</td>
 <td style="text-align: center;">✓</td>
 <td>callback-driven client (<code>NntpSession</code>)</td>
 </tr>
 <tr>
 <td>Redis / Valkey (RESP2, RESP3)</td>
 <td><code>hopf-redis</code></td>
-<td style="text-align: center;">—</td>
+<td style="text-align: center;">-</td>
 <td style="text-align: center;">✓</td>
 <td>pipelined client (<code>RedisClient</code>)</td>
 </tr>
@@ -454,21 +454,21 @@
 <tr>
 <td>AMQP 0-9-1</td>
 <td><code>hopf-amqp</code></td>
-<td style="text-align: center;">—</td>
+<td style="text-align: center;">-</td>
 <td style="text-align: center;">✓</td>
 <td>client-only (RabbitMQ); AMQPS</td>
 </tr>
 <tr>
 <td>AMQP 1.0</td>
 <td><code>hopf-amqp1</code></td>
-<td style="text-align: center;">—</td>
+<td style="text-align: center;">-</td>
 <td style="text-align: center;">✓</td>
 <td>client-only (ISO/IEC 19464); separate crate from <code>hopf-amqp</code>; AMQPS</td>
 </tr>
 <tr>
 <td>LDAP</td>
 <td><code>hopf-ldap</code></td>
-<td style="text-align: center;">—</td>
+<td style="text-align: center;">-</td>
 <td style="text-align: center;">✓</td>
 <td>client-only; LDAPS/StartTLS; RFC 4533 content sync</td>
 </tr>
@@ -476,7 +476,7 @@
 <td>Mailbox storage</td>
 <td><code>hopf-mailbox</code></td>
 <td style="text-align: center;">SPI</td>
-<td style="text-align: center;">—</td>
+<td style="text-align: center;">-</td>
 <td>mbox / Maildir++</td>
 </tr>
 <tr>

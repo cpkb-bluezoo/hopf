@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Composition — Hopf</title>
+  <title>Composition - Hopf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
@@ -77,7 +77,7 @@
     <main class="main">
       <header>
         <h1>Composition</h1>
-        <p class="lead">Crate <code>hopf-core</code>: <code>Composition</code> is the canonical builder that starts a <code>Runtime</code> and applies listen/dial bindings. Declarative XML (via <a href="https://github.com/cpkb-bluezoo/tractrix">tractrix</a>) desugars into the same builder. Handler names resolve through a closed <code>CompositionRegistry</code> — not reflective DI.</p>
+        <p class="lead">Crate <code>hopf-core</code>: <code>Composition</code> is the canonical builder that starts a <code>Runtime</code> and applies listen/dial bindings. Declarative XML (via <a href="https://github.com/cpkb-bluezoo/tractrix">tractrix</a>) desugars into the same builder. Handler names resolve through a closed <code>CompositionRegistry</code> - not reflective DI.</p>
       </header>
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
@@ -124,7 +124,7 @@
 </tr>
 <tr>
 <td><code>runtime() -&gt; &amp;Arc&lt;Runtime&gt;</code></td>
-<td>Accessor — build <code>Arc&lt;Runtime&gt;</code>-dependent protocol services before adding bindings</td>
+<td>Accessor - build <code>Arc&lt;Runtime&gt;</code>-dependent protocol services before adding bindings</td>
 </tr>
 <tr>
 <td><code>listen_tcp(TcpListenerConfig) -&gt; io::Result&lt;BindingId&gt;</code></td>
@@ -136,7 +136,7 @@
 </tr>
 <tr>
 <td><code>from_xml</code> / <code>from_xml_str</code> / <code>from_xml_path</code> (and <code>_with_telemetry</code> siblings)</td>
-<td>Parse XML and apply it against a fresh Runtime — returns an already-running <code>Composition</code></td>
+<td>Parse XML and apply it against a fresh Runtime - returns an already-running <code>Composition</code></td>
 </tr>
 <tr>
 <td><code>primary_addr()</code> / <code>remove_binding(BindingId)</code> / <code>shutdown(self)</code></td>
@@ -148,7 +148,7 @@
 </tr>
 </tbody>
 </table>
-<p>There is no separate <code>build()</code> step — a <code>Composition</code> is running as soon as it's constructed (<code>Runtime::start</code> before the script runs). This is also what lets a registered listener close over <code>Arc&lt;Runtime&gt;</code> — required by any protocol service that offloads work to the storage pool (SMTP local delivery, POP3, IMAP, ...).</p>
+<p>There is no separate <code>build()</code> step - a <code>Composition</code> is running as soon as it's constructed (<code>Runtime::start</code> before the script runs). This is also what lets a registered listener close over <code>Arc&lt;Runtime&gt;</code> - required by any protocol service that offloads work to the storage pool (SMTP local delivery, POP3, IMAP, ...).</p>
 <h2 id="compositionregistry">CompositionRegistry</h2>
 <p><code>handler="…"</code> in XML (and conceptual names in docs) is <strong>not</strong> a <code>Service</code> or HTTP Stream handler name. It resolves a closed map of connection-level <code>HandlerFactory</code> values (<code>Fn() -&gt; Box&lt;dyn ProtocolHandler&gt;</code>).</p>
 <div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
@@ -163,7 +163,7 @@
 <span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="st">&lt;/composition&gt;&quot;#</span><span class="op">;</span></span>
 <span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> comp <span class="op">=</span> <span class="pp">Composition::</span>from_xml_str(xml<span class="op">,</span> <span class="op">&amp;</span>reg)<span class="op">?;</span>   <span class="co">// already running</span></span></code></pre></div>
-<p>Register pre-wired stacks in Rust before load. Unknown <code>handler</code> names fail parse with <code>CompositionXmlError</code>. Only <strong>self-contained</strong> handlers can be registered here — the registry is built and resolved before <code>from_xml*</code> starts the Runtime, so a factory that needs <code>Arc&lt;Runtime&gt;</code> (any storage-offloading protocol service — SMTP local delivery, POP3, IMAP, ...) can't go through XML. Wire those with the Rust builder instead, using <a href="#builder-api"><code>Composition::runtime()</code></a> after <code>new()</code>.</p>
+<p>Register pre-wired stacks in Rust before load. Unknown <code>handler</code> names fail parse with <code>CompositionXmlError</code>. Only <strong>self-contained</strong> handlers can be registered here - the registry is built and resolved before <code>from_xml*</code> starts the Runtime, so a factory that needs <code>Arc&lt;Runtime&gt;</code> (any storage-offloading protocol service - SMTP local delivery, POP3, IMAP, ...) can't go through XML. Wire those with the Rust builder instead, using <a href="#builder-api"><code>Composition::runtime()</code></a> after <code>new()</code>.</p>
 <h2 id="xml-from_xml">XML (from_xml)</h2>
 <p>Declarative files use <strong>elements and attributes only</strong> (no character data). Naming mirrors the Rust builder. Parsing is entirely through tractrix.</p>
 <div class="sourceCode" id="cb3"><pre class="sourceCode xml"><code class="sourceCode xml"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>&lt;<span class="kw">composition</span> <span class="ot">worker-threads=</span><span class="st">&quot;4&quot;</span> <span class="ot">storage-threads=</span><span class="st">&quot;4&quot;</span>&gt;</span>
@@ -214,7 +214,7 @@
 </tr>
 </tbody>
 </table>
-<p>Also: <code>Composition::from_xml(bytes, &amp;registry)</code>, <code>from_xml_path(path, &amp;registry)</code> — both return an already-running <code>Composition</code>, no separate build step.</p>
+<p>Also: <code>Composition::from_xml(bytes, &amp;registry)</code>, <code>from_xml_path(path, &amp;registry)</code> - both return an already-running <code>Composition</code>, no separate build step.</p>
 <h2 id="xml-attribute-map">XML attribute map</h2>
 <h3 id="composition"><code>&lt;composition&gt;</code></h3>
 <table>
@@ -333,16 +333,16 @@ let acceptor = ServerTlsBuilder::new()
     .alpn(&amp;[b&quot;imap&quot;])
     .build()?;
 comp.listen_tcp(TcpListenerConfig::new(listen_addr, factory).with_tls(acceptor))?;</code></pre>
-<p>Telemetry is <strong>not</strong> expressed in XML v1 — pass it to <code>Composition::from_xml_with_telemetry</code> / <code>from_xml_str_with_telemetry</code> / <code>from_xml_path_with_telemetry</code> instead of the plain <code>from_xml*</code> entry points, since it must be known before the Runtime starts.</p>
+<p>Telemetry is <strong>not</strong> expressed in XML v1 - pass it to <code>Composition::from_xml_with_telemetry</code> / <code>from_xml_str_with_telemetry</code> / <code>from_xml_path_with_telemetry</code> instead of the plain <code>from_xml*</code> entry points, since it must be known before the Runtime starts.</p>
 <h2 id="binding-lifecycle">Binding lifecycle</h2>
 <ol type="1">
-<li><strong>Start</strong> — <code>Composition::new</code> / <code>new_with_telemetry</code> / <code>from_xml*</code> starts the Runtime immediately (worker reactors, accept loop, storage pool), before any bindings exist.</li>
-<li><strong>Add</strong> — <code>Composition::listen_tcp</code> / <code>Runtime::add_tcp_listener</code> → <code>(SocketAddr, BindingId)</code>, applied immediately against the live Runtime. Port <code>0</code> yields an ephemeral local address.</li>
-<li><strong>Run</strong> — accept loop registers the mio listener; each accept round-robins onto a worker reactor (affinity for life).</li>
-<li><strong>Remove</strong> — <code>Composition::remove_binding</code> / <code>Runtime::remove_binding</code>. The accept loop deregisters the listener; <strong>existing connections keep affinity until close</strong>.</li>
+<li><strong>Start</strong> - <code>Composition::new</code> / <code>new_with_telemetry</code> / <code>from_xml*</code> starts the Runtime immediately (worker reactors, accept loop, storage pool), before any bindings exist.</li>
+<li><strong>Add</strong> - <code>Composition::listen_tcp</code> / <code>Runtime::add_tcp_listener</code> → <code>(SocketAddr, BindingId)</code>, applied immediately against the live Runtime. Port <code>0</code> yields an ephemeral local address.</li>
+<li><strong>Run</strong> - accept loop registers the mio listener; each accept round-robins onto a worker reactor (affinity for life).</li>
+<li><strong>Remove</strong> - <code>Composition::remove_binding</code> / <code>Runtime::remove_binding</code>. The accept loop deregisters the listener; <strong>existing connections keep affinity until close</strong>.</li>
 <li><strong>Shutdown</strong> - <code>Composition::shutdown</code> / <code>Runtime::shutdown</code> tears down workers, accept loop, and storage. Best-effort on <code>Composition</code>: if a registered service factory kept its own <code>Arc&lt;Runtime&gt;</code> clone (from <code>runtime()</code>), that clone keeps the Runtime alive past this call, as with the standalone protocol examples, which never call <code>Runtime::shutdown</code> and just drop their <code>Arc&lt;Runtime&gt;</code> at process exit. <code>Composition::shutdown_graceful</code> drains first: the drain happens even while services hold clones; the threads stop once the last clone is dropped.</li>
 </ol>
-<p>Trust policies and DNS caches attach at the protocol layer (e.g. HTTP <code>BasicAuthFactory</code>, <code>DnsResolver</code>), not as core Composition fields — core stays free of HTTP/auth types.</p>
+<p>Trust policies and DNS caches attach at the protocol layer (e.g. HTTP <code>BasicAuthFactory</code>, <code>DnsResolver</code>), not as core Composition fields - core stays free of HTTP/auth types.</p>
 <h2 id="telemetry">Telemetry</h2>
 <div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span>Composition<span class="op">;</span></span>
 <span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co">// hook: Arc&lt;dyn TelemetryHook&gt; from hopf-otel TelemetryPipeline::hook()</span></span>
@@ -351,10 +351,10 @@ comp.listen_tcp(TcpListenerConfig::new(listen_addr, factory).with_tls(acceptor))
 <p>See <a href="runtime-options.html">runtime-options.md</a> and <a href="telemetry.html">telemetry.md</a>.</p>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li>Closed registry only — no dynamic plugin loading.</li>
-<li>Registry factories can't depend on <code>Arc&lt;Runtime&gt;</code> — they're resolved before <code>from_xml*</code> starts the Runtime. Storage-offloading protocol services (SMTP local delivery, POP3, IMAP, ...) compose via the Rust builder instead.</li>
+<li>Closed registry only - no dynamic plugin loading.</li>
+<li>Registry factories can't depend on <code>Arc&lt;Runtime&gt;</code> - they're resolved before <code>from_xml*</code> starts the Runtime. Storage-offloading protocol services (SMTP local delivery, POP3, IMAP, ...) compose via the Rust builder instead.</li>
 <li>XML v1 has no TLS / secure / PROXY protocol / telemetry attributes.</li>
-<li><code>idle_timeout</code> is accepted and stored but not yet enforced on the datapath — see <a href="runtime-options.html">runtime-options.md</a>.</li>
+<li><code>idle_timeout</code> is accepted and stored but not yet enforced on the datapath - see <a href="runtime-options.html">runtime-options.md</a>.</li>
 <li>QUIC / H3 bindings are not Composition XML elements; use <code>listen_h3</code> / <code>RuntimeQuicExt</code> in Rust.</li>
 </ul>
 <h2 id="see-also">See also</h2>

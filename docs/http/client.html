@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>HTTP client — Hopf</title>
+  <title>HTTP client - Hopf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
@@ -120,10 +120,10 @@
 </table>
 <h3 id="callback-sequence">Callback sequence</h3>
 <ol type="1">
-<li><code>start(&amp;mut dyn ClientWriter)</code> — write request headers ± body</li>
+<li><code>start(&amp;mut dyn ClientWriter)</code> - write request headers ± body</li>
 <li><code>response_headers</code></li>
 <li><code>start_response_body</code> / <code>response_body_content</code>* / <code>end_response_body</code> (optional)</li>
-<li><code>response_trailers</code> (H2/H3; default ignore — used by gRPC)</li>
+<li><code>response_trailers</code> (H2/H3; default ignore - used by gRPC)</li>
 <li><code>response_complete</code></li>
 </ol>
 <p>Interim 1xx responses arrive through <code>informational_response</code>; a <code>101</code> goes to <code>switching_protocols</code> instead and ends HTTP framing for that request. <code>request_failed</code> fires if the connection fails or closes first; at most one of <code>response_complete</code> and <code>request_failed</code> fires per request.</p>
@@ -259,21 +259,21 @@ HttpClient::new("api.example.com", 443)
     .tls(connector, "api.example.com")
     .connect(&amp;rt, Box::new(Conn))?;</code></pre>
 <h3 id="several-requests-at-once">Several requests at once</h3>
-<p>On HTTP/2 the session accepts any number of bodyless requests (<code>send</code>) without waiting for earlier ones to complete: each opens its own stream, in the order accepted, as the peer's <code>SETTINGS_MAX_CONCURRENT_STREAMS</code> allows (the rest queue and open as streams finish). A request <em>body</em> streams for one request at a time, since <code>request_body_content</code> carries no request id — a second <code>start_request_body</code> before the first body's <code>end_request_body</code> is refused with <code>request body already in flight</code>; bodyless requests may still join the queue meanwhile. <code>HttpClientSessionHandle::supports_multiplexing()</code> says which case you are in: on HTTP/1.1 a second request of any kind while one is in flight is refused with <code>request already in flight</code>. <code>HttpClientSessionHandle</code> is <code>Clone</code>, so <code>on_connected</code> can hand the connection to another thread or a later task; requests from any clone share the one connection, and a <code>send</code> made off the reactor thread is followed by <code>conn_handle().poke()</code> to flush it (see below).</p>
+<p>On HTTP/2 the session accepts any number of bodyless requests (<code>send</code>) without waiting for earlier ones to complete: each opens its own stream, in the order accepted, as the peer's <code>SETTINGS_MAX_CONCURRENT_STREAMS</code> allows (the rest queue and open as streams finish). A request <em>body</em> streams for one request at a time, since <code>request_body_content</code> carries no request id - a second <code>start_request_body</code> before the first body's <code>end_request_body</code> is refused with <code>request body already in flight</code>; bodyless requests may still join the queue meanwhile. <code>HttpClientSessionHandle::supports_multiplexing()</code> says which case you are in: on HTTP/1.1 a second request of any kind while one is in flight is refused with <code>request already in flight</code>. <code>HttpClientSessionHandle</code> is <code>Clone</code>, so <code>on_connected</code> can hand the connection to another thread or a later task; requests from any clone share the one connection, and a <code>send</code> made off the reactor thread is followed by <code>conn_handle().poke()</code> to flush it (see below).</p>
 <h3 id="deferred-request-body">Deferred request body</h3>
-<p><code>HttpRequest::start_request_body</code> / <code>request_body_content</code> / <code>end_request_body</code> stream a request body in caller-chosen chunks — on both H1 and H2, bytes reach the wire as each chunk arrives rather than being buffered until the whole body is known:</p>
+<p><code>HttpRequest::start_request_body</code> / <code>request_body_content</code> / <code>end_request_body</code> stream a request body in caller-chosen chunks - on both H1 and H2, bytes reach the wire as each chunk arrives rather than being buffered until the whole body is known:</p>
 <table>
 <colgroup><col style="width: 45%" /><col style="width: 54%" /></colgroup>
 <thead><tr><th>Method</th><th>Behaviour</th></tr></thead>
 <tbody>
-<tr><td><code>start_request_body(handler)</code></td><td>H1: flushes request headers and opens chunked encoding. H2: opens the stream and sends HEADERS immediately (no <code>END_STREAM</code>) — it does not wait for <code>end_request_body</code> the way a one-shot <code>ClientWriter::start</code> call does.</td></tr>
-<tr><td><code>request_body_content(data) -&gt; Result&lt;usize, HttpClientError&gt;</code></td><td>Queues <code>data</code> and returns the number of bytes actually accepted — a <em>short write</em> (less than <code>data.len()</code>, possibly <code>0</code>) when the connection's bounded outbound buffer (H1) or the H2 stream's flow-control backlog is currently full, rather than growing unboundedly. Never blocks.</td></tr>
+<tr><td><code>start_request_body(handler)</code></td><td>H1: flushes request headers and opens chunked encoding. H2: opens the stream and sends HEADERS immediately (no <code>END_STREAM</code>) - it does not wait for <code>end_request_body</code> the way a one-shot <code>ClientWriter::start</code> call does.</td></tr>
+<tr><td><code>request_body_content(data) -&gt; Result&lt;usize, HttpClientError&gt;</code></td><td>Queues <code>data</code> and returns the number of bytes actually accepted - a <em>short write</em> (less than <code>data.len()</code>, possibly <code>0</code>) when the connection's bounded outbound buffer (H1) or the H2 stream's flow-control backlog is currently full, rather than growing unboundedly. Never blocks.</td></tr>
 <tr><td><code>on_body_writable(callback)</code></td><td>One-shot resume signal, fired once more bytes can be accepted after a short write. Register it in response to a short write and retry the remainder from the callback instead of polling.</td></tr>
 <tr><td><code>end_request_body()</code></td><td>Marks the body complete; the final bytes (and <code>END_STREAM</code> on H2) go out once anything still queued has drained.</td></tr>
 </tbody>
 </table>
 <h3 id="cross-connection-streaming">Cross-connection streaming (claim-check / tee pattern)</h3>
-<p>Because <code>request_body_content</code> just queues bytes, it's safe to call from a thread or connection other than this one — the common case being another protocol connection (e.g. SMTP DATA) teeing its incoming bytes straight into an HTTP PUT without holding the whole message in memory on either side. Stash the <code>hopf_core::ConnHandle</code> handed to <code>on_connected</code> via <code>HttpClientSessionHandle::conn_handle()</code>, and call <code>.poke()</code> on it after each out-of-band <code>request_body_content</code> / <code>end_request_body</code> call to ask this connection's own reactor to flush the newly queued bytes without waiting for its own next I/O event:</p>
+<p>Because <code>request_body_content</code> just queues bytes, it's safe to call from a thread or connection other than this one - the common case being another protocol connection (e.g. SMTP DATA) teeing its incoming bytes straight into an HTTP PUT without holding the whole message in memory on either side. Stash the <code>hopf_core::ConnHandle</code> handed to <code>on_connected</code> via <code>HttpClientSessionHandle::conn_handle()</code>, and call <code>.poke()</code> on it after each out-of-band <code>request_body_content</code> / <code>end_request_body</code> call to ask this connection's own reactor to flush the newly queued bytes without waiting for its own next I/O event:</p>
 <pre><code>// In on_connected: stash session.conn_handle() and the HttpRequest
 // somewhere the other connection's callback can reach (e.g. Arc&lt;Mutex&lt;_&gt;&gt;).
 //
@@ -284,18 +284,18 @@ conn_handle.poke();   // wakes the HTTP connection's reactor to flush now
 // At end of message:
 request.end_request_body()?;
 conn_handle.poke();</code></pre>
-<p><code>ConnHandle::poke()</code> is the same primitive storage-offload completion callbacks already use to make a paused connection re-check its own state (<code>Endpoint::poke_handler</code>) — it re-invokes this connection's <code>receive</code> path with no new bytes, which is exactly where both the H1 and H2 session codecs already flush anything queued.</p>
+<p><code>ConnHandle::poke()</code> is the same primitive storage-offload completion callbacks already use to make a paused connection re-check its own state (<code>Endpoint::poke_handler</code>) - it re-invokes this connection's <code>receive</code> path with no new bytes, which is exactly where both the H1 and H2 session codecs already flush anything queued.</p>
 <h3 id="connection-and-request-failure">Connection and request failure</h3>
-<p><code>HttpConnectionHandler::on_error</code> fires for DNS failure, refused/reset connect, or a TLS handshake failure — anything that happens before <code>on_connected</code> could ever run. Once a request is in flight, its own <code>HttpResponseHandler::failed</code> fires instead (mid-connection resets/disconnects route through whichever of the two is still waiting to hear about it — never both, and never neither).</p>
+<p><code>HttpConnectionHandler::on_error</code> fires for DNS failure, refused/reset connect, or a TLS handshake failure - anything that happens before <code>on_connected</code> could ever run. Once a request is in flight, its own <code>HttpResponseHandler::failed</code> fires instead (mid-connection resets/disconnects route through whichever of the two is still waiting to hear about it - never both, and never neither).</p>
 <p><code>HttpConnectionHandler::on_security_established</code> fires once, right before <code>on_connected</code>, on TLS dials only; a plaintext <code>HttpClient</code> never calls it. Use it to inspect the negotiated <code>hopf_core::SecurityInfo</code> (ALPN, protocol version, cipher suite, and the server's certificate chain via <code>peer_certificate_chain()</code>) before the first request goes out; the default implementation is a no-op.</p>
 <h3 id="httpclienttimeouts">HttpClientTimeouts</h3>
 <table>
 <colgroup><col style="width: 20%" /><col style="width: 20%" /><col style="width: 59%" /></colgroup>
 <thead><tr><th>Field</th><th>Default</th><th>Applies to</th></tr></thead>
 <tbody>
-<tr><td><code>dns</code></td><td>5s</td><td>Hostname resolution, via the resolver's own query timeout — only when <code>HttpClient</code> created the resolver itself (not when the caller supplied one via <code>.resolver(...)</code>, which may be shared elsewhere)</td></tr>
+<tr><td><code>dns</code></td><td>5s</td><td>Hostname resolution, via the resolver's own query timeout - only when <code>HttpClient</code> created the resolver itself (not when the caller supplied one via <code>.resolver(...)</code>, which may be shared elsewhere)</td></tr>
 <tr><td><code>connect</code></td><td>30s</td><td>TCP connect handshake</td></tr>
-<tr><td><code>stage</code></td><td>60s</td><td>Budget for one request/response round trip once bytes are on the wire — renewed on outbound and inbound progress alike, so an actively-streaming request or response doesn't spuriously time out; a genuinely stalled peer fails the request via <code>HttpResponseHandler::failed</code> with <code>TimedOut</code>. <code>Duration::ZERO</code> disables it.</td></tr>
+<tr><td><code>stage</code></td><td>60s</td><td>Budget for one request/response round trip once bytes are on the wire - renewed on outbound and inbound progress alike, so an actively-streaming request or response doesn't spuriously time out; a genuinely stalled peer fails the request via <code>HttpResponseHandler::failed</code> with <code>TimedOut</code>. <code>Duration::ZERO</code> disables it.</td></tr>
 <tr><td><code>attempt_delay</code></td><td>250 ms</td><td>When a name resolves to several addresses, how long one connection attempt may run before the next address is tried alongside it (RFC 8305 §5). A failed attempt starts the next at once.</td></tr>
 </tbody>
 </table>

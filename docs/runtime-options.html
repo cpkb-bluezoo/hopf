@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Runtime options — Hopf</title>
+  <title>Runtime options - Hopf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
@@ -77,7 +77,7 @@
     <main class="main">
       <header>
         <h1>Runtime options</h1>
-        <p class="lead">Crate <code>hopf-core</code>: process-wide <code>Runtime</code> knobs — worker reactors, blocking storage pool, per-connection TCP listen/dial parameters, and the optional <code>TelemetryHook</code>.</p>
+        <p class="lead">Crate <code>hopf-core</code>: process-wide <code>Runtime</code> knobs - worker reactors, blocking storage pool, per-connection TCP listen/dial parameters, and the optional <code>TelemetryHook</code>.</p>
       </header>
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
@@ -177,9 +177,9 @@
 </tr>
 </tbody>
 </table>
-<p>Fail-fast backpressure: <code>StorageError::Rejected</code> — never blocks a reactor thread waiting for a storage slot.</p>
+<p>Fail-fast backpressure: <code>StorageError::Rejected</code> - never blocks a reactor thread waiting for a storage slot.</p>
 <h2 id="tcplistenerconfig">TcpListenerConfig</h2>
-<p>TCP listen birth path — peer of <code>TcpConnectorConfig</code>.</p>
+<p>TCP listen birth path - peer of <code>TcpConnectorConfig</code>.</p>
 <table>
 <colgroup>
 <col style="width: 22%" />
@@ -308,7 +308,7 @@
 <span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_tls(acceptor)</span>
 <span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_acl(<span class="pp">PeerAcl::</span>open())<span class="op">;</span></span></code></pre></div>
 <h2 id="tcpconnectorconfig">TcpConnectorConfig</h2>
-<p>TCP dial birth path — same buffer / idle / TLS knobs as listen.</p>
+<p>TCP dial birth path - same buffer / idle / TLS knobs as listen.</p>
 <table>
 <colgroup>
 <col style="width: 22%" />
@@ -436,7 +436,7 @@
 </table>
 <p>Applied on the accept path before the connection is handed to a worker.</p>
 <h2 id="idle-timeout">Idle timeout</h2>
-<p><code>idle_timeout: Option&lt;Duration&gt;</code> exists on both listen and dial configs and is carried into <code>TcpConnParams</code>, but nothing in the reactor / connection datapath reads it yet — <strong>it is accepted and stored, not enforced</strong>. Do not rely on it to close idle connections. Prefer application-level timers via <code>Endpoint::schedule_timer</code> until this lands.</p>
+<p><code>idle_timeout: Option&lt;Duration&gt;</code> exists on both listen and dial configs and is carried into <code>TcpConnParams</code>, but nothing in the reactor / connection datapath reads it yet - <strong>it is accepted and stored, not enforced</strong>. Do not rely on it to close idle connections. Prefer application-level timers via <code>Endpoint::schedule_timer</code> until this lands.</p>
 <h2 id="telemetry-hook">Telemetry hook</h2>
 <div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span>TelemetryHook<span class="op">;</span></span>
 <span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::net::</span>SocketAddr<span class="op">;</span></span>
@@ -469,7 +469,7 @@
 </tr>
 <tr>
 <td><code>Composition::new_with_telemetry</code> / <code>from_xml*_with_telemetry</code></td>
-<td>Same, via Composition — must be supplied at start, since it can't attach after the Runtime is already running</td>
+<td>Same, via Composition - must be supplied at start, since it can't attach after the Runtime is already running</td>
 </tr>
 </tbody>
 </table>
@@ -505,7 +505,7 @@
 </tr>
 </tbody>
 </table>
-<p>HTTP servers typically obtain <code>ConnHandle</code> from <code>ServerWriter::conn_handle</code> or <code>ServerResponseHandle</code> — see <a href="http/server.html#deferred-responses">http/server.md</a>.</p>
+<p>HTTP servers typically obtain <code>ConnHandle</code> from <code>ServerWriter::conn_handle</code> or <code>ServerResponseHandle</code> - see <a href="http/server.html#deferred-responses">http/server.md</a>.</p>
 <h2 id="worker-handles">Worker handles</h2>
 <table>
 <colgroup>
@@ -541,7 +541,7 @@
 </tr>
 </tbody>
 </table>
-<p>Use worker handles for UDP registration (DNS), reactor-affine timers, and advanced scheduling — not for blocking filesystem work.</p>
+<p>Use worker handles for UDP registration (DNS), reactor-affine timers, and advanced scheduling - not for blocking filesystem work.</p>
 <h2 id="see-also">See also</h2>
 <ul>
 <li><a href="composition.html">Composition</a></li>

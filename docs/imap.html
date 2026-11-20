@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>IMAP — Hopf</title>
+  <title>IMAP - Hopf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
@@ -110,27 +110,27 @@
 </tr>
 <tr>
 <td>FETCH data items</td>
-<td>FLAGS, UID, MODSEQ, RFC822[.SIZE/.HEADER/.TEXT], <code>BODY[section]</code> / <code>BODY.PEEK[section]</code> with <code>&lt;start.count&gt;</code> partial-fetch ranges, ENVELOPE, and BODYSTRUCTURE (recursive MIME structure via <code>rmimeparser</code>'s streaming parser — see <a href="conformance.html">Conformance</a> for the exact scope of what BODYSTRUCTURE's extension data omits)</td>
+<td>FLAGS, UID, MODSEQ, RFC822[.SIZE/.HEADER/.TEXT], <code>BODY[section]</code> / <code>BODY.PEEK[section]</code> with <code>&lt;start.count&gt;</code> partial-fetch ranges, ENVELOPE, and BODYSTRUCTURE (recursive MIME structure via <code>rmimeparser</code>'s streaming parser - see <a href="conformance.html">Conformance</a> for the exact scope of what BODYSTRUCTURE's extension data omits)</td>
 </tr>
 <tr>
 <td><code>IDLE</code></td>
-<td><a href="https://www.rfc-editor.org/rfc/rfc2177">RFC 2177</a> — continuation + <code>DONE</code>; mailbox polled off-reactor for EXISTS / EXPUNGE / FETCH FLAGS (Maildir <code>refresh</code>); auto-completes after <code>idle_max_duration</code> (default 29 minutes)</td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc2177">RFC 2177</a> - continuation + <code>DONE</code>; mailbox polled off-reactor for EXISTS / EXPUNGE / FETCH FLAGS (Maildir <code>refresh</code>); auto-completes after <code>idle_max_duration</code> (default 29 minutes)</td>
 </tr>
 <tr>
 <td><code>UIDPLUS</code></td>
-<td><a href="https://www.rfc-editor.org/rfc/rfc4315">RFC 4315</a> — <code>APPENDUID</code>, <code>COPYUID</code>, <code>UID EXPUNGE</code></td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc4315">RFC 4315</a> - <code>APPENDUID</code>, <code>COPYUID</code>, <code>UID EXPUNGE</code></td>
 </tr>
 <tr>
 <td><code>MOVE</code></td>
-<td><a href="https://www.rfc-editor.org/rfc/rfc6851">RFC 6851</a> — copy + <code>\Deleted</code> + expunge with <code>COPYUID</code></td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc6851">RFC 6851</a> - copy + <code>\Deleted</code> + expunge with <code>COPYUID</code></td>
 </tr>
 <tr>
 <td><code>NAMESPACE</code></td>
-<td><a href="https://www.rfc-editor.org/rfc/rfc2342">RFC 2342</a> — personal namespace from the mailbox store; optional other-users / shared namespaces via <code>ImapConfig</code></td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc2342">RFC 2342</a> - personal namespace from the mailbox store; optional other-users / shared namespaces via <code>ImapConfig</code></td>
 </tr>
 <tr>
 <td><code>ENABLE</code> / <code>CONDSTORE</code> / <code>QRESYNC</code></td>
-<td><a href="https://www.rfc-editor.org/rfc/rfc5161">RFC 5161</a> / <a href="https://www.rfc-editor.org/rfc/rfc7162">RFC 7162</a> — <code>HIGHESTMODSEQ</code>, <code>CHANGEDSINCE</code>, <code>MODSEQ</code> when the backend provides modseqs; QRESYNC degrades safely (no fabricated <code>VANISHED (EARLIER)</code> history)</td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc5161">RFC 5161</a> / <a href="https://www.rfc-editor.org/rfc/rfc7162">RFC 7162</a> - <code>HIGHESTMODSEQ</code>, <code>CHANGEDSINCE</code>, <code>MODSEQ</code> when the backend provides modseqs; QRESYNC degrades safely (no fabricated <code>VANISHED (EARLIER)</code> history)</td>
 </tr>
 <tr>
 <td><code>UNSELECT</code> / <code>ID</code></td>
@@ -142,11 +142,11 @@
 </tr>
 <tr>
 <td><code>QUOTA</code></td>
-<td><a href="https://www.rfc-editor.org/rfc/rfc9208">RFC 9208</a> — <code>GETQUOTA</code> / <code>GETQUOTAROOT</code> / <code>SETQUOTA</code> via pluggable <code>QuotaManager</code> (default unlimited). The stock <code>MemoryQuotaManager</code> is an adapter over a shared <a href="quota.html"><code>hopf_core::QuotaManager</code></a> — the same backend an <code>hopf-ftp</code> service can enforce against, so a user's mailbox and FTP storage can share one real quota instead of two independent trackers.</td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc9208">RFC 9208</a> - <code>GETQUOTA</code> / <code>GETQUOTAROOT</code> / <code>SETQUOTA</code> via pluggable <code>QuotaManager</code> (default unlimited). The stock <code>MemoryQuotaManager</code> is an adapter over a shared <a href="quota.html"><code>hopf_core::QuotaManager</code></a> - the same backend an <code>hopf-ftp</code> service can enforce against, so a user's mailbox and FTP storage can share one real quota instead of two independent trackers.</td>
 </tr>
 <tr>
 <td><code>COMPRESS=DEFLATE</code> / <code>UTF8=ACCEPT</code></td>
-<td><a href="https://www.rfc-editor.org/rfc/rfc4978">RFC 4978</a> — raw DEFLATE (<a href="https://www.rfc-editor.org/rfc/rfc1951">RFC 1951</a>, no zlib/gzip wrapper) compression activated by <code>COMPRESS DEFLATE</code> and kept active for the rest of the connection (both directions); advertised only once authenticated and only while not already compressed. <a href="https://www.rfc-editor.org/rfc/rfc6855">RFC 6855</a> <code>UTF8=ACCEPT</code> is tracked via <code>ENABLE</code> — no wire-format change is needed, since IMAP4rev2 responses are already raw UTF-8 rather than modified UTF-7.</td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc4978">RFC 4978</a> - raw DEFLATE (<a href="https://www.rfc-editor.org/rfc/rfc1951">RFC 1951</a>, no zlib/gzip wrapper) compression activated by <code>COMPRESS DEFLATE</code> and kept active for the rest of the connection (both directions); advertised only once authenticated and only while not already compressed. <a href="https://www.rfc-editor.org/rfc/rfc6855">RFC 6855</a> <code>UTF8=ACCEPT</code> is tracked via <code>ENABLE</code> - no wire-format change is needed, since IMAP4rev2 responses are already raw UTF-8 rather than modified UTF-7.</td>
 </tr>
 <tr>
 <td><code>SORT</code> / <code>THREAD</code> / <code>STATUS=SIZE</code></td>
@@ -154,7 +154,7 @@
 </tr>
 <tr>
 <td><code>OBJECTID</code> / <code>METADATA</code> / <code>NOTIFY</code></td>
-<td><a href="https://www.rfc-editor.org/rfc/rfc8474">RFC 8474</a> <code>OBJECTID</code> — <code>MAILBOXID</code> generated once per mailbox and persisted (survives <code>RENAME</code>); <code>EMAILID</code> derived deterministically from <code>MAILBOXID</code> + UID. <a href="https://www.rfc-editor.org/rfc/rfc5464">RFC 5464</a> <code>METADATA</code> — <code>GETMETADATA</code>/<code>SETMETADATA</code> with <code>DEPTH</code>/<code>MAXSIZE</code>, backed by a directory tree per mailbox (and a separate one for server-level annotations). <a href="https://www.rfc-editor.org/rfc/rfc5465">RFC 5465</a> <code>NOTIFY</code> — a documented subset: <code>SET</code>/<code>NONE</code> for the <em>currently selected</em> mailbox's <code>MessageNew</code>/<code>MessageExpunge</code>/<code>FlagChange</code> events only, reusing <code>IDLE</code>'s poll-and-diff machinery so an event is never reported twice regardless of which mechanism observes it first (see Limitations).</td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc8474">RFC 8474</a> <code>OBJECTID</code> - <code>MAILBOXID</code> generated once per mailbox and persisted (survives <code>RENAME</code>); <code>EMAILID</code> derived deterministically from <code>MAILBOXID</code> + UID. <a href="https://www.rfc-editor.org/rfc/rfc5464">RFC 5464</a> <code>METADATA</code> - <code>GETMETADATA</code>/<code>SETMETADATA</code> with <code>DEPTH</code>/<code>MAXSIZE</code>, backed by a directory tree per mailbox (and a separate one for server-level annotations). <a href="https://www.rfc-editor.org/rfc/rfc5465">RFC 5465</a> <code>NOTIFY</code> - a documented subset: <code>SET</code>/<code>NONE</code> for the <em>currently selected</em> mailbox's <code>MessageNew</code>/<code>MessageExpunge</code>/<code>FlagChange</code> events only, reusing <code>IDLE</code>'s poll-and-diff machinery so an event is never reported twice regardless of which mechanism observes it first (see Limitations).</td>
 </tr>
 <tr>
 <td>Auth</td>
@@ -219,9 +219,9 @@ ImapClient::new(&quot;mail.example.com&quot;, 143)
         ),
     )?;</code></pre>
 <p>For full control implement <code>ImapClientDriver</code>: every server event surfaces as a callback (<code>on_greeting</code>, <code>on_capability</code>, <code>on_authenticated</code>, <code>on_selected</code>, <code>on_fetch_data</code>, <code>on_status_data</code>, <code>on_list_entry</code>, <code>on_idle_started</code>, …), and each callback receives the staged state reference (<code>ImapClientNotAuthenticated</code> → <code>ImapClientAuthenticated</code> → <code>ImapClientSelected</code> / <code>ImapClientIdle</code>) whose methods issue the commands that are legal in that state.</p>
-<p><code>on_fetch_data</code> delivers an <code>ImapFetchData</code> with <code>FLAGS</code>, <code>UID</code>, <code>RFC822.SIZE</code>, <code>MODSEQ</code>, <code>EMAILID</code>/<code>THREADID</code> parsed, and <code>ENVELOPE</code>, <code>BODYSTRUCTURE</code> (or <code>BODY</code>) and <code>INTERNALDATE</code> captured verbatim — any literal the server used inside them (a non-ASCII subject, say) is re-encoded as a quoted string, so each is one line of IMAP syntax. Parse them with <code>ImapEnvelope::parse</code> and <code>ImapBodyStructure::parse</code>; <code>ImapBodyStructure::parts()</code> lists every leaf with the section number <code>BODY[section]</code> would use for it (RFC 3501 §6.4.5, encapsulated <code>message/rfc822</code> parts included), and <code>display_candidates()</code> picks the first non-attachment <code>text/plain</code> and <code>text/html</code> parts, which is what a mail client fetches instead of the whole message. Literal-bearing items (<code>BODY[section]</code>, <code>RFC822*</code>) are streamed through <code>on_fetch_literal*</code> as before.</p>
+<p><code>on_fetch_data</code> delivers an <code>ImapFetchData</code> with <code>FLAGS</code>, <code>UID</code>, <code>RFC822.SIZE</code>, <code>MODSEQ</code>, <code>EMAILID</code>/<code>THREADID</code> parsed, and <code>ENVELOPE</code>, <code>BODYSTRUCTURE</code> (or <code>BODY</code>) and <code>INTERNALDATE</code> captured verbatim - any literal the server used inside them (a non-ASCII subject, say) is re-encoded as a quoted string, so each is one line of IMAP syntax. Parse them with <code>ImapEnvelope::parse</code> and <code>ImapBodyStructure::parse</code>; <code>ImapBodyStructure::parts()</code> lists every leaf with the section number <code>BODY[section]</code> would use for it (RFC 3501 §6.4.5, encapsulated <code>message/rfc822</code> parts included), and <code>display_candidates()</code> picks the first non-attachment <code>text/plain</code> and <code>text/html</code> parts, which is what a mail client fetches instead of the whole message. Literal-bearing items (<code>BODY[section]</code>, <code>RFC822*</code>) are streamed through <code>on_fetch_literal*</code> as before.</p>
 <p><code>list_extended(reference, pattern, &amp;ImapListOptions)</code> issues an RFC 5258 <code>LIST</code> with selection options (<code>SUBSCRIBED</code>, <code>REMOTE</code>, <code>RECURSIVEMATCH</code>, <code>SPECIAL-USE</code>) and <code>RETURN</code> items (<code>SUBSCRIBED</code>, <code>CHILDREN</code>, <code>SPECIAL-USE</code>, and <code>STATUS (…)</code> per RFC 5819); the <code>* STATUS</code> replies a <code>RETURN (STATUS …)</code> provokes are routed to <code>on_status_data</code> interleaved with the <code>on_list_entry</code> calls, which is the one round trip a mail client needs for a folder list with unread counts. Extended data items after a LIST name (<code>CHILDINFO</code>, <code>OLDNAME</code>) are accepted and skipped. <code>ImapCapabilities</code> reports <code>list_extended</code>, <code>list_status</code>, <code>special_use</code> and <code>children</code>.</p>
-<p>Commands that do not originate in a reply — a mail client whose user just clicked a folder, say — reach a live session through <code>ImapClientDriver::on_wake</code>. It runs at the start of every <code>receive</code>, so in particular after a <code>hopf_core::ConnHandle::poke()</code> from any thread (which re-enters <code>receive</code> with no data), and it is handed an <code>ImapClientWakeState</code>: the staged state reference for the session's current state (<code>NotAuthenticated</code> / <code>Authenticated</code> / <code>Selected</code> / <code>Idle</code>), or <code>Busy</code> while nothing can be issued (connecting, mid-STARTTLS, IDLE sent but not yet acknowledged). Whatever the driver issues is flushed when it returns. The pattern is: stash the <code>ConnHandle</code> from <code>ep.handle()</code> in an early callback, queue work somewhere the driver can see it, poke, and drain the queue in <code>on_wake</code> — putting back anything the current state does not allow. During IDLE the only legal command is <code>done()</code>; issue the real work from <code>on_idle_complete</code>, which hands over <code>ImapClientSelected</code>.</p>
+<p>Commands that do not originate in a reply - a mail client whose user just clicked a folder, say - reach a live session through <code>ImapClientDriver::on_wake</code>. It runs at the start of every <code>receive</code>, so in particular after a <code>hopf_core::ConnHandle::poke()</code> from any thread (which re-enters <code>receive</code> with no data), and it is handed an <code>ImapClientWakeState</code>: the staged state reference for the session's current state (<code>NotAuthenticated</code> / <code>Authenticated</code> / <code>Selected</code> / <code>Idle</code>), or <code>Busy</code> while nothing can be issued (connecting, mid-STARTTLS, IDLE sent but not yet acknowledged). Whatever the driver issues is flushed when it returns. The pattern is: stash the <code>ConnHandle</code> from <code>ep.handle()</code> in an early callback, queue work somewhere the driver can see it, poke, and drain the queue in <code>on_wake</code> - putting back anything the current state does not allow. During IDLE the only legal command is <code>done()</code>; issue the real work from <code>on_idle_complete</code>, which hands over <code>ImapClientSelected</code>.</p>
 <pre class="rust,ignore"><code>fn on_wake(&amp;mut self, state: ImapClientWakeState&lt;'_&gt;, _ep: &amp;mut dyn Endpoint) {
     let Some(job) = self.queue.lock().unwrap().pop_front() else { return };
     match (job, state) {
@@ -234,7 +234,7 @@ ImapClient::new(&quot;mail.example.com&quot;, 143)
 queue.lock().unwrap().push_back(Job::Fetch("1:*".into()));
 conn_handle.poke();</code></pre>
 <h3 id="client-options">Client options</h3>
-<p>Two things the options table below does not cover. <code>max_net_out(bytes)</code> (and <code>max_net_in</code>) set this connection's buffer limits; hopf-core's 4 MiB outbound default closes the connection on a send that would overflow it, and <code>ImapClientAppend::send_literal</code> writes a whole <code>APPEND</code> literal in one call, so a client that appends messages must raise it above its largest message. And a dial that never produces a connection — DNS failure, no addresses, a connect that cannot start — reaches <code>ImapClientHandlerFactory::connect_failed(host, error)</code>, which prints to stderr unless overridden; <code>ImapFetch</code> and <code>ImapIdle</code> override it to call their <code>on_complete(false)</code>.</p>
+<p>Two things the options table below does not cover. <code>max_net_out(bytes)</code> (and <code>max_net_in</code>) set this connection's buffer limits; hopf-core's 4 MiB outbound default closes the connection on a send that would overflow it, and <code>ImapClientAppend::send_literal</code> writes a whole <code>APPEND</code> literal in one call, so a client that appends messages must raise it above its largest message. And a dial that never produces a connection - DNS failure, no addresses, a connect that cannot start - reaches <code>ImapClientHandlerFactory::connect_failed(host, error)</code>, which prints to stderr unless overridden; <code>ImapFetch</code> and <code>ImapIdle</code> override it to call their <code>on_complete(false)</code>.</p>
 <table>
 <colgroup>
 <col style="width: 33%" />
@@ -251,12 +251,12 @@ conn_handle.poke();</code></pre>
 <tbody>
 <tr>
 <td><code>ImapClient::new(host, port)</code></td>
-<td>—</td>
+<td>-</td>
 <td>Plain TCP; DNS-resolved off-reactor</td>
 </tr>
 <tr>
 <td><code>ImapClient::from_addr(addr)</code></td>
-<td>—</td>
+<td>-</td>
 <td>Skip DNS</td>
 </tr>
 <tr>
@@ -281,7 +281,7 @@ conn_handle.poke();</code></pre>
 </tr>
 <tr>
 <td><code>ImapFetch::credentials(user, pass)</code></td>
-<td>—</td>
+<td>-</td>
 <td>LOGIN or AUTHENTICATE PLAIN</td>
 </tr>
 <tr>
@@ -364,7 +364,7 @@ conn_handle.poke();</code></pre>
 <li>BODYSTRUCTURE body size/line counts reflect <code>rmimeparser</code>'s decoded body bytes; for <code>base64</code>/<code>quoted-printable</code>-encoded parts this differs from the RFC-mandated wire-encoded octet count (<code>7bit</code>/<code>8bit</code>/<code>binary</code> parts, including <code>message/rfc822</code>, are unaffected since decoded and wire bytes are identical there).</li>
 <li>BODYSTRUCTURE extension data always reports Content-Language/Content-Location as <code>NIL</code> (not parsed by <code>rmimeparser</code>'s handler trait) and Content-Disposition parameters other than <code>filename</code> are omitted (<code>rmimeparser</code> only supports named parameter lookup, not enumeration).</li>
 <li><code>NOTIFY</code> (RFC 5465) is a deliberately partial implementation: the <code>personal</code>/<code>inboxes</code>/<code>subtree</code>/<code>mailboxes</code> mailbox-selectors (real support needs polling every mailbox in the store, not just the selected one), the <code>AnnotationChange</code>/<code>MailboxName</code>/<code>SubscriptionChange</code>/<code>MailboxMetadataChange</code>/<code>ServerMetadataChange</code> event groups, <code>MessageNew</code>'s optional status-item sublist, and <code>SET STATUS</code>'s immediate catch-up response are all rejected with a tagged <code>BAD</code> rather than silently ignored.</li>
-<li>THREAD REFERENCES doesn't fabricate a new dummy parent to join two root-level messages that share a base subject when neither is itself a reply/forward (RFC 5256 §2.2 step 5C) — there is no <code>thread-list</code> wire form for a parent-less placeholder there, so the two threads are left separate instead of merged.</li>
+<li>THREAD REFERENCES doesn't fabricate a new dummy parent to join two root-level messages that share a base subject when neither is itself a reply/forward (RFC 5256 §2.2 step 5C) - there is no <code>thread-list</code> wire form for a parent-less placeholder there, so the two threads are left separate instead of merged.</li>
 <li>OBJECTID (<code>MAILBOXID</code>/<code>EMAILID</code>) and per-mailbox/server METADATA storage are implemented against the Maildir backend only; the mbox backend returns no id/entries for either (the underlying <code>Mailbox</code>/<code>MailboxStore</code> trait methods default to <code>None</code>/empty).</li>
 </ul>
 

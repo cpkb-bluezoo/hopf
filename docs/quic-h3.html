@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>QUIC / HTTP/3 — Hopf</title>
+  <title>QUIC / HTTP/3 - Hopf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
@@ -114,7 +114,7 @@
 <p>Each bidirectional QUIC stream is a <code>QuicStreamEndpoint</code> implementing <code>hopf_core::Endpoint</code>. HTTP/3 framing lives in <code>hopf-http</code>, not in <code>hopf-quic</code>.</p>
 <h2 id="pqc-first-tls-13">TLS 1.3 on QUIC</h2>
 <ul>
-<li><strong>TLS 1.3 only</strong> (RFC 9001). Every QUIC TLS config builds a <code>hopf_core::tls::HandshakeConfig</code> with <code>HandshakeMode::Quic</code> — the same in-tree TLS 1.3 engine TCP <a href="tls.html">TLS</a> uses. There's no TLS 1.2 mode for QUIC at all, so the question of negotiating down never arises.</li>
+<li><strong>TLS 1.3 only</strong> (RFC 9001). Every QUIC TLS config builds a <code>hopf_core::tls::HandshakeConfig</code> with <code>HandshakeMode::Quic</code> - the same in-tree TLS 1.3 engine TCP <a href="tls.html">TLS</a> uses. There's no TLS 1.2 mode for QUIC at all, so the question of negotiating down never arises.</li>
 <li><strong>Key exchange is classical X25519 by default</strong>; hybrid PQC key exchange is opt-in via <code>QuicTlsOptions::with_pqc()</code> (or <code>with_kx_policy(KxPolicy::…)</code>) on both peers. The default stays classical because the ML-KEM key share makes the ClientHello span two Initial datagrams. See <a href="conformance.html#quic">Conformance → QUIC</a>.</li>
 </ul>
 <h2 id="standards">Standards</h2>
@@ -385,7 +385,7 @@
 </tr>
 <tr>
 <td>Protocol versions</td>
-<td>TLS 1.3 only — no TLS 1.2 mode exists on QUIC</td>
+<td>TLS 1.3 only - no TLS 1.2 mode exists on QUIC</td>
 </tr>
 <tr>
 <td>Key exchange</td>
@@ -478,7 +478,7 @@ listen_h3(addr, server_cfg, factory, limits)?;   // HTTP/3 takes the same Arc&lt
 <li>Addresses must be pre-resolved (no DNS inside <code>connect_quic</code> / <code>connect_h3</code>).</li>
 <li>Plain (non-hooks) server mode installs <code>NopHandler</code> on accepted unidirectional streams.</li>
 <li>No HTTP/2-style server push and no WebTransport. CONNECT-UDP and CONNECT-IP are provided by <a href="masque.html"><code>hopf-masque</code></a> on top of the RFC 9297 HTTP Datagram and Capsule plumbing here.</li>
-<li>0-RTT is off by default; enable via <code>QuicTlsOptions::with_early_data</code> (replay risk — see SECURITY.md). Plain <code>connect_quic</code> opens the first stream before <code>Event::Connected</code> when a session ticket makes <code>has_0rtt()</code> true; H3 hooks-mode still starts after the full handshake.</li>
+<li>0-RTT is off by default; enable via <code>QuicTlsOptions::with_early_data</code> (replay risk - see SECURITY.md). Plain <code>connect_quic</code> opens the first stream before <code>Event::Connected</code> when a session ticket makes <code>has_0rtt()</code> true; H3 hooks-mode still starts after the full handshake.</li>
 <li>Locally-initiated connection close (<code>LocallyClosed</code>) still calls <code>ProtocolHandler::disconnected</code> on this endpoint's streams; only the peer sees <code>QuicConnectionCloseError</code> via <code>error</code>. Use the return value of <code>close_connection</code> locally if you need the code you just sent.</li>
 <li>Migration is partial (RFC 9000 §9). A server validates a client's new address with <code>PATH_CHALLENGE</code> and moves to it once answered (NAT rebinding survives), resetting congestion state and switching to a spare connection ID; a client follows a server's <code>preferred_address</code>. A client moving of its own accord to a new local address is not implemented, the server always advertises <code>disable_active_migration</code>, there is no API to offer a <code>preferred_address</code>, and the <code>migration</code> hardening knob is not consulted.</li>
 <li>No <code>NEW_TOKEN</code> (§8.1.3): address validation is Retry-based only (§8.1.2); a client ignores tokens it receives.</li>
@@ -486,13 +486,13 @@ listen_h3(addr, server_cfg, factory, limits)?;   // HTTP/3 takes the same Arc&lt
 <h2 id="implementation-status">Implementation status</h2>
 <p><strong>Shipped:</strong> QUIC transport (RFC 9002 loss recovery, CUBIC with HyStart++ or NewReno, pacing; RFC 9001 packet protection; path validation, server-side migration and spare connection IDs; QUIC v1 and v2; qlog) and the TLS 1.3 handshake are both in-tree, with no external QUIC or TLS library dependency; the handshake is driven by the same engine TCP TLS 1.3 uses. HTTP/3 codecs and QPACK in <code>hopf-http</code> (feature <code>h3</code>) are Hopf-owned. Hopf adds the mio UDP driver, stream-as-<code>Endpoint</code> model, and hooks-mode connection API for H3. <code>examples/quic-interop</code> is an endpoint for the quic-interop-runner.</p>
 <p><strong>Known gaps:</strong> client-initiated active migration, <code>NEW_TOKEN</code> address validation and compatible version negotiation aren't implemented. Hybrid PQC key exchange is opt-in rather than default. See <a href="conformance.html#quic">Conformance → QUIC</a> for the full, row-by-row detail.</p>
-<p><strong>MASQUE:</strong> RFC 9298 CONNECT-UDP (full server relay + client) and RFC 9484 CONNECT-IP (accept/capsule plumbing; the application supplies IP forwarding) live in <code>hopf-masque</code>, over HTTP/1.1, HTTP/2, and HTTP/3 alike — not H3-only. See <a href="masque.html">masque.html</a> and <a href="conformance.html#masque">Conformance → MASQUE</a>.</p>
+<p><strong>MASQUE:</strong> RFC 9298 CONNECT-UDP (full server relay + client) and RFC 9484 CONNECT-IP (accept/capsule plumbing; the application supplies IP forwarding) live in <code>hopf-masque</code>, over HTTP/1.1, HTTP/2, and HTTP/3 alike - not H3-only. See <a href="masque.html">masque.html</a> and <a href="conformance.html#masque">Conformance → MASQUE</a>.</p>
 <h2 id="see-also">See also</h2>
 <ul>
 <li><a href="http/overview.html">HTTP overview</a></li>
 <li><a href="http/server.html">HTTP server</a></li>
 <li><a href="http/client.html">HTTP client</a></li>
-<li><a href="tls.html">TLS</a> — TCP TLS helpers (same in-tree engine; QUIC is the 1.3-only subset)</li>
+<li><a href="tls.html">TLS</a> - TCP TLS helpers (same in-tree engine; QUIC is the 1.3-only subset)</li>
 <li><a href="architecture.html">Architecture</a></li>
 </ul>
 

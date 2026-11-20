@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Services — Hopf</title>
+  <title>Services - Hopf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
@@ -105,7 +105,7 @@ Endpoint  (TCP Connection | QuicStreamEndpoint | …)
 Worker reactor (affinity for life)</code></pre>
 <p>HTTP inserts an extra Stream layer: the <code>ProtocolHandler</code> is <code>H1Endpoint</code> / <code>CleartextHttpEndpoint</code> / …, which drives <code>ServerHandler</code>. FTP/SMTP implement <code>ProtocolHandler</code> directly on the control connection.</p>
 <h2 id="protocolhandler">ProtocolHandler</h2>
-<p>Invoked on the owning reactor thread — must not block. Panics are caught at the connection boundary (log + close).</p>
+<p>Invoked on the owning reactor thread - must not block. Panics are caught at the connection boundary (log + close).</p>
 <table>
 <colgroup>
 <col style="width: 57%" />
@@ -192,11 +192,11 @@ Worker reactor (affinity for life)</code></pre>
 </tr>
 <tr>
 <td><code>tcp_listeners</code></td>
-<td>Optional static set — <strong>transitional</strong>; prefer Runtime registration</td>
+<td>Optional static set - <strong>transitional</strong>; prefer Runtime registration</td>
 </tr>
 </tbody>
 </table>
-<p><code>Runtime::start_service(&amp;mut service)</code> calls <code>start</code>. Composition owns the listen/dial script for declarative apps — a frozen <code>tcp_listeners</code> slice is not the preferred model.</p>
+<p><code>Runtime::start_service(&amp;mut service)</code> calls <code>start</code>. Composition owns the listen/dial script for declarative apps - a frozen <code>tcp_listeners</code> slice is not the preferred model.</p>
 <h2 id="runtimeadd_tcp_listener">Runtime::add_tcp_listener</h2>
 <div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> (bound<span class="op">,</span> id) <span class="op">=</span> rt<span class="op">.</span>add_tcp_listener(config)<span class="op">?;</span></span>
 <span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co">// later</span></span>
@@ -319,9 +319,9 @@ Worker reactor (affinity for life)</code></pre>
 </table>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li><code>Service::tcp_listeners</code> is transitional — Composition / Runtime APIs own bindings.</li>
+<li><code>Service::tcp_listeners</code> is transitional - Composition / Runtime APIs own bindings.</li>
 <li>Protocol <code>start</code> signatures vary (<code>&amp;Runtime</code> vs <code>Arc&lt;Runtime&gt;</code>); FTP needs <code>Arc</code> for PASV.</li>
-<li>QUIC/H3 services are not <code>Service</code> trait objects today — call <code>listen_h3</code> directly.</li>
+<li>QUIC/H3 services are not <code>Service</code> trait objects today - call <code>listen_h3</code> directly.</li>
 </ul>
 <h2 id="see-also">See also</h2>
 <ul>
