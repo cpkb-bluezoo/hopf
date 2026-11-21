@@ -54,7 +54,7 @@ use crate::commands::{
 use crate::config::RedisConfig;
 use crate::error::RedisError;
 use crate::keys::{command_slot, key_slot, SLOTS};
-use crate::pubsub::is_subscription_command;
+use crate::pubsub::{is_subscription_command, Push};
 use crate::resp::{ServerError, Value};
 use crate::topology::{parse_redirect, parse_shards, parse_slots, NodeAddr, SlotRange};
 
@@ -194,11 +194,15 @@ struct State {
     last: HashMap<u16, Arc<Track>>,
 }
 
+type PushHandler = Box<dyn FnMut(&NodeAddr, Push) + Send>;
+
 struct Inner {
     reactor: ReactorHandle,
     config: ClusterConfig,
     state: Mutex<State>,
     closed: AtomicBool,
+    /// Where the nodes' RESP3 pushes go.
+    push: Mutex<Option<Arc<Mutex<PushHandler>>>>,
     refreshes: AtomicUsize,
     /// Numbers each sending of a `WAIT`.
     wait_sends: AtomicU64,
@@ -227,6 +231,7 @@ impl RedisCluster {
                 last: HashMap::new(),
             }),
             closed: AtomicBool::new(false),
+            push: Mutex::new(None),
             refreshes: AtomicUsize::new(0),
             wait_sends: AtomicU64::new(0),
         });
@@ -466,6 +471,75 @@ impl RedisCluster {
         );
     }
 
+    /// Receive the RESP3 pushes the connections to the nodes get: key
+    /// invalidations after `CLIENT TRACKING`, and anything else a server pushes,
+    /// of whatever kind (see [`Push`]). `handler` is given the node the push
+    /// came from, and runs on the cluster's reactor. It applies to every node
+    /// connection, those made before it was set and those made after (a node
+    /// found by a refresh, or reached through `MOVED` or `ASK`), and to one
+    /// that replaces another. Without a handler, pushes are discarded.
+    ///
+    /// Tracking belongs to a connection, not to the cluster: the application
+    /// enables it on the connections it wants, with
+    /// [`send_to_node`](Self::send_to_node) or
+    /// [`send_to_masters`](Self::send_to_masters), and does so again on a
+    /// connection that is replaced, since the server forgets it with the old
+    /// one. A node that stops being a master is let go of, and with it what was
+    /// tracked on it. Pushes that carry subscription messages belong to a
+    /// [`RedisSubscriber`](crate::RedisSubscriber), not here.
+    pub fn set_push_handler(&self, handler: impl FnMut(&NodeAddr, Push) + Send + 'static) {
+        *self.inner.push.lock().unwrap() = Some(Arc::new(Mutex::new(Box::new(handler))));
+    }
+
+    /// Stop passing pushes to the handler.
+    pub fn clear_push_handler(&self) {
+        *self.inner.push.lock().unwrap() = None;
+    }
+
+    /// [`send`](Self::send) to the master at `node`, whatever the command's
+    /// keys are: for a command that belongs to a connection rather than a slot,
+    /// such as `CLIENT TRACKING on`. The node must be a master in the current
+    /// layout; otherwise the callback gets [`RedisError::Unexpected`] and
+    /// nothing is sent. The command is neither redirected nor sent again.
+    pub fn send_to_node(&self, node: &NodeAddr, command: &Command, callback: impl FnOnce(Reply) + Send + 'static) {
+        let inner = &self.inner;
+        if inner.closed.load(Ordering::SeqCst) {
+            return finish(inner, Box::new(callback), Err(RedisError::Closed));
+        }
+        let client = {
+            let mut st = inner.state.lock().unwrap();
+            if master_addrs(&st).contains(node) {
+                Some(client_for(inner, &mut st, node))
+            } else {
+                None
+            }
+        };
+        match client {
+            None => finish(
+                inner,
+                Box::new(callback),
+                Err(RedisError::Unexpected(format!("{node} is not a master in the cluster's layout"))),
+            ),
+            Some(client) => {
+                let inner2 = Arc::clone(inner);
+                client.send(command, move |reply| callback(unsent_closed(&inner2, reply)));
+            }
+        }
+    }
+
+    /// [`send_to_node`](Self::send_to_node) to every master in the current
+    /// layout; `callback` is called once for each, with the node and its reply.
+    /// With no layout known yet there are no masters, and it is never called.
+    pub fn send_to_masters(&self, command: &Command, callback: impl FnMut(NodeAddr, Reply) + Send + 'static) {
+        let masters = master_addrs(&self.inner.state.lock().unwrap());
+        let callback = Arc::new(Mutex::new(callback));
+        for node in masters {
+            let callback = Arc::clone(&callback);
+            let who = node.clone();
+            self.send_to_node(&node, command, move |reply| (callback.lock().unwrap())(who, reply));
+        }
+    }
+
     /// The slot `key` hashes to.
     pub fn slot_of(&self, key: impl AsRef<[u8]>) -> u16 {
         key_slot(key.as_ref())
@@ -479,15 +553,7 @@ impl RedisCluster {
 
     /// The masters in the current layout.
     pub fn masters(&self) -> Vec<(String, u16)> {
-        let st = self.inner.state.lock().unwrap();
-        let mut seen: Vec<(String, u16)> = Vec::new();
-        for a in st.slots.iter().flatten() {
-            let m = (a.host.clone(), a.port);
-            if !seen.contains(&m) {
-                seen.push(m);
-            }
-        }
-        seen
+        master_addrs(&self.inner.state.lock().unwrap()).into_iter().map(|a| (a.host, a.port)).collect()
     }
 
     /// Whether the layout is known.
@@ -523,6 +589,17 @@ impl RedisCluster {
     }
 }
 
+/// The masters in the layout, each once.
+fn master_addrs(st: &State) -> Vec<NodeAddr> {
+    let mut seen: Vec<NodeAddr> = Vec::new();
+    for a in st.slots.iter().flatten() {
+        if !seen.contains(a) {
+            seen.push((**a).clone());
+        }
+    }
+    seen
+}
+
 fn crossslot() -> RedisError {
     RedisError::Server(ServerError {
         code: "CROSSSLOT".into(),
@@ -554,6 +631,18 @@ fn client_for(inner: &Arc<Inner>, st: &mut State, addr: &NodeAddr) -> RedisClien
             client.on_unresponsive(move || {
                 if let Some(inner) = weak.upgrade() {
                     request_refresh(&inner);
+                }
+            });
+            // Pushes go to whatever handler the cluster has when they arrive, so
+            // a handler set or cleared later, and a client made later, all work.
+            let (weak, node) = (Arc::downgrade(inner), addr.clone());
+            client.set_push_handler(move |push| {
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                let handler = inner.push.lock().unwrap().clone();
+                if let Some(handler) = handler {
+                    (handler.lock().unwrap())(&node, push);
                 }
             });
             client

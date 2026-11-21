@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use hopf_core::Bytes;
-use hopf_redis::{key_slot, ClusterConfig, Command, Deadline, RedisCluster, RedisError};
+use hopf_redis::{key_slot, ClusterConfig, Command, Deadline, NodeAddr, Push, RedisCluster, RedisError};
 
 use common::scripted_server::*;
 use common::*;
@@ -672,4 +672,201 @@ fn a_command_sent_through_the_cluster_can_have_a_deadline_of_its_own() {
     c.close();
     rt.shutdown();
     server.rt.shutdown();
+}
+
+// ---- RESP3 pushes on node connections ----
+
+/// `+OK`, then an `invalidate` push for `key`: what a node does on `CLIENT TRACKING on`.
+fn tracked_reply(key: &str) -> String {
+    format!("+OK\r\n>2\r\n$10\r\ninvalidate\r\n*1\r\n${}\r\n{key}\r\n", key.len())
+}
+
+/// Two masters, `a` serving 0-8191 and `b` the rest. A `CLIENT TRACKING` to
+/// either is answered with `+OK` and an invalidation of the key `"<port>"`,
+/// and a `GET` of `"moved"` to `a` is redirected to `b`.
+fn two_masters() -> (hopf_core::Runtime, RedisCluster, Server, Server) {
+    let pair: Arc<OnceLock<(SocketAddr, SocketAddr)>> = Arc::default();
+    let script = |pair: Arc<OnceLock<(SocketAddr, SocketAddr)>>, me_is_a: bool| {
+        move |s: &mut Session, w: &[Vec<u8>]| {
+            let (a, b) = *pair.get().unwrap();
+            let me = if me_is_a { a } else { b };
+            match name_of(w).as_str() {
+                "CLUSTER" => s.reply(slots_split(a, b)),
+                "CLIENT" => s.reply(tracked_reply(&me.port().to_string())),
+                "GET" if me_is_a && arg(w, 1) == "moved" => {
+                    s.reply(format!("-MOVED {} {b}\r\n", key_slot(b"moved")));
+                }
+                "GET" => s.reply("$2\r\nok\r\n"),
+                other => panic!("unexpected {other}"),
+            }
+        }
+    };
+    let a = node(script(Arc::clone(&pair), true));
+    let b = node(script(Arc::clone(&pair), false));
+    pair.set((a.addr, b.addr)).unwrap();
+    let rt = runtime();
+    let c = RedisCluster::connect(
+        rt.pick_worker(),
+        ClusterConfig::new([("127.0.0.1".to_string(), a.addr.port())]).min_refresh_interval(Duration::from_millis(5)),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !c.is_ready() {
+        assert!(Instant::now() < deadline, "no layout");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    (rt, c, a, b)
+}
+
+fn addr_of(server: &Server) -> NodeAddr {
+    NodeAddr {
+        host: "127.0.0.1".into(),
+        port: server.addr.port(),
+    }
+}
+
+fn tracking() -> Command {
+    Command::new("CLIENT").arg("TRACKING").arg("on")
+}
+
+fn invalidated(push: &Push) -> String {
+    match push.invalidation() {
+        Some(hopf_redis::Invalidation::Keys(keys)) => String::from_utf8_lossy(&keys[0]).into_owned(),
+        other => panic!("not a key invalidation: {other:?}"),
+    }
+}
+
+#[test]
+fn a_push_on_a_node_connection_reaches_the_handler_with_the_nodes_address() {
+    let (rt, c, a, nb) = two_masters();
+    let (tx, rx) = std::sync::mpsc::channel();
+    c.set_push_handler(move |node, push| tx.send((node.clone(), push)).unwrap());
+
+    // The connection to `a` was made before the handler was set.
+    call!(|cb| c.send_to_node(&addr_of(&a), &tracking(), cb)).unwrap();
+    let (from, push) = rx.recv_timeout(Duration::from_secs(5)).expect("a push from a");
+    assert_eq!(from, addr_of(&a));
+    assert_eq!(invalidated(&push), a.addr.port().to_string());
+
+    // The connection to `b` is made now, after it.
+    call!(|cb| c.send_to_node(&addr_of(&nb), &tracking(), cb)).unwrap();
+    let (from, push) = rx.recv_timeout(Duration::from_secs(5)).expect("a push from b");
+    assert_eq!(from, addr_of(&nb));
+    assert_eq!(invalidated(&push), nb.addr.port().to_string());
+
+    // Replies stay in step with their commands around the pushes.
+    assert_eq!(call!(|cb| c.get("moved", cb)).unwrap(), Some(b("ok")));
+    c.close();
+    rt.shutdown();
+    a.rt.shutdown();
+    nb.rt.shutdown();
+}
+
+#[test]
+fn pushes_still_arrive_from_a_node_first_reached_through_a_moved() {
+    let (rt, c, a, nb) = two_masters();
+    let (tx, rx) = std::sync::mpsc::channel();
+    c.set_push_handler(move |node, push| tx.send((node.clone(), push)).unwrap());
+    // `a` answers this with MOVED to `b`, which is where the connection to `b` comes from.
+    assert_eq!(call!(|cb| c.get("moved", cb)).unwrap(), Some(b("ok")));
+    call!(|cb| c.send_to_node(&addr_of(&nb), &tracking(), cb)).unwrap();
+    let (from, _) = rx.recv_timeout(Duration::from_secs(5)).expect("a push");
+    assert_eq!(from, addr_of(&nb));
+    c.close();
+    rt.shutdown();
+    a.rt.shutdown();
+    nb.rt.shutdown();
+}
+
+#[test]
+fn pushes_are_dropped_without_a_handler_and_after_it_is_cleared() {
+    let (rt, c, a, nb) = two_masters();
+    // No handler: the push is dropped and the reply behind it is still the reply.
+    call!(|cb| c.send_to_node(&addr_of(&a), &tracking(), cb)).unwrap();
+    assert_eq!(call!(|cb| c.get("k", cb)).unwrap(), Some(b("ok")));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    c.set_push_handler(move |node, push| tx.send((node.clone(), push)).unwrap());
+    call!(|cb| c.send_to_node(&addr_of(&a), &tracking(), cb)).unwrap();
+    rx.recv_timeout(Duration::from_secs(5)).expect("delivered once a handler is set");
+
+    c.clear_push_handler();
+    call!(|cb| c.send_to_node(&addr_of(&a), &tracking(), cb)).unwrap();
+    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "nothing after it is cleared");
+    c.close();
+    rt.shutdown();
+    a.rt.shutdown();
+    nb.rt.shutdown();
+}
+
+#[test]
+fn a_node_that_replaces_another_in_a_new_layout_pushes_to_the_same_handler() {
+    // `old` serves everything until it is asked for the layout a second time,
+    // when it says `new` does; `old` is then let go of and `new` connected to.
+    let new_addr: Arc<OnceLock<SocketAddr>> = Arc::default();
+    let own_new = Arc::clone(&new_addr);
+    let new = node(move |s, w| match name_of(w).as_str() {
+        "CLUSTER" => s.reply(slots_of(*own_new.get().unwrap(), "new")),
+        "CLIENT" => s.reply(tracked_reply("from-new")),
+        other => panic!("unexpected {other}"),
+    });
+    new_addr.set(new.addr).unwrap();
+    let layouts = Arc::new(AtomicUsize::new(0));
+    let (seen, new_a) = (Arc::clone(&layouts), new.addr);
+    let old_addr: Arc<OnceLock<SocketAddr>> = Arc::default();
+    let own_old = Arc::clone(&old_addr);
+    let old = node(move |s, w| match name_of(w).as_str() {
+        "CLUSTER" => {
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                s.reply(slots_of(*own_old.get().unwrap(), "old"));
+            } else {
+                s.reply(slots_of(new_a, "new"));
+            }
+        }
+        other => panic!("unexpected {other}"),
+    });
+    old_addr.set(old.addr).unwrap();
+    let (rt, c) = one_node_cluster(&old, |c| c.min_refresh_interval(Duration::from_millis(5)));
+    let (tx, rx) = std::sync::mpsc::channel();
+    c.set_push_handler(move |node, push| tx.send((node.clone(), push)).unwrap());
+
+    c.refresh();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while c.masters() != vec![("127.0.0.1".to_string(), new.addr.port())] {
+        assert!(Instant::now() < deadline, "the new layout was not taken");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    call!(|cb| c.send_to_node(&addr_of(&new), &tracking(), cb)).unwrap();
+    let (from, push) = rx.recv_timeout(Duration::from_secs(5)).expect("a push from the new node");
+    assert_eq!(from, addr_of(&new));
+    assert_eq!(invalidated(&push), "from-new");
+    c.close();
+    rt.shutdown();
+    old.rt.shutdown();
+    new.rt.shutdown();
+}
+
+#[test]
+fn a_command_can_be_sent_to_a_given_master_or_to_every_one() {
+    let (rt, c, a, nb) = two_masters();
+    // Not a master in the layout: refused without being sent anywhere.
+    let stranger = NodeAddr {
+        host: "127.0.0.1".into(),
+        port: 1,
+    };
+    let err = call!(|cb| c.send_to_node(&stranger, &tracking(), cb)).unwrap_err();
+    assert!(matches!(err, RedisError::Unexpected(_)), "{err:?}");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    c.send_to_masters(&Command::new("GET").arg("k"), move |node, reply| tx.send((node, reply)).unwrap());
+    let mut got: Vec<(NodeAddr, bool)> =
+        (0..2).map(|_| rx.recv_timeout(Duration::from_secs(5)).expect("a reply per master")).map(|(n, r)| (n, r.is_ok())).collect();
+    got.sort_by_key(|(n, _)| n.port);
+    let mut want = vec![(addr_of(&a), true), (addr_of(&nb), true)];
+    want.sort_by_key(|(n, _)| n.port);
+    assert_eq!(got, want);
+    assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "once each");
+    c.close();
+    rt.shutdown();
+    a.rt.shutdown();
+    nb.rt.shutdown();
 }
