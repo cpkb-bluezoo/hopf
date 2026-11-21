@@ -23,6 +23,7 @@
 //! implement [`ReplySink`] directly.
 
 use crate::client::{Deadline, RedisClient, StreamHandle};
+use crate::cluster::RedisCluster;
 use crate::error::RedisError;
 use crate::resp::{AggKind, Flow, ReplySink, Scalar, ServerError, StrKind};
 use crate::Command;
@@ -607,106 +608,114 @@ fn keyed(name: &str, key: impl AsRef<[u8]>) -> Command {
     Command::new(name).arg(key)
 }
 
-impl RedisClient {
-    /// `GET`, streamed: the value goes to `handler` as chunks, whatever its size.
-    pub fn get_stream(&self, key: impl AsRef<[u8]>, handler: impl BulkHandler + 'static) -> StreamHandle {
-        self.send_streaming(&keyed("GET", key), BulkSink::new(handler))
-    }
+/// The streaming methods, for a client and for a cluster alike.
+macro_rules! stream_methods {
+    ($ty:ty) => {
+        impl $ty {
+        /// `GET`, streamed: the value goes to `handler` as chunks, whatever its size.
+        pub fn get_stream(&self, key: impl AsRef<[u8]>, handler: impl BulkHandler + 'static) -> StreamHandle {
+            self.send_streaming(&keyed("GET", key), BulkSink::new(handler))
+        }
 
-    /// `GETDEL`, streamed.
-    pub fn getdel_stream(&self, key: impl AsRef<[u8]>, handler: impl BulkHandler + 'static) -> StreamHandle {
-        self.send_streaming(&keyed("GETDEL", key), BulkSink::new(handler))
-    }
+        /// `GETDEL`, streamed.
+        pub fn getdel_stream(&self, key: impl AsRef<[u8]>, handler: impl BulkHandler + 'static) -> StreamHandle {
+            self.send_streaming(&keyed("GETDEL", key), BulkSink::new(handler))
+        }
 
-    /// `GETRANGE key start end`, streamed.
-    pub fn getrange_stream(
-        &self,
-        key: impl AsRef<[u8]>,
-        start: i64,
-        end: i64,
-        handler: impl BulkHandler + 'static,
-    ) -> StreamHandle {
-        let command = keyed("GETRANGE", key).arg(start.to_string()).arg(end.to_string());
-        self.send_streaming(&command, BulkSink::new(handler))
-    }
+        /// `GETRANGE key start end`, streamed.
+        pub fn getrange_stream(
+            &self,
+            key: impl AsRef<[u8]>,
+            start: i64,
+            end: i64,
+            handler: impl BulkHandler + 'static,
+        ) -> StreamHandle {
+            let command = keyed("GETRANGE", key).arg(start.to_string()).arg(end.to_string());
+            self.send_streaming(&command, BulkSink::new(handler))
+        }
 
-    /// `HGET`, streamed.
-    pub fn hget_stream(
-        &self,
-        key: impl AsRef<[u8]>,
-        field: impl AsRef<[u8]>,
-        handler: impl BulkHandler + 'static,
-    ) -> StreamHandle {
-        self.send_streaming(&keyed("HGET", key).arg(field), BulkSink::new(handler))
-    }
+        /// `HGET`, streamed.
+        pub fn hget_stream(
+            &self,
+            key: impl AsRef<[u8]>,
+            field: impl AsRef<[u8]>,
+            handler: impl BulkHandler + 'static,
+        ) -> StreamHandle {
+            self.send_streaming(&keyed("HGET", key).arg(field), BulkSink::new(handler))
+        }
 
-    /// `LINDEX`, streamed.
-    pub fn lindex_stream(&self, key: impl AsRef<[u8]>, index: i64, handler: impl BulkHandler + 'static) -> StreamHandle {
-        self.send_streaming(&keyed("LINDEX", key).arg(index.to_string()), BulkSink::new(handler))
-    }
+        /// `LINDEX`, streamed.
+        pub fn lindex_stream(&self, key: impl AsRef<[u8]>, index: i64, handler: impl BulkHandler + 'static) -> StreamHandle {
+            self.send_streaming(&keyed("LINDEX", key).arg(index.to_string()), BulkSink::new(handler))
+        }
 
-    /// `LPOP`, streamed.
-    pub fn lpop_stream(&self, key: impl AsRef<[u8]>, handler: impl BulkHandler + 'static) -> StreamHandle {
-        self.send_streaming(&keyed("LPOP", key), BulkSink::new(handler))
-    }
+        /// `LPOP`, streamed.
+        pub fn lpop_stream(&self, key: impl AsRef<[u8]>, handler: impl BulkHandler + 'static) -> StreamHandle {
+            self.send_streaming(&keyed("LPOP", key), BulkSink::new(handler))
+        }
 
-    /// `RPOP`, streamed.
-    pub fn rpop_stream(&self, key: impl AsRef<[u8]>, handler: impl BulkHandler + 'static) -> StreamHandle {
-        self.send_streaming(&keyed("RPOP", key), BulkSink::new(handler))
-    }
+        /// `RPOP`, streamed.
+        pub fn rpop_stream(&self, key: impl AsRef<[u8]>, handler: impl BulkHandler + 'static) -> StreamHandle {
+            self.send_streaming(&keyed("RPOP", key), BulkSink::new(handler))
+        }
 
-    /// `MGET`, streamed: each value goes to `handler` as chunks, in key order.
-    pub fn mget_stream(&self, keys: &[impl AsRef<[u8]>], handler: impl ElementsHandler + 'static) -> StreamHandle {
-        let command = Command::new("MGET").args(keys);
-        self.send_streaming(&command, ElementsSink::new(handler))
-    }
+        /// `MGET`, streamed: each value goes to `handler` as chunks, in key order.
+        pub fn mget_stream(&self, keys: &[impl AsRef<[u8]>], handler: impl ElementsHandler + 'static) -> StreamHandle {
+            let command = Command::new("MGET").args(keys);
+            self.send_streaming(&command, ElementsSink::new(handler))
+        }
 
-    /// `LRANGE`, streamed.
-    pub fn lrange_stream(
-        &self,
-        key: impl AsRef<[u8]>,
-        start: i64,
-        stop: i64,
-        handler: impl ElementsHandler + 'static,
-    ) -> StreamHandle {
-        let command = keyed("LRANGE", key).arg(start.to_string()).arg(stop.to_string());
-        self.send_streaming(&command, ElementsSink::new(handler))
-    }
+        /// `LRANGE`, streamed.
+        pub fn lrange_stream(
+            &self,
+            key: impl AsRef<[u8]>,
+            start: i64,
+            stop: i64,
+            handler: impl ElementsHandler + 'static,
+        ) -> StreamHandle {
+            let command = keyed("LRANGE", key).arg(start.to_string()).arg(stop.to_string());
+            self.send_streaming(&command, ElementsSink::new(handler))
+        }
 
-    /// `SMEMBERS`, streamed: each member goes to `handler` as chunks.
-    pub fn smembers_stream(&self, key: impl AsRef<[u8]>, handler: impl ElementsHandler + 'static) -> StreamHandle {
-        self.send_streaming(&keyed("SMEMBERS", key), ElementsSink::new(handler))
-    }
+        /// `SMEMBERS`, streamed: each member goes to `handler` as chunks.
+        pub fn smembers_stream(&self, key: impl AsRef<[u8]>, handler: impl ElementsHandler + 'static) -> StreamHandle {
+            self.send_streaming(&keyed("SMEMBERS", key), ElementsSink::new(handler))
+        }
 
-    /// `ZRANGE key start stop`, streamed: each member goes to `handler` as chunks.
-    pub fn zrange_stream(
-        &self,
-        key: impl AsRef<[u8]>,
-        start: i64,
-        stop: i64,
-        handler: impl ElementsHandler + 'static,
-    ) -> StreamHandle {
-        let command = keyed("ZRANGE", key).arg(start.to_string()).arg(stop.to_string());
-        self.send_streaming(&command, ElementsSink::new(handler))
-    }
+        /// `ZRANGE key start stop`, streamed: each member goes to `handler` as chunks.
+        pub fn zrange_stream(
+            &self,
+            key: impl AsRef<[u8]>,
+            start: i64,
+            stop: i64,
+            handler: impl ElementsHandler + 'static,
+        ) -> StreamHandle {
+            let command = keyed("ZRANGE", key).arg(start.to_string()).arg(stop.to_string());
+            self.send_streaming(&command, ElementsSink::new(handler))
+        }
 
-    /// `HGETALL`, streamed: each field name whole, each value as chunks.
-    pub fn hgetall_stream(&self, key: impl AsRef<[u8]>, handler: impl FieldsHandler + 'static) -> StreamHandle {
-        self.send_streaming(&keyed("HGETALL", key), FieldsSink::new(handler))
-    }
+        /// `HGETALL`, streamed: each field name whole, each value as chunks.
+        pub fn hgetall_stream(&self, key: impl AsRef<[u8]>, handler: impl FieldsHandler + 'static) -> StreamHandle {
+            self.send_streaming(&keyed("HGETALL", key), FieldsSink::new(handler))
+        }
 
-    /// `KEYS pattern`, each key whole.
-    pub fn keys_stream(&self, pattern: impl AsRef<[u8]>, handler: impl KeysHandler + 'static) -> StreamHandle {
-        self.send_streaming(&keyed("KEYS", pattern), KeysSink::new(handler))
-    }
+        /// `KEYS pattern`, each key whole.
+        pub fn keys_stream(&self, pattern: impl AsRef<[u8]>, handler: impl KeysHandler + 'static) -> StreamHandle {
+            self.send_streaming(&keyed("KEYS", pattern), KeysSink::new(handler))
+        }
 
-    /// [`get_stream`](Self::get_stream) with a deadline of its own.
-    pub fn get_stream_with_deadline(
-        &self,
-        key: impl AsRef<[u8]>,
-        deadline: Deadline,
-        handler: impl BulkHandler + 'static,
-    ) -> StreamHandle {
-        self.send_streaming_with_deadline(&keyed("GET", key), deadline, BulkSink::new(handler))
-    }
+        /// [`get_stream`](Self::get_stream) with a deadline of its own.
+        pub fn get_stream_with_deadline(
+            &self,
+            key: impl AsRef<[u8]>,
+            deadline: Deadline,
+            handler: impl BulkHandler + 'static,
+        ) -> StreamHandle {
+            self.send_streaming_with_deadline(&keyed("GET", key), deadline, BulkSink::new(handler))
+        }
+        }
+    };
 }
+
+stream_methods!(RedisClient);
+stream_methods!(RedisCluster);

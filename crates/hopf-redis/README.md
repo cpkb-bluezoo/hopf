@@ -36,6 +36,11 @@ speaking RESP2 and RESP3.
   collected; a sink can pause it, or discard the rest of a reply in constant
   memory. A reply nobody waits for, such as a timed-out command's, is discarded
   as it arrives, however large.
+- **Streaming through a cluster.** `RedisCluster::send_streaming` and the same
+  helpers as a client follow `MOVED`, `ASK` and retries without the sink hearing
+  of an attempt that was redirected: only the start of a reply is held back, to
+  see if it is an error. After the first event that is not, the command is
+  committed to its node and nothing more is held.
 - **Streaming values out.** `Command::arg_stream` takes an argument pulled from a
   source a block at a time, so a value of any size is never held whole; the
   source is opened afresh for each attempt, so redirections and reconnections

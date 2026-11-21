@@ -34,6 +34,15 @@
 //! caller's. (`WAIT` is never sent again: see
 //! [`wait_replicas`](RedisCluster::wait_replicas).)
 //!
+//! # Streaming
+//!
+//! [`send_streaming`](RedisCluster::send_streaming) tells a sink the reply as it
+//! arrives. Each attempt has a gate in front of the sink that holds back only the
+//! start of the reply: `MOVED`, `ASK`, `CLUSTERDOWN` and `TRYAGAIN` arrive as an
+//! error, so an error that comes first is kept and followed as above, the sink
+//! having heard nothing. Anything else commits the attempt to its node, and the
+//! rest is passed straight on.
+//!
 //! Refreshes are one at a time and at most one in
 //! [`min_refresh_interval`](ClusterConfig::min_refresh_interval), however many
 //! commands ask for one. A node that is no longer a master is let go of
@@ -47,7 +56,7 @@ use std::time::{Duration, Instant};
 
 use hopf_core::ReactorHandle;
 
-use crate::client::{Callback, Command, Deadline, RedisClient, Reply};
+use crate::client::{Callback, ClusterStream, Command, Deadline, RedisClient, Reply, StreamHandle};
 use crate::commands::{
     aof_counts, is_connection_scoped, server_timeout_ms, wait_command, wait_count, wait_deadline, waitaof_command,
 };
@@ -55,7 +64,7 @@ use crate::config::RedisConfig;
 use crate::error::RedisError;
 use crate::keys::{command_slot, key_indexes, key_slot, SLOTS};
 use crate::pubsub::{is_subscription_command, Push};
-use crate::resp::{ServerError, Value};
+use crate::resp::{AggKind, Flow, ReplyKind, ReplySink, Scalar, ServerError, StrKind, Value};
 use crate::topology::{parse_redirect, parse_shards, parse_slots, NodeAddr, SlotRange};
 
 /// Settings for a [`RedisCluster`].
@@ -149,11 +158,61 @@ struct Job {
     target: Target,
     /// Redirections and retries left.
     budget: u32,
-    callback: Callback,
+    reply: JobReply,
     /// What a `WAIT` for this command's slot is bound to while it is unanswered.
     track: Option<Arc<Track>>,
     /// How long each try may go unanswered.
     deadline: Deadline,
+}
+
+/// Where a command's reply goes.
+enum JobReply {
+    /// A callback that takes the reply as a value.
+    Value(Callback),
+    /// A sink of the caller's own, told the reply as it arrives.
+    Stream(StreamJob),
+}
+
+/// A command whose reply streams to the caller's sink.
+struct StreamJob {
+    /// The caller's sink, until the command ends.
+    sink: Option<Box<dyn ReplySink + Send>>,
+    /// Shared with the caller's handle: whether it has cancelled, and the attempt
+    /// now under way.
+    control: Arc<ClusterStream>,
+}
+
+impl Job {
+    /// End the job with `error`: nothing of the reply reached the caller.
+    fn fail(self, inner: &Arc<Inner>, error: RedisError) {
+        match self.reply {
+            JobReply::Value(callback) => finish(inner, callback, Err(error)),
+            JobReply::Stream(stream) => {
+                if let Some(t) = &self.track {
+                    complete(inner, t, Some(&error));
+                }
+                fail_sink(inner, stream.sink, error);
+            }
+        }
+    }
+}
+
+/// Tell a streaming sink its command failed, having heard nothing of a reply. A
+/// server's error is delivered as the error reply it is, so a shape sink reports
+/// it as it would one that came from a node.
+fn fail_sink(inner: &Inner, sink: Option<Box<dyn ReplySink + Send>>, error: RedisError) {
+    let Some(mut sink) = sink else {
+        return;
+    };
+    inner.reactor.execute(Box::new(move || match error {
+        RedisError::Server(e) => {
+            sink.begin_reply(ReplyKind::Normal);
+            sink.error(&e.to_string());
+            sink.end_reply(false);
+            sink.finished(Ok(()));
+        }
+        other => sink.finished(Err(other)),
+    }));
 }
 
 /// Work that cannot go anywhere until the layout is known.
@@ -164,9 +223,9 @@ enum Parked {
 
 impl Parked {
     /// Fail it with `error`.
-    fn fail(self, inner: &Inner, error: RedisError) {
+    fn fail(self, inner: &Arc<Inner>, error: RedisError) {
         match self {
-            Parked::Command(j) => finish(inner, j.callback, Err(error)),
+            Parked::Command(j) => j.fail(inner, error),
             Parked::Tx(j) => finish_tx(inner, j.callback, Err(error)),
         }
     }
@@ -338,12 +397,106 @@ impl RedisCluster {
                 slot,
                 target: Target::Owner,
                 budget: inner.config.max_redirects,
-                callback,
+                reply: JobReply::Value(callback),
                 track,
                 deadline,
             },
             true,
         );
+    }
+
+    /// Send `command` to the master that owns its slot and tell `sink` what its
+    /// reply is, as it arrives: see
+    /// [`RedisClient::send_streaming`](crate::RedisClient::send_streaming), whose
+    /// flow control, cancellation and timeouts this has.
+    ///
+    /// Redirections (`MOVED`, `ASK`) and retries (`CLUSTERDOWN`, `TRYAGAIN`, a node
+    /// that cannot be reached) are followed as for any command, and the sink hears
+    /// nothing of an attempt that was redirected: the cluster holds back only the
+    /// first of a reply, which is an error if there is one. From the first event
+    /// that is not an error the command is committed to that node, and a
+    /// connection lost after it is the sink's `ConnectionLost`, not sent again.
+    /// A streamed argument is opened afresh for each attempt.
+    pub fn send_streaming(&self, command: &Command, sink: impl ReplySink + Send + 'static) -> StreamHandle {
+        self.submit_streaming(command, None, Deadline::Default, Box::new(sink))
+    }
+
+    /// [`send_streaming`](Self::send_streaming) with a deadline of its own.
+    pub fn send_streaming_with_deadline(
+        &self,
+        command: &Command,
+        deadline: Deadline,
+        sink: impl ReplySink + Send + 'static,
+    ) -> StreamHandle {
+        self.submit_streaming(command, None, deadline, Box::new(sink))
+    }
+
+    /// [`send_streaming`](Self::send_streaming) to the master that owns
+    /// `routing_key`'s slot, whatever the command's own keys are.
+    pub fn send_streaming_for_key(
+        &self,
+        routing_key: impl AsRef<[u8]>,
+        command: &Command,
+        sink: impl ReplySink + Send + 'static,
+    ) -> StreamHandle {
+        self.submit_streaming(command, Some(key_slot(routing_key.as_ref())), Deadline::Default, Box::new(sink))
+    }
+
+    fn submit_streaming(
+        &self,
+        command: &Command,
+        routed: Option<u16>,
+        deadline: Deadline,
+        sink: Box<dyn ReplySink + Send>,
+    ) -> StreamHandle {
+        let inner = &self.inner;
+        let control = Arc::new(ClusterStream::default());
+        let handle = StreamHandle::cluster(Arc::clone(&control));
+        let refuse = |why: RedisError, sink: Box<dyn ReplySink + Send>| {
+            fail_sink(inner, Some(sink), why);
+            StreamHandle::cluster(Arc::new(ClusterStream::default()))
+        };
+        if inner.closed.load(Ordering::SeqCst) {
+            return refuse(RedisError::Closed, sink);
+        }
+        if command.words().first().is_some_and(|w| is_subscription_command(w)) {
+            return refuse(
+                RedisError::Unexpected("subscriptions need a RedisSubscriber, not a cluster command connection".into()),
+                sink,
+            );
+        }
+        if command.words().first().is_some_and(|w| is_connection_scoped(w)) {
+            return refuse(
+                RedisError::Unexpected("WAIT and WAITAOF cannot be streamed: use wait_replicas or wait_aof".into()),
+                sink,
+            );
+        }
+        if command.has_streams() && key_indexes(command.words()).into_iter().any(|i| command.is_streamed(i)) {
+            return refuse(RedisError::Unexpected("a streamed argument cannot be a key".into()), sink);
+        }
+        let slot = match (command_slot(command.words()), routed) {
+            (Err(_), _) => return refuse(crossslot(), sink),
+            (Ok(own), Some(r)) if own.is_some_and(|s| s != r) => return refuse(crossslot(), sink),
+            (Ok(own), r) => r.or(own),
+        };
+        let track = slot.map(|s| register(inner, s));
+        dispatch(
+            inner,
+            Job {
+                command: command.clone(),
+                slot,
+                target: Target::Owner,
+                budget: inner.config.max_redirects,
+                reply: JobReply::Stream(StreamJob {
+                    sink: Some(sink),
+                    control,
+                }),
+                track,
+                deadline,
+            },
+            true,
+        );
+        handle
     }
 
     /// `WAIT num_replicas timeout_ms`, for the writes just made to the slot of
@@ -719,23 +872,40 @@ fn dispatch(inner: &Arc<Inner>, mut job: Job, fresh: bool) {
             job.budget -= 1;
             park(inner, Parked::Command(job), Some(unserved()))
         } else {
-            finish(inner, job.callback, Err(unserved()))
+            job.fail(inner, unserved())
         };
     };
     let sent = job.command.clone();
     let deadline = job.deadline;
     let track = job.track.clone();
     let inner2 = Arc::clone(inner);
-    let reply = move |reply: Reply| on_reply(&inner2, job, addr, reply);
-    if asking {
-        // ASKING applies to the next command on the connection and no other, so
-        // the two go in one batch with nothing between them.
-        client.send_batch_with_deadline(
-            vec![(Command::new("ASKING"), Box::new(|_: Reply| {})), (sent, Box::new(reply))],
-            deadline,
-        );
-    } else {
-        client.send_with_deadline(&sent, deadline, reply);
+    match &job.reply {
+        JobReply::Value(_) => {
+            let reply = move |reply: Reply| on_reply(&inner2, job, addr, reply);
+            if asking {
+                // ASKING applies to the next command on the connection and no other, so
+                // the two go in one batch with nothing between them.
+                client.send_batch_with_deadline(
+                    vec![(Command::new("ASKING"), Box::new(|_: Reply| {})), (sent, Box::new(reply))],
+                    deadline,
+                );
+            } else {
+                client.send_with_deadline(&sent, deadline, reply);
+            }
+        }
+        JobReply::Stream(stream) => {
+            let control = Arc::clone(&stream.control);
+            let gate = Gate::new(inner2, job, addr);
+            let handle = if asking {
+                client.send_asking_streaming(&sent, deadline, gate)
+            } else {
+                client.send_streaming_with_deadline(&sent, deadline, gate)
+            };
+            *control.current.lock().unwrap() = Some(handle.clone());
+            if control.cancelled.load(Ordering::SeqCst) {
+                handle.cancel();
+            }
+        }
     }
     if let Some(t) = track {
         attach(inner, &t, &client);
@@ -743,11 +913,20 @@ fn dispatch(inner: &Arc<Inner>, mut job: Job, fresh: bool) {
 }
 
 /// A node answered, or failed to.
-fn on_reply(inner: &Arc<Inner>, mut job: Job, from: Arc<NodeAddr>, reply: Reply) {
-    let error = match reply {
-        Ok(v) => return (job.callback)(Ok(v)),
-        Err(e) => e,
-    };
+fn on_reply(inner: &Arc<Inner>, job: Job, from: Arc<NodeAddr>, reply: Reply) {
+    match reply {
+        Ok(v) => {
+            if let JobReply::Value(callback) = job.reply {
+                callback(Ok(v));
+            }
+        }
+        Err(error) => on_failure(inner, job, from, error),
+    }
+}
+
+/// A node did not answer a command with a reply: follow a redirection, try
+/// again, or end the command with `error`.
+fn on_failure(inner: &Arc<Inner>, mut job: Job, from: Arc<NodeAddr>, error: RedisError) {
     match &error {
         RedisError::Server(e) if (e.code == "MOVED" || e.code == "ASK") && job.budget > 0 => {
             if let Some((slot, node)) = parse_redirect(&e.message) {
@@ -801,7 +980,165 @@ fn on_reply(inner: &Arc<Inner>, mut job: Job, from: Arc<NodeAddr>, reply: Reply)
         }
         _ => {}
     }
-    (job.callback)(Err(error));
+    job.fail(inner, error);
+}
+
+/// Stands in front of a streaming command's sink for one attempt at it, so that
+/// the attempt can be followed elsewhere if the node redirects it.
+///
+/// It holds back only the start of the reply. If the first thing is an error
+/// (`MOVED`, `ASK`, `CLUSTERDOWN`, `TRYAGAIN` all arrive as one), it is kept, and
+/// when the reply ends the usual policy decides what to do with it, the sink
+/// having heard nothing. Anything else commits the attempt: the sink is told the
+/// reply began and everything after is passed straight on, so nothing of a large
+/// value is held.
+struct Gate {
+    inner: Arc<Inner>,
+    job: Option<Job>,
+    from: Arc<NodeAddr>,
+    committed: bool,
+    /// The error line, or the start of the text of a bulk error, held back.
+    captured: Option<String>,
+    bulk_error: Option<Vec<u8>>,
+}
+
+/// The most of a bulk error's text that is kept to read a redirection from.
+const MAX_HELD_ERROR: usize = 4096;
+
+impl Gate {
+    fn new(inner: Arc<Inner>, job: Job, from: Arc<NodeAddr>) -> Self {
+        Self {
+            inner,
+            job: Some(job),
+            from,
+            committed: false,
+            captured: None,
+            bulk_error: None,
+        }
+    }
+
+    fn stream(&mut self) -> Option<&mut StreamJob> {
+        match self.job.as_mut().map(|j| &mut j.reply) {
+            Some(JobReply::Stream(stream)) => Some(stream),
+            _ => None,
+        }
+    }
+
+    fn cancelled(&mut self) -> bool {
+        self.stream().is_some_and(|s| s.control.cancelled.load(Ordering::SeqCst))
+    }
+
+    /// The reply has begun for the sink: the attempt is committed to this node.
+    fn commit(&mut self) {
+        if self.committed {
+            return;
+        }
+        self.committed = true;
+        if let Some(sink) = self.stream().and_then(|s| s.sink.as_mut()) {
+            sink.begin_reply(ReplyKind::Normal);
+        }
+    }
+
+    fn forward(&mut self, f: impl FnOnce(&mut dyn ReplySink) -> Flow) -> Flow {
+        if self.cancelled() {
+            return Flow::Skip;
+        }
+        match self.stream().and_then(|s| s.sink.as_mut()) {
+            Some(sink) => f(&mut **sink),
+            None => Flow::Skip,
+        }
+    }
+}
+
+impl ReplySink for Gate {
+    fn scalar(&mut self, v: Scalar<'_>) -> Flow {
+        self.commit();
+        self.forward(|s| s.scalar(v))
+    }
+
+    fn error(&mut self, line: &str) -> Flow {
+        if self.committed {
+            return self.forward(|s| s.error(line));
+        }
+        self.captured = Some(line.to_owned());
+        Flow::Continue
+    }
+
+    fn begin_aggregate(&mut self, kind: AggKind, len: Option<usize>) -> Flow {
+        self.commit();
+        self.forward(|s| s.begin_aggregate(kind, len))
+    }
+
+    fn end_aggregate(&mut self) -> Flow {
+        self.forward(|s| s.end_aggregate())
+    }
+
+    fn begin_string(&mut self, kind: StrKind, len: Option<usize>) -> Flow {
+        if kind == StrKind::Error && !self.committed {
+            self.bulk_error = Some(Vec::new());
+            return Flow::Continue;
+        }
+        self.commit();
+        self.forward(|s| s.begin_string(kind, len))
+    }
+
+    fn string_chunk(&mut self, data: &[u8]) -> Flow {
+        if let Some(held) = self.bulk_error.as_mut() {
+            let room = MAX_HELD_ERROR.saturating_sub(held.len());
+            held.extend_from_slice(&data[..data.len().min(room)]);
+            return Flow::Continue;
+        }
+        self.forward(|s| s.string_chunk(data))
+    }
+
+    fn end_string(&mut self) -> Flow {
+        if let Some(held) = self.bulk_error.take() {
+            self.captured = Some(String::from_utf8_lossy(&held).into_owned());
+            return Flow::Continue;
+        }
+        self.forward(|s| s.end_string())
+    }
+
+    fn end_reply(&mut self, skipped: bool) {
+        if self.committed {
+            if let Some(sink) = self.stream().and_then(|s| s.sink.as_mut()) {
+                sink.end_reply(skipped);
+            }
+        }
+    }
+
+    fn finished(&mut self, outcome: Result<(), RedisError>) {
+        let Some(job) = self.job.take() else {
+            return;
+        };
+        let inner = Arc::clone(&self.inner);
+        let cancelled = matches!(&job.reply, JobReply::Stream(s) if s.control.cancelled.load(Ordering::SeqCst));
+        // Committed, cancelled or complete: this is the end of the command. The
+        // sink has heard of the reply, or asked not to.
+        if self.committed || cancelled || matches!(outcome, Err(RedisError::Cancelled)) {
+            let result = if self.committed { outcome } else { Err(RedisError::Cancelled) };
+            return end_stream(&inner, job, result);
+        }
+        match (self.captured.take(), outcome) {
+            // An error reply: a redirection to follow, a retry, or the error.
+            (Some(line), _) => on_failure(&inner, job, Arc::clone(&self.from), RedisError::Server(ServerError::parse(&line))),
+            (None, Err(e)) => on_failure(&inner, job, Arc::clone(&self.from), e),
+            (None, Ok(())) => end_stream(&inner, job, Ok(())),
+        }
+    }
+}
+
+/// A streaming command is over, and its sink has heard all it will of its reply:
+/// tell it how it ended.
+fn end_stream(inner: &Arc<Inner>, job: Job, result: Result<(), RedisError>) {
+    if let Some(t) = &job.track {
+        complete(inner, t, result.as_ref().err());
+    }
+    if let JobReply::Stream(mut stream) = job.reply {
+        if let Some(mut sink) = stream.sink.take() {
+            sink.finished(result);
+        }
+    }
 }
 
 /// A node could not be reached: drop its connection so a refresh starts afresh

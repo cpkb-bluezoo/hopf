@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use hopf_core::Bytes;
 use hopf_redis::{
-    key_slot, ArgSource, ClusterConfig, Command, Deadline, NodeAddr, Push, RedisCluster, RedisError, SourceCtl, SourceRead,
-    StreamArg,
+    key_slot, ArgSource, BulkHandler, ClusterConfig, Command, Deadline, Flow, NodeAddr, Push, RedisCluster, RedisError,
+    ReplyKind, ReplySink, Scalar, SourceCtl, SourceRead, StreamArg, StrKind, AggKind,
 };
 
 use common::scripted_server::*;
@@ -962,4 +962,499 @@ fn a_streamed_argument_cannot_be_a_key_or_be_in_a_transaction() {
     c.close();
     rt.shutdown();
     server.rt.shutdown();
+}
+
+// ---- streaming replies through a cluster ----
+
+#[derive(Default)]
+struct Told {
+    begun: usize,
+    nil: bool,
+    chunks: usize,
+    bytes: usize,
+    ended: bool,
+    outcome: Option<Result<(), RedisError>>,
+}
+
+type Shared = Arc<Mutex<Told>>;
+
+struct Bulk {
+    told: Shared,
+    pause_first: bool,
+}
+
+impl Bulk {
+    fn new() -> (Self, Shared) {
+        let told: Shared = Arc::default();
+        (
+            Self {
+                told: Arc::clone(&told),
+                pause_first: false,
+            },
+            told,
+        )
+    }
+}
+
+impl BulkHandler for Bulk {
+    fn nil(&mut self) {
+        self.told.lock().unwrap().nil = true;
+    }
+    fn begin(&mut self, _len: Option<u64>) {
+        self.told.lock().unwrap().begun += 1;
+    }
+    fn chunk(&mut self, data: &[u8]) -> Flow {
+        let mut t = self.told.lock().unwrap();
+        t.chunks += 1;
+        t.bytes += data.len();
+        if t.chunks == 1 && self.pause_first {
+            return Flow::Pause;
+        }
+        Flow::Continue
+    }
+    fn end(&mut self) {
+        self.told.lock().unwrap().ended = true;
+    }
+    fn finished(&mut self, outcome: Result<(), RedisError>) {
+        self.told.lock().unwrap().outcome = Some(outcome);
+    }
+}
+
+fn wait_outcome(told: &Shared) -> Result<(), RedisError> {
+    for _ in 0..1500 {
+        if let Some(o) = told.lock().unwrap().outcome.clone() {
+            return o;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("the command never finished");
+}
+
+/// Two masters, `a` serving 0-8191 and `b` the rest, each running its own script
+/// for everything but the layout.
+fn two_with(
+    on_a: impl Fn(&mut Session, &[Vec<u8>]) + Send + Sync + 'static,
+    on_b: impl Fn(&mut Session, &[Vec<u8>]) + Send + Sync + 'static,
+    tweak: impl FnOnce(ClusterConfig) -> ClusterConfig,
+) -> (hopf_core::Runtime, RedisCluster, Server, Server) {
+    let pair: Arc<OnceLock<(SocketAddr, SocketAddr)>> = Arc::default();
+    let (pa, pb) = (Arc::clone(&pair), Arc::clone(&pair));
+    let a = node(move |s, w| match name_of(w).as_str() {
+        "CLUSTER" => {
+            let (a, b) = *pa.get().unwrap();
+            s.reply(slots_split(a, b))
+        }
+        _ => on_a(s, w),
+    });
+    let b = node(move |s, w| match name_of(w).as_str() {
+        "CLUSTER" => {
+            let (a, b) = *pb.get().unwrap();
+            s.reply(slots_split(a, b))
+        }
+        _ => on_b(s, w),
+    });
+    pair.set((a.addr, b.addr)).unwrap();
+    let rt = runtime();
+    let c = RedisCluster::connect(
+        rt.pick_worker(),
+        tweak(ClusterConfig::new([("127.0.0.1".to_string(), a.addr.port())]).min_refresh_interval(Duration::from_millis(5))),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !c.is_ready() {
+        assert!(Instant::now() < deadline, "no layout");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    (rt, c, a, b)
+}
+
+const BULK: usize = 700_000;
+
+fn a_value(s: &mut Session) {
+    s.stream(&format!("${BULK}\r\n"), BULK, "\r\n");
+}
+
+#[test]
+fn a_streamed_get_goes_to_the_owner_of_its_slot() {
+    let (rt, c, a, nb) = two_with(
+        |s, w| match name_of(w).as_str() {
+            "GET" => s.reply("$1\r\nA\r\n"),
+            other => panic!("unexpected {other}"),
+        },
+        |s, w| match name_of(w).as_str() {
+            "GET" => a_value(s),
+            other => panic!("unexpected {other}"),
+        },
+        |c| c,
+    );
+    let (h, told) = Bulk::new();
+    c.get_stream(key_with_slot(0..=8191), h);
+    wait_outcome(&told).unwrap();
+    assert_eq!(told.lock().unwrap().bytes, 1, "a's value");
+    let (h, told) = Bulk::new();
+    c.get_stream(key_with_slot(8192..=16383), h);
+    wait_outcome(&told).unwrap();
+    let t = told.lock().unwrap();
+    assert_eq!((t.bytes, t.begun, t.ended), (BULK, 1, true), "b's, in chunks");
+    assert!(t.chunks > 1);
+    drop(t);
+    c.close();
+    rt.shutdown();
+    a.rt.shutdown();
+    nb.rt.shutdown();
+}
+
+#[test]
+fn a_streamed_reply_that_is_redirected_is_heard_once_from_the_node_it_moved_to() {
+    let moved = key_with_slot(0..=8191);
+    let slot = key_slot(moved.as_bytes());
+    let new_addr: Arc<OnceLock<SocketAddr>> = Arc::default();
+    let to = Arc::clone(&new_addr);
+    let a_gets = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&a_gets);
+    let (rt, c, a, nb) = two_with(
+        move |s, w| match name_of(w).as_str() {
+            "GET" => {
+                counted.fetch_add(1, Ordering::SeqCst);
+                s.reply(format!("-MOVED {slot} {}\r\n", to.get().unwrap()));
+            }
+            other => panic!("unexpected {other}"),
+        },
+        |s, w| match name_of(w).as_str() {
+            "GET" => a_value(s),
+            other => panic!("unexpected {other}"),
+        },
+        |c| c,
+    );
+    new_addr.set(nb.addr).unwrap();
+    let (h, told) = Bulk::new();
+    c.get_stream(&moved, h);
+    wait_outcome(&told).unwrap();
+    let t = told.lock().unwrap();
+    assert_eq!((t.bytes, t.begun, t.ended), (BULK, 1, true), "the sink heard one reply, the second node's");
+    drop(t);
+    assert_eq!(a_gets.load(Ordering::SeqCst), 1);
+    c.close();
+    rt.shutdown();
+    a.rt.shutdown();
+    nb.rt.shutdown();
+}
+
+#[test]
+fn an_ask_sends_the_command_behind_an_asking_to_the_other_node() {
+    let key = key_with_slot(0..=8191);
+    let slot = key_slot(key.as_bytes());
+    let new_addr: Arc<OnceLock<SocketAddr>> = Arc::default();
+    let to = Arc::clone(&new_addr);
+    let seen: Log = Arc::default();
+    let log = Arc::clone(&seen);
+    let (rt, c, a, nb) = two_with(
+        move |s, w| match name_of(w).as_str() {
+            "GET" => s.reply(format!("-ASK {slot} {}\r\n", to.get().unwrap())),
+            other => panic!("unexpected {other}"),
+        },
+        move |s, w| {
+            log.lock().unwrap().push((s.conn, name_of(w)));
+            match name_of(w).as_str() {
+                "ASKING" => s.reply("+OK\r\n"),
+                "GET" => a_value(s),
+                other => panic!("unexpected {other}"),
+            }
+        },
+        |c| c,
+    );
+    new_addr.set(nb.addr).unwrap();
+    let (h, told) = Bulk::new();
+    c.get_stream(&key, h);
+    wait_outcome(&told).unwrap();
+    assert_eq!(told.lock().unwrap().bytes, BULK);
+    let names: Vec<String> = seen.lock().unwrap().iter().map(|(_, n)| n.clone()).collect();
+    assert_eq!(names, vec!["ASKING".to_string(), "GET".to_string()], "ASKING, then the command");
+    c.close();
+    rt.shutdown();
+    a.rt.shutdown();
+    nb.rt.shutdown();
+}
+
+#[test]
+fn a_streamed_command_is_tried_again_when_the_slot_is_between_masters() {
+    let tries = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&tries);
+    let (rt, c, a, nb) = two_with(
+        move |s, w| match name_of(w).as_str() {
+            "GET" => {
+                if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                    s.reply("-TRYAGAIN multiple keys request during rehashing of slot\r\n");
+                } else {
+                    a_value(s);
+                }
+            }
+            other => panic!("unexpected {other}"),
+        },
+        |_, w| panic!("unexpected {}", name_of(w)),
+        |c| c,
+    );
+    let (h, told) = Bulk::new();
+    c.get_stream(key_with_slot(0..=8191), h);
+    wait_outcome(&told).unwrap();
+    assert_eq!(told.lock().unwrap().bytes, BULK);
+    assert_eq!(tries.load(Ordering::SeqCst), 2);
+    c.close();
+    rt.shutdown();
+    a.rt.shutdown();
+    nb.rt.shutdown();
+}
+
+/// Records the events as they are told.
+#[derive(Default)]
+struct Events(Arc<Mutex<Vec<String>>>);
+
+impl ReplySink for Events {
+    fn begin_reply(&mut self, kind: ReplyKind) {
+        self.0.lock().unwrap().push(format!("begin {kind:?}"));
+    }
+    fn scalar(&mut self, v: Scalar<'_>) -> Flow {
+        self.0.lock().unwrap().push(format!("{v:?}"));
+        Flow::Continue
+    }
+    fn error(&mut self, line: &str) -> Flow {
+        self.0.lock().unwrap().push(format!("error {line}"));
+        Flow::Continue
+    }
+    fn begin_aggregate(&mut self, _kind: AggKind, _len: Option<usize>) -> Flow {
+        Flow::Continue
+    }
+    fn end_aggregate(&mut self) -> Flow {
+        Flow::Continue
+    }
+    fn begin_string(&mut self, _kind: StrKind, _len: Option<usize>) -> Flow {
+        Flow::Continue
+    }
+    fn string_chunk(&mut self, _data: &[u8]) -> Flow {
+        Flow::Continue
+    }
+    fn end_string(&mut self) -> Flow {
+        Flow::Continue
+    }
+    fn end_reply(&mut self, skipped: bool) {
+        self.0.lock().unwrap().push(format!("end {skipped}"));
+    }
+    fn finished(&mut self, outcome: Result<(), RedisError>) {
+        self.0.lock().unwrap().push(format!("finished {outcome:?}"));
+    }
+}
+
+fn wait_for(events: &Arc<Mutex<Vec<String>>>, last: &str) -> Vec<String> {
+    for _ in 0..1500 {
+        {
+            let e = events.lock().unwrap();
+            if e.last().is_some_and(|l| l.starts_with(last)) {
+                return e.clone();
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("never saw {last}: {:?}", events.lock().unwrap());
+}
+
+#[test]
+fn an_error_that_is_not_a_redirection_reaches_the_sink_as_the_error_reply_it_is() {
+    let (rt, c, a, nb) = two_with(
+        |s, w| match name_of(w).as_str() {
+            "GET" => s.reply("-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"),
+            other => panic!("unexpected {other}"),
+        },
+        |_, w| panic!("unexpected {}", name_of(w)),
+        |c| c,
+    );
+    // A shape sink reports it as a server error, as it would from a single node.
+    let (h, told) = Bulk::new();
+    c.get_stream(key_with_slot(0..=8191), h);
+    let err = wait_outcome(&told).unwrap_err();
+    assert_eq!(err.server_code(), Some("WRONGTYPE"), "{err:?}");
+    // And a sink of any other shape is told it as an error reply.
+    let events = Events::default();
+    let seen = Arc::clone(&events.0);
+    c.send_streaming(&Command::new("GET").arg(key_with_slot(0..=8191)), events);
+    let got = wait_for(&seen, "finished");
+    assert_eq!(
+        got,
+        vec![
+            "begin Normal".to_string(),
+            "error WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+            "end false".to_string(),
+            "finished Ok(())".to_string()
+        ]
+    );
+    c.close();
+    rt.shutdown();
+    a.rt.shutdown();
+    nb.rt.shutdown();
+}
+
+#[test]
+fn redirections_run_out_with_the_error_for_the_sink_and_a_lost_connection_is_not_repeated() {
+    let a_key = key_with_slot(0..=8191);
+    let slot = key_slot(a_key.as_bytes());
+    let addrs: Arc<OnceLock<(SocketAddr, SocketAddr)>> = Arc::default();
+    let (to_b, to_a) = (Arc::clone(&addrs), Arc::clone(&addrs));
+    let (rt, c, a, nb) = two_with(
+        move |s, w| match name_of(w).as_str() {
+            "GET" => s.reply(format!("-MOVED {slot} {}\r\n", to_b.get().unwrap().1)),
+            other => panic!("unexpected {other}"),
+        },
+        move |s, w| match name_of(w).as_str() {
+            "GET" => s.reply(format!("-MOVED {slot} {}\r\n", to_a.get().unwrap().0)),
+            other => panic!("unexpected {other}"),
+        },
+        |c| c.max_redirects(1),
+    );
+    addrs.set((a.addr, nb.addr)).unwrap();
+    // a says b, b says a: one redirection is allowed, the second is the answer.
+    let (h, told) = Bulk::new();
+    c.get_stream(&a_key, h);
+    let err = wait_outcome(&told).unwrap_err();
+    assert_eq!(err.server_code(), Some("MOVED"), "{err:?}");
+    c.close();
+    rt.shutdown();
+    a.rt.shutdown();
+    nb.rt.shutdown();
+
+    // A connection lost part-way through a value: the sink hears so, once, and
+    // the command is not sent again.
+    let gets = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&gets);
+    let (rt, c, a, nb) = two_with(
+        move |s, w| match name_of(w).as_str() {
+            "GET" => {
+                counted.fetch_add(1, Ordering::SeqCst);
+                s.reply("$1000\r\nabc");
+                s.close();
+            }
+            other => panic!("unexpected {other}"),
+        },
+        |_, w| panic!("unexpected {}", name_of(w)),
+        |c| c,
+    );
+    let (h, told) = Bulk::new();
+    c.get_stream(key_with_slot(0..=8191), h);
+    let err = wait_outcome(&told).unwrap_err();
+    assert!(matches!(err, RedisError::ConnectionLost(_)), "{err:?}");
+    assert_eq!(told.lock().unwrap().bytes, 3);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(gets.load(Ordering::SeqCst), 1, "never repeated");
+    c.close();
+    rt.shutdown();
+    a.rt.shutdown();
+    nb.rt.shutdown();
+}
+
+#[test]
+fn the_handle_of_a_cluster_command_pauses_resumes_and_cancels_the_reply() {
+    let (rt, c, a, nb) = two_with(
+        |s, w| match name_of(w).as_str() {
+            "GET" => s.stream("$16777216\r\n", 16 * 1024 * 1024, "\r\n"),
+            _ => s.reply("+PONG\r\n"),
+        },
+        |_, w| panic!("unexpected {}", name_of(w)),
+        |c| c.node_config(|n| n.command_timeout(Some(Duration::from_millis(200))).ping_interval(Some(Duration::from_millis(100)))),
+    );
+    let key = key_with_slot(0..=8191);
+
+    // Paused for far longer than the command timeout and the health check.
+    let (mut h, told) = Bulk::new();
+    h.pause_first = true;
+    let stream = c.get_stream(&key, h);
+    for _ in 0..500 {
+        if told.lock().unwrap().chunks >= 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    let then = told.lock().unwrap().chunks;
+    std::thread::sleep(Duration::from_millis(700));
+    assert_eq!(told.lock().unwrap().chunks, then, "nothing was delivered while paused");
+    assert!(told.lock().unwrap().outcome.is_none());
+    stream.resume();
+    wait_outcome(&told).unwrap();
+    assert_eq!(told.lock().unwrap().bytes, 16 * 1024 * 1024);
+
+    // Cancelled while paused.
+    let (mut h, told) = Bulk::new();
+    h.pause_first = true;
+    let stream = c.get_stream(&key, h);
+    for _ in 0..500 {
+        if told.lock().unwrap().chunks >= 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    stream.cancel();
+    assert_eq!(wait_outcome(&told).unwrap_err(), RedisError::Cancelled);
+    c.close();
+    rt.shutdown();
+    a.rt.shutdown();
+    nb.rt.shutdown();
+}
+
+#[test]
+fn a_command_cancelled_before_its_reply_begins_is_not_sent_again() {
+    let tries = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&tries);
+    let (rt, c, a, nb) = two_with(
+        move |s, w| match name_of(w).as_str() {
+            "GET" => {
+                counted.fetch_add(1, Ordering::SeqCst);
+                // The reply is a redirection, and a long time coming.
+                s.reply_after(Duration::from_millis(400), "-TRYAGAIN try later\r\n");
+            }
+            other => panic!("unexpected {other}"),
+        },
+        |_, w| panic!("unexpected {}", name_of(w)),
+        |c| c,
+    );
+    let (h, told) = Bulk::new();
+    let stream = c.get_stream(key_with_slot(0..=8191), h);
+    std::thread::sleep(Duration::from_millis(100));
+    stream.cancel();
+    assert_eq!(wait_outcome(&told).unwrap_err(), RedisError::Cancelled);
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(tries.load(Ordering::SeqCst), 1, "the retry the TRYAGAIN asks for was not made");
+    c.close();
+    rt.shutdown();
+    a.rt.shutdown();
+    nb.rt.shutdown();
+}
+
+#[test]
+fn a_streamed_upload_and_a_streamed_reply_through_a_cluster() {
+    let len: u64 = 500_000;
+    let sizes = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&sizes);
+    let (rt, c, a, nb) = two_with(
+        move |s, w| match name_of(w).as_str() {
+            "SET" => {
+                log.lock().unwrap().push(w[2].len());
+                s.reply("+OK\r\n");
+            }
+            other => panic!("unexpected {other}"),
+        },
+        |_, w| panic!("unexpected {}", name_of(w)),
+        |c| c,
+    );
+    let events = Events::default();
+    let seen = Arc::clone(&events.0);
+    let command = Command::new("SET")
+        .arg(key_with_slot(0..=8191))
+        .arg_stream(StreamArg::from_fn(len, move || Ok(Box::new(Fill { left: len }))));
+    c.send_streaming(&command, events);
+    let got = wait_for(&seen, "finished");
+    assert_eq!(got.last().unwrap(), "finished Ok(())");
+    assert!(got.contains(&r#"Simple("OK")"#.to_string()), "{got:?}");
+    assert_eq!(*sizes.lock().unwrap(), vec![len as usize]);
+    c.close();
+    rt.shutdown();
+    a.rt.shutdown();
+    nb.rt.shutdown();
 }

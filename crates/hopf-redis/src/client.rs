@@ -388,29 +388,69 @@ fn run_deferred(inner: &Inner, cmd: &Cmd) {
     }
 }
 
-/// A handle on a command sent with [`RedisClient::send_streaming`], for the
+/// A handle on a command sent with [`RedisClient::send_streaming`] or
+/// [`RedisCluster::send_streaming`](crate::RedisCluster::send_streaming), for the
 /// consumer of its reply: to resume it after pausing, or to cancel it.
 ///
-/// Clones are cheap and share the command. Calls may come from any thread.
+/// Clones are cheap and share the command. Calls may come from any thread. For a
+/// command sent through a cluster, which may be sent again before any of its
+/// reply reaches the sink, a handle follows whichever attempt is current.
 #[derive(Clone)]
 pub struct StreamHandle {
-    cmd: Arc<Cmd>,
-    inner: Weak<Inner>,
+    target: HandleTarget,
+}
+
+#[derive(Clone)]
+enum HandleTarget {
+    /// One command on one connection.
+    Command { cmd: Arc<Cmd>, inner: Weak<Inner> },
+    /// A command through a cluster.
+    Cluster(Arc<ClusterStream>),
+}
+
+/// What a cluster's streaming command shares with its handle: that it has been
+/// cancelled, and the handle of the attempt now under way.
+#[derive(Default)]
+pub(crate) struct ClusterStream {
+    pub(crate) cancelled: AtomicBool,
+    pub(crate) current: Mutex<Option<StreamHandle>>,
 }
 
 impl StreamHandle {
+    pub(crate) fn command(cmd: Arc<Cmd>, inner: Weak<Inner>) -> Self {
+        Self {
+            target: HandleTarget::Command { cmd, inner },
+        }
+    }
+
+    pub(crate) fn cluster(state: Arc<ClusterStream>) -> Self {
+        Self {
+            target: HandleTarget::Cluster(state),
+        }
+    }
+
     /// Resume reading after the sink returned [`Flow::Pause`]. It may be called
     /// from any thread at any time: even while the sink is still running, before
     /// it has returned the `Pause` (the pause is then cancelled), or after the
     /// command has ended (when it does nothing).
     pub fn resume(&self) {
-        let flow = &self.cmd.flow;
+        let (cmd, weak) = match &self.target {
+            HandleTarget::Command { cmd, inner } => (cmd, inner),
+            HandleTarget::Cluster(state) => {
+                let current = state.current.lock().unwrap().clone();
+                if let Some(h) = current {
+                    h.resume();
+                }
+                return;
+            }
+        };
+        let flow = &cmd.flow;
         loop {
             let cur = flow.load(Ordering::SeqCst);
             let released = |to: u8| flow.compare_exchange(cur, to, Ordering::SeqCst, Ordering::SeqCst).is_ok();
             if cur & FLOW_PAUSED != 0 {
                 if released(FLOW_RUNNING) {
-                    if let Some(inner) = self.inner.upgrade() {
+                    if let Some(inner) = weak.upgrade() {
                         let inner2 = Arc::clone(&inner);
                         inner.reactor.execute(Box::new(move || resume_read(&inner2)));
                     }
@@ -420,7 +460,7 @@ impl StreamHandle {
                 if released(FLOW_RUNNING) {
                     return;
                 }
-            } else if self.cmd.in_sink.load(Ordering::SeqCst) {
+            } else if cmd.in_sink.load(Ordering::SeqCst) {
                 if released(cur | FLOW_PERMIT) {
                     return;
                 }
@@ -434,10 +474,22 @@ impl StreamHandle {
     /// in constant memory, and the sink is finished with
     /// [`RedisError::Cancelled`]. The connection is not closed and the commands
     /// pipelined behind it are unaffected. Does nothing once the command has
-    /// ended.
+    /// ended. Through a cluster, a command that has not yet begun to reply is not
+    /// sent again.
     pub fn cancel(&self) {
-        self.cmd.cancelled.store(true, Ordering::SeqCst);
-        self.resume();
+        match &self.target {
+            HandleTarget::Command { cmd, .. } => {
+                cmd.cancelled.store(true, Ordering::SeqCst);
+                self.resume();
+            }
+            HandleTarget::Cluster(state) => {
+                state.cancelled.store(true, Ordering::SeqCst);
+                let current = state.current.lock().unwrap().clone();
+                if let Some(h) = current {
+                    h.cancel();
+                }
+            }
+        }
     }
 }
 
@@ -762,10 +814,23 @@ impl RedisClient {
     ) -> StreamHandle {
         let sink: Box<dyn CmdSink> = Box::new(Streaming { sink });
         let cmd = self.send_one(command, sink, deadline, true).expect("a streaming command is returned");
-        StreamHandle {
-            cmd,
-            inner: Arc::downgrade(&self.inner),
-        }
+        StreamHandle::command(cmd, Arc::downgrade(&self.inner))
+    }
+
+    /// [`send_streaming_with_deadline`](Self::send_streaming_with_deadline) behind
+    /// an `ASKING`, in one write with nothing between them: a cluster sending the
+    /// command to the node its slot is moving to.
+    pub(crate) fn send_asking_streaming(
+        &self,
+        command: &Command,
+        deadline: Deadline,
+        sink: impl ReplySink + Send + 'static,
+    ) -> StreamHandle {
+        let asking = self.collecting(|_: Reply| {});
+        let streamed: Box<dyn CmdSink> = Box::new(Streaming { sink });
+        let items = vec![(Command::new("ASKING").encoded(), asking), (command.encoded(), streamed)];
+        let cmd = submit_timed(&self.inner, items, deadline, true, false).expect("a streaming command is returned");
+        StreamHandle::command(cmd, Arc::downgrade(&self.inner))
     }
 
     /// A sink that assembles the reply as a value, under the configured limits,
@@ -1014,8 +1079,9 @@ fn submit_timed(
         let cmd = Cmd::new(sink, by_activity, limit);
         prepared.push(Waiting { qid, bytes, cmd, held });
     }
-    // A streaming command is sent alone, and its caller is given it.
-    let handle = if streaming { prepared.first().map(|w| Arc::clone(&w.cmd)) } else { None };
+    // A streaming command is sent alone (or behind an `ASKING`), and its caller
+    // is given it.
+    let handle = if streaming { prepared.last().map(|w| Arc::clone(&w.cmd)) } else { None };
     if refused {
         for w in prepared {
             end_cmd(inner, &w.cmd, Outcome::Failed(subscription_refused()));
@@ -2323,10 +2389,7 @@ mod tests {
 
     fn cell() -> (Arc<Cmd>, StreamHandle) {
         let cmd = Cmd::new(Box::new(Streaming { sink: Nothing }), true, None);
-        let handle = StreamHandle {
-            cmd: Arc::clone(&cmd),
-            inner: Weak::new(),
-        };
+        let handle = StreamHandle::command(Arc::clone(&cmd), Weak::new());
         (cmd, handle)
     }
 

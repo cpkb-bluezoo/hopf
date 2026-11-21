@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use hopf_core::{Runtime, RuntimeConfig};
 use hopf_redis::{
-    AggKind, ArgSource, BulkHandler, BulkSink, Command, Deadline, Feed, Flow, RedisClient, RedisConfig, RedisError, ReplySink,
+    ClusterConfig, RedisCluster, AggKind, ArgSource, BulkHandler, BulkSink, Command, Deadline, Feed, Flow, RedisClient, RedisConfig, RedisError, ReplySink,
     RespLimits, RespParser, Scalar, SourceCtl, SourceRead, StrKind, StreamArg, StreamHandle,
 };
 
@@ -145,6 +145,14 @@ fn handle(mut s: TcpStream) {
                 write_bulk(&mut s, size)
             }
             "PING" => s.write_all(b"+PONG\r\n"),
+            // A cluster of one node, this one, serving every slot.
+            "CLUSTER" if words.get(1).is_some_and(|w| w.eq_ignore_ascii_case(b"SHARDS")) => {
+                s.write_all(b"-ERR unknown subcommand 'SHARDS'\r\n")
+            }
+            "CLUSTER" => {
+                let port = PORT.load(Ordering::SeqCst);
+                s.write_all(format!("*1\r\n*3\r\n:0\r\n:16383\r\n*3\r\n$9\r\n127.0.0.1\r\n:{port}\r\n$4\r\nnode\r\n").as_bytes())
+            }
             _ => s.write_all(b"+OK\r\n"),
         };
         if ok.is_err() {
@@ -153,8 +161,11 @@ fn handle(mut s: TcpStream) {
     }
 }
 
+static PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
 fn serve() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    PORT.store(listener.local_addr().unwrap().port(), Ordering::SeqCst);
     println!("PORT {}", listener.local_addr().unwrap().port());
     std::io::stdout().flush().unwrap();
     // Run until the parent closes our stdin.
@@ -436,6 +447,46 @@ fn a_command_larger_than_the_outbound_buffer_is_sent() {
     rt.shutdown();
 }
 
+/// A 256 MiB value through a cluster client, to a sink that keeps nothing: the
+/// cluster holds back only the first event of a reply, to see if it is an error
+/// to follow, and none of the value.
+fn a_value_streams_through_a_cluster_in_constant_memory() {
+    const SIZE: usize = 256 * MIB;
+    let server = Server::start();
+    let rt = runtime();
+    let c = RedisCluster::connect(
+        rt.pick_worker(),
+        ClusterConfig::new([("127.0.0.1".to_string(), server.port)]),
+    );
+    for _ in 0..500 {
+        if c.is_ready() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(c.is_ready(), "no layout");
+    let base = reset_peak();
+    let (tx, rx) = mpsc::channel();
+    let (bytes, chunks) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    c.send_streaming(
+        &Command::new("GET").arg(SIZE.to_string()).arg("now"),
+        BulkSink::new(Drain {
+            bytes: Arc::clone(&bytes),
+            chunks: Arc::clone(&chunks),
+            pause_at_first: false,
+            done: tx,
+        }),
+    );
+    let outcome = rx.recv_timeout(Duration::from_secs(120)).expect("the command finished");
+    assert_eq!(outcome, Ok(()));
+    assert_eq!(bytes.load(Ordering::SeqCst), SIZE);
+    let above = peak_above(base);
+    println!("a 256 MiB value streamed through a cluster: peak heap {above} bytes above baseline");
+    assert!(above < 256 * 1024, "the heap rose by {above} bytes streaming a {SIZE} byte value through a cluster");
+    c.close();
+    rt.shutdown();
+}
+
 /// Makes `left` bytes as it is asked for them, and holds none.
 struct Generator {
     left: u64,
@@ -483,5 +534,6 @@ fn main() {
     a_value_streams_through_a_client_in_constant_memory();
     a_command_larger_than_the_outbound_buffer_is_sent();
     a_value_streams_out_of_a_client_in_constant_memory();
+    a_value_streams_through_a_cluster_in_constant_memory();
     println!("memory_bound: ok");
 }

@@ -160,3 +160,11 @@ generator as it is asked for, and the peak heap rises by about 770 KB (one block
 of the source and the outbound buffer), not by the size of the value. A 12 MiB
 value in memory, larger than the 4 MiB outbound buffer, is sent where it used to
 fail.
+
+## Streaming through a cluster
+
+`RedisCluster::send_streaming` puts a small gate in front of the caller's sink
+for each attempt, holding back only the first event of a reply to see if it is
+an error to follow. The cluster rows above are unchanged, and a 256 MiB value
+streamed through a cluster client to a sink that keeps nothing raises the peak
+heap by about 3.6 KB, the same as through one connection.
