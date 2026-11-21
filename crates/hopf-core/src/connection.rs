@@ -462,6 +462,11 @@ impl TcpConnection {
         self.tls.is_some() && self.net_in.is_full()
     }
 
+    /// The handler has called [`Endpoint::pause_read`] and not resumed.
+    pub fn is_read_paused(&self) -> bool {
+        self.read_paused
+    }
+
     pub fn read_from_socket(&mut self) -> io::Result<ReadOutcome> {
         if self.net_in.is_full() {
             // Full after the handler has had its turn. With TLS the handler

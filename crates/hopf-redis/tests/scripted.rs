@@ -16,7 +16,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use hopf_core::Runtime;
-use hopf_redis::{Command, Deadline, RedisClient, RedisConfig, RedisError, RespLimits, Value};
+use hopf_redis::{
+    BulkHandler, Command, Deadline, ElementsHandler, FieldsHandler, Flow, KeysHandler, KeysSink, RedisClient, RedisConfig,
+    RedisError, RespLimits, StreamHandle, Value,
+};
 
 use common::*;
 
@@ -990,6 +993,546 @@ fn a_reply_discarded_past_the_limit_closes_the_connection_and_the_next_command_r
     call!(|cb| c.ping(cb)).expect("the next command dials again and is answered");
     assert_eq!(server.connections.load(Ordering::SeqCst), 2);
     c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+// ---- streaming sinks ----
+
+/// What a handler of the streaming tests was told, and when it is done.
+#[derive(Default)]
+struct Told {
+    nil: bool,
+    begun: Option<Option<u64>>,
+    chunks: usize,
+    bytes: usize,
+    ended: bool,
+    outcome: Option<Result<(), RedisError>>,
+    /// Elements, as (index, bytes) per element, for the array shapes.
+    elements: Vec<(usize, Vec<u8>)>,
+    nils: Vec<usize>,
+    keys: Vec<Vec<u8>>,
+    fields: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    pairs: Option<Option<usize>>,
+}
+
+type Shared = Arc<Mutex<Told>>;
+
+fn wait_outcome(told: &Shared) -> Result<(), RedisError> {
+    for _ in 0..1500 {
+        if let Some(o) = told.lock().unwrap().outcome.clone() {
+            return o;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("the command never finished");
+}
+
+/// A bulk handler that records, and can pause or skip at its first chunk.
+struct Bulk {
+    told: Shared,
+    pause_first: bool,
+    skip_first: bool,
+}
+
+impl Bulk {
+    fn new() -> (Self, Shared) {
+        let told: Shared = Arc::default();
+        (
+            Self {
+                told: Arc::clone(&told),
+                pause_first: false,
+                skip_first: false,
+            },
+            told,
+        )
+    }
+}
+
+impl BulkHandler for Bulk {
+    fn nil(&mut self) {
+        self.told.lock().unwrap().nil = true;
+    }
+    fn begin(&mut self, len: Option<u64>) {
+        self.told.lock().unwrap().begun = Some(len);
+    }
+    fn chunk(&mut self, data: &[u8]) -> Flow {
+        let mut t = self.told.lock().unwrap();
+        t.chunks += 1;
+        t.bytes += data.len();
+        if t.chunks == 1 && self.skip_first {
+            return Flow::Skip;
+        }
+        if t.chunks == 1 && self.pause_first {
+            return Flow::Pause;
+        }
+        Flow::Continue
+    }
+    fn end(&mut self) {
+        self.told.lock().unwrap().ended = true;
+    }
+    fn finished(&mut self, outcome: Result<(), RedisError>) {
+        self.told.lock().unwrap().outcome = Some(outcome);
+    }
+}
+
+/// The first argument of a command, or nothing.
+fn a1(w: &[Vec<u8>]) -> String {
+    w.get(1).map(|a| String::from_utf8_lossy(a).into_owned()).unwrap_or_default()
+}
+
+fn bulk_reply(n: usize) -> Vec<u8> {
+    let mut v = format!("${n}\r\n").into_bytes();
+    v.extend(std::iter::repeat_n(b'x', n));
+    v.extend_from_slice(b"\r\n");
+    v
+}
+
+#[test]
+fn a_reply_streams_to_a_bulk_handler_as_chunks_without_a_limit_on_its_size() {
+    // Far over the budget the collecting callbacks keep: no limit applies here.
+    let limits = RespLimits {
+        max_bulk: 1000,
+        max_reply_bytes: 2000,
+        ..RespLimits::default()
+    };
+    let server = serve(move |s, w| match (name_of(w).as_str(), a1(w).as_str()) {
+        ("HELLO", _) => s.reply(HELLO_OK),
+        ("GET", "big") => s.stream("$3145728\r\n", 3 * 1024 * 1024, "\r\n"),
+        ("GET", "none") => s.reply("$-1\r\n"),
+        ("GET", "wrongtype") => s.reply("-WRONGTYPE not a string\r\n"),
+        ("GET", "number") => s.reply(":7\r\n"),
+        ("PING", _) => s.reply("+PONG\r\n"),
+        _ => s.reply("+OK\r\n"),
+    });
+    let (rt, c) = client(&server, |c| c.limits(limits));
+
+    let (h, told) = Bulk::new();
+    c.get_stream("big", h);
+    wait_outcome(&told).unwrap();
+    {
+        let t = told.lock().unwrap();
+        assert_eq!(t.begun, Some(Some(3 * 1024 * 1024)));
+        assert_eq!(t.bytes, 3 * 1024 * 1024);
+        assert!(t.chunks > 1, "a large value arrives in chunks: {}", t.chunks);
+        assert!(t.ended);
+    }
+
+    let (h, told) = Bulk::new();
+    c.get_stream("none", h);
+    wait_outcome(&told).unwrap();
+    assert!(told.lock().unwrap().nil);
+
+    let (h, told) = Bulk::new();
+    c.get_stream("wrongtype", h);
+    let err = wait_outcome(&told).unwrap_err();
+    assert_eq!(err.server_code(), Some("WRONGTYPE"), "{err:?}");
+
+    let (h, told) = Bulk::new();
+    c.get_stream("number", h);
+    let err = wait_outcome(&told).unwrap_err();
+    assert!(matches!(err, RedisError::Unexpected(_)), "a reply of the wrong shape: {err:?}");
+
+    // Every one of them left the connection in step.
+    call!(|cb| c.ping(cb)).unwrap();
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+/// Records what an elements handler was told.
+struct Elements(Shared);
+
+impl ElementsHandler for Elements {
+    fn begin(&mut self, len: Option<usize>) {
+        self.0.lock().unwrap().pairs = Some(len);
+    }
+    fn nil(&mut self, index: usize) {
+        self.0.lock().unwrap().nils.push(index);
+    }
+    fn element_begin(&mut self, index: usize, _len: Option<u64>) {
+        self.0.lock().unwrap().elements.push((index, Vec::new()));
+    }
+    fn element_chunk(&mut self, index: usize, data: &[u8]) -> Flow {
+        let mut t = self.0.lock().unwrap();
+        let last = t.elements.last_mut().unwrap();
+        assert_eq!(last.0, index);
+        last.1.extend_from_slice(data);
+        Flow::Continue
+    }
+    fn finished(&mut self, outcome: Result<(), RedisError>) {
+        self.0.lock().unwrap().outcome = Some(outcome);
+    }
+}
+
+#[test]
+fn an_array_of_payloads_streams_each_element_in_its_place() {
+    let server = serve(move |s, w| match name_of(w).as_str() {
+        "HELLO" => s.reply(HELLO_OK),
+        "MGET" => {
+            let mut reply = b"*3\r\n$2\r\nab\r\n_\r\n".to_vec();
+            reply.extend_from_slice(&bulk_reply(200_000));
+            s.reply(reply);
+        }
+        "SMEMBERS" => s.reply("*2\r\n$1\r\na\r\n:5\r\n"),
+        _ => s.reply("+PONG\r\n"),
+    });
+    let (rt, c) = client(&server, |c| c);
+    let told: Shared = Arc::default();
+    c.mget_stream(&["a", "b", "c"], Elements(Arc::clone(&told)));
+    wait_outcome(&told).unwrap();
+    {
+        let t = told.lock().unwrap();
+        assert_eq!(t.pairs, Some(Some(3)));
+        assert_eq!(t.nils, vec![1], "the null element is reported by its index");
+        assert_eq!(t.elements.len(), 2);
+        assert_eq!((t.elements[0].0, t.elements[0].1.as_slice()), (0, &b"ab"[..]));
+        assert_eq!((t.elements[1].0, t.elements[1].1.len()), (2, 200_000));
+    }
+    // An element that is not a string is a reply of the wrong shape, and it is reported, not guessed at.
+    let told: Shared = Arc::default();
+    c.smembers_stream("k", Elements(Arc::clone(&told)));
+    assert!(matches!(wait_outcome(&told).unwrap_err(), RedisError::Unexpected(_)));
+    call!(|cb| c.ping(cb)).unwrap();
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+struct Keys(Shared);
+
+impl KeysHandler for Keys {
+    fn key(&mut self, key: &[u8]) -> Flow {
+        self.0.lock().unwrap().keys.push(key.to_vec());
+        Flow::Continue
+    }
+    fn finished(&mut self, outcome: Result<(), RedisError>) {
+        self.0.lock().unwrap().outcome = Some(outcome);
+    }
+}
+
+#[test]
+fn identifiers_arrive_whole_and_one_that_is_too_long_fails_only_its_reply() {
+    let server = serve(move |s, w| match (name_of(w).as_str(), a1(w).as_str()) {
+        ("HELLO", _) => s.reply(HELLO_OK),
+        ("KEYS", "short") => s.reply("*3\r\n$3\r\none\r\n$3\r\ntwo\r\n$5\r\nthree\r\n"),
+        ("KEYS", "long") => {
+            let mut reply = b"*2\r\n$3\r\none\r\n".to_vec();
+            reply.extend_from_slice(&bulk_reply(5000));
+            s.reply(reply);
+        }
+        _ => s.reply("+PONG\r\n"),
+    });
+    let (rt, c) = client(&server, |c| c);
+    let told: Shared = Arc::default();
+    c.keys_stream("short", Keys(Arc::clone(&told)));
+    wait_outcome(&told).unwrap();
+    assert_eq!(told.lock().unwrap().keys, vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
+
+    // A limit of 100 bytes: the 5000-byte identifier is refused, the one before it was delivered.
+    let told: Shared = Arc::default();
+    c.send_streaming(&Command::new("KEYS").arg("long"), KeysSink::with_max_field(Keys(Arc::clone(&told)), 100));
+    let err = wait_outcome(&told).unwrap_err();
+    assert_eq!(err, RedisError::FieldTooLong { limit: 100 });
+    assert_eq!(told.lock().unwrap().keys, vec![b"one".to_vec()]);
+    call!(|cb| c.ping(cb)).unwrap();
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+struct Fields(Shared);
+
+impl FieldsHandler for Fields {
+    fn begin(&mut self, pairs: Option<usize>) {
+        self.0.lock().unwrap().pairs = Some(pairs);
+    }
+    fn field(&mut self, field: &[u8]) -> Flow {
+        self.0.lock().unwrap().fields.push((field.to_vec(), None));
+        Flow::Continue
+    }
+    fn value_nil(&mut self) {}
+    fn value_begin(&mut self, _len: Option<u64>) {
+        self.0.lock().unwrap().fields.last_mut().unwrap().1 = Some(Vec::new());
+    }
+    fn value_chunk(&mut self, data: &[u8]) -> Flow {
+        self.0.lock().unwrap().fields.last_mut().unwrap().1.as_mut().unwrap().extend_from_slice(data);
+        Flow::Continue
+    }
+    fn finished(&mut self, outcome: Result<(), RedisError>) {
+        self.0.lock().unwrap().outcome = Some(outcome);
+    }
+}
+
+#[test]
+fn a_hash_streams_its_fields_whole_and_its_values_in_chunks_in_either_protocol() {
+    let hash = |resp3: bool| {
+        let mut r = if resp3 { b"%2\r\n".to_vec() } else { b"*4\r\n".to_vec() };
+        r.extend_from_slice(b"$1\r\na\r\n$3\r\none\r\n$1\r\nb\r\n");
+        r.extend_from_slice(&bulk_reply(150_000));
+        r
+    };
+    let server = serve(move |s, w| match name_of(w).as_str() {
+        "HELLO" if arg(w, 1) == "3" => s.reply(HELLO_OK),
+        "HELLO" => s.reply("-ERR unknown command 'HELLO'\r\n"),
+        "HGETALL" => {
+            let resp3 = s.conn == 0;
+            s.reply(hash(resp3));
+        }
+        _ => s.reply("+OK\r\n"),
+    });
+    for resp2 in [false, true] {
+        let (rt, c) = client(&server, |c| if resp2 { c.resp2_only() } else { c });
+        // Connection 0 is RESP3, connection 1 RESP2: the reply form follows.
+        let told: Shared = Arc::default();
+        c.hgetall_stream("h", Fields(Arc::clone(&told)));
+        wait_outcome(&told).unwrap();
+        let t = told.lock().unwrap();
+        assert_eq!(t.pairs, Some(Some(2)), "resp2: {resp2}");
+        assert_eq!(t.fields.len(), 2);
+        assert_eq!((t.fields[0].0.as_slice(), t.fields[0].1.as_deref()), (&b"a"[..], Some(&b"one"[..])));
+        assert_eq!(t.fields[1].0, b"b");
+        assert_eq!(t.fields[1].1.as_ref().map(Vec::len), Some(150_000));
+        drop(t);
+        c.close();
+        rt.shutdown();
+    }
+    server.rt.shutdown();
+}
+
+/// Waits for the handle a pausing handler's command was given.
+fn wait_chunks(told: &Shared, n: usize) {
+    for _ in 0..1000 {
+        if told.lock().unwrap().chunks >= n {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("no chunk arrived");
+}
+
+#[test]
+fn a_paused_reply_stops_all_reading_and_neither_timeout_nor_health_check_fires_meanwhile() {
+    // 16 MiB is far more than a socket and the ring hold, so the server's writes stall.
+    let server = serve(move |s, w| match name_of(w).as_str() {
+        "HELLO" => s.reply(HELLO_OK),
+        "GET" => s.stream("$16777216\r\n", 16 * 1024 * 1024, "\r\n"),
+        _ => s.reply("+PONG\r\n"),
+    });
+    // A command timeout and a health check, each far shorter than the pause.
+    let (rt, c) = client(&server, |c| {
+        c.command_timeout(Some(Duration::from_millis(150))).ping_interval(Some(Duration::from_millis(100)))
+    });
+    let (mut h, told) = Bulk::new();
+    h.pause_first = true;
+    let stream: StreamHandle = c.get_stream("k", h);
+    wait_chunks(&told, 1);
+    thread::sleep(Duration::from_millis(100));
+    let chunks_then = told.lock().unwrap().chunks;
+    let bytes_then = told.lock().unwrap().bytes;
+    thread::sleep(Duration::from_millis(800)); // many timeouts and health intervals
+    assert_eq!(told.lock().unwrap().chunks, chunks_then, "nothing more was delivered while paused");
+    assert!(told.lock().unwrap().outcome.is_none(), "the command did not time out and the connection was not dropped");
+    assert!(bytes_then < 4 * 1024 * 1024, "only a ring's worth was read: {bytes_then}");
+
+    stream.resume();
+    wait_outcome(&told).unwrap();
+    assert_eq!(told.lock().unwrap().bytes, 16 * 1024 * 1024, "the same reply, from where it stopped");
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+    call!(|cb| c.ping(cb)).unwrap();
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_resume_before_the_pause_has_taken_effect_leaves_no_pause() {
+    let server = serve(move |s, w| match name_of(w).as_str() {
+        "HELLO" => s.reply(HELLO_OK),
+        "GET" => s.stream("$1048576\r\n", 1024 * 1024, "\r\n"),
+        _ => s.reply("+PONG\r\n"),
+    });
+    let (rt, c) = client(&server, |c| c);
+    // A handler that resumes at once, from inside the chunk that paused it.
+    struct Eager {
+        told: Shared,
+        handle: Arc<Mutex<Option<StreamHandle>>>,
+    }
+    impl BulkHandler for Eager {
+        fn chunk(&mut self, data: &[u8]) -> Flow {
+            let mut t = self.told.lock().unwrap();
+            t.chunks += 1;
+            t.bytes += data.len();
+            if t.chunks == 1 {
+                // The handle is set by the time the second thread asks: spin for it.
+                let handle = Arc::clone(&self.handle);
+                thread::spawn(move || {
+                    for _ in 0..500 {
+                        if let Some(h) = handle.lock().unwrap().as_ref() {
+                            h.resume();
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                });
+                return Flow::Pause;
+            }
+            Flow::Continue
+        }
+        fn finished(&mut self, outcome: Result<(), RedisError>) {
+            self.told.lock().unwrap().outcome = Some(outcome);
+        }
+    }
+    let told: Shared = Arc::default();
+    let cell: Arc<Mutex<Option<StreamHandle>>> = Arc::default();
+    let h = c.get_stream("k", Eager { told: Arc::clone(&told), handle: Arc::clone(&cell) });
+    *cell.lock().unwrap() = Some(h);
+    wait_outcome(&told).unwrap();
+    assert_eq!(told.lock().unwrap().bytes, 1024 * 1024);
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_streaming_command_is_timed_by_silence_not_by_how_long_the_reply_takes() {
+    // A reply that takes 1.2 s in all, in pieces 60 ms apart, to a client that
+    // gives a command 250 ms: each piece is life.
+    let server = serve(move |s, w| match (name_of(w).as_str(), a1(w).as_str()) {
+        ("HELLO", _) => s.reply(HELLO_OK),
+        ("GET", "slow") => {
+            s.reply("$20\r\n");
+            for i in 1..=20u64 {
+                s.reply_after(Duration::from_millis(60 * i), "x");
+            }
+            s.reply_after(Duration::from_millis(60 * 21), "\r\n");
+        }
+        // Starts, then says nothing more.
+        ("GET", "stall") => s.reply("$100\r\nabc"),
+        _ => s.reply("+PONG\r\n"),
+    });
+    let (rt, c) = client(&server, |c| c.command_timeout(Some(Duration::from_millis(250))).ping_interval(None));
+    let (h, told) = Bulk::new();
+    let started = Instant::now();
+    c.get_stream("slow", h);
+    wait_outcome(&told).unwrap();
+    assert!(started.elapsed() > Duration::from_millis(1000), "it took longer than the timeout: {:?}", started.elapsed());
+    assert_eq!(told.lock().unwrap().bytes, 20);
+
+    // A reply that stops half-way is a timeout, 250 ms after the last of it.
+    let (h, told) = Bulk::new();
+    let started = Instant::now();
+    c.get_stream("stall", h);
+    let err = wait_outcome(&told).unwrap_err();
+    assert_eq!(err, RedisError::Timeout);
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(240) && waited < Duration::from_millis(900), "{waited:?}");
+    assert_eq!(told.lock().unwrap().bytes, 3, "what came before the stall was delivered");
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_sink_that_skips_or_a_consumer_that_cancels_ends_its_command_and_nothing_else() {
+    let server = serve(move |s, w| match name_of(w).as_str() {
+        "HELLO" => s.reply(HELLO_OK),
+        "GET" => s.stream("$2097152\r\n", 2 * 1024 * 1024, "\r\n"),
+        _ => s.reply("+PONG\r\n"),
+    });
+    let (rt, c) = client(&server, |c| c);
+
+    // Skip, from inside the sink.
+    let (mut h, told) = Bulk::new();
+    h.skip_first = true;
+    c.get_stream("a", h);
+    assert_eq!(wait_outcome(&told).unwrap_err(), RedisError::Cancelled);
+    assert_eq!(told.lock().unwrap().chunks, 1, "nothing was delivered after Skip");
+    call!(|cb| c.ping(cb)).unwrap();
+
+    // Cancel, from outside, while the reply is paused.
+    let (mut h, told) = Bulk::new();
+    h.pause_first = true;
+    let stream = c.get_stream("b", h);
+    wait_chunks(&told, 1);
+    thread::sleep(Duration::from_millis(100));
+    stream.cancel();
+    assert_eq!(wait_outcome(&told).unwrap_err(), RedisError::Cancelled);
+    assert_eq!(told.lock().unwrap().chunks, 1);
+
+    // The connection carries on, in step, and was never redialled.
+    call!(|cb| c.ping(cb)).unwrap();
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_connection_lost_in_the_middle_of_a_streamed_reply_is_told_to_its_sink_once() {
+    let server = serve(move |s, w| match name_of(w).as_str() {
+        "HELLO" => s.reply(HELLO_OK),
+        "GET" => {
+            s.reply("$1000\r\nabc");
+            s.close();
+        }
+        _ => s.reply("+PONG\r\n"),
+    });
+    let (rt, c) = client(&server, |c| c);
+    let (h, told) = Bulk::new();
+    c.get_stream("k", h);
+    let err = wait_outcome(&told).unwrap_err();
+    assert!(matches!(err, RedisError::ConnectionLost(_)), "{err:?}");
+    assert_eq!(told.lock().unwrap().bytes, 3, "what arrived was delivered");
+    assert!(!told.lock().unwrap().ended);
+    // And the next command dials afresh.
+    call!(|cb| c.ping(cb)).unwrap();
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_sink_may_close_the_client_from_inside_its_own_callback() {
+    // The reactor is inside the sink when it calls close(), which ends the very
+    // command it is running: that must be deferred until the call returns, not
+    // wait for the sink to be free.
+    let server = serve(move |s, w| match name_of(w).as_str() {
+        "HELLO" => s.reply(HELLO_OK),
+        "GET" => s.stream("$1048576\r\n", 1024 * 1024, "\r\n"),
+        _ => s.reply("+PONG\r\n"),
+    });
+    let (rt, c) = client(&server, |c| c);
+    struct Closer {
+        told: Shared,
+        client: Arc<Mutex<Option<RedisClient>>>,
+    }
+    impl BulkHandler for Closer {
+        fn chunk(&mut self, data: &[u8]) -> Flow {
+            let mut t = self.told.lock().unwrap();
+            t.chunks += 1;
+            t.bytes += data.len();
+            if t.chunks == 2 {
+                if let Some(c) = self.client.lock().unwrap().as_ref() {
+                    c.close();
+                }
+            }
+            Flow::Continue
+        }
+        fn finished(&mut self, outcome: Result<(), RedisError>) {
+            self.told.lock().unwrap().outcome = Some(outcome);
+        }
+    }
+    let told: Shared = Arc::default();
+    let cell: Arc<Mutex<Option<RedisClient>>> = Arc::new(Mutex::new(Some(c.clone())));
+    c.get_stream("k", Closer { told: Arc::clone(&told), client: Arc::clone(&cell) });
+    let err = wait_outcome(&told).unwrap_err();
+    assert_eq!(err, RedisError::Closed, "{err:?}");
+    // And once it is closed, later commands fail the same way.
+    assert_eq!(call!(|cb| c.ping(cb)).unwrap_err(), RedisError::Closed);
+    cell.lock().unwrap().take();
     rt.shutdown();
     server.rt.shutdown();
 }

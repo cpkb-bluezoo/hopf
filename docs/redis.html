@@ -144,6 +144,41 @@ redis.incr("visits", |r| println!("{:?}", r));       // Ok(1)</code></pre>
 <li><strong>A connection that has gone dead.</strong> A route that is black-holed, or a server that is paused or partitioned, sends no reset and no close, so the connection looks fine while every command on it waits out its timeout. While replies are owed and nothing at all has arrived for <code>ping_interval</code>, the connection is closed: what it owed fails with <code>ConnectionLost</code> and the next command dials afresh. Traffic of any kind counts as life, and a connection with nothing owed is never closed. No <code>PING</code> is sent first: replies come back in the order commands were sent, so a probe queued behind an unanswered command would be answered only after it. A command given no limit, or a longer one than <code>command_timeout</code>, is not checked while it is outstanding, since a server holding a blocking command or a <code>WAIT</code> says nothing meanwhile; with <code>command_timeout(None)</code>, no connection is checked while it owes anything.</li>
 <li><strong>Close.</strong> <code>close()</code> fails what is waiting with <code>Closed</code>, and so does every later command.</li>
 </ul>
+<h2 id="streaming">Streaming large values</h2>
+<p>A reply may be of any size, and the client never needs to hold it. <code>send_streaming(&amp;command, sink)</code> tells a <code>ReplySink</code> what the reply is as it arrives (see <a href="#resp">the codec</a>): a string's payload comes as chunks that borrow from the connection's buffer, so memory stays constant however large the value is. It returns a <code>StreamHandle</code>. The sink runs on the client's reactor and must not block; its last call is <code>finished(outcome)</code>, with <code>Ok</code>, or how the command failed.</p>
+<p>The rule the shapes follow is <em>payloads stream, identifiers are bounded and delivered whole</em>, as in HTTP, where a body streams and a header field is a limited unit. A value, a list element or a hash value is a payload. A key or a hash field name is an identifier, delivered whole up to a limit (<code>DEFAULT_MAX_FIELD</code>, 64 KiB, unless set), past which that reply fails with <code>FieldTooLong</code> and is skipped.</p>
+<table>
+<thead><tr><th>Sink</th><th>The reply is</th><th>Examples</th></tr></thead>
+<tbody>
+<tr><td><code>BulkSink</code> (<code>BulkHandler</code>)</td><td>one string, or null</td><td><code>get_stream</code>, <code>getrange_stream</code>, <code>hget_stream</code>, <code>lpop_stream</code></td></tr>
+<tr><td><code>ElementsSink</code> (<code>ElementsHandler</code>)</td><td>an array of payload strings, some perhaps null</td><td><code>mget_stream</code>, <code>lrange_stream</code>, <code>smembers_stream</code>, <code>zrange_stream</code></td></tr>
+<tr><td><code>KeysSink</code> (<code>KeysHandler</code>)</td><td>an array of identifiers, each whole</td><td><code>keys_stream</code></td></tr>
+<tr><td><code>FieldsSink</code> (<code>FieldsHandler</code>)</td><td>a map, or flat pairs, of identifier to payload</td><td><code>hgetall_stream</code></td></tr>
+</tbody>
+</table>
+<p>A server error ends the command with <code>Server</code> in the handler's <code>finished</code>, and a reply of some other shape with <code>Unexpected</code>; either way the rest of the reply is skipped and the connection stays in step. For any other shape, implement <code>ReplySink</code> directly.</p>
+<pre class="rust,ignore"><code>use hopf_redis::{BulkHandler, Flow, RedisError};
+
+struct ToFile { out: std::fs::File }
+
+impl BulkHandler for ToFile {
+    fn chunk(&amp;mut self, data: &amp;[u8]) -&gt; Flow {
+        use std::io::Write;
+        match self.out.write_all(data) {
+            Ok(()) =&gt; Flow::Continue,
+            Err(_) =&gt; Flow::Skip,           // stop: the rest is discarded as it arrives
+        }
+    }
+    fn finished(&amp;mut self, outcome: Result&lt;(), RedisError&gt;) { /* Ok, or why not */ }
+}
+
+redis.get_stream("big", ToFile { out });</code></pre>
+<ul>
+<li><strong>Flow control.</strong> A sink returns a <code>Flow</code> from every event. <code>Pause</code> stops reading after the event: what is in the buffer stays there, the rest waits in the socket, where TCP holds the server back, and memory stays constant however long the pause. <code>StreamHandle::resume()</code>, from any thread, continues the same reply; one that arrives while the sink is still running, before it has returned its <code>Pause</code>, cancels that pause rather than being lost. <code>Skip</code> gives up on the reply: the rest is discarded in constant memory and <code>finished</code> gets <code>Cancelled</code>. <code>StreamHandle::cancel()</code> does the same from outside, even while paused.</li>
+<li><strong>One reply at a time.</strong> Replies come back in the order commands were sent, so a streamed reply, and a pause, holds the connection for everything pipelined behind it. Give a large value a connection of its own.</li>
+<li><strong>Timeouts.</strong> The command timeout of a streaming command is for the first byte and then for silence: every chunk resets it, and it stops while the consumer is paused. A reply that takes minutes in all is fine; one that stops half-way times out. The connection's health check (<code>ping_interval</code>) likewise leaves a connection alone while the consumer has paused it.</li>
+<li><strong>Re-entrancy.</strong> A sink may close the client, or issue more commands, from inside its own callback.</li>
+</ul>
 <h2 id="transactions-and-scripts">Transactions and scripts</h2>
 <p><code>transaction(commands, callback)</code> writes <code>MULTI</code>, the commands and <code>EXEC</code> as one batch, so nothing from another caller can come between them on the shared connection. The callback gets each command's result in order, or <code>None</code> if <code>EXEC</code> was aborted by a watched key. A command that fails when it runs is a <code>Value::Error</code> in the list; one refused when queued fails the transaction with that error.</p>
 <p><code>watch</code>, <code>unwatch</code>, <code>multi</code>, <code>exec</code> and <code>discard</code> act on the <em>connection</em>, which every user of a client shares, so another caller's commands can run in between. For a watch-then-transact sequence use a client of your own. <code>eval</code> and <code>evalsha</code> run a script; <code>EVALSHA</code> answers <code>NOSCRIPT</code> for one the server has not seen, so <code>script_load</code> it and try again.</p>

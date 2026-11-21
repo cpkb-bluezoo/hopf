@@ -22,6 +22,30 @@
 //! redis.set("greeting", "hello", |r| assert!(r.is_ok()));
 //! redis.get("greeting", |r| println!("{:?}", r));
 //! ```
+//!
+//! A value of any size can be streamed, in constant memory, to a sink that is
+//! told its payload chunk by chunk (see [`BulkSink`], [`ElementsSink`],
+//! [`KeysSink`], [`FieldsSink`] and [`RedisClient::send_streaming`]):
+//!
+//! ```no_run
+//! use hopf_redis::{BulkHandler, Flow, RedisClient, RedisError};
+//!
+//! struct Count(usize);
+//!
+//! impl BulkHandler for Count {
+//!     fn chunk(&mut self, data: &[u8]) -> Flow {
+//!         self.0 += data.len();
+//!         Flow::Continue
+//!     }
+//!     fn finished(&mut self, outcome: Result<(), RedisError>) {
+//!         println!("{} bytes: {outcome:?}", self.0);
+//!     }
+//! }
+//!
+//! # fn demo(redis: &RedisClient) {
+//! redis.get_stream("big", Count(0));
+//! # }
+//! ```
 
 mod client;
 mod cluster;
@@ -32,12 +56,17 @@ mod error;
 mod keys;
 mod pubsub;
 pub mod resp;
+mod sinks;
 mod topology;
 
-pub use client::{Callback, Command, Deadline, RedisClient, Reply};
+pub use client::{Callback, Command, Deadline, RedisClient, Reply, StreamHandle};
 pub use cluster::{ClusterConfig, RedisCluster};
 pub use commands::SetOptions;
 pub use config::RedisConfig;
+pub use sinks::{
+    BulkHandler, BulkSink, ElementsHandler, ElementsSink, FieldsHandler, FieldsSink, KeysHandler, KeysSink,
+    DEFAULT_MAX_FIELD,
+};
 pub use error::RedisError;
 pub use keys::{command_slot, crc16, key_indexes, key_slot, CrossSlot, SLOTS};
 pub use topology::NodeAddr;

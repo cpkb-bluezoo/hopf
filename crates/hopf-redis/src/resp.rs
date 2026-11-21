@@ -419,6 +419,13 @@ pub trait ReplySink {
     fn end_string(&mut self) -> Flow;
     /// The reply is complete, or has been discarded to its end (`skipped`).
     fn end_reply(&mut self, _skipped: bool) {}
+    /// The command this sink was sent with is over, and this is the last call
+    /// it gets. The parser never makes it; a client does, once the reply is
+    /// complete (`Ok`), or the command timed out, the connection was lost, the
+    /// consumer cancelled it, or it failed in some other way. If the sink chose
+    /// [`Flow::Skip`] to stop a reply it had begun, that is
+    /// [`RedisError::Cancelled`](crate::RedisError::Cancelled).
+    fn finished(&mut self, _outcome: Result<(), crate::error::RedisError>) {}
 }
 
 // ---- the parser ----

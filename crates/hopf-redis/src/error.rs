@@ -29,6 +29,17 @@ pub enum RedisError {
     Overloaded,
     /// The client was closed.
     Closed,
+    /// The consumer of a streamed reply stopped it ([`Flow::Skip`](crate::Flow::Skip)
+    /// or [`StreamHandle::cancel`](crate::StreamHandle::cancel)): the rest of the
+    /// reply was discarded.
+    Cancelled,
+    /// An identifier in a reply (a key, a hash field) was longer than the
+    /// limit for one, and so was not delivered. Payloads are streamed and have
+    /// no such limit; identifiers are delivered whole and are bounded.
+    FieldTooLong {
+        /// The limit, in bytes.
+        limit: usize,
+    },
 }
 
 impl RedisError {
@@ -52,6 +63,8 @@ impl std::fmt::Display for RedisError {
             Self::Unexpected(why) => write!(f, "unexpected reply: {why}"),
             Self::Overloaded => f.write_str("too many commands waiting"),
             Self::Closed => f.write_str("the client is closed"),
+            Self::Cancelled => f.write_str("the reply was cancelled by its consumer"),
+            Self::FieldTooLong { limit } => write!(f, "an identifier in the reply is longer than {limit} bytes"),
         }
     }
 }
@@ -68,6 +81,8 @@ impl From<RedisError> for io::Error {
             RedisError::Protocol(_) | RedisError::Unexpected(_) => io::ErrorKind::InvalidData,
             RedisError::Overloaded => io::ErrorKind::WouldBlock,
             RedisError::Closed => io::ErrorKind::NotConnected,
+            RedisError::Cancelled => io::ErrorKind::Interrupted,
+            RedisError::FieldTooLong { .. } => io::ErrorKind::InvalidData,
         };
         io::Error::new(kind, e.to_string())
     }

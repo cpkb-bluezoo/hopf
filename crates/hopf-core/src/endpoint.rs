@@ -100,6 +100,13 @@ pub trait Endpoint: Send {
     }
 
     /// Stop delivering inbound data (`OP_READ` off) — TCP backpressure.
+    ///
+    /// The reactor stops reading the socket at once, even part-way through
+    /// draining it: what is in the ring stays there (the handler leaves it
+    /// unconsumed), and what the peer sends beyond it waits in the socket's
+    /// buffers, where TCP holds the peer back. Nothing is lost and nothing
+    /// fails, however long the pause. [`resume_read`](Self::resume_read) and
+    /// [`poke_handler`](Self::poke_handler) continue from there.
     fn pause_read(&mut self);
 
     /// Resume inbound delivery after [`pause_read`](Self::pause_read).

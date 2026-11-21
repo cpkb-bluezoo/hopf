@@ -30,8 +30,8 @@
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, ReactorHandle, TcpConnectorConfig};
@@ -42,7 +42,8 @@ use crate::error::RedisError;
 use crate::pubsub::{self, Desired, Push, SubscriberHandler};
 use crate::collect::{Collector, TooLarge};
 use crate::resp::{
-    encode_command, encode_words, AggKind, Flow, ReplyKind, ReplySink, RespParser, Scalar, ServerError, StrKind, Value,
+    encode_command, encode_words, AggKind, Feed, Flow, ReplyKind, ReplySink, RespParser, Scalar, ServerError, StrKind,
+    Value,
 };
 
 /// What a command's callback is given.
@@ -109,16 +110,286 @@ enum Step {
 }
 
 enum Kind {
-    User(Option<Callback>),
+    /// A command: its reply goes to the sink in the cell, unless the command
+    /// was abandoned (it timed out), when the reply is discarded as it arrives.
+    User(Arc<Cmd>),
     Internal(Step),
+}
+
+/// How a command ended, for its sink to be told.
+pub(crate) enum Outcome {
+    /// The reply is complete, or was discarded to its end because the sink chose
+    /// [`Flow::Skip`] (`skipped`).
+    Complete { skipped: bool },
+    /// The command did not get a reply.
+    Failed(RedisError),
+}
+
+/// What receives a command's reply, event by event, and hears how it ended.
+pub(crate) trait CmdSink: Send {
+    fn events(&mut self) -> &mut dyn ReplySink;
+    /// Exactly once, and last.
+    fn finish(self: Box<Self>, outcome: Outcome);
+}
+
+/// A callback that takes the reply as a [`Value`]: the events are assembled by a
+/// [`Collector`] under the configured limits.
+struct Collecting<F> {
+    collector: Collector,
+    callback: F,
+}
+
+impl<F: FnOnce(Reply) + Send> CmdSink for Collecting<F> {
+    fn events(&mut self) -> &mut dyn ReplySink {
+        &mut self.collector
+    }
+
+    fn finish(self: Box<Self>, outcome: Outcome) {
+        let Collecting { mut collector, callback } = *self;
+        callback(match outcome {
+            Outcome::Complete { .. } => match collector.take() {
+                Ok(value) => into_reply(value),
+                Err(TooLarge(why)) => Err(RedisError::Protocol(why)),
+            },
+            Outcome::Failed(e) => Err(e),
+        });
+    }
+}
+
+/// A sink the caller wrote: the events go to it as they arrive, and it is told
+/// how the command ended.
+struct Streaming<S> {
+    sink: S,
+}
+
+impl<S: ReplySink + Send> CmdSink for Streaming<S> {
+    fn events(&mut self) -> &mut dyn ReplySink {
+        &mut self.sink
+    }
+
+    fn finish(mut self: Box<Self>, outcome: Outcome) {
+        self.sink.finished(match outcome {
+            Outcome::Complete { skipped: false } => Ok(()),
+            Outcome::Complete { skipped: true } => Err(RedisError::Cancelled),
+            Outcome::Failed(e) => Err(e),
+        });
+    }
+}
+
+/// Nothing is holding up the reply.
+const FLOW_RUNNING: u8 = 0;
+/// The sink returned [`Flow::Pause`]: the connection is to stop reading.
+const FLOW_PAUSE_REQUESTED: u8 = 1;
+/// The connection has stopped reading until [`StreamHandle::resume`].
+const FLOW_PAUSED: u8 = 2;
+/// [`StreamHandle::resume`] was called while the sink was still running, so
+/// before the pause it is about to return: it is held to cancel that pause. It
+/// exists only during a call of the sink, so a resume that comes at any other
+/// time and finds nothing to resume cannot cancel a later pause.
+const FLOW_PERMIT: u8 = 4;
+
+/// Nanoseconds from a fixed point, for a timestamp that fits an atomic.
+fn now_nanos() -> u64 {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    BASE.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
+
+/// One command, shared between the queue and the connection that reads its
+/// reply, so that a timeout can take the sink out from under a reply that has
+/// begun, and a consumer on another thread can pause, resume or cancel it.
+pub(crate) struct Cmd {
+    /// The sink, until the command ends; `None` once it has, so that a reply
+    /// still to come is discarded as it arrives.
+    sink: Mutex<Option<Box<dyn CmdSink>>>,
+    /// The caller's own sink: its timeout is one of inactivity, not of the whole
+    /// reply, and stops while the consumer has paused.
+    streaming: bool,
+    limit: Option<Duration>,
+    /// When the sink last heard something (or the command was issued).
+    activity: AtomicU64,
+    /// How the command ended while the sink was being called, so it could not be
+    /// taken: the call that is running finishes it when it returns. Set when a
+    /// sink closes the client from inside its own callback, or a timer or a
+    /// caller on another thread ends the command during one.
+    deferred: Mutex<Option<Outcome>>,
+    has_deferred: AtomicBool,
+    flow: AtomicU8,
+    /// The sink is being called, on the reactor.
+    in_sink: AtomicBool,
+    cancelled: AtomicBool,
+    /// Stops the command's first timeout timer once it has ended. Set once, so
+    /// no lock is needed for the commands that are only timed from issue to reply.
+    timer: OnceLock<Arc<AtomicBool>>,
+    /// A streaming command's timer is set again when it fires and there has been
+    /// activity since: the one that is current, to be stopped when it ends. Only
+    /// such a command has the lock.
+    rearmed: Option<Mutex<Option<Arc<AtomicBool>>>>,
+}
+
+impl Cmd {
+    fn new(sink: Box<dyn CmdSink>, streaming: bool, limit: Option<Duration>) -> Arc<Self> {
+        Arc::new(Self {
+            sink: Mutex::new(Some(sink)),
+            streaming,
+            limit,
+            activity: AtomicU64::new(now_nanos()),
+            deferred: Mutex::new(None),
+            has_deferred: AtomicBool::new(false),
+            flow: AtomicU8::new(FLOW_RUNNING),
+            in_sink: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            timer: OnceLock::new(),
+            rearmed: streaming.then(|| Mutex::new(None)),
+        })
+    }
+
+    fn cancel_timer(&self) {
+        if let Some(flag) = self.timer.get() {
+            flag.store(true, Ordering::SeqCst);
+        }
+        if let Some(rearmed) = &self.rearmed {
+            if let Some(flag) = rearmed.lock().unwrap().take() {
+                flag.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn take_sink(&self) -> Option<Box<dyn CmdSink>> {
+        self.sink.lock().unwrap().take()
+    }
+
+    fn touch(&self) {
+        self.activity.store(now_nanos(), Ordering::Relaxed);
+    }
+
+    /// What the sink's `flow` comes to: a pause is requested, unless the consumer
+    /// has already resumed, in which case there is none.
+    fn settle(&self, flow: Flow) -> Flow {
+        if flow != Flow::Pause {
+            self.flow.fetch_and(!FLOW_PERMIT, Ordering::SeqCst);
+            return flow;
+        }
+        loop {
+            let cur = self.flow.load(Ordering::SeqCst);
+            if cur & FLOW_PERMIT != 0 {
+                if self.flow.compare_exchange(cur, cur & !FLOW_PERMIT, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                    return Flow::Continue;
+                }
+            } else if self.flow.compare_exchange(cur, FLOW_PAUSE_REQUESTED, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                return Flow::Pause;
+            }
+        }
+    }
+}
+
+/// End a command with `outcome`, on the reactor and never inline: a caller
+/// holding a lock when it issues a command must not see its sink re-enter it.
+///
+/// If the sink is in the middle of a call, which is possible when the call itself
+/// ends the command (a sink that closes the client), it cannot be taken and the
+/// outcome is left for the call to act on when it returns.
+fn end_cmd(inner: &Inner, cmd: &Cmd, outcome: Outcome) {
+    cmd.cancel_timer();
+    let taken = match cmd.sink.try_lock() {
+        Ok(mut slot) => Some(slot.take()),
+        Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner().take()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    };
+    match taken {
+        Some(Some(sink)) => inner.reactor.execute(Box::new(move || sink.finish(outcome))),
+        Some(None) => {} // it had already ended
+        None => {
+            cmd.deferred.lock().unwrap().get_or_insert(outcome);
+            cmd.has_deferred.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Act on how a command ended during a call of its sink, now that the call has
+/// returned.
+fn run_deferred(inner: &Inner, cmd: &Cmd) {
+    if !cmd.has_deferred.load(Ordering::SeqCst) {
+        return;
+    }
+    cmd.has_deferred.store(false, Ordering::SeqCst);
+    let outcome = cmd.deferred.lock().unwrap().take();
+    if let (Some(outcome), Some(sink)) = (outcome, cmd.take_sink()) {
+        inner.reactor.execute(Box::new(move || sink.finish(outcome)));
+    }
+}
+
+/// A handle on a command sent with [`RedisClient::send_streaming`], for the
+/// consumer of its reply: to resume it after pausing, or to cancel it.
+///
+/// Clones are cheap and share the command. Calls may come from any thread.
+#[derive(Clone)]
+pub struct StreamHandle {
+    cmd: Arc<Cmd>,
+    inner: Weak<Inner>,
+}
+
+impl StreamHandle {
+    /// Resume reading after the sink returned [`Flow::Pause`]. It may be called
+    /// from any thread at any time: even while the sink is still running, before
+    /// it has returned the `Pause` (the pause is then cancelled), or after the
+    /// command has ended (when it does nothing).
+    pub fn resume(&self) {
+        let flow = &self.cmd.flow;
+        loop {
+            let cur = flow.load(Ordering::SeqCst);
+            let released = |to: u8| flow.compare_exchange(cur, to, Ordering::SeqCst, Ordering::SeqCst).is_ok();
+            if cur & FLOW_PAUSED != 0 {
+                if released(FLOW_RUNNING) {
+                    if let Some(inner) = self.inner.upgrade() {
+                        let inner2 = Arc::clone(&inner);
+                        inner.reactor.execute(Box::new(move || resume_read(&inner2)));
+                    }
+                    return;
+                }
+            } else if cur & FLOW_PAUSE_REQUESTED != 0 {
+                if released(FLOW_RUNNING) {
+                    return;
+                }
+            } else if self.cmd.in_sink.load(Ordering::SeqCst) {
+                if released(cur | FLOW_PERMIT) {
+                    return;
+                }
+            } else {
+                return;
+            }
+        }
+    }
+
+    /// The consumer wants no more of this reply: it is discarded as it arrives,
+    /// in constant memory, and the sink is finished with
+    /// [`RedisError::Cancelled`]. The connection is not closed and the commands
+    /// pipelined behind it are unaffected. Does nothing once the command has
+    /// ended.
+    pub fn cancel(&self) {
+        self.cmd.cancelled.store(true, Ordering::SeqCst);
+        self.resume();
+    }
+}
+
+/// Start reading again, on the reactor: the consumer is ready for more.
+fn resume_read(inner: &Arc<Inner>) {
+    let handle = {
+        let mut st = inner.state.lock().unwrap();
+        st.read_paused = false;
+        st.handle.clone()
+    };
+    if let Some(h) = handle {
+        h.with_endpoint(|ep| {
+            ep.resume_read();
+            // What is already in the ring is read without waiting for more.
+            ep.poke_handler();
+        });
+    }
 }
 
 /// Written to the connection, awaiting its reply.
 struct Sent {
-    qid: u64,
     kind: Kind,
-    /// Stops the command's timeout timer once it is answered.
-    cancel: Option<Arc<AtomicBool>>,
     /// The server may legitimately sit on this command for longer than the
     /// health check waits (a blocking command, a `WAIT`, or one given no
     /// limit), so its silence says nothing.
@@ -129,8 +400,7 @@ struct Sent {
 struct Waiting {
     qid: u64,
     bytes: Vec<u8>,
-    callback: Callback,
-    cancel: Option<Arc<AtomicBool>>,
+    cmd: Arc<Cmd>,
     held: bool,
 }
 
@@ -174,6 +444,9 @@ pub(crate) struct State {
     /// A `MULTI` has been sent on the connection and not yet an `EXEC` or
     /// `DISCARD`.
     in_multi: bool,
+    /// The consumer of a streamed reply has paused the connection: it is not
+    /// being read, and its silence is the consumer's doing, not the server's.
+    read_paused: bool,
 }
 
 pub(crate) struct Inner {
@@ -219,6 +492,7 @@ pub(crate) fn start(reactor: &ReactorHandle, config: RedisConfig, sub: Option<Bo
             desired: Desired::default(),
             last_rx: Instant::now(),
             in_multi: false,
+            read_paused: false,
         }),
         closed: AtomicBool::new(false),
         retiring: AtomicBool::new(false),
@@ -277,6 +551,7 @@ pub(crate) fn close(inner: &Arc<Inner>) {
         let mut st = inner.state.lock().unwrap();
         st.phase = Phase::Idle;
         st.in_multi = false;
+        st.read_paused = false;
         st.conn_id += 1;
         st.outbox.clear();
         (st.handle.take(), std::mem::take(&mut st.waiting), std::mem::take(&mut st.pending))
@@ -285,13 +560,11 @@ pub(crate) fn close(inner: &Arc<Inner>) {
         h.close();
     }
     for w in waiting {
-        cancel_timer(&w.cancel);
-        finish(inner, w.callback, Err(RedisError::Closed));
+        end_cmd(inner, &w.cmd, Outcome::Failed(RedisError::Closed));
     }
     for s in pending {
-        cancel_timer(&s.cancel);
-        if let Kind::User(Some(cb)) = s.kind {
-            finish(inner, cb, Err(RedisError::Closed));
+        if let Kind::User(cmd) = s.kind {
+            end_cmd(inner, &cmd, Outcome::Failed(RedisError::Closed));
         }
     }
 }
@@ -351,34 +624,82 @@ impl RedisClient {
 
     /// Send `command` and call `callback` with the reply. Returns at once.
     pub fn send(&self, command: &Command, callback: impl FnOnce(Reply) + Send + 'static) {
-        if command.words().first().is_some_and(|w| pubsub::is_subscription_command(w)) {
-            return refuse_subscription(&self.inner, Box::new(callback));
-        }
-        submit(&self.inner, vec![(command.encode(), Box::new(callback))]);
+        self.send_one(command, self.collecting(callback), Deadline::Default, false);
     }
 
     /// Send the command made of `words` (the name first) and call `callback`
     /// with the reply. Returns at once.
     pub fn command(&self, words: &[&[u8]], callback: impl FnOnce(Reply) + Send + 'static) {
         if words.first().is_some_and(|w| pubsub::is_subscription_command(w)) {
-            return refuse_subscription(&self.inner, Box::new(callback));
+            return self.refuse(self.collecting(callback));
         }
         let mut bytes = Vec::new();
         encode_command(words, &mut bytes);
-        submit(&self.inner, vec![(bytes, Box::new(callback))]);
+        submit_timed(&self.inner, vec![(bytes, self.collecting(callback))], Deadline::Default, false, false);
     }
 
     /// Send several commands as one write, in order, with nothing from another
     /// caller between them. Each has its own callback, called in the order the
     /// commands were given.
     pub fn send_batch(&self, commands: Vec<(Command, Callback)>) {
-        if commands.iter().any(|(c, _)| c.words().first().is_some_and(|w| pubsub::is_subscription_command(w))) {
-            for (_, cb) in commands {
-                refuse_subscription(&self.inner, cb);
-            }
-            return;
+        self.send_batch_with_deadline(commands, Deadline::Default);
+    }
+
+    /// Send `command` and tell `sink` what its reply is, as the reply arrives:
+    /// the events of [`ReplySink`], with a string's payload as chunks that
+    /// borrow from the connection's buffer, so nothing of a large reply is held.
+    /// Returns at once, with a handle to resume the reply after pausing it, or to
+    /// cancel it.
+    ///
+    /// The sink runs on the client's reactor and must not block: to wait for
+    /// something, return [`Flow::Pause`] and call [`StreamHandle::resume`] when
+    /// ready. Replies come back in the order commands were sent, so a streamed
+    /// reply holds the connection until it ends, and so does a pause: use a
+    /// connection of its own for a large value.
+    ///
+    /// The command timeout is for the first byte of the reply and then for
+    /// silence from the server: it is reset by every chunk and stops while the
+    /// consumer has paused. [`ReplySink::finished`] is the sink's last call, with
+    /// how the command ended.
+    pub fn send_streaming(&self, command: &Command, sink: impl ReplySink + Send + 'static) -> StreamHandle {
+        self.send_streaming_with_deadline(command, Deadline::Default, sink)
+    }
+
+    /// [`send_streaming`](Self::send_streaming) with a deadline of its own
+    /// instead of the configured command timeout.
+    pub fn send_streaming_with_deadline(
+        &self,
+        command: &Command,
+        deadline: Deadline,
+        sink: impl ReplySink + Send + 'static,
+    ) -> StreamHandle {
+        let sink: Box<dyn CmdSink> = Box::new(Streaming { sink });
+        let cmd = self.send_one(command, sink, deadline, true).expect("a streaming command is returned");
+        StreamHandle {
+            cmd,
+            inner: Arc::downgrade(&self.inner),
         }
-        submit(&self.inner, commands.into_iter().map(|(c, cb)| (c.encode(), cb)).collect());
+    }
+
+    /// A sink that assembles the reply as a value, under the configured limits,
+    /// for `callback`.
+    fn collecting<F: FnOnce(Reply) + Send + 'static>(&self, callback: F) -> Box<dyn CmdSink> {
+        Box::new(Collecting {
+            collector: Collector::new(&self.inner.config.limits),
+            callback,
+        })
+    }
+
+    /// Fail `sink` as a refused subscription.
+    fn refuse(&self, sink: Box<dyn CmdSink>) {
+        self.inner.reactor.execute(Box::new(move || sink.finish(Outcome::Failed(subscription_refused()))));
+    }
+
+    /// Send one command with the sink that takes its reply. Returns the command
+    /// if `streaming`, for its handle.
+    fn send_one(&self, command: &Command, sink: Box<dyn CmdSink>, deadline: Deadline, streaming: bool) -> Option<Arc<Cmd>> {
+        let refused = command.words().first().is_some_and(|w| pubsub::is_subscription_command(w));
+        submit_timed(&self.inner, vec![(command.encode(), sink)], deadline, streaming, refused)
     }
 
     /// Whether the connection is up and past its handshake.
@@ -403,15 +724,16 @@ impl RedisClient {
     /// likes. A command that is not answered in time calls back with
     /// [`RedisError::Timeout`]; its reply, if it comes later, is dropped.
     pub fn send_with_deadline(&self, command: &Command, deadline: Deadline, callback: impl FnOnce(Reply) + Send + 'static) {
-        if command.words().first().is_some_and(|w| pubsub::is_subscription_command(w)) {
-            return refuse_subscription(&self.inner, Box::new(callback));
-        }
-        submit_timed(&self.inner, vec![(command.encode(), Box::new(callback))], deadline);
+        self.send_one(command, self.collecting(callback), deadline, false);
     }
 
     /// [`send_batch`](Self::send_batch) with one deadline for every command.
     pub(crate) fn send_batch_with_deadline(&self, commands: Vec<(Command, Callback)>, deadline: Deadline) {
-        submit_timed(&self.inner, commands.into_iter().map(|(c, cb)| (c.encode(), cb)).collect(), deadline);
+        let refused = commands
+            .iter()
+            .any(|(c, _)| c.words().first().is_some_and(|w| pubsub::is_subscription_command(w)));
+        let items = commands.into_iter().map(|(c, cb)| (c.encode(), self.collecting(cb))).collect();
+        submit_timed(&self.inner, items, deadline, false, refused);
     }
 
     /// Call `f` when the health check closes a connection because the server
@@ -435,26 +757,8 @@ impl RedisClient {
 /// A command connection does not take subscriptions: in RESP3 the server
 /// answers them with pushes, not a reply, which would put every later reply out
 /// of step with its command, and in RESP2 it would stop accepting commands.
-fn refuse_subscription(inner: &Inner, callback: Callback) {
-    finish(
-        inner,
-        callback,
-        Err(RedisError::Unexpected(
-            "subscriptions need a RedisSubscriber, not a command connection".into(),
-        )),
-    );
-}
-
-fn cancel_timer(cancel: &Option<Arc<AtomicBool>>) {
-    if let Some(c) = cancel {
-        c.store(true, Ordering::SeqCst);
-    }
-}
-
-/// Run `callback` on the reactor, never inline: a caller holding a lock when it
-/// issues a command must not see its callback re-enter that lock.
-fn finish(inner: &Inner, callback: Callback, reply: Reply) {
-    inner.reactor.execute(Box::new(move || callback(reply)));
+fn subscription_refused() -> RedisError {
+    RedisError::Unexpected("subscriptions need a RedisSubscriber, not a command connection".into())
 }
 
 /// An error reply is an error; anything else is the reply.
@@ -592,21 +896,17 @@ fn note_transaction_state(st: &mut State, batch: &[Waiting]) {
 }
 
 /// Accept commands from a caller: send them, queue them for the connection, or
-/// fail them.
-fn submit(inner: &Arc<Inner>, items: Vec<(Vec<u8>, Callback)>) {
-    submit_timed(inner, items, Deadline::Default);
-}
-
-fn submit_timed(inner: &Arc<Inner>, items: Vec<(Vec<u8>, Callback)>, deadline: Deadline) {
-    if inner.closed.load(Ordering::SeqCst) || inner.retiring.load(Ordering::SeqCst) {
-        for (_, cb) in items {
-            finish(inner, cb, Err(RedisError::Closed));
-        }
-        return;
-    }
-    // Each command's timeout starts now, covering the connect.
+/// fail them. `refused` fails them all as subscriptions. Returns the command if
+/// `streaming`, whether or not it was sent.
+fn submit_timed(
+    inner: &Arc<Inner>,
+    items: Vec<(Vec<u8>, Box<dyn CmdSink>)>,
+    deadline: Deadline,
+    streaming: bool,
+    refused: bool,
+) -> Option<Arc<Cmd>> {
     let mut prepared = Vec::with_capacity(items.len());
-    for (bytes, callback) in items {
+    for (bytes, sink) in items {
         let qid = inner.next_qid.fetch_add(1, Ordering::Relaxed);
         let limit = match deadline {
             Deadline::Default => inner.config.command_timeout,
@@ -621,24 +921,28 @@ fn submit_timed(inner: &Arc<Inner>, items: Vec<(Vec<u8>, Callback)>, deadline: D
             Deadline::Extra(_) | Deadline::Never => true,
             Deadline::After(d) => inner.config.command_timeout.is_none_or(|t| d > t),
         };
-        let cancel = limit.map(|timeout| {
-            let weak = Arc::downgrade(inner);
-            inner.reactor.schedule_timer(
-                timeout,
-                Box::new(move || {
-                    if let Some(inner) = weak.upgrade() {
-                        expire(&inner, qid);
-                    }
-                }),
-            )
-        });
-        prepared.push(Waiting {
-            qid,
-            bytes,
-            callback,
-            cancel,
-            held,
-        });
+        let cmd = Cmd::new(sink, streaming, limit);
+        prepared.push(Waiting { qid, bytes, cmd, held });
+    }
+    // A streaming command is sent alone, and its caller is given it.
+    let handle = if streaming { prepared.first().map(|w| Arc::clone(&w.cmd)) } else { None };
+    if refused {
+        for w in prepared {
+            end_cmd(inner, &w.cmd, Outcome::Failed(subscription_refused()));
+        }
+        return handle;
+    }
+    if inner.closed.load(Ordering::SeqCst) || inner.retiring.load(Ordering::SeqCst) {
+        for w in prepared {
+            end_cmd(inner, &w.cmd, Outcome::Failed(RedisError::Closed));
+        }
+        return handle;
+    }
+    // Each command's timeout starts now, covering the connect.
+    for w in &prepared {
+        if let Some(limit) = w.cmd.limit {
+            arm_timer(inner, &w.cmd, w.qid, limit);
+        }
     }
 
     enum Next {
@@ -669,9 +973,7 @@ fn submit_timed(inner: &Arc<Inner>, items: Vec<(Vec<u8>, Callback)>, deadline: D
                     for w in prepared {
                         append_to_outbox(&mut st.outbox, w.bytes);
                         st.pending.push_back(Sent {
-                            qid: w.qid,
-                            kind: Kind::User(Some(w.callback)),
-                            cancel: w.cancel,
+                            kind: Kind::User(w.cmd),
                             held: w.held,
                         });
                     }
@@ -709,8 +1011,30 @@ fn submit_timed(inner: &Arc<Inner>, items: Vec<(Vec<u8>, Callback)>, deadline: D
         Next::Dial(id) => dial(inner, id),
         Next::Fail(jobs, why) => {
             for w in jobs {
-                cancel_timer(&w.cancel);
-                finish(inner, w.callback, Err(why.clone()));
+                end_cmd(inner, &w.cmd, Outcome::Failed(why.clone()));
+            }
+        }
+    }
+    handle
+}
+
+/// Start the timer that ends `cmd` if it is not answered in `delay`.
+fn arm_timer(inner: &Arc<Inner>, cmd: &Arc<Cmd>, qid: u64, delay: Duration) {
+    let (weak, cmd2) = (Arc::downgrade(inner), Arc::clone(cmd));
+    let flag = inner.reactor.schedule_timer(
+        delay,
+        Box::new(move || {
+            if let Some(inner) = weak.upgrade() {
+                expire(&inner, &cmd2, qid);
+            }
+        }),
+    );
+    // The first timer is kept without a lock; one set again replaces the last.
+    match cmd.timer.set(Arc::clone(&flag)) {
+        Ok(()) => {}
+        Err(_) => {
+            if let Some(rearmed) = &cmd.rearmed {
+                *rearmed.lock().unwrap() = Some(flag);
             }
         }
     }
@@ -759,9 +1083,11 @@ fn arm_health(inner: &Arc<Inner>, conn_id: u64) {
                 if st.conn_id != conn_id || !matches!(st.phase, Phase::Handshaking | Phase::Ready) {
                     Act::Stop
                 } else {
+                    // A connection the consumer has paused is silent by choice.
                     let watched = st.phase == Phase::Handshaking
                         || (st.pending.iter().any(|s| matches!(s.kind, Kind::User(_)))
-                            && !st.pending.iter().any(|s| s.held));
+                            && !st.pending.iter().any(|s| s.held)
+                            && !st.read_paused);
                     if watched && st.last_rx.elapsed() >= interval {
                         Act::Drop
                     } else {
@@ -826,24 +1152,31 @@ fn flush(inner: &Arc<Inner>) {
     });
 }
 
-/// A command's timeout fired: fail it if it is still unanswered.
-fn expire(inner: &Arc<Inner>, qid: u64) {
-    let callback = {
+/// A command's timer fired: end it if it is still unanswered. For the caller's
+/// own sink the patience is for silence, not for the whole reply: if the sink
+/// has heard something since, or the consumer has paused, the timer is set again
+/// for what is left.
+fn expire(inner: &Arc<Inner>, cmd: &Arc<Cmd>, qid: u64) {
+    if cmd.streaming {
+        if let Some(limit) = cmd.limit {
+            let paused = cmd.flow.load(Ordering::SeqCst) != FLOW_RUNNING;
+            let idle = Duration::from_nanos(now_nanos().saturating_sub(cmd.activity.load(Ordering::Relaxed)));
+            if paused || idle < limit {
+                let wait = if paused { limit } else { limit - idle };
+                return arm_timer(inner, cmd, qid, wait);
+            }
+        }
+    }
+    // Not yet sent: take it out of the queue. Sent: the reply is still to come
+    // and still takes its place in the queue, so the entry stays, and only its
+    // sink goes, so that the reply is discarded as it arrives.
+    {
         let mut st = inner.state.lock().unwrap();
         if let Some(pos) = st.waiting.iter().position(|w| w.qid == qid) {
-            st.waiting.remove(pos).map(|w| w.callback)
-        } else {
-            // Sent: the reply is still to come and still takes its place in the
-            // queue, so the entry stays and only loses its callback.
-            st.pending.iter_mut().find(|s| s.qid == qid).and_then(|s| match &mut s.kind {
-                Kind::User(cb) => cb.take(),
-                Kind::Internal(_) => None,
-            })
+            st.waiting.remove(pos);
         }
-    };
-    if let Some(cb) = callback {
-        finish(inner, cb, Err(RedisError::Timeout));
     }
+    end_cmd(inner, cmd, Outcome::Failed(RedisError::Timeout));
 }
 
 /// The resolver for a host name: the configured one, or one made on first use.
@@ -960,6 +1293,7 @@ fn connect_failed(inner: &Arc<Inner>, conn_id: u64, error: RedisError) {
         }
         st.phase = Phase::Idle;
         st.in_multi = false;
+        st.read_paused = false;
         st.handle = None;
         st.outbox.clear();
         st.flush_scheduled = false;
@@ -971,8 +1305,7 @@ fn connect_failed(inner: &Arc<Inner>, conn_id: u64, error: RedisError) {
         std::mem::take(&mut st.waiting)
     };
     for w in waiting {
-        cancel_timer(&w.cancel);
-        finish(inner, w.callback, Err(error.clone()));
+        end_cmd(inner, &w.cmd, Outcome::Failed(error.clone()));
     }
     pubsub::schedule_redial(inner);
 }
@@ -993,6 +1326,7 @@ pub(crate) fn lost(inner: &Arc<Inner>, conn_id: u64, reason: &str) {
         } else {
             st.phase = Phase::Idle;
             st.in_multi = false;
+            st.read_paused = false;
             st.handle = None;
             st.outbox.clear();
             st.flush_scheduled = false;
@@ -1021,9 +1355,8 @@ pub(crate) fn lost(inner: &Arc<Inner>, conn_id: u64, reason: &str) {
         return;
     }
     for s in pending {
-        cancel_timer(&s.cancel);
-        if let Kind::User(Some(cb)) = s.kind {
-            finish(inner, cb, Err(RedisError::ConnectionLost(reason.to_string())));
+        if let Kind::User(cmd) = s.kind {
+            end_cmd(inner, &cmd, Outcome::Failed(RedisError::ConnectionLost(reason.to_string())));
         }
     }
     let why = if was_ready {
@@ -1032,8 +1365,7 @@ pub(crate) fn lost(inner: &Arc<Inner>, conn_id: u64, reason: &str) {
         RedisError::Connect(reason.to_string())
     };
     for w in waiting {
-        cancel_timer(&w.cancel);
-        finish(inner, w.callback, Err(why.clone()));
+        end_cmd(inner, &w.cmd, Outcome::Failed(why.clone()));
     }
     if inner.sub.is_some() {
         if was_ready {
@@ -1041,6 +1373,14 @@ pub(crate) fn lost(inner: &Arc<Inner>, conn_id: u64, reason: &str) {
         }
         pubsub::schedule_redial(inner);
     }
+}
+
+/// What answers the command at the head of the queue.
+enum Answer {
+    /// A reply the connection built itself.
+    Value(Result<Value, RedisError>),
+    /// A reply that went to the command's sink as it arrived.
+    Streamed { skipped: bool },
 }
 
 /// The reactor-side half of a connection.
@@ -1062,11 +1402,12 @@ struct Conn {
 
 /// What one reply, as the parser delivered it, came to.
 enum Completed {
-    /// The reply to the command at the head of the queue.
+    /// A reply the handshake or a stray one: built whole, for the connection's
+    /// own use.
     Reply(Result<Value, RedisError>),
-    /// A reply nobody was waiting for (its command had timed out): discarded as
-    /// it arrived, in constant memory.
-    Discarded,
+    /// The reply to the command at the head of the queue is over: its events have
+    /// all gone to the command's sink (or been discarded, if it was abandoned).
+    Done { skipped: bool },
     /// Out-of-band data, built whole.
     Push(Value),
     /// Out-of-band data that was too large to build: dropped.
@@ -1074,19 +1415,23 @@ enum Completed {
 }
 
 /// Where the events of the reply being read go.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone)]
 enum Target {
     /// Between replies.
     None,
-    /// Into the collector.
+    /// Into the connection's own collector: a handshake reply, a push, a
+    /// subscriber's message.
     Collect(ReplyKind),
-    /// Nowhere: the reply is skipped.
-    Discard,
+    /// To the sink of the command at the head of the queue, or, if the command
+    /// has ended (it timed out) and its sink is gone, nowhere: the reply is
+    /// skipped as it arrives.
+    Command(Arc<Cmd>),
 }
 
-/// Routes the parser's events: to the collector, for a reply somebody waits
-/// for or a push, or nowhere, for a reply whose command has timed out. A
-/// reply that is skipped costs no memory however large it is.
+/// Routes the parser's events: to the sink of the command the reply answers,
+/// to the collector, for a push or the connection's own, or nowhere, for a reply
+/// whose command has ended. A reply that is skipped costs no memory however
+/// large it is.
 struct Router<'a> {
     collector: &'a mut Collector,
     inner: &'a Inner,
@@ -1099,7 +1444,51 @@ struct Router<'a> {
     /// Where the reply in progress goes. It lives on the connection, not here:
     /// a reply may take several reads.
     target: &'a mut Target,
+    /// A sink asked for a pause, and which command it was.
+    paused: &'a mut Option<Arc<Cmd>>,
     out: &'a mut Vec<Completed>,
+}
+
+impl Router<'_> {
+    /// Deliver an event to where the reply goes.
+    fn event(&mut self, f: impl FnOnce(&mut dyn ReplySink) -> Flow) -> Flow {
+        match &*self.target {
+            Target::Collect(_) => f(&mut *self.collector),
+            Target::Command(cmd) if !cmd.streaming => {
+                // A callback that takes a value: its collector never pauses and
+                // it is timed from issue to reply, so nothing more is tracked.
+                let flow = match cmd.sink.lock().unwrap().as_mut() {
+                    Some(sink) => f(sink.events()),
+                    // The command ended (it timed out) while its reply was coming.
+                    None => Flow::Skip,
+                };
+                run_deferred(self.inner, cmd);
+                flow
+            }
+            Target::Command(cmd) => {
+                if cmd.cancelled.load(Ordering::Relaxed) {
+                    return Flow::Skip;
+                }
+                cmd.in_sink.store(true, Ordering::SeqCst);
+                let flow = match cmd.sink.lock().unwrap().as_mut() {
+                    Some(sink) => f(sink.events()),
+                    None => {
+                        cmd.in_sink.store(false, Ordering::SeqCst);
+                        return Flow::Skip;
+                    }
+                };
+                cmd.touch();
+                let flow = cmd.settle(flow);
+                cmd.in_sink.store(false, Ordering::SeqCst);
+                run_deferred(self.inner, cmd);
+                if flow == Flow::Pause {
+                    *self.paused = Some(Arc::clone(cmd));
+                }
+                flow
+            }
+            _ => Flow::Skip,
+        }
+    }
 }
 
 impl ReplySink for Router<'_> {
@@ -1108,78 +1497,64 @@ impl ReplySink for Router<'_> {
             ReplyKind::Push => Target::Collect(ReplyKind::Push),
             ReplyKind::Normal if self.sub_ready => Target::Collect(ReplyKind::Normal),
             ReplyKind::Normal => {
-                let timed_out = {
-                    let st = self.inner.state.lock().unwrap();
-                    matches!(st.pending.get(self.head), Some(Sent { kind: Kind::User(None), .. }))
-                };
-                if timed_out {
-                    Target::Discard
-                } else {
-                    Target::Collect(ReplyKind::Normal)
+                let st = self.inner.state.lock().unwrap();
+                match st.pending.get(self.head) {
+                    // Even a command that has ended: its sink is gone, so the
+                    // events find none and the reply is skipped as it arrives.
+                    Some(Sent { kind: Kind::User(cmd), .. }) => Target::Command(Arc::clone(cmd)),
+                    // A handshake reply, or one nobody asked for.
+                    _ => Target::Collect(ReplyKind::Normal),
                 }
             }
         };
-        if matches!(*self.target, Target::Collect(_)) {
-            self.collector.begin_reply(kind);
+        match &*self.target {
+            Target::Collect(_) => self.collector.begin_reply(kind),
+            Target::Command(cmd) => {
+                if let Some(sink) = cmd.sink.lock().unwrap().as_mut() {
+                    sink.events().begin_reply(kind);
+                }
+            }
+            _ => {}
         }
     }
 
     fn scalar(&mut self, v: Scalar<'_>) -> Flow {
-        match *self.target {
-            Target::Collect(_) => self.collector.scalar(v),
-            _ => Flow::Skip,
-        }
+        self.event(|s| s.scalar(v))
     }
 
     fn error(&mut self, line: &str) -> Flow {
-        match *self.target {
-            Target::Collect(_) => self.collector.error(line),
-            _ => Flow::Skip,
-        }
+        self.event(|s| s.error(line))
     }
 
     fn begin_aggregate(&mut self, kind: AggKind, len: Option<usize>) -> Flow {
-        match *self.target {
-            Target::Collect(_) => self.collector.begin_aggregate(kind, len),
-            _ => Flow::Skip,
-        }
+        self.event(|s| s.begin_aggregate(kind, len))
     }
 
     fn end_aggregate(&mut self) -> Flow {
-        match *self.target {
-            Target::Collect(_) => self.collector.end_aggregate(),
-            _ => Flow::Skip,
-        }
+        self.event(|s| s.end_aggregate())
     }
 
     fn begin_string(&mut self, kind: StrKind, len: Option<usize>) -> Flow {
-        match *self.target {
-            Target::Collect(_) => self.collector.begin_string(kind, len),
-            _ => Flow::Skip,
-        }
+        self.event(|s| s.begin_string(kind, len))
     }
 
     fn string_chunk(&mut self, data: &[u8]) -> Flow {
-        match *self.target {
-            Target::Collect(_) => self.collector.string_chunk(data),
-            _ => Flow::Skip,
-        }
+        self.event(|s| s.string_chunk(data))
     }
 
     fn end_string(&mut self) -> Flow {
-        match *self.target {
-            Target::Collect(_) => self.collector.end_string(),
-            _ => Flow::Skip,
-        }
+        self.event(|s| s.end_string())
     }
 
-    fn end_reply(&mut self, _skipped: bool) {
-        let target = std::mem::replace(&mut *self.target, Target::None);
-        match target {
+    fn end_reply(&mut self, skipped: bool) {
+        match std::mem::replace(&mut *self.target, Target::None) {
             Target::None => {}
-            Target::Discard => {
+            Target::Command(cmd) => {
+                if let Some(sink) = cmd.sink.lock().unwrap().as_mut() {
+                    sink.events().end_reply(skipped);
+                }
                 self.head += 1;
-                self.out.push(Completed::Discarded);
+                self.out.push(Completed::Done { skipped });
             }
             Target::Collect(kind) => {
                 let built = self.collector.take();
@@ -1210,9 +1585,7 @@ impl Conn {
             let plan = handshake_plan(&inner.config, inner.config.resp3);
             for (step, _) in &plan {
                 st.pending.push_back(Sent {
-                    qid: u64::MAX,
                     kind: Kind::Internal(*step),
-                    cancel: None,
                     held: false,
                 });
             }
@@ -1248,9 +1621,7 @@ impl Conn {
             while let Some(w) = st.waiting.pop_front() {
                 append_to_outbox(&mut st.outbox, w.bytes);
                 st.pending.push_back(Sent {
-                    qid: w.qid,
-                    kind: Kind::User(Some(w.callback)),
-                    cancel: w.cancel,
+                    kind: Kind::User(w.cmd),
                     held: w.held,
                 });
             }
@@ -1291,14 +1662,13 @@ impl Conn {
                 }
             }
             Completed::Push(_) => {}
-            Completed::Reply(reply) => self.on_reply(endpoint, Some(reply)),
-            Completed::Discarded => self.on_reply(endpoint, None),
+            Completed::Reply(reply) => self.on_reply(endpoint, Answer::Value(reply)),
+            Completed::Done { skipped } => self.on_reply(endpoint, Answer::Streamed { skipped }),
         }
     }
 
-    /// The reply to the command at the head of the queue; `None` for one that
-    /// was discarded because the command had timed out.
-    fn on_reply(&mut self, endpoint: &mut dyn Endpoint, reply: Option<Result<Value, RedisError>>) {
+    /// The reply to the command at the head of the queue.
+    fn on_reply(&mut self, endpoint: &mut dyn Endpoint, answer: Answer) {
         let inner = Arc::clone(&self.inner);
         let sent = {
             let mut st = inner.state.lock().unwrap();
@@ -1313,13 +1683,23 @@ impl Conn {
             endpoint.close();
             return;
         };
-        cancel_timer(&sent.cancel);
-        match (sent.kind, reply) {
-            (Kind::User(Some(cb)), Some(reply)) => cb(reply.and_then(into_reply)),
-            (Kind::Internal(step), Some(Ok(value))) => self.on_handshake_reply(endpoint, step, value),
-            (Kind::Internal(_), Some(Err(e))) => return self.handshake_failed(endpoint, e),
-            // Timed out: the reply was discarded as it arrived.
-            _ => {}
+        match (sent.kind, answer) {
+            // The command's sink has heard the whole reply, or none of it if the
+            // command had ended: it is told how it went, if it is still there.
+            (Kind::User(cmd), Answer::Streamed { skipped }) => {
+                cmd.cancel_timer();
+                if let Some(sink) = cmd.take_sink() {
+                    sink.finish(Outcome::Complete { skipped });
+                }
+            }
+            (Kind::Internal(step), Answer::Value(Ok(value))) => self.on_handshake_reply(endpoint, step, value),
+            (Kind::Internal(_), Answer::Value(Err(e))) => return self.handshake_failed(endpoint, e),
+            // The reply was read for something other than the command that was
+            // waiting for it: the stream has lost step with us.
+            (Kind::User(cmd), Answer::Value(_)) => {
+                end_cmd(&inner, &cmd, Outcome::Failed(RedisError::Protocol("a reply did not match its command".into())));
+            }
+            (Kind::Internal(_), Answer::Streamed { .. }) => {}
         }
         close_if_drained(&inner);
     }
@@ -1362,9 +1742,7 @@ impl Conn {
     /// Send one more handshake command, and expect its reply.
     fn push_internal(&mut self, endpoint: &mut dyn Endpoint, step: Step, bytes: &[u8]) {
         self.inner.state.lock().unwrap().pending.push_back(Sent {
-            qid: u64::MAX,
             kind: Kind::Internal(step),
-            cancel: None,
             held: false,
         });
         endpoint.send(bytes);
@@ -1397,6 +1775,11 @@ impl ProtocolHandler for Conn {
     fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
         let sub_ready = {
             let mut st = self.inner.state.lock().unwrap();
+            if st.read_paused {
+                // The consumer of a streamed reply holds the connection: what is
+                // in the ring stays there until it resumes.
+                return;
+            }
             if st.conn_id == self.conn_id {
                 st.last_rx = Instant::now();
             }
@@ -1404,42 +1787,63 @@ impl ProtocolHandler for Conn {
         };
         let mut completed = std::mem::take(&mut self.completed);
         let mut bad = None;
-        let consumed = {
-            // Read the ring where it lies: a payload is handed on as it arrives
-            // and the parser keeps none of it.
-            let mut router = Router {
-                collector: &mut self.collector,
-                inner: &self.inner,
-                sub_ready,
-                head: 0,
-                target: &mut self.target,
-                out: &mut completed,
-            };
-            let (first, second) = buf.readable_spans();
-            let mut consumed = 0;
-            for span in [first, second] {
-                if span.is_empty() {
-                    continue;
-                }
-                let mut data = span;
-                match self.parser.feed(&mut data, &mut router) {
-                    Ok(_) => consumed += span.len() - data.len(),
-                    Err(e) => {
-                        // The stream cannot be trusted: nothing more of it is read.
-                        consumed += span.len();
-                        bad = Some(e);
-                        break;
+        loop {
+            let mut paused = None;
+            let consumed = {
+                // Read the ring where it lies: a payload is handed on as it arrives
+                // and the parser keeps none of it.
+                let mut router = Router {
+                    collector: &mut self.collector,
+                    inner: &self.inner,
+                    sub_ready,
+                    head: 0,
+                    target: &mut self.target,
+                    paused: &mut paused,
+                    out: &mut completed,
+                };
+                let (first, second) = buf.readable_spans();
+                let mut consumed = 0;
+                for span in [first, second] {
+                    if span.is_empty() {
+                        continue;
+                    }
+                    let mut data = span;
+                    match self.parser.feed(&mut data, &mut router) {
+                        Ok(Feed::Consumed) => consumed += span.len() - data.len(),
+                        Ok(Feed::Paused) => {
+                            consumed += span.len() - data.len();
+                            break;
+                        }
+                        Err(e) => {
+                            // The stream cannot be trusted: nothing more of it is read.
+                            consumed += span.len();
+                            bad = Some(e);
+                            break;
+                        }
                     }
                 }
+                consumed
+            };
+            buf.advance(consumed);
+            if bad.is_some() {
+                buf.advance(buf.len());
             }
-            consumed
-        };
-        buf.advance(consumed);
-        if bad.is_some() {
-            buf.advance(buf.len());
-        }
-        for c in completed.drain(..) {
-            self.on_completed(endpoint, c);
+            for c in completed.drain(..) {
+                self.on_completed(endpoint, c);
+            }
+            let Some(cmd) = paused else {
+                break;
+            };
+            // Stop reading, unless the consumer has already resumed or cancelled.
+            if cmd
+                .flow
+                .compare_exchange(FLOW_PAUSE_REQUESTED, FLOW_PAUSED, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                self.inner.state.lock().unwrap().read_paused = true;
+                endpoint.pause_read();
+                break;
+            }
         }
         self.completed = completed;
         if let Some(e) = bad {
@@ -1460,6 +1864,91 @@ impl ProtocolHandler for Conn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sink that wants nothing, for a command cell.
+    struct Nothing;
+
+    impl ReplySink for Nothing {
+        fn scalar(&mut self, _v: Scalar<'_>) -> Flow {
+            Flow::Continue
+        }
+        fn error(&mut self, _line: &str) -> Flow {
+            Flow::Continue
+        }
+        fn begin_aggregate(&mut self, _kind: AggKind, _len: Option<usize>) -> Flow {
+            Flow::Continue
+        }
+        fn end_aggregate(&mut self) -> Flow {
+            Flow::Continue
+        }
+        fn begin_string(&mut self, _kind: StrKind, _len: Option<usize>) -> Flow {
+            Flow::Continue
+        }
+        fn string_chunk(&mut self, _data: &[u8]) -> Flow {
+            Flow::Continue
+        }
+        fn end_string(&mut self) -> Flow {
+            Flow::Continue
+        }
+    }
+
+    fn cell() -> (Arc<Cmd>, StreamHandle) {
+        let cmd = Cmd::new(Box::new(Streaming { sink: Nothing }), true, None);
+        let handle = StreamHandle {
+            cmd: Arc::clone(&cmd),
+            inner: Weak::new(),
+        };
+        (cmd, handle)
+    }
+
+    #[test]
+    fn a_resume_during_the_call_that_pauses_cancels_that_pause() {
+        let (cmd, handle) = cell();
+        // The sink is running; the consumer, on another thread, resumes before the
+        // sink has returned the Pause it is about to.
+        cmd.in_sink.store(true, Ordering::SeqCst);
+        handle.resume();
+        assert_eq!(cmd.settle(Flow::Pause), Flow::Continue, "there is no pause to take effect");
+        assert_eq!(cmd.flow.load(Ordering::SeqCst), FLOW_RUNNING, "and nothing is left over");
+        cmd.in_sink.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_resume_when_nothing_is_paused_does_not_cancel_a_later_pause() {
+        let (cmd, handle) = cell();
+        // Not in the sink, not paused: nothing to resume, and nothing kept.
+        handle.resume();
+        handle.resume();
+        cmd.in_sink.store(true, Ordering::SeqCst);
+        assert_eq!(cmd.settle(Flow::Pause), Flow::Pause, "a stray resume did not use up this pause");
+        assert_eq!(cmd.flow.load(Ordering::SeqCst), FLOW_PAUSE_REQUESTED);
+        // A resume during the call that did not pause leaves nothing for the next.
+        let (cmd, handle) = cell();
+        cmd.in_sink.store(true, Ordering::SeqCst);
+        handle.resume();
+        assert_eq!(cmd.settle(Flow::Continue), Flow::Continue);
+        assert_eq!(cmd.flow.load(Ordering::SeqCst), FLOW_RUNNING, "the permit went with the call");
+        assert_eq!(cmd.settle(Flow::Pause), Flow::Pause);
+    }
+
+    #[test]
+    fn a_resume_between_the_pause_and_its_taking_effect_cancels_it_and_one_after_releases_it() {
+        let (cmd, handle) = cell();
+        assert_eq!(cmd.settle(Flow::Pause), Flow::Pause);
+        handle.resume(); // before the connection has stopped reading
+        assert_eq!(cmd.flow.load(Ordering::SeqCst), FLOW_RUNNING);
+        assert!(
+            cmd.flow
+                .compare_exchange(FLOW_PAUSE_REQUESTED, FLOW_PAUSED, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err(),
+            "so the connection does not stop"
+        );
+        // And once it has stopped, a resume releases it.
+        assert_eq!(cmd.settle(Flow::Pause), Flow::Pause);
+        cmd.flow.store(FLOW_PAUSED, Ordering::SeqCst);
+        handle.resume();
+        assert_eq!(cmd.flow.load(Ordering::SeqCst), FLOW_RUNNING);
+    }
 
     #[test]
     fn the_command_name_is_read_from_the_encoding() {

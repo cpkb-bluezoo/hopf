@@ -114,3 +114,34 @@ reused from one reply to the next.
 allocations: a 1 GiB reply fed to the parser in 4 KiB and 64 KiB reads, streamed
 or skipped, raises it by 36 bytes; a late 256 MiB reply to a command that had
 already timed out raises it by about 2.8 KB, where before it raised it by 256 MiB.
+
+## Streaming replies to a sink
+
+`send_streaming` gives a command a sink of its own, and every command now has a
+cell that its queue entry, the reader of its reply and its timer share, so that a
+timeout can take the sink out from under a reply that has begun, and a consumer
+on another thread can pause, resume or cancel it. That costs the small-reply
+path two allocations and some CPU per operation, most visibly at high pipeline
+depths, where each reply's few events each take the cell's lock:
+
+| scenario | ops/s | allocs/op | cpu us/op |
+|---|---:|---:|---:|
+| single get 16B depth 1 | 30201 -> 29845 | 17.1 -> 19.1 | 15.10 -> 15.57 |
+| single get 16B depth 16 | 293799 -> 271040 | 13.5 -> 15.5 | 1.97 -> 2.24 |
+| single get 16B depth 256 | 703281 -> 596988 | 13.1 -> 15.1 | 1.08 -> 1.35 |
+| cluster publish depth 16 | 164495 -> 159181 | 17.0 -> 18.9 | 6.04 -> 6.23 |
+| cluster publish depth 256 | 667095 -> 579374 | 15.3 -> 17.3 | 1.50 -> 1.73 |
+| tls single get 16B depth 16 | 275125 -> 256189 | 13.9 -> 15.9 | 2.11 -> 2.35 |
+
+(Before, then after. On macOS `std::sync::Mutex` allocates its pthread mutex on
+first use, which is one of the two allocations; on Linux the lock is a futex and
+allocates nothing, so the count there is lower.)
+
+`tests/memory_bound.rs` measures what streaming through a real client costs in
+memory: a 256 MiB value through `get_stream` to a sink that keeps nothing raises
+the peak heap by about 2.9 KB, and the same with the consumer paused in the
+middle for half a second raises it by the same. Pausing is by `pause_read`, so the
+value waits in the socket and the server's writes are held back by TCP; it relies
+on the reactor stopping reading as soon as a handler pauses (a read loop that
+carried on until the ring was full used to fail the connection with "inbound
+buffer full", under load).

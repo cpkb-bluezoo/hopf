@@ -357,6 +357,13 @@ impl Reactor {
             return Ok(());
         }
         loop {
+            // A handler that has paused reading is not read for: what is in the
+            // ring stays there, and what the peer has sent beyond it waits in the
+            // socket, where TCP holds the peer back. Reading on regardless would
+            // only fill the ring and fail with "inbound buffer full".
+            if conn.is_read_paused() {
+                break;
+            }
             match conn.read_from_socket() {
                 Ok(ReadOutcome::Bytes) => {
                     conn.process_inbound();

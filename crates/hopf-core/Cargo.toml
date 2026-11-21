@@ -60,3 +60,8 @@ required-features = ["integration"]
 name = "graceful_drain"
 path = "tests/graceful_drain.rs"
 required-features = ["integration"]
+
+[[test]]
+name = "pause_read"
+path = "tests/pause_read.rs"
+required-features = ["integration"]

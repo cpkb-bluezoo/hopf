@@ -35,9 +35,14 @@ speaking RESP2 and RESP3.
   borrowed from the connection's ring, so nothing it parses is copied or
   collected; a sink can pause it, or discard the rest of a reply in constant
   memory. A reply nobody waits for, such as a timed-out command's, is discarded
-  as it arrives, however large. (Callbacks that take a whole `Value` are still
-  fed through a bounded collector; streaming sinks for commands are the next
-  step, see [#541](https://github.com/cpkb-bluezoo/hopf/issues/541).)
+  as it arrives, however large.
+- **Streaming replies.** `send_streaming` and the shape sinks (`BulkSink`,
+  `ElementsSink`, `KeysSink`, `FieldsSink`) deliver a value of any size as
+  chunks in constant memory, with `Pause` and `StreamHandle::resume` for
+  backpressure and `Skip` and `StreamHandle::cancel` to give up. The timeout of
+  such a command is for silence, not for the whole reply. (Callbacks that take a
+  whole `Value` are still fed through a bounded collector for now, see
+  [#541](https://github.com/cpkb-bluezoo/hopf/issues/541).)
 
 ```rust
 use hopf_core::{Runtime, RuntimeConfig};

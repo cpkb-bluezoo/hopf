@@ -15,12 +15,13 @@ use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command as Process, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hopf_core::{Runtime, RuntimeConfig};
 use hopf_redis::{
-    AggKind, Command, Deadline, Feed, Flow, RedisClient, RedisConfig, RedisError, ReplySink, RespLimits, RespParser, Scalar,
-    StrKind,
+    AggKind, BulkHandler, BulkSink, Command, Deadline, Feed, Flow, RedisClient, RedisConfig, RedisError, ReplySink, RespLimits,
+    RespParser, Scalar, StrKind, StreamHandle,
 };
 
 // ---- the allocator: live bytes, and the highest they have been ----
@@ -123,7 +124,10 @@ fn handle(mut s: TcpStream) {
             // enough for the client's command timeout to have passed.
             "GET" => {
                 let size: usize = String::from_utf8_lossy(&words[1]).parse().unwrap();
-                std::thread::sleep(Duration::from_millis(400));
+                // `GET <size> now` answers at once.
+                if words.len() < 3 {
+                    std::thread::sleep(Duration::from_millis(400));
+                }
                 write_bulk(&mut s, size)
             }
             "PING" => s.write_all(b"+PONG\r\n"),
@@ -335,11 +339,81 @@ fn the_parser_holds_a_constant_amount_however_large_the_reply() {
     }
 }
 
+/// Counts what a streamed reply holds and keeps none of it; may pause once.
+struct Drain {
+    bytes: Arc<AtomicUsize>,
+    chunks: Arc<AtomicUsize>,
+    pause_at_first: bool,
+    done: mpsc::Sender<Result<(), RedisError>>,
+}
+
+impl BulkHandler for Drain {
+    fn chunk(&mut self, data: &[u8]) -> Flow {
+        self.bytes.fetch_add(data.len(), Ordering::SeqCst);
+        if self.chunks.fetch_add(1, Ordering::SeqCst) == 0 && self.pause_at_first {
+            return Flow::Pause;
+        }
+        Flow::Continue
+    }
+    fn finished(&mut self, outcome: Result<(), RedisError>) {
+        let _ = self.done.send(outcome);
+    }
+}
+
+/// A 256 MiB value through `get_stream`: held for no longer than a chunk, with
+/// or without the consumer pausing in the middle of it.
+fn a_value_streams_through_a_client_in_constant_memory() {
+    const SIZE: usize = 256 * MIB;
+    let server = Server::start();
+    let rt = runtime();
+    let c = RedisClient::connect(rt.pick_worker(), RedisConfig::new("127.0.0.1", server.port));
+    call(|cb| c.ping(move |r| cb(r))).expect("the connection is up");
+
+    for pause in [false, true] {
+        let base = reset_peak();
+        let (tx, rx) = mpsc::channel();
+        let (bytes, chunks) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let started = Instant::now();
+        let handle: StreamHandle = c.send_streaming(
+            &Command::new("GET").arg(SIZE.to_string()).arg("now"),
+            BulkSink::new(Drain {
+                bytes: Arc::clone(&bytes),
+                chunks: Arc::clone(&chunks),
+                pause_at_first: pause,
+                done: tx,
+            }),
+        );
+        if pause {
+            // Stalled in the middle of a 256 MiB reply for a while: still nothing held.
+            std::thread::sleep(Duration::from_millis(500));
+            let held = bytes.load(Ordering::SeqCst);
+            assert!(held < SIZE / 4, "{held} bytes were read while the consumer was paused");
+            handle.resume();
+        }
+        let outcome = rx.recv_timeout(Duration::from_secs(120)).expect("the command finished");
+        if let Err(e) = &outcome {
+            panic!("the streamed command failed: {e:?} (paused: {pause}, {} bytes read)", bytes.load(Ordering::SeqCst));
+        }
+        assert_eq!(bytes.load(Ordering::SeqCst), SIZE);
+        let above = peak_above(base);
+        println!(
+            "a 256 MiB value streamed{}: {} chunks, peak heap {above} bytes above baseline, {:.1} s",
+            if pause { ", paused in the middle" } else { "" },
+            chunks.load(Ordering::SeqCst),
+            started.elapsed().as_secs_f64()
+        );
+        assert!(above < 256 * 1024, "the heap rose by {above} bytes streaming a {SIZE} byte value (paused: {pause})");
+    }
+    c.close();
+    rt.shutdown();
+}
+
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("--serve") {
         return serve();
     }
     the_parser_holds_a_constant_amount_however_large_the_reply();
     a_late_reply_to_a_timed_out_command_is_discarded_in_constant_memory();
+    a_value_streams_through_a_client_in_constant_memory();
     println!("memory_bound: ok");
 }

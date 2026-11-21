@@ -41,6 +41,27 @@ impl Session<'_> {
     pub fn close(&mut self) {
         self.endpoint.close();
     }
+
+    /// Send `prefix`, then `size` bytes, then `suffix`, a block at a time as the
+    /// connection can take them: a reply far larger than the outbound buffer.
+    pub fn stream(&mut self, prefix: &str, size: usize, suffix: &str) {
+        self.endpoint.send(prefix.as_bytes());
+        pump(self.endpoint, size, suffix.to_string());
+    }
+}
+
+fn pump(ep: &mut dyn Endpoint, left: usize, suffix: String) {
+    const BLOCK: usize = 64 * 1024;
+    let n = left.min(BLOCK);
+    if n > 0 {
+        ep.send(&vec![b'v'; n]);
+    }
+    let left = left - n;
+    if left == 0 {
+        ep.send(suffix.as_bytes());
+        return;
+    }
+    ep.on_write_ready(Some(Box::new(move |ep| pump(ep, left, suffix))));
 }
 
 pub type Script = dyn Fn(&mut Session, &[Vec<u8>]) + Send + Sync;
