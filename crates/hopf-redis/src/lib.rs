@@ -33,7 +33,7 @@ mod pubsub;
 pub mod resp;
 mod topology;
 
-pub use client::{Callback, Command, RedisClient, Reply};
+pub use client::{Callback, Command, Deadline, RedisClient, Reply};
 pub use cluster::{ClusterConfig, RedisCluster};
 pub use commands::SetOptions;
 pub use config::RedisConfig;

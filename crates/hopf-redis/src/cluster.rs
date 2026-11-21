@@ -152,6 +152,8 @@ struct Job {
     callback: Callback,
     /// What a `WAIT` for this command's slot is bound to while it is unanswered.
     track: Option<Arc<Track>>,
+    /// How long each try may go unanswered.
+    deadline: Deadline,
 }
 
 /// Work that cannot go anywhere until the layout is known.
@@ -237,13 +239,24 @@ impl RedisCluster {
     /// module for how redirections, failures and commands with several keys are
     /// handled.
     pub fn send(&self, command: &Command, callback: impl FnOnce(Reply) + Send + 'static) {
-        self.submit(command, None, Box::new(callback));
+        self.submit(command, None, Deadline::Default, Box::new(callback));
+    }
+
+    /// [`send`](Self::send) with a deadline of its own instead of the node
+    /// connections' command timeout: [`Deadline::After`] for a time,
+    /// [`Deadline::Never`] for a command that blocks for as long as the server
+    /// likes. The deadline applies to each try: a command that is redirected
+    /// (`MOVED`, `ASK`) or sent again after the layout changed gets it afresh.
+    /// `WAIT` and `WAITAOF` keep the deadline [`wait_replicas`](Self::wait_replicas)
+    /// gives them.
+    pub fn send_with_deadline(&self, command: &Command, deadline: Deadline, callback: impl FnOnce(Reply) + Send + 'static) {
+        self.submit(command, None, deadline, Box::new(callback));
     }
 
     /// [`send`](Self::send) for the command made of `words`.
     pub fn command(&self, words: &[&[u8]], callback: impl FnOnce(Reply) + Send + 'static) {
         let command = Command::new(words.first().copied().unwrap_or(b"")).args(words.iter().skip(1));
-        self.submit(&command, None, Box::new(callback));
+        self.submit(&command, None, Deadline::Default, Box::new(callback));
     }
 
     /// [`send`](Self::send) to the master that owns `routing_key`'s slot,
@@ -257,10 +270,10 @@ impl RedisCluster {
     /// and one sent here behaves as [`wait_replicas`](Self::wait_replicas)
     /// does: it is bound to the last command submitted for the key's slot.
     pub fn command_for_key(&self, routing_key: impl AsRef<[u8]>, command: &Command, callback: impl FnOnce(Reply) + Send + 'static) {
-        self.submit(command, Some(key_slot(routing_key.as_ref())), Box::new(callback));
+        self.submit(command, Some(key_slot(routing_key.as_ref())), Deadline::Default, Box::new(callback));
     }
 
-    fn submit(&self, command: &Command, routed: Option<u16>, callback: Callback) {
+    fn submit(&self, command: &Command, routed: Option<u16>, deadline: Deadline, callback: Callback) {
         let inner = &self.inner;
         if inner.closed.load(Ordering::SeqCst) {
             return finish(inner, callback, Err(RedisError::Closed));
@@ -310,6 +323,7 @@ impl RedisCluster {
                 budget: inner.config.max_redirects,
                 callback,
                 track,
+                deadline,
             },
             true,
         );
@@ -531,7 +545,19 @@ fn finish_tx(inner: &Inner, callback: TxCallback, result: Result<Option<Vec<Valu
 fn client_for(inner: &Arc<Inner>, st: &mut State, addr: &NodeAddr) -> RedisClient {
     st.pool
         .entry(addr.clone())
-        .or_insert_with(|| RedisClient::connect(&inner.reactor, inner.config.for_node(addr)))
+        .or_insert_with(|| {
+            let client = RedisClient::connect(&inner.reactor, inner.config.for_node(addr));
+            // A node the health check gave up on may have been replaced by a
+            // failover; whether or not any command was waiting to say so, look
+            // at the layout again.
+            let weak = Arc::downgrade(inner);
+            client.on_unresponsive(move || {
+                if let Some(inner) = weak.upgrade() {
+                    request_refresh(&inner);
+                }
+            });
+            client
+        })
         .clone()
 }
 
@@ -600,15 +626,19 @@ fn dispatch(inner: &Arc<Inner>, mut job: Job, fresh: bool) {
         };
     };
     let sent = job.command.clone();
+    let deadline = job.deadline;
     let track = job.track.clone();
     let inner2 = Arc::clone(inner);
     let reply = move |reply: Reply| on_reply(&inner2, job, addr, reply);
     if asking {
         // ASKING applies to the next command on the connection and no other, so
         // the two go in one batch with nothing between them.
-        client.send_batch(vec![(Command::new("ASKING"), Box::new(|_: Reply| {})), (sent, Box::new(reply))]);
+        client.send_batch_with_deadline(
+            vec![(Command::new("ASKING"), Box::new(|_: Reply| {})), (sent, Box::new(reply))],
+            deadline,
+        );
     } else {
-        client.send(&sent, reply);
+        client.send_with_deadline(&sent, deadline, reply);
     }
     if let Some(t) = track {
         attach(inner, &t, &client);
@@ -654,8 +684,16 @@ fn on_reply(inner: &Arc<Inner>, mut job: Job, from: NodeAddr, reply: Reply) {
             return park(inner, Parked::Command(job), Some(error));
         }
         // Sent, and the connection went: not repeated, but the layout has
-        // probably changed.
+        // probably changed. The same goes for a connection closed because its
+        // node stopped answering, whether or not a command was waiting (see
+        // `client_for`).
         RedisError::ConnectionLost(_) => request_refresh(inner),
+        // A command that merely timed out does not ask for a new layout: a slow
+        // node is not a moved one, and a refresh on every timeout would turn a
+        // slow server into a storm of `CLUSTER SHARDS`. A node that has really
+        // gone quiet is found by the connection's health check, which closes
+        // it and asks for the layout itself.
+        RedisError::Timeout => {}
         // The node's client was let go of while this command was on its way to
         // it, so the command was not sent: to the owner as the layout now has it.
         RedisError::Closed if job.budget > 0 && !inner.closed.load(Ordering::SeqCst) => {

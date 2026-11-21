@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use hopf_core::Runtime;
-use hopf_redis::{RedisClient, RedisConfig, RedisError, Value};
+use hopf_redis::{Command, Deadline, RedisClient, RedisConfig, RedisError, Value};
 
 use common::*;
 
@@ -667,5 +667,226 @@ fn the_handshake_does_not_use_up_the_room_max_pending_gives_the_callers_commands
     }
     c.close();
     rt.shutdown();
+    server.rt.shutdown();
+}
+
+// ---- the health check on a command connection ----
+
+/// The commands a scripted server was sent, by connection.
+type Seen = Arc<Mutex<Vec<(usize, String)>>>;
+
+fn seen_count(seen: &Seen, conn: usize, name: &str) -> usize {
+    seen.lock().unwrap().iter().filter(|(c, n)| *c == conn && n == name).count()
+}
+
+fn wait_for_reply<T>(rx: &mpsc::Receiver<T>, what: &str) -> T {
+    rx.recv_timeout(Duration::from_secs(3)).unwrap_or_else(|_| panic!("no reply: {what}"))
+}
+
+#[test]
+fn a_black_holed_connection_is_closed_and_what_it_owed_fails_with_connection_lost() {
+    // Connection 0 answers its handshake and then nothing at all: no reset, no
+    // close, no reply to a PING. Connection 1 is a healthy server.
+    let seen: Seen = Arc::default();
+    let log = Arc::clone(&seen);
+    let server = serve(move |s, w| {
+        log.lock().unwrap().push((s.conn, name_of(w)));
+        match (name_of(w).as_str(), s.conn) {
+            ("HELLO", _) => s.reply(HELLO_OK),
+            (_, 0) => {}
+            ("GET", _) => s.reply("$2\r\nok\r\n"),
+            _ => s.reply("+PONG\r\n"),
+        }
+    });
+    let (rt, c) = client(&server, |c| {
+        c.ping_interval(Some(Duration::from_millis(100))).command_timeout(Some(Duration::from_secs(30)))
+    });
+    let started = Instant::now();
+    let (tx, rx) = mpsc::channel();
+    for k in ["k1", "k2"] {
+        let tx = tx.clone();
+        c.get(k, move |r| tx.send(r).unwrap());
+    }
+    for _ in 0..2 {
+        let err = wait_for_reply(&rx, "a command on the black-holed connection").unwrap_err();
+        assert!(matches!(err, RedisError::ConnectionLost(_)), "{err:?}");
+    }
+    assert!(started.elapsed() < Duration::from_secs(2), "detected within a few intervals: {:?}", started.elapsed());
+    assert_eq!(seen_count(&seen, 0, "PING"), 0, "no probe is queued behind what the server owes");
+    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "each callback ran once");
+
+    // The next command dials afresh and is answered.
+    assert_eq!(call!(|cb| c.get("k3", cb)).unwrap().map(|b| b.to_vec()), Some(b"ok".to_vec()));
+    assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_connection_that_never_finishes_its_handshake_is_given_up_on() {
+    let server = serve(move |_s, _w| {}); // HELLO is never answered
+    let (rt, c) = client(&server, |c| {
+        c.ping_interval(Some(Duration::from_millis(100))).command_timeout(Some(Duration::from_secs(30)))
+    });
+    let (tx, rx) = mpsc::channel();
+    c.get("k", move |r| tx.send(r).unwrap());
+    let err = wait_for_reply(&rx, "a command waiting for the handshake").unwrap_err();
+    assert!(matches!(err, RedisError::Connect(_)), "{err:?}");
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn traffic_of_any_kind_counts_as_life() {
+    // The replies take far longer in all than the interval, but none of the
+    // silences does.
+    let server = serve(move |s, w| match name_of(w).as_str() {
+        "HELLO" => s.reply(HELLO_OK),
+        "GET" => {
+            let i = s.seq as u64; // 1, 2, 3, 4, 5
+            s.reply_after(Duration::from_millis(100 * i), format!("${}\r\nk{i}\r\n", 2));
+        }
+        _ => s.reply("+OK\r\n"),
+    });
+    let (rt, c) = client(&server, |c| {
+        c.ping_interval(Some(Duration::from_millis(160))).command_timeout(Some(Duration::from_secs(30)))
+    });
+    let (tx, rx) = mpsc::channel();
+    for _ in 0..5 {
+        let tx = tx.clone();
+        c.get("k", move |r| tx.send(r).unwrap());
+    }
+    let got: Vec<_> = (0..5).map(|_| wait_for_reply(&rx, "a slow but steady server").unwrap()).collect();
+    assert_eq!(got.len(), 5);
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1, "the connection was kept");
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn an_idle_connection_is_never_closed_for_being_quiet() {
+    let seen: Seen = Arc::default();
+    let log = Arc::clone(&seen);
+    let server = serve(move |s, w| {
+        log.lock().unwrap().push((s.conn, name_of(w)));
+        match name_of(w).as_str() {
+            "HELLO" => s.reply(HELLO_OK),
+            _ => s.reply("+PONG\r\n"),
+        }
+    });
+    let (rt, c) = client(&server, |c| c.ping_interval(Some(Duration::from_millis(50))));
+    call!(|cb| c.ping(cb)).unwrap();
+    thread::sleep(Duration::from_millis(700)); // many intervals with nothing outstanding
+    assert!(c.is_ready());
+    assert_eq!(seen_count(&seen, 0, "PING"), 1, "only the caller's own: nothing was sent for it");
+    // A command after the long quiet is not mistaken for a dead connection.
+    call!(|cb| c.ping(cb)).unwrap();
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_command_the_server_may_hold_is_not_taken_for_a_dead_connection() {
+    // A server holding a blocking command says nothing meanwhile, so silence
+    // proves nothing: with commands that may block outstanding, the
+    // connection is left to the commands' own timeouts.
+    let seen: Seen = Arc::default();
+    let log = Arc::clone(&seen);
+    let server = serve(move |s, w| {
+        log.lock().unwrap().push((s.conn, name_of(w)));
+        if name_of(w) == "HELLO" {
+            s.reply(HELLO_OK);
+        }
+    });
+    // No command timeout: nothing says how long a command may take.
+    let (rt, unbounded) = client(&server, |c| c.ping_interval(Some(Duration::from_millis(50))).command_timeout(None));
+    let (tx, rx) = mpsc::channel();
+    unbounded.get("k", move |r| tx.send(r).unwrap());
+    // A WAIT is held by the server for up to its own timeout.
+    let waiting = RedisClient::connect(
+        rt.pick_worker(),
+        RedisConfig::from_addr(server.addr)
+            .ping_interval(Some(Duration::from_millis(50)))
+            .command_timeout(Some(Duration::from_secs(30))),
+    );
+    let (wtx, wrx) = mpsc::channel();
+    waiting.wait_replicas("k", 1, 20_000, move |r| wtx.send(r).unwrap());
+    thread::sleep(Duration::from_millis(700));
+    assert!(rx.try_recv().is_err() && wrx.try_recv().is_err(), "neither was failed");
+    assert_eq!(server.connections.load(Ordering::SeqCst), 2, "no connection was dropped and redialled");
+    unbounded.close();
+    waiting.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_silent_connection_in_the_middle_of_a_transaction_is_dropped_without_a_probe() {
+    // A PING inside a MULTI would be queued into the transaction and change what
+    // EXEC returns, so none is ever sent.
+    let seen: Seen = Arc::default();
+    let log = Arc::clone(&seen);
+    let server = serve(move |s, w| {
+        log.lock().unwrap().push((s.conn, name_of(w)));
+        if name_of(w) == "HELLO" {
+            s.reply(HELLO_OK);
+        }
+    });
+    let (rt, c) = client(&server, |c| {
+        c.ping_interval(Some(Duration::from_millis(100))).command_timeout(Some(Duration::from_secs(30)))
+    });
+    let (tx, rx) = mpsc::channel();
+    c.transaction(vec![hopf_redis::Command::new("SET").arg("k").arg("v")], move |r| tx.send(r).unwrap());
+    let err = wait_for_reply(&rx, "a transaction on the black-holed connection").unwrap_err();
+    assert!(matches!(err, RedisError::ConnectionLost(_)), "{err:?}");
+    assert_eq!(seen_count(&seen, 0, "PING"), 0, "nothing was slipped into the transaction");
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn one_command_can_have_a_timeout_of_its_own_with_the_client_default_set_or_unset() {
+    // GET "slow" is answered after 400 ms, "never" not at all.
+    let server = serve(move |s, w| match name_of(w).as_str() {
+        "HELLO" => s.reply(HELLO_OK),
+        "GET" if arg(w, 1) == "never" => {}
+        "GET" => s.reply_after(Duration::from_millis(400), "$4\r\nslow\r\n"),
+        _ => s.reply("+OK\r\n"),
+    });
+    let get = |key: &str| Command::new("GET").arg(key);
+    let is_slow = |v: Value| matches!(v, Value::Bulk(b) if &b[..] == b"slow");
+    for default in [Some(Duration::from_millis(150)), None] {
+        let (rt, c) = client(&server, |c| c.command_timeout(default));
+        let label = format!("default {default:?}");
+
+        // Longer than the default: it waits for the reply the default would not.
+        let reply = call!(|cb| c.send_with_deadline(&get("slow"), Deadline::After(Duration::from_secs(5)), cb));
+        assert!(is_slow(reply.unwrap()), "{label}");
+        let reply = call!(|cb| c.send_with_deadline(&get("slow"), Deadline::Never, cb));
+        assert!(is_slow(reply.unwrap()), "{label}");
+
+        // A reply after the timeout does not call back a second time, and does
+        // not disturb the next command.
+        let (tx, rx) = mpsc::channel();
+        c.send_with_deadline(&get("slow"), Deadline::After(Duration::from_millis(100)), move |r| tx.send(r).unwrap());
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap_err(), RedisError::Timeout, "{label}");
+        thread::sleep(Duration::from_millis(500)); // the late reply arrives
+        assert!(rx.try_recv().is_err(), "{label}: called back once only");
+        assert!(c.is_ready(), "{label}");
+        // Shorter than the default (or one where there was none): it gives up in time.
+        // Last, because the server never answers this one, and replies are matched in order.
+        let started = Instant::now();
+        let err = call!(|cb| c.send_with_deadline(&get("never"), Deadline::After(Duration::from_millis(50)), cb)).unwrap_err();
+        assert_eq!(err, RedisError::Timeout, "{label}");
+        assert!(started.elapsed() < Duration::from_millis(140), "{label}: {:?}", started.elapsed());
+        c.close();
+        rt.shutdown();
+    }
     server.rt.shutdown();
 }

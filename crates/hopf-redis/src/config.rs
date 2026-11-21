@@ -152,11 +152,28 @@ impl RedisConfig {
         self
     }
 
-    /// For a [`RedisSubscriber`](crate::RedisSubscriber): how often to check the
-    /// connection is alive. After this long with nothing received it sends a
-    /// `PING`; after three times as long with nothing at all, it drops the
-    /// connection and dials again (a connection can die without telling either
-    /// end). `None` never checks. Default 30 s.
+    /// How long a connection may be silent before it is taken for dead (a
+    /// connection can die without telling either end). `None` never checks.
+    /// Default 30 s.
+    ///
+    /// On a command connection ([`RedisClient`](crate::RedisClient), and each
+    /// node of a [`RedisCluster`](crate::RedisCluster)) it applies while
+    /// replies are owed: after this long with nothing received, the connection
+    /// is closed, what it owed fails with
+    /// [`RedisError::ConnectionLost`](crate::RedisError::ConnectionLost), a
+    /// cluster looks at its layout again, and the next command dials afresh. An
+    /// idle connection is never closed by it. Keep it longer than the command
+    /// timeout and than the slowest ordinary command you expect, since a server
+    /// busy with one says nothing meanwhile. A command given no limit, or a
+    /// longer one than the command timeout (a blocking command, a `WAIT`), is
+    /// not checked while it is outstanding: it is left to its own deadline. So
+    /// with `command_timeout(None)`, no connection is checked while it owes
+    /// anything.
+    ///
+    /// On a [`RedisSubscriber`](crate::RedisSubscriber), which owes no replies,
+    /// it is how often to check: after this long with nothing received it
+    /// sends a `PING`; after three times as long with nothing at all, it drops
+    /// the connection and dials again.
     pub fn ping_interval(mut self, interval: Option<Duration>) -> Self {
         self.ping_interval = interval;
         self

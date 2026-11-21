@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use hopf_core::Bytes;
-use hopf_redis::{key_slot, ClusterConfig, Command, RedisCluster, RedisError};
+use hopf_redis::{key_slot, ClusterConfig, Command, Deadline, RedisCluster, RedisError};
 
 use common::scripted_server::*;
 use common::*;
@@ -523,6 +523,152 @@ fn clusterdown_that_does_not_go_away_reaches_the_caller_once_the_retries_are_spe
     let err = call!(|cb| c.get("k", cb)).unwrap_err();
     assert_eq!(err.server_code(), Some("CLUSTERDOWN"), "{err:?}");
     assert_eq!(gets.load(Ordering::SeqCst), 4, "the first try and three retries");
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+// ---- a node that stops answering ----
+
+/// Two nodes. `a` is the cluster's master at first and then goes dark on its
+/// first connection (no reply, no reset) and on every later one (not even the
+/// handshake); `b` is the master from the second layout on, which is all `b`
+/// ever shows. Returns the cluster once it has `a`'s layout.
+fn dark_master_cluster(
+    command_timeout: Duration,
+    ping_interval: Duration,
+) -> (hopf_core::Runtime, RedisCluster, Server, Server) {
+    let b_addr: Arc<OnceLock<SocketAddr>> = Arc::default();
+    let own_b = Arc::clone(&b_addr);
+    let b = node(move |s, w| match name_of(w).as_str() {
+        "CLUSTER" => s.reply(slots_of(*own_b.get().unwrap(), "b")),
+        "GET" => s.reply("$1\r\nB\r\n"),
+        other => panic!("unexpected {other}"),
+    });
+    b_addr.set(b.addr).unwrap();
+
+    let a_addr: Arc<OnceLock<SocketAddr>> = Arc::default();
+    let own_a = Arc::clone(&a_addr);
+    let a = serve(move |s, w| {
+        if s.conn != 0 {
+            return; // black-holed from the second connection on
+        }
+        match name_of(w).as_str() {
+            "HELLO" => s.reply(HELLO_OK),
+            "CLUSTER" if arg(w, 1).eq_ignore_ascii_case("SHARDS") => s.reply("-ERR unknown subcommand 'SHARDS'\r\n"),
+            "CLUSTER" => s.reply(slots_of(*own_a.get().unwrap(), "a")),
+            _ => {} // a GET is swallowed
+        }
+    });
+    a_addr.set(a.addr).unwrap();
+
+    let rt = runtime();
+    let config = ClusterConfig::new([("127.0.0.1".to_string(), a.addr.port()), ("127.0.0.1".to_string(), b.addr.port())])
+        .min_refresh_interval(Duration::from_millis(5))
+        .node_config(move |c| c.command_timeout(Some(command_timeout)).ping_interval(Some(ping_interval)));
+    let c = RedisCluster::connect(rt.pick_worker(), config);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while c.masters() != vec![("127.0.0.1".to_string(), a.addr.port())] {
+        assert!(Instant::now() < deadline, "no layout from a");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    (rt, c, a, b)
+}
+
+fn wait_for_master(c: &RedisCluster, b: &Server) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while c.masters() != vec![("127.0.0.1".to_string(), b.addr.port())] {
+        assert!(Instant::now() < deadline, "the cluster never moved to the other node: {:?}", c.masters());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_black_holed_master_is_dropped_its_commands_fail_and_the_layout_is_fetched_again() {
+    let (rt, c, a, node_b) = dark_master_cluster(Duration::from_secs(30), Duration::from_millis(150));
+    let refreshes = c.refresh_count();
+    let started = Instant::now();
+    let err = call!(|cb| c.get("k", cb)).unwrap_err();
+    assert!(matches!(err, RedisError::ConnectionLost(_)), "{err:?}");
+    assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+    wait_for_master(&c, &node_b);
+    assert!(c.refresh_count() > refreshes, "the layout was fetched again");
+    assert_eq!(call!(|cb| c.get("k", cb)).unwrap(), Some(b("B")), "new commands go to the new master");
+    c.close();
+    rt.shutdown();
+    a.rt.shutdown();
+    node_b.rt.shutdown();
+}
+
+#[test]
+fn the_layout_is_fetched_again_even_when_every_command_had_already_timed_out() {
+    // The command gives up at 100 ms, long before the connection is judged dead
+    // at 400 ms; at that point nothing is waiting to hear that it was lost.
+    let (rt, c, a, node_b) = dark_master_cluster(Duration::from_millis(100), Duration::from_millis(400));
+    let err = call!(|cb| c.get("k", cb)).unwrap_err();
+    assert_eq!(err, RedisError::Timeout);
+    wait_for_master(&c, &node_b);
+    assert_eq!(call!(|cb| c.get("k", cb)).unwrap(), Some(b("B")));
+    c.close();
+    rt.shutdown();
+    a.rt.shutdown();
+    node_b.rt.shutdown();
+}
+
+#[test]
+fn a_command_that_merely_times_out_does_not_ask_for_a_new_layout() {
+    // A slow node is not a moved one: with the health check off, a timeout alone
+    // leaves the layout alone.
+    let own: Arc<OnceLock<SocketAddr>> = Arc::default();
+    let addr = Arc::clone(&own);
+    let server = node(move |s, w| match name_of(w).as_str() {
+        "CLUSTER" => s.reply(slots_of(*addr.get().unwrap(), "only")),
+        "GET" => {} // never answered
+        other => panic!("unexpected {other}"),
+    });
+    own.set(server.addr).unwrap();
+    let (rt, c) = one_node_cluster(&server, |c| {
+        c.min_refresh_interval(Duration::from_millis(5))
+            .node_config(|n| n.command_timeout(Some(Duration::from_millis(100))).ping_interval(None))
+    });
+    let before = c.refresh_count();
+    for _ in 0..3 {
+        assert_eq!(call!(|cb| c.get("k", cb)).unwrap_err(), RedisError::Timeout);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(c.refresh_count(), before, "no refresh was asked for");
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_command_sent_through_the_cluster_can_have_a_deadline_of_its_own() {
+    let own: Arc<OnceLock<SocketAddr>> = Arc::default();
+    let addr = Arc::clone(&own);
+    let server = node(move |s, w| match name_of(w).as_str() {
+        "CLUSTER" => s.reply(slots_of(*addr.get().unwrap(), "only")),
+        "GET" if arg(w, 1) == "never" => {}
+        "GET" => s.reply_after(Duration::from_millis(400), "$4\r\nslow\r\n"),
+        other => panic!("unexpected {other}"),
+    });
+    own.set(server.addr).unwrap();
+    let (rt, c) = one_node_cluster(&server, |c| c.node_config(|n| n.command_timeout(Some(Duration::from_millis(150)))));
+    let get = |key: &str| Command::new("GET").arg(key);
+
+    // The node default gives up on the slow reply; a longer deadline of its own waits for it.
+    assert_eq!(call!(|cb| c.send(&get("slow"), cb)).unwrap_err(), RedisError::Timeout);
+    let slow = call!(|cb| c.send_with_deadline(&get("slow"), Deadline::After(Duration::from_secs(5)), cb));
+    assert_eq!(slow.unwrap(), hopf_redis::Value::Bulk(b("slow")));
+    assert_eq!(
+        call!(|cb| c.send_with_deadline(&get("slow"), Deadline::Never, cb)).unwrap(),
+        hopf_redis::Value::Bulk(b("slow"))
+    );
+    // And a shorter one fails sooner than the default.
+    let started = Instant::now();
+    let err = call!(|cb| c.send_with_deadline(&get("never"), Deadline::After(Duration::from_millis(40)), cb)).unwrap_err();
+    assert_eq!(err, RedisError::Timeout);
+    assert!(started.elapsed() < Duration::from_millis(130), "{:?}", started.elapsed());
     c.close();
     rt.shutdown();
     server.rt.shutdown();

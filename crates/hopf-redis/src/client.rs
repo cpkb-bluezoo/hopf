@@ -114,6 +114,10 @@ struct Sent {
     kind: Kind,
     /// Stops the command's timeout timer once it is answered.
     cancel: Option<Arc<AtomicBool>>,
+    /// The server may legitimately sit on this command for longer than the
+    /// health check waits (a blocking command, a `WAIT`, or one given no
+    /// limit), so its silence says nothing.
+    held: bool,
 }
 
 /// Not yet written: waiting for the connection.
@@ -122,6 +126,7 @@ struct Waiting {
     bytes: Vec<u8>,
     callback: Callback,
     cancel: Option<Arc<AtomicBool>>,
+    held: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -157,7 +162,9 @@ pub(crate) struct State {
     pub(crate) last_error: Option<RedisError>,
     /// What a subscriber wants to be subscribed to.
     pub(crate) desired: Desired,
-    /// When anything last arrived on the connection (a subscriber's health).
+    /// When anything last arrived on the connection, or, on a command
+    /// connection, when it last began to owe a reply, if later: how long it has
+    /// been silent while something is owed (the health check).
     pub(crate) last_rx: Instant,
     /// A `MULTI` has been sent on the connection and not yet an `EXEC` or
     /// `DISCARD`.
@@ -180,6 +187,9 @@ pub(crate) struct Inner {
     pub(crate) sub: Option<Mutex<Box<dyn SubscriberHandler>>>,
     /// A subscriber has been connected at least once.
     pub(crate) sub_connected_before: AtomicBool,
+    /// Told when the health check gives up on a connection, so a layer above
+    /// (the cluster) can look for another route even if no command was waiting.
+    unresponsive: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// Build the shared state for a connection and dial it. A subscriber passes its
@@ -212,6 +222,7 @@ pub(crate) fn start(reactor: &ReactorHandle, config: RedisConfig, sub: Option<Bo
         push: Mutex::new(None),
         sub: sub.map(Mutex::new),
         sub_connected_before: AtomicBool::new(false),
+        unresponsive: Mutex::new(None),
     });
     let first = {
         let mut st = inner.state.lock().unwrap();
@@ -381,10 +392,27 @@ impl RedisClient {
         close(&self.inner);
     }
 
-    /// Send `command` with a deadline of its own, for one the server holds for
-    /// a time of its own.
-    pub(crate) fn send_with_deadline(&self, command: &Command, deadline: Deadline, callback: impl FnOnce(Reply) + Send + 'static) {
+    /// [`send`](Self::send) with a deadline of its own instead of the
+    /// configured command timeout: [`Deadline::After`] for a time, or
+    /// [`Deadline::Never`] for a command that blocks for as long as the server
+    /// likes. A command that is not answered in time calls back with
+    /// [`RedisError::Timeout`]; its reply, if it comes later, is dropped.
+    pub fn send_with_deadline(&self, command: &Command, deadline: Deadline, callback: impl FnOnce(Reply) + Send + 'static) {
+        if command.words().first().is_some_and(|w| pubsub::is_subscription_command(w)) {
+            return refuse_subscription(&self.inner, Box::new(callback));
+        }
         submit_timed(&self.inner, vec![(command.encode(), Box::new(callback))], deadline);
+    }
+
+    /// [`send_batch`](Self::send_batch) with one deadline for every command.
+    pub(crate) fn send_batch_with_deadline(&self, commands: Vec<(Command, Callback)>, deadline: Deadline) {
+        submit_timed(&self.inner, commands.into_iter().map(|(c, cb)| (c.encode(), cb)).collect(), deadline);
+    }
+
+    /// Call `f` when the health check closes a connection because the server
+    /// stopped answering, whether or not any command was waiting.
+    pub(crate) fn on_unresponsive(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.inner.unresponsive.lock().unwrap() = Some(Arc::new(f));
     }
 
     /// Whether a `MULTI` is open on the connection: it was sent, and no `EXEC`
@@ -511,14 +539,26 @@ fn begin_dial(st: &mut State) -> Option<u64> {
     Some(st.conn_id)
 }
 
-/// How long a command may go unanswered.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Deadline {
+/// How long one command may go unanswered, counted from when it is issued,
+/// the connect and handshake included. See [`RedisClient::send_with_deadline`].
+///
+/// Every variant but `Default` says something about how long the server may
+/// take, and the connection's health check (see
+/// [`RedisConfig::ping_interval`](crate::RedisConfig::ping_interval)) takes
+/// the hint: while a command with no limit, or with a limit longer than the
+/// configured command timeout, is outstanding, the connection is not closed
+/// for being silent, because a server holding such a command says nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Deadline {
     /// The configured command timeout.
     Default,
     /// The configured command timeout and this much more: for a command that
     /// the server itself holds for a time, such as `WAIT`.
     Extra(Duration),
+    /// Exactly this long, whatever the configured command timeout is (and
+    /// whether or not one is set): shorter to fail fast, or longer for a
+    /// command the server holds, such as `BLPOP key 30`.
+    After(Duration),
     /// No limit.
     Never,
 }
@@ -566,7 +606,15 @@ fn submit_timed(inner: &Arc<Inner>, items: Vec<(Vec<u8>, Callback)>, deadline: D
         let limit = match deadline {
             Deadline::Default => inner.config.command_timeout,
             Deadline::Extra(more) => inner.config.command_timeout.map(|t| t + more),
+            Deadline::After(d) => Some(d),
             Deadline::Never => None,
+        };
+        // A command with no limit, or one the server is expected to hold, may
+        // be answered after any length of silence.
+        let held = match deadline {
+            Deadline::Default => limit.is_none(),
+            Deadline::Extra(_) | Deadline::Never => true,
+            Deadline::After(d) => inner.config.command_timeout.is_none_or(|t| d > t),
         };
         let cancel = limit.map(|timeout| {
             let weak = Arc::downgrade(inner);
@@ -584,6 +632,7 @@ fn submit_timed(inner: &Arc<Inner>, items: Vec<(Vec<u8>, Callback)>, deadline: D
             bytes,
             callback,
             cancel,
+            held,
         });
     }
 
@@ -607,12 +656,18 @@ fn submit_timed(inner: &Arc<Inner>, items: Vec<(Vec<u8>, Callback)>, deadline: D
             }
             match st.phase {
                 Phase::Ready => {
+                    // The health check counts the silence from here, not from
+                    // whenever the connection last heard something.
+                    if !st.pending.iter().any(|s| matches!(s.kind, Kind::User(_))) {
+                        st.last_rx = Instant::now();
+                    }
                     for w in prepared {
                         st.outbox.extend_from_slice(&w.bytes);
                         st.pending.push_back(Sent {
                             qid: w.qid,
                             kind: Kind::User(Some(w.callback)),
                             cancel: w.cancel,
+                            held: w.held,
                         });
                     }
                     if std::mem::replace(&mut st.flush_scheduled, true) {
@@ -654,6 +709,80 @@ fn submit_timed(inner: &Arc<Inner>, items: Vec<(Vec<u8>, Callback)>, deadline: D
             }
         }
     }
+}
+
+/// Watch a command connection that may have died without saying so (a
+/// black-holed route, a paused or partitioned server: no reset, no close).
+///
+/// It only watches while the connection owes replies; with nothing owed it is
+/// idle, and idle is not dead. When replies are owed and nothing at all has
+/// arrived for `ping_interval`, the connection is closed: what it owed fails
+/// with [`RedisError::ConnectionLost`], and the next command dials afresh.
+/// Traffic of any kind counts as life. A handshake that is not answered is
+/// given up on the same way.
+///
+/// No `PING` is sent first. Replies come back in the order commands were sent,
+/// so a probe queued behind an unanswered command is answered only after it:
+/// it could tell nothing that the command's own reply would not. It would also
+/// be queued into an open `MULTI`.
+///
+/// Not watched: a connection with a command outstanding that the server may
+/// hold for longer than the interval, a blocking command or a `WAIT` (see
+/// [`Deadline`]), whose silence means nothing. Those are left to their own
+/// timeouts.
+fn arm_health(inner: &Arc<Inner>, conn_id: u64) {
+    let Some(interval) = inner.config.ping_interval else {
+        return;
+    };
+    if inner.sub.is_some() {
+        return; // a subscriber has its own
+    }
+    let weak = Arc::downgrade(inner);
+    inner.reactor.schedule_timer(
+        (interval / 2).max(Duration::from_millis(1)),
+        Box::new(move || {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            enum Act {
+                Stop,
+                Wait,
+                Drop,
+            }
+            let act = {
+                let st = inner.state.lock().unwrap();
+                if st.conn_id != conn_id || !matches!(st.phase, Phase::Handshaking | Phase::Ready) {
+                    Act::Stop
+                } else {
+                    let watched = st.phase == Phase::Handshaking
+                        || (st.pending.iter().any(|s| matches!(s.kind, Kind::User(_)))
+                            && !st.pending.iter().any(|s| s.held));
+                    if watched && st.last_rx.elapsed() >= interval {
+                        Act::Drop
+                    } else {
+                        Act::Wait
+                    }
+                }
+            };
+            match act {
+                Act::Stop => return,
+                Act::Wait => {}
+                Act::Drop => {
+                    let handle = inner.state.lock().unwrap().handle.clone();
+                    lost(&inner, conn_id, "the server stopped answering");
+                    if let Some(h) = handle {
+                        h.close();
+                    }
+                    let hook = inner.unresponsive.lock().unwrap().clone();
+                    if let Some(f) = hook {
+                        f();
+                    }
+                    return;
+                }
+            }
+            arm_health(&inner, conn_id);
+        }),
+    );
 }
 
 /// Hand what is in the outbox to the connection, on the reactor.
@@ -919,10 +1048,13 @@ impl Conn {
                     qid: u64::MAX,
                     kind: Kind::Internal(*step),
                     cancel: None,
+                    held: false,
                 });
             }
+            st.last_rx = Instant::now();
             plan
         };
+        arm_health(&self.inner, self.conn_id);
         if plan.is_empty() {
             return self.ready(endpoint);
         }
@@ -954,6 +1086,7 @@ impl Conn {
                     qid: w.qid,
                     kind: Kind::User(Some(w.callback)),
                     cancel: w.cancel,
+                    held: w.held,
                 });
             }
             st.flush_scheduled = false;
@@ -1054,6 +1187,7 @@ impl Conn {
             qid: u64::MAX,
             kind: Kind::Internal(step),
             cancel: None,
+            held: false,
         });
         endpoint.send(bytes);
     }
@@ -1083,7 +1217,7 @@ impl ProtocolHandler for Conn {
     }
 
     fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
-        if self.inner.sub.is_some() {
+        {
             let mut st = self.inner.state.lock().unwrap();
             if st.conn_id == self.conn_id {
                 st.last_rx = Instant::now();
