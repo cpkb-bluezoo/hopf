@@ -40,7 +40,10 @@ use hopf_dns::DnsResolver;
 use crate::config::RedisConfig;
 use crate::error::RedisError;
 use crate::pubsub::{self, Desired, Push, SubscriberHandler};
-use crate::resp::{encode_command, encode_words, RespParser, ServerError, Value};
+use crate::collect::{Collector, TooLarge};
+use crate::resp::{
+    encode_command, encode_words, AggKind, Flow, ReplyKind, ReplySink, RespParser, Scalar, ServerError, StrKind, Value,
+};
 
 /// What a command's callback is given.
 pub type Reply = Result<Value, RedisError>;
@@ -924,6 +927,9 @@ fn dial_next(inner: &Arc<Inner>, conn_id: u64) {
                 inner: Arc::clone(&handler_inner),
                 conn_id,
                 parser: RespParser::with_limits(handler_inner.config.limits),
+                collector: Collector::new(&handler_inner.config.limits),
+                completed: Vec::new(),
+                target: Target::None,
                 tls,
             }) as Box<dyn ProtocolHandler>
         });
@@ -1042,7 +1048,153 @@ struct Conn {
     inner: Arc<Inner>,
     conn_id: u64,
     parser: RespParser,
+    /// Assembles the one reply being read into a value, for the callbacks that
+    /// take one. Reused for every reply.
+    collector: Collector,
+    /// What the replies of the last read came to, to be acted on once it has
+    /// been fully read. Reused.
+    completed: Vec<Completed>,
+    /// Where the reply being read goes, until it is complete: it may take
+    /// several reads.
+    target: Target,
     tls: bool,
+}
+
+/// What one reply, as the parser delivered it, came to.
+enum Completed {
+    /// The reply to the command at the head of the queue.
+    Reply(Result<Value, RedisError>),
+    /// A reply nobody was waiting for (its command had timed out): discarded as
+    /// it arrived, in constant memory.
+    Discarded,
+    /// Out-of-band data, built whole.
+    Push(Value),
+    /// Out-of-band data that was too large to build: dropped.
+    PushDropped,
+}
+
+/// Where the events of the reply being read go.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Target {
+    /// Between replies.
+    None,
+    /// Into the collector.
+    Collect(ReplyKind),
+    /// Nowhere: the reply is skipped.
+    Discard,
+}
+
+/// Routes the parser's events: to the collector, for a reply somebody waits
+/// for or a push, or nowhere, for a reply whose command has timed out. A
+/// reply that is skipped costs no memory however large it is.
+struct Router<'a> {
+    collector: &'a mut Collector,
+    inner: &'a Inner,
+    /// A subscriber past its handshake: everything it is sent is for its
+    /// handler, whatever the kind.
+    sub_ready: bool,
+    /// How many replies to commands this read has completed so far, so which
+    /// entry of the queue the next belongs to.
+    head: usize,
+    /// Where the reply in progress goes. It lives on the connection, not here:
+    /// a reply may take several reads.
+    target: &'a mut Target,
+    out: &'a mut Vec<Completed>,
+}
+
+impl ReplySink for Router<'_> {
+    fn begin_reply(&mut self, kind: ReplyKind) {
+        *self.target = match kind {
+            ReplyKind::Push => Target::Collect(ReplyKind::Push),
+            ReplyKind::Normal if self.sub_ready => Target::Collect(ReplyKind::Normal),
+            ReplyKind::Normal => {
+                let timed_out = {
+                    let st = self.inner.state.lock().unwrap();
+                    matches!(st.pending.get(self.head), Some(Sent { kind: Kind::User(None), .. }))
+                };
+                if timed_out {
+                    Target::Discard
+                } else {
+                    Target::Collect(ReplyKind::Normal)
+                }
+            }
+        };
+        if matches!(*self.target, Target::Collect(_)) {
+            self.collector.begin_reply(kind);
+        }
+    }
+
+    fn scalar(&mut self, v: Scalar<'_>) -> Flow {
+        match *self.target {
+            Target::Collect(_) => self.collector.scalar(v),
+            _ => Flow::Skip,
+        }
+    }
+
+    fn error(&mut self, line: &str) -> Flow {
+        match *self.target {
+            Target::Collect(_) => self.collector.error(line),
+            _ => Flow::Skip,
+        }
+    }
+
+    fn begin_aggregate(&mut self, kind: AggKind, len: Option<usize>) -> Flow {
+        match *self.target {
+            Target::Collect(_) => self.collector.begin_aggregate(kind, len),
+            _ => Flow::Skip,
+        }
+    }
+
+    fn end_aggregate(&mut self) -> Flow {
+        match *self.target {
+            Target::Collect(_) => self.collector.end_aggregate(),
+            _ => Flow::Skip,
+        }
+    }
+
+    fn begin_string(&mut self, kind: StrKind, len: Option<usize>) -> Flow {
+        match *self.target {
+            Target::Collect(_) => self.collector.begin_string(kind, len),
+            _ => Flow::Skip,
+        }
+    }
+
+    fn string_chunk(&mut self, data: &[u8]) -> Flow {
+        match *self.target {
+            Target::Collect(_) => self.collector.string_chunk(data),
+            _ => Flow::Skip,
+        }
+    }
+
+    fn end_string(&mut self) -> Flow {
+        match *self.target {
+            Target::Collect(_) => self.collector.end_string(),
+            _ => Flow::Skip,
+        }
+    }
+
+    fn end_reply(&mut self, _skipped: bool) {
+        let target = std::mem::replace(&mut *self.target, Target::None);
+        match target {
+            Target::None => {}
+            Target::Discard => {
+                self.head += 1;
+                self.out.push(Completed::Discarded);
+            }
+            Target::Collect(kind) => {
+                let built = self.collector.take();
+                if kind == ReplyKind::Normal {
+                    self.head += 1;
+                }
+                self.out.push(match (kind, built) {
+                    (ReplyKind::Normal, Ok(v)) => Completed::Reply(Ok(v)),
+                    (ReplyKind::Normal, Err(TooLarge(why))) => Completed::Reply(Err(RedisError::Protocol(why))),
+                    (ReplyKind::Push, Ok(v)) => Completed::Push(v),
+                    (ReplyKind::Push, Err(_)) => Completed::PushDropped,
+                });
+            }
+        }
+    }
 }
 
 impl Conn {
@@ -1116,27 +1268,38 @@ impl Conn {
         endpoint.close();
     }
 
-    /// One reply from the server.
-    fn on_reply(&mut self, endpoint: &mut dyn Endpoint, value: Value) {
+    /// What the last read came to.
+    fn on_completed(&mut self, endpoint: &mut dyn Endpoint, completed: Completed) {
         let inner = Arc::clone(&self.inner);
         // A subscriber's connection, once past its handshake, gets messages and
         // acknowledgements, not replies.
-        if inner.sub.is_some() && inner.state.lock().unwrap().phase == Phase::Ready {
-            return pubsub::sub_reply(&inner, value);
-        }
-        if let Value::Push(mut items) = value {
-            // Out-of-band data belongs to no command: to the push handler, of
-            // whatever kind.
-            if inner.state.lock().unwrap().conn_id != self.conn_id {
-                return;
+        let sub_ready = inner.sub.is_some() && inner.state.lock().unwrap().phase == Phase::Ready;
+        match completed {
+            Completed::PushDropped => {}
+            Completed::Push(value) | Completed::Reply(Ok(value)) if sub_ready => pubsub::sub_reply(&inner, value),
+            Completed::Reply(Err(_)) if sub_ready => {}
+            Completed::Push(Value::Push(mut items)) => {
+                // Out-of-band data belongs to no command: to the push handler, of
+                // whatever kind.
+                if inner.state.lock().unwrap().conn_id != self.conn_id {
+                    return;
+                }
+                let kind = items.first().and_then(Value::as_str).unwrap_or("").to_string();
+                let data = if items.is_empty() { Vec::new() } else { items.split_off(1) };
+                if let Some(handler) = inner.push.lock().unwrap().as_mut() {
+                    handler(Push { kind, data });
+                }
             }
-            let kind = items.first().and_then(Value::as_str).unwrap_or("").to_string();
-            let data = if items.is_empty() { Vec::new() } else { items.split_off(1) };
-            if let Some(handler) = inner.push.lock().unwrap().as_mut() {
-                handler(Push { kind, data });
-            }
-            return;
+            Completed::Push(_) => {}
+            Completed::Reply(reply) => self.on_reply(endpoint, Some(reply)),
+            Completed::Discarded => self.on_reply(endpoint, None),
         }
+    }
+
+    /// The reply to the command at the head of the queue; `None` for one that
+    /// was discarded because the command had timed out.
+    fn on_reply(&mut self, endpoint: &mut dyn Endpoint, reply: Option<Result<Value, RedisError>>) {
+        let inner = Arc::clone(&self.inner);
         let sent = {
             let mut st = inner.state.lock().unwrap();
             if st.conn_id != self.conn_id {
@@ -1151,10 +1314,12 @@ impl Conn {
             return;
         };
         cancel_timer(&sent.cancel);
-        match sent.kind {
-            Kind::User(Some(cb)) => cb(into_reply(value)),
-            Kind::User(None) => {} // timed out: the reply is discarded
-            Kind::Internal(step) => self.on_handshake_reply(endpoint, step, value),
+        match (sent.kind, reply) {
+            (Kind::User(Some(cb)), Some(reply)) => cb(reply.and_then(into_reply)),
+            (Kind::Internal(step), Some(Ok(value))) => self.on_handshake_reply(endpoint, step, value),
+            (Kind::Internal(_), Some(Err(e))) => return self.handshake_failed(endpoint, e),
+            // Timed out: the reply was discarded as it arrived.
+            _ => {}
         }
         close_if_drained(&inner);
     }
@@ -1230,23 +1395,53 @@ impl ProtocolHandler for Conn {
     }
 
     fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
-        {
+        let sub_ready = {
             let mut st = self.inner.state.lock().unwrap();
             if st.conn_id == self.conn_id {
                 st.last_rx = Instant::now();
             }
-        }
-        let mut replies = Vec::new();
+            self.inner.sub.is_some() && st.phase == Phase::Ready
+        };
+        let mut completed = std::mem::take(&mut self.completed);
         let mut bad = None;
-        hopf_core::with_slice(buf, |data| {
-            if let Err(e) = self.parser.feed(data, &mut |v| replies.push(v)) {
-                bad = Some(e);
-                *data = &[];
+        let consumed = {
+            // Read the ring where it lies: a payload is handed on as it arrives
+            // and the parser keeps none of it.
+            let mut router = Router {
+                collector: &mut self.collector,
+                inner: &self.inner,
+                sub_ready,
+                head: 0,
+                target: &mut self.target,
+                out: &mut completed,
+            };
+            let (first, second) = buf.readable_spans();
+            let mut consumed = 0;
+            for span in [first, second] {
+                if span.is_empty() {
+                    continue;
+                }
+                let mut data = span;
+                match self.parser.feed(&mut data, &mut router) {
+                    Ok(_) => consumed += span.len() - data.len(),
+                    Err(e) => {
+                        // The stream cannot be trusted: nothing more of it is read.
+                        consumed += span.len();
+                        bad = Some(e);
+                        break;
+                    }
+                }
             }
-        });
-        for v in replies {
-            self.on_reply(endpoint, v);
+            consumed
+        };
+        buf.advance(consumed);
+        if bad.is_some() {
+            buf.advance(buf.len());
         }
+        for c in completed.drain(..) {
+            self.on_completed(endpoint, c);
+        }
+        self.completed = completed;
         if let Some(e) = bad {
             lost(&self.inner, self.conn_id, &format!("protocol error: {e}"));
             endpoint.close();

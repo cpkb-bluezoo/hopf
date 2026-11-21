@@ -25,6 +25,7 @@
 
 mod client;
 mod cluster;
+mod collect;
 mod commands;
 mod config;
 mod error;
@@ -43,4 +44,7 @@ pub use topology::NodeAddr;
 pub use pubsub::{
     Invalidation, Message, Push, RedisSubscriber, SubscriberHandler, SubscriptionChange, SubscriptionKind,
 };
-pub use resp::{encode_command, RespError, RespLimits, RespParser, ServerError, Value};
+pub use resp::{
+    encode_command, AggKind, Feed, Flow, ReplyKind, ReplySink, RespError, RespLimits, RespParser, Scalar, ServerError,
+    StrKind, Value,
+};

@@ -86,6 +86,31 @@ What the figures show:
   commands expire in the order they were sent and each is found at the front of
   the queue. A deadline-ordered structure would not pay for itself, so the
   timers are unchanged.
-- **Parsing a large reply allocates twice its size** when it arrives in small
-  reads, because the reply is built up by doubling. That is a separate matter
-  from the router and is not changed here.
+- **The parser used to buffer whole replies, which was a defect.** It collected a
+  bulk string's payload until it was complete and only then handed it on, so a
+  reply was held in full: up to 512 MiB for one string, with the buffer growing
+  by doubling on the way. It is now event-driven (see below).
+
+## The streaming core
+
+The parser tells a sink what it reads, with a string's payload as chunks that
+borrow from the connection's ring, and holds none of it
+([#541](https://github.com/cpkb-bluezoo/hopf/issues/541)). The `stream` rows
+feed a reply of the given size, in 512-byte reads, to a sink that keeps nothing:
+
+| scenario | ops/s | allocs/op | bytes/op | cpu us/op |
+|---|---:|---:|---:|---:|
+| stream 64KiB reply, 512B reads | 963755 | 0.0 | 0 | 1.04 |
+| stream 1MiB reply, 512B reads | 63248 | 0.0 | 0 | 15.81 |
+| stream 64MiB reply, 512B reads | 993 | 0.0 | 0 | 1007.09 |
+
+Bytes per operation is flat at zero from 64 KiB to 64 MiB, where the `parse` rows
+above, which assemble a `Value` for a callback, allocate the size of the reply.
+The small-reply rows are unchanged within noise from the table above, and each
+allocates about one fewer time, since the buffer a reply is assembled in is now
+reused from one reply to the next.
+
+`tests/memory_bound.rs` measures the peak of the live heap rather than the
+allocations: a 1 GiB reply fed to the parser in 4 KiB and 64 KiB reads, streamed
+or skipped, raises it by 36 bytes; a late 256 MiB reply to a command that had
+already timed out raises it by about 2.8 KB, where before it raised it by 256 MiB.

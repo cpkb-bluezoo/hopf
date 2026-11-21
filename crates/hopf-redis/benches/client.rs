@@ -27,7 +27,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use hopf_core::{Bytes, ClientTlsBuilder, Endpoint, ProtocolHandler, Runtime, RuntimeConfig, SharedTlsConnector, TcpListenerConfig};
-use hopf_redis::{ClusterConfig, Command, RedisClient, RedisCluster, RedisConfig, RespParser, Value};
+use hopf_redis::{
+    AggKind, ClusterConfig, Command, Flow, RedisClient, RedisCluster, RedisConfig, ReplySink, RespParser, Scalar, StrKind,
+    Value,
+};
 
 // ---- counting allocator ----
 
@@ -157,7 +160,7 @@ impl ProtocolHandler for Conn {
         let mut out = Vec::new();
         let cfg = Arc::clone(&self.cfg);
         hopf_core::with_slice(buf, |data| {
-            let _ = self.parser.feed(data, &mut |v| {
+            let _ = self.parser.feed_values(data, &mut |v| {
                 let Value::Array(words) = v else { return };
                 let name = words[0].as_bytes().unwrap_or(b"");
                 if name.eq_ignore_ascii_case(b"HELLO") {
@@ -426,6 +429,8 @@ enum Kind {
     Single { op: Op, depth: usize, reply: usize },
     Cluster { op: Op, depth: usize },
     Parse { size: usize, chunk: usize },
+    /// A reply streamed through a sink that keeps nothing.
+    Stream { size: usize, chunk: usize },
     Timeouts { pending: usize },
 }
 
@@ -460,6 +465,10 @@ fn scenarios() -> Vec<Scenario> {
             add(&format!("parse {} reply, {label}", human(size)), Kind::Parse { size, chunk }, false, ops);
         }
     }
+    for size in [64 * 1024, 1024 * 1024, 64 * 1024 * 1024] {
+        let ops = if size >= 64 * 1024 * 1024 { 20 } else if size >= 1024 * 1024 { 500 } else { 5_000 };
+        add(&format!("stream {} reply, 512B reads", human(size)), Kind::Stream { size, chunk: 512 }, false, ops);
+    }
     for pending in [1024, 4096, 16384] {
         add(&format!("timeouts {pending} pending"), Kind::Timeouts { pending }, false, pending);
     }
@@ -485,7 +494,7 @@ fn parse_bench(size: usize, chunk: usize, ops: usize) -> Row {
     let one = |parser: &mut RespParser, seen: &mut usize| {
         for piece in reply.chunks(chunk.min(reply.len())) {
             let mut data: &[u8] = piece;
-            parser.feed(&mut data, &mut |v| {
+            parser.feed_values(&mut data, &mut |v| {
                 std::hint::black_box(&v);
                 *seen += 1;
             })
@@ -502,6 +511,64 @@ fn parse_bench(size: usize, chunk: usize, ops: usize) -> Row {
     let row = window.close(ops as u64);
     assert!(seen >= ops);
     row
+}
+
+/// Keeps nothing of what it is given.
+struct Discard;
+
+impl ReplySink for Discard {
+    fn scalar(&mut self, _v: Scalar<'_>) -> Flow {
+        Flow::Continue
+    }
+    fn error(&mut self, _line: &str) -> Flow {
+        Flow::Continue
+    }
+    fn begin_aggregate(&mut self, _kind: AggKind, _len: Option<usize>) -> Flow {
+        Flow::Continue
+    }
+    fn end_aggregate(&mut self) -> Flow {
+        Flow::Continue
+    }
+    fn begin_string(&mut self, _kind: StrKind, _len: Option<usize>) -> Flow {
+        Flow::Continue
+    }
+    fn string_chunk(&mut self, data: &[u8]) -> Flow {
+        std::hint::black_box(data);
+        Flow::Continue
+    }
+    fn end_string(&mut self) -> Flow {
+        Flow::Continue
+    }
+}
+
+/// A reply of `size` bytes streamed to a sink in `chunk`-byte reads: what the
+/// parser costs when nothing is held, however large the reply.
+fn stream_bench(size: usize, chunk: usize, ops: usize) -> Row {
+    let head = format!("${size}\r\n").into_bytes();
+    let block = vec![b'v'; chunk];
+    let mut parser = RespParser::new();
+    let one = |parser: &mut RespParser| {
+        let feed = |bytes: &[u8], parser: &mut RespParser| {
+            let mut data = bytes;
+            parser.feed(&mut data, &mut Discard).unwrap();
+        };
+        feed(&head, parser);
+        let mut left = size;
+        while left > 0 {
+            let n = left.min(chunk);
+            feed(&block[..n], parser);
+            left -= n;
+        }
+        feed(b"\r\n", parser);
+    };
+    for _ in 0..(ops / 10).max(2) {
+        one(&mut parser);
+    }
+    let window = Window::open();
+    for _ in 0..ops {
+        one(&mut parser);
+    }
+    window.close(ops as u64)
 }
 
 /// `pending` commands sent to a server that answers nothing after its handshake,
@@ -552,6 +619,7 @@ fn run(s: &Scenario, scale: f64, rt: &Runtime) -> Row {
             row
         }
         Kind::Parse { size, chunk } => parse_bench(*size, *chunk, ops),
+        Kind::Stream { size, chunk } => stream_bench(*size, *chunk, ops),
         Kind::Timeouts { pending } => timeouts_bench(rt, *pending),
     }
 }

@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use hopf_core::Runtime;
-use hopf_redis::{Command, Deadline, RedisClient, RedisConfig, RedisError, Value};
+use hopf_redis::{Command, Deadline, RedisClient, RedisConfig, RedisError, RespLimits, Value};
 
 use common::*;
 
@@ -888,5 +888,108 @@ fn one_command_can_have_a_timeout_of_its_own_with_the_client_default_set_or_unse
         c.close();
         rt.shutdown();
     }
+    server.rt.shutdown();
+}
+
+// ---- replies are read as events, in pieces, and never held beyond their budget ----
+
+#[test]
+fn a_reply_that_arrives_in_several_reads_is_one_reply() {
+    // The reply to the first GET is written in three pieces with pauses between
+    // them, so the client reads it in three. So is an array holding a string
+    // cut in the middle.
+    let server = serve(move |s, w| match (name_of(w).as_str(), arg(w, 1).as_str()) {
+        ("HELLO", _) => s.reply(HELLO_OK),
+        ("GET", "split") => {
+            s.reply("$10\r\n01");
+            s.reply_after(Duration::from_millis(120), "2345");
+            s.reply_after(Duration::from_millis(240), "6789\r\n");
+        }
+        ("MGET", _) => {
+            s.reply("*2\r\n$5\r\nab");
+            s.reply_after(Duration::from_millis(120), "cde\r\n:7");
+            s.reply_after(Duration::from_millis(240), "\r\n");
+        }
+        _ => s.reply("+OK\r\n"),
+    });
+    let (rt, c) = client(&server, |c| c);
+    assert_eq!(call!(|cb| c.get("split", cb)).unwrap().map(|b| b.to_vec()), Some(b"0123456789".to_vec()));
+    let got = call!(|cb| c.send(&Command::new("MGET").arg("a").arg("b"), cb)).unwrap();
+    assert_eq!(got, Value::Array(vec![Value::Bulk(b"abcde".to_vec().into()), Value::Int(7)]));
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_reply_over_the_budget_is_skipped_and_fails_only_its_own_command() {
+    let limits = RespLimits {
+        max_bulk: 1000,
+        ..RespLimits::default()
+    };
+    let bulk = |n: usize| format!("${n}\r\n{}\r\n", "x".repeat(n));
+    let server = serve(move |s, w| match (name_of(w).as_str(), arg(w, 1).as_str()) {
+        ("HELLO", _) => s.reply(HELLO_OK),
+        ("GET", "big") => s.reply(bulk(5000)),
+        ("MGET", _) => s.reply(format!("*3\r\n{}{}{}", bulk(2), bulk(5000), bulk(2))),
+        ("GET", _) => s.reply(bulk(2)),
+        _ => s.reply("+OK\r\n"),
+    });
+    let (rt, c) = client(&server, |c| c.limits(limits));
+    // Pipelined: the one in the middle is too large, the ones either side are not.
+    let (tx, rx) = mpsc::channel();
+    for (i, k) in ["small", "big", "small"].into_iter().enumerate() {
+        let tx = tx.clone();
+        c.get(k, move |r| tx.send((i, r)).unwrap());
+    }
+    let mut got: Vec<_> = (0..3).map(|_| rx.recv_timeout(Duration::from_secs(5)).unwrap()).collect();
+    got.sort_by_key(|(i, _)| *i);
+    assert!(got[0].1.is_ok() && got[2].1.is_ok(), "{got:?}");
+    let err = got[1].1.clone().unwrap_err();
+    assert!(matches!(&err, RedisError::Protocol(m) if m.contains("exceeds")), "{err:?}");
+
+    // The same inside an array: the whole command fails, and nothing after it is disturbed.
+    let err = call!(|cb| c.send(&Command::new("MGET").arg("a").arg("b").arg("c"), cb)).unwrap_err();
+    assert!(matches!(err, RedisError::Protocol(_)), "{err:?}");
+    assert!(call!(|cb| c.get("small", cb)).unwrap().is_some());
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1, "the connection was never dropped");
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_reply_discarded_past_the_limit_closes_the_connection_and_the_next_command_redials() {
+    let limits = RespLimits {
+        max_skip: 100_000,
+        ..RespLimits::default()
+    };
+    let server = serve(move |s, w| match name_of(w).as_str() {
+        "HELLO" => s.reply(HELLO_OK),
+        // Long after the client has given up on it, and larger than it will discard.
+        "GET" if s.conn == 0 => {
+            let mut reply = format!("${}\r\n", 500_000).into_bytes();
+            reply.extend(std::iter::repeat_n(b'x', 500_000));
+            reply.extend_from_slice(b"\r\n");
+            s.reply_after(Duration::from_millis(250), reply);
+        }
+        // A real server answers in order: behind the large reply, on the first connection.
+        "PING" if s.conn == 0 => s.reply_after(Duration::from_millis(600), "+PONG\r\n"),
+        "PING" => s.reply("+PONG\r\n"),
+        _ => s.reply("+OK\r\n"),
+    });
+    let (rt, c) = client(&server, |c| {
+        c.limits(limits).command_timeout(Some(Duration::from_millis(100))).ping_interval(None)
+    });
+    assert_eq!(call!(|cb| c.get("k", cb)).unwrap_err(), RedisError::Timeout);
+    // The PING waits behind the reply being discarded; when the discard is
+    // abandoned the connection goes, and it with it.
+    let err = call!(|cb| c.send_with_deadline(&Command::new("PING"), Deadline::After(Duration::from_secs(10)), cb)).unwrap_err();
+    assert!(matches!(err, RedisError::ConnectionLost(_)), "{err:?}");
+    call!(|cb| c.ping(cb)).expect("the next command dials again and is answered");
+    assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+    c.close();
+    rt.shutdown();
     server.rt.shutdown();
 }

@@ -59,7 +59,7 @@ impl ProtocolHandler for Scripted {
         let mut commands = Vec::new();
         hopf_core::with_slice(buf, |data| {
             self.parser
-                .feed(data, &mut |v| {
+                .feed_values(data, &mut |v| {
                     if let Value::Array(words) = v {
                         commands.push(words.iter().map(|w| w.as_bytes().unwrap().to_vec()).collect::<Vec<_>>());
                     }

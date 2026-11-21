@@ -1,20 +1,31 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! RESP2 and RESP3: the reply [`Value`], the command encoder and the
-//! incremental [`RespParser`].
+//! RESP2 and RESP3: the command encoder, the incremental [`RespParser`] and the
+//! events it produces ([`ReplySink`]), and the reply [`Value`] the crate's
+//! callbacks still receive.
 //!
-//! The parser is push-fed and holds none of the stream. [`RespParser::feed`] is
-//! given whatever bytes have arrived, in any split, and consumes all of them:
-//! a header line that is not finished is kept in a small scratch buffer, a
-//! bulk payload is appended to the value it will become as it arrives, and
-//! aggregates under construction wait on an explicit stack. A reply is handed
-//! to the sink the moment its last byte is seen. There is no recursion, so the
-//! nesting depth is a limit and not a stack overflow, and every size the
-//! server announces is checked against [`RespLimits`] before any memory is
-//! reserved for it.
+//! The parser is push-fed, event-driven and holds none of the stream.
+//! [`RespParser::feed`] is given whatever bytes have arrived, in any split, and
+//! tells a [`ReplySink`] what they hold: a scalar, the start of an aggregate,
+//! the start of a string, the string's payload as chunks that borrow from the
+//! bytes it was given, the end of each. A payload is never copied or collected,
+//! whatever its size. All the parser keeps is a header line that is not yet
+//! finished (at most [`RespLimits::max_line`] bytes), a small explicit stack of
+//! counts for the aggregates that are open (at most [`RespLimits::max_depth`]),
+//! and a few counters. There is no recursion, so nesting depth is a limit and not
+//! a stack overflow, and no size a server announces makes it reserve memory.
 //!
-//! One reply is one [`Value`]; a reply is built whole because that is what a
-//! command's callback receives, and [`RespLimits::max_reply_bytes`] bounds it.
+//! A sink steers the parser with the [`Flow`] it returns: [`Flow::Pause`] stops
+//! it after the event, leaving the unconsumed bytes with the caller;
+//! [`Flow::Skip`] discards the rest of that reply as it arrives, in constant
+//! memory, bounded by [`RespLimits::max_skip`]. RESP3 streamed strings and
+//! aggregates have no announced length and are events like any other; attributes
+//! are read and dropped.
+//!
+//! [`Value`] is a reply assembled whole, for the callbacks that take one. It is
+//! built outside the parser, from the events, under [`RespLimits::max_bulk`] and
+//! [`RespLimits::max_reply_bytes`]: a string announced as longer than the limit
+//! is not buffered, not even its first chunk.
 
 use hopf_core::Bytes;
 
@@ -234,22 +245,31 @@ fn push_decimal(mut n: usize, out: &mut Vec<u8>) {
     out.extend_from_slice(&digits[at..]);
 }
 
-/// Bounds on what a server may make the parser hold.
+/// Bounds on what a server may make the client hold.
+///
+/// The parser itself holds only `max_line`, `max_depth` and what it takes to
+/// discard a reply (`max_skip`); the rest bound the crate's own assembly of a
+/// whole [`Value`] for a command's callback, and go away with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RespLimits {
-    /// The largest bulk string, verbatim string or bulk error. Redis's own
-    /// default for `proto-max-bulk-len` is 512 MiB, which is this default, so
-    /// anything a default server can send fits. Lower it to bound memory.
+    /// The largest bulk string, verbatim string or bulk error assembled into a
+    /// value. A longer one is not buffered, not even its first chunk: it is
+    /// skipped, and its command fails.
     pub max_bulk: usize,
-    /// The most elements one aggregate may announce.
+    /// The most elements one aggregate assembled into a value may announce.
     pub max_aggregate: usize,
     /// The most levels of aggregate inside aggregate.
     pub max_depth: usize,
     /// The longest header or simple-string line.
     pub max_line: usize,
-    /// The most memory one reply may take, counting bulk payloads and a small
-    /// overhead per element.
+    /// The most memory one reply assembled into a value may take, counting bulk
+    /// payloads and a small overhead per element.
     pub max_reply_bytes: usize,
+    /// The most bytes of one reply that may be discarded (a sink that chose
+    /// [`Flow::Skip`], a reply nobody waits for, an attribute): past it the
+    /// stream is abandoned and the connection should be closed, since
+    /// reading on only to discard has a cost of its own.
+    pub max_skip: usize,
 }
 
 impl Default for RespLimits {
@@ -260,6 +280,7 @@ impl Default for RespLimits {
             max_depth: 32,
             max_line: 64 * 1024,
             max_reply_bytes: 1024 * 1024 * 1024,
+            max_skip: 256 * 1024 * 1024,
         }
     }
 }
@@ -281,23 +302,141 @@ fn bad(msg: impl Into<String>) -> RespError {
     RespError(msg.into())
 }
 
-/// What an aggregate under construction will become.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Agg {
-    Array,
-    Set,
+// ---- events ----
+
+/// What a [`ReplySink`] tells the parser to do after an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flow {
+    /// Go on.
+    Continue,
+    /// Stop after this event: [`RespParser::feed`] returns [`Feed::Paused`] with
+    /// the bytes not yet consumed left in the caller's slice, and the caller
+    /// stops reading until it is ready for more.
+    Pause,
+    /// The consumer wants no more of this reply: the rest of it is discarded
+    /// as it arrives, in constant memory, and the sink hears nothing more of it
+    /// but [`ReplySink::end_reply`] with `skipped` true.
+    Skip,
+}
+
+/// Whether [`RespParser::feed`] consumed all it was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Feed {
+    /// All of the data was consumed.
+    Consumed,
+    /// A sink asked for [`Flow::Pause`]: the unconsumed rest of the data is
+    /// left in the caller's slice, to be fed again when it can take more.
+    Paused,
+}
+
+/// A reply, or a push, as it begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyKind {
+    /// The reply to the command at the head of the queue.
+    Normal,
+    /// RESP3 out-of-band data (`>`), which belongs to no command.
     Push,
+}
+
+/// A value with nothing in it that grows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Scalar<'a> {
+    /// RESP2's null bulk or array, and RESP3's `_`.
+    Null,
+    /// `:`.
+    Int(i64),
+    /// `,`.
+    Double(f64),
+    /// `#`.
+    Bool(bool),
+    /// `(`, as its digits.
+    BigNumber(&'a str),
+    /// `+`.
+    Simple(&'a str),
+}
+
+/// The kind of an aggregate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggKind {
+    /// `*`.
+    Array,
+    /// `~`.
+    Set,
+    /// `>`.
+    Push,
+    /// `%`; its length counts pairs.
     Map,
-    /// Out-of-band attributes (RESP3): read and dropped; the value that follows
-    /// is the reply.
+}
+
+/// The kind of a length-prefixed string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrKind {
+    /// `$`.
+    Bulk,
+    /// `=`: the three-letter format (`txt`, `mkd`), then the text.
+    Verbatim {
+        /// The format tag.
+        format: [u8; 3],
+    },
+    /// `!`: an error too long for a line.
+    Error,
+}
+
+/// What a reply is, event by event, as the parser reads it.
+///
+/// The events of one reply come between [`begin_reply`](Self::begin_reply) and
+/// [`end_reply`](Self::end_reply). They borrow from the bytes the parser was
+/// fed, so a payload is handed over without a copy and nothing is held. A
+/// string arrives as [`begin_string`](Self::begin_string), any number of
+/// [`string_chunk`](Self::string_chunk)s in order, then
+/// [`end_string`](Self::end_string); an aggregate as
+/// [`begin_aggregate`](Self::begin_aggregate), its elements, then
+/// [`end_aggregate`](Self::end_aggregate). RESP3 attributes are read and
+/// discarded by the parser and produce no events.
+///
+/// Every event that can start or continue data returns a [`Flow`]. A sink runs
+/// on the connection's reactor and must not block: to wait for something, it
+/// returns [`Flow::Pause`] and the caller resumes later.
+pub trait ReplySink {
+    /// A reply or push begins. Nothing is announced before its first event.
+    fn begin_reply(&mut self, _kind: ReplyKind) {}
+    /// A scalar.
+    fn scalar(&mut self, v: Scalar<'_>) -> Flow;
+    /// An error line (`-`), without the dash or the CRLF.
+    fn error(&mut self, line: &str) -> Flow;
+    /// An aggregate begins. `len` is its element count (pairs, for a map), or
+    /// `None` for a RESP3 streamed aggregate, which an `end_aggregate` closes.
+    fn begin_aggregate(&mut self, kind: AggKind, len: Option<usize>) -> Flow;
+    /// The aggregate opened last is complete.
+    fn end_aggregate(&mut self) -> Flow;
+    /// A string begins. `len` is its length in bytes (for a verbatim string,
+    /// that of the text without its format tag), or `None` for a RESP3
+    /// streamed string.
+    fn begin_string(&mut self, kind: StrKind, len: Option<usize>) -> Flow;
+    /// The next bytes of the string, never empty.
+    fn string_chunk(&mut self, data: &[u8]) -> Flow;
+    /// The string is complete.
+    fn end_string(&mut self) -> Flow;
+    /// The reply is complete, or has been discarded to its end (`skipped`).
+    fn end_reply(&mut self, _skipped: bool) {}
+}
+
+// ---- the parser ----
+
+/// Which kind of aggregate a frame of the stack is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Open {
+    Agg,
+    /// RESP3 attributes: read and dropped; the value that follows is the reply.
     Attribute,
 }
 
 struct Frame {
-    kind: Agg,
-    /// Elements to collect: twice the pair count for a map or attributes.
-    expected: usize,
-    items: Vec<Value>,
+    kind: Open,
+    /// Elements still to come: twice the pair count for a map or attributes.
+    /// Not used by a streamed aggregate, which an `.` line ends.
+    remaining: usize,
+    streamed: bool,
 }
 
 /// Which kind of length-prefixed string is being read.
@@ -316,19 +455,37 @@ enum State {
     /// Reading the payload of a length-prefixed string.
     Payload { body: Body, remaining: usize },
     /// Expecting the CRLF after a payload; `seen_cr` once the CR is in.
-    PayloadEnd { body: Body, seen_cr: bool },
+    PayloadEnd { seen_cr: bool },
 }
 
 /// The incremental RESP parser. See the [module documentation](self).
 pub struct RespParser {
     limits: RespLimits,
     state: State,
-    /// The line being read, or the payload being collected.
-    scratch: Vec<u8>,
+    /// The line being read, bounded by `max_line`.
+    line: Vec<u8>,
+    /// The aggregates open, innermost last: counts only, never elements.
     stack: Vec<Frame>,
-    /// Memory the reply under construction has taken so far.
-    reply_bytes: usize,
+    /// Attribute frames open: while there are any, events are not forwarded.
+    muted: usize,
+    /// `begin_reply` has been sent for the reply in progress.
+    in_reply: bool,
+    /// A sink chose [`Flow::Skip`] for the reply in progress.
+    skipping: bool,
+    /// Bytes discarded so far in the reply in progress.
+    skipped: usize,
+    /// A sink asked for a pause.
+    paused: bool,
     failed: bool,
+    /// Inside a RESP3 streamed string: a `;` chunk header comes next, or `;0`.
+    streamed_string: bool,
+    /// A verbatim string's four-byte head (`txt:`) being collected, and the
+    /// length announced for the whole.
+    vhead: [u8; 4],
+    vhead_len: usize,
+    vtotal: usize,
+    /// Assembles `Value`s for [`feed_values`](Self::feed_values).
+    values: Option<Box<crate::collect::Collector>>,
 }
 
 impl RespParser {
@@ -342,24 +499,35 @@ impl RespParser {
         Self {
             limits,
             state: State::Tag,
-            scratch: Vec::new(),
+            line: Vec::new(),
             stack: Vec::new(),
-            reply_bytes: 0,
+            muted: 0,
+            in_reply: false,
+            skipping: false,
+            skipped: 0,
+            paused: false,
             failed: false,
+            streamed_string: false,
+            vhead: [0; 4],
+            vhead_len: 0,
+            vtotal: 0,
+            values: None,
         }
     }
 
     /// Whether the parser is between replies: nothing of the next one has
     /// arrived.
     pub fn is_idle(&self) -> bool {
-        matches!(self.state, State::Tag) && self.stack.is_empty()
+        matches!(self.state, State::Tag) && self.stack.is_empty() && !self.streamed_string
     }
 
-    /// Consume `data`, handing each reply completed by it to `sink`.
+    /// Consume `data`, telling `sink` what it holds.
     ///
-    /// Always consumes all of `data` unless it returns an error, however it is
-    /// split; what has not yet made a whole reply is kept inside the parser.
-    pub fn feed(&mut self, data: &mut &[u8], sink: &mut dyn FnMut(Value)) -> Result<(), RespError> {
+    /// Always consumes all of `data` unless it returns [`Feed::Paused`] or an
+    /// error, however it is split: `data` is advanced past what was consumed.
+    /// What has not yet made a whole token (a header line) is kept inside the
+    /// parser, and that is all it keeps.
+    pub fn feed(&mut self, data: &mut &[u8], sink: &mut dyn ReplySink) -> Result<Feed, RespError> {
         if self.failed {
             return Err(bad("the stream is not valid RESP"));
         }
@@ -370,16 +538,45 @@ impl RespParser {
         result
     }
 
-    fn run(&mut self, data: &mut &[u8], sink: &mut dyn FnMut(Value)) -> Result<(), RespError> {
+    /// Transitional, and removed with [`Value`]: feed `data` and hand each
+    /// reply, assembled whole under [`RespLimits`], to `sink`. A reply over a
+    /// limit is an error here, and poisons the parser.
+    #[doc(hidden)]
+    pub fn feed_values(&mut self, data: &mut &[u8], sink: &mut dyn FnMut(Value)) -> Result<(), RespError> {
+        let mut collector = self.values.take().unwrap_or_else(|| Box::new(crate::collect::Collector::new(&self.limits)));
+        let mut adapter = crate::collect::Adapter {
+            collector: &mut *collector,
+            out: sink,
+            error: None,
+        };
+        let fed = self.feed(data, &mut adapter);
+        let error = adapter.error.take();
+        self.values = Some(collector);
+        fed?;
+        if let Some(e) = error {
+            self.failed = true;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn run(&mut self, data: &mut &[u8], sink: &mut dyn ReplySink) -> Result<Feed, RespError> {
         while !data.is_empty() {
             match self.state {
                 State::Tag => {
                     let tag = data[0];
                     *data = &data[1..];
+                    if self.streamed_string != (tag == b';') {
+                        return Err(bad("a RESP streamed string has something other than a chunk"));
+                    }
                     match tag {
                         b'+' | b'-' | b':' | b',' | b'#' | b'_' | b'(' | b'$' | b'!' | b'=' | b'*' | b'~' | b'>'
-                        | b'%' | b'|' => {
-                            self.scratch.clear();
+                        | b'%' | b'|' | b';' => {
+                            self.line.clear();
+                            self.state = State::Line(tag);
+                        }
+                        b'.' if self.stack.last().is_some_and(|f| f.streamed) => {
+                            self.line.clear();
                             self.state = State::Line(tag);
                         }
                         other => return Err(bad(format!("unknown RESP type byte 0x{other:02x}"))),
@@ -389,86 +586,237 @@ impl RespParser {
                     // Everything up to and including the next LF.
                     let end = data.iter().position(|&b| b == b'\n');
                     let take = end.map_or(data.len(), |i| i + 1);
-                    if self.scratch.len() + take > self.limits.max_line + 2 {
+                    if self.line.len() + take > self.limits.max_line + 2 {
                         return Err(bad("a RESP line is too long"));
                     }
-                    self.scratch.extend_from_slice(&data[..take]);
+                    self.line.extend_from_slice(&data[..take]);
                     *data = &data[take..];
                     if end.is_some() {
-                        if !self.scratch.ends_with(b"\r\n") {
+                        if !self.line.ends_with(b"\r\n") {
                             return Err(bad("a RESP line does not end in CRLF"));
                         }
-                        let n = self.scratch.len() - 2;
-                        self.scratch.truncate(n);
-                        self.line(tag, sink)?;
+                        let n = self.line.len() - 2;
+                        self.line.truncate(n);
+                        self.discarding(n + 2)?;
+                        self.header(tag, sink)?;
                     }
                 }
                 State::Payload { body, remaining } => {
-                    let take = remaining.min(data.len());
-                    self.scratch.extend_from_slice(&data[..take]);
-                    *data = &data[take..];
-                    self.state = if remaining == take {
-                        State::PayloadEnd { body, seen_cr: false }
-                    } else {
-                        State::Payload {
-                            body,
-                            remaining: remaining - take,
+                    let mut remaining = remaining;
+                    // A verbatim string's first four bytes are its format tag.
+                    if body == Body::Verbatim && self.vhead_len < 4 {
+                        let head = remaining.min(data.len()).min(4 - self.vhead_len);
+                        self.vhead[self.vhead_len..self.vhead_len + head].copy_from_slice(&data[..head]);
+                        self.vhead_len += head;
+                        *data = &data[head..];
+                        remaining -= head;
+                        if self.vhead_len == 4 {
+                            if self.vhead[3] != b':' {
+                                return Err(bad("a RESP verbatim string has no format tag"));
+                            }
+                            let format = [self.vhead[0], self.vhead[1], self.vhead[2]];
+                            self.string_begin(sink, StrKind::Verbatim { format }, Some(self.vtotal - 4));
                         }
+                    }
+                    let take = if body == Body::Verbatim && self.vhead_len < 4 { 0 } else { remaining.min(data.len()) };
+                    if take > 0 {
+                        self.discarding(take)?;
+                        self.string_chunk(sink, &data[..take]);
+                        *data = &data[take..];
+                        remaining -= take;
+                    }
+                    self.state = if remaining == 0 && (body != Body::Verbatim || self.vhead_len == 4) {
+                        State::PayloadEnd { seen_cr: false }
+                    } else {
+                        State::Payload { body, remaining }
                     };
                 }
-                State::PayloadEnd { body, seen_cr } => {
+                State::PayloadEnd { seen_cr } => {
                     let b = data[0];
                     *data = &data[1..];
                     match (seen_cr, b) {
-                        (false, b'\r') => self.state = State::PayloadEnd { body, seen_cr: true },
+                        (false, b'\r') => self.state = State::PayloadEnd { seen_cr: true },
                         (true, b'\n') => {
                             self.state = State::Tag;
-                            let payload = std::mem::take(&mut self.scratch);
-                            self.payload(body, payload, sink)?;
+                            self.payload_done(sink)?;
                         }
                         _ => return Err(bad("a RESP string does not end in CRLF")),
                     }
                 }
             }
+            if self.paused {
+                break;
+            }
+        }
+        Ok(if std::mem::take(&mut self.paused) { Feed::Paused } else { Feed::Consumed })
+    }
+
+    // ---- what the sink hears ----
+
+    /// Count `n` bytes against the discard limit, if they are being discarded.
+    fn discarding(&mut self, n: usize) -> Result<(), RespError> {
+        if self.skipping || self.muted > 0 {
+            self.skipped = self.skipped.saturating_add(n);
+            if self.skipped > self.limits.max_skip {
+                return Err(bad("a RESP reply to be discarded exceeds the discard limit"));
+            }
         }
         Ok(())
     }
 
-    /// A header or simple line is complete in `scratch`.
-    fn line(&mut self, tag: u8, sink: &mut dyn FnMut(Value)) -> Result<(), RespError> {
-        let line = std::mem::take(&mut self.scratch);
+    fn apply(&mut self, flow: Flow) {
+        match flow {
+            Flow::Continue => {}
+            Flow::Pause => self.paused = true,
+            Flow::Skip => self.skipping = true,
+        }
+    }
+
+    /// Whether events reach the sink.
+    fn live(&self) -> bool {
+        self.muted == 0 && !self.skipping
+    }
+
+    fn open_reply(&mut self, sink: &mut dyn ReplySink, kind: ReplyKind) {
+        if !self.in_reply && self.muted == 0 {
+            self.in_reply = true;
+            self.skipping = false;
+            self.skipped = 0;
+            sink.begin_reply(kind);
+        }
+    }
+
+    fn finish_reply(&mut self, sink: &mut dyn ReplySink) {
+        if self.in_reply {
+            sink.end_reply(self.skipping);
+            self.in_reply = false;
+            self.skipping = false;
+            self.skipped = 0;
+        }
+    }
+
+    fn scalar(&mut self, sink: &mut dyn ReplySink, v: Scalar<'_>) {
+        self.open_reply(sink, ReplyKind::Normal);
+        if self.live() {
+            let f = sink.scalar(v);
+            self.apply(f);
+        }
+    }
+
+    fn error_line(&mut self, sink: &mut dyn ReplySink, line: &str) {
+        self.open_reply(sink, ReplyKind::Normal);
+        if self.live() {
+            let f = sink.error(line);
+            self.apply(f);
+        }
+    }
+
+    fn aggregate_begin(&mut self, sink: &mut dyn ReplySink, kind: AggKind, len: Option<usize>) {
+        let reply = if kind == AggKind::Push { ReplyKind::Push } else { ReplyKind::Normal };
+        self.open_reply(sink, reply);
+        if self.live() {
+            let f = sink.begin_aggregate(kind, len);
+            self.apply(f);
+        }
+    }
+
+    fn aggregate_end(&mut self, sink: &mut dyn ReplySink) {
+        if self.live() {
+            let f = sink.end_aggregate();
+            self.apply(f);
+        }
+    }
+
+    fn string_begin(&mut self, sink: &mut dyn ReplySink, kind: StrKind, len: Option<usize>) {
+        self.open_reply(sink, ReplyKind::Normal);
+        if self.live() {
+            let f = sink.begin_string(kind, len);
+            self.apply(f);
+        }
+    }
+
+    fn string_chunk(&mut self, sink: &mut dyn ReplySink, data: &[u8]) {
+        if self.live() {
+            let f = sink.string_chunk(data);
+            self.apply(f);
+        }
+    }
+
+    fn string_end(&mut self, sink: &mut dyn ReplySink) {
+        if self.live() {
+            let f = sink.end_string();
+            self.apply(f);
+        }
+    }
+
+    // ---- structure ----
+
+    /// A header or simple line is complete in `line`.
+    fn header(&mut self, tag: u8, sink: &mut dyn ReplySink) -> Result<(), RespError> {
         self.state = State::Tag;
-        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        let line = std::mem::take(&mut self.line);
+        let result = self.header_of(tag, &line, sink);
+        self.line = line;
+        result
+    }
+
+    fn header_of(&mut self, tag: u8, line: &[u8], sink: &mut dyn ReplySink) -> Result<(), RespError> {
         match tag {
-            b'+' => self.add(Value::Simple(text(&line)), 16 + line.len(), sink),
-            b'-' => self.add(Value::Error(ServerError::parse(&text(&line))), 16 + line.len(), sink),
+            b'+' => {
+                let text = String::from_utf8_lossy(line);
+                self.scalar(sink, Scalar::Simple(&text));
+                self.value_complete(sink)
+            }
+            b'-' => {
+                let text = String::from_utf8_lossy(line);
+                self.error_line(sink, &text);
+                self.value_complete(sink)
+            }
             b':' => {
-                let n = parse_int(&line)?;
-                self.add(Value::Int(n), 16, sink)
+                let n = parse_int(line)?;
+                self.scalar(sink, Scalar::Int(n));
+                self.value_complete(sink)
             }
             b',' => {
-                let d = parse_double(&line)?;
-                self.add(Value::Double(d), 16, sink)
+                let d = parse_double(line)?;
+                self.scalar(sink, Scalar::Double(d));
+                self.value_complete(sink)
             }
-            b'#' => match &line[..] {
-                b"t" => self.add(Value::Bool(true), 16, sink),
-                b"f" => self.add(Value::Bool(false), 16, sink),
-                _ => Err(bad("a RESP boolean is neither t nor f")),
-            },
+            b'#' => {
+                let v = match line {
+                    b"t" => true,
+                    b"f" => false,
+                    _ => return Err(bad("a RESP boolean is neither t nor f")),
+                };
+                self.scalar(sink, Scalar::Bool(v));
+                self.value_complete(sink)
+            }
             b'_' => {
                 if !line.is_empty() {
                     return Err(bad("a RESP null has content"));
                 }
-                self.add(Value::Null, 16, sink)
+                self.scalar(sink, Scalar::Null);
+                self.value_complete(sink)
             }
             b'(' => {
                 if line.is_empty() || !line.iter().enumerate().all(|(i, b)| b.is_ascii_digit() || (i == 0 && *b == b'-')) {
                     return Err(bad("a RESP big number is not a number"));
                 }
-                self.add(Value::BigNumber(text(&line)), 16 + line.len(), sink)
+                // Digits only, so this is valid UTF-8.
+                let text = std::str::from_utf8(line).map_err(|_| bad("a RESP big number is not a number"))?;
+                self.scalar(sink, Scalar::BigNumber(text));
+                self.value_complete(sink)
             }
             b'$' | b'!' | b'=' => {
-                let n = parse_int(&line)?;
+                if line == b"?" {
+                    if tag != b'$' {
+                        return Err(bad("only a RESP bulk string may be streamed"));
+                    }
+                    self.streamed_string = true;
+                    self.string_begin(sink, StrKind::Bulk, None);
+                    return Ok(());
+                }
+                let n = parse_int(line)?;
                 let body = match tag {
                     b'$' => Body::Bulk,
                     b'!' => Body::Error,
@@ -477,63 +825,123 @@ impl RespParser {
                 if n < 0 {
                     // RESP2's null bulk string.
                     if tag == b'$' && n == -1 {
-                        return self.add(Value::Null, 16, sink);
+                        self.scalar(sink, Scalar::Null);
+                        return self.value_complete(sink);
                     }
                     return Err(bad("a RESP string has a negative length"));
                 }
                 let len = n as usize;
-                if len > self.limits.max_bulk {
-                    return Err(bad(format!("a RESP string of {len} bytes exceeds the limit")));
+                match body {
+                    Body::Bulk => self.string_begin(sink, StrKind::Bulk, Some(len)),
+                    Body::Error => self.string_begin(sink, StrKind::Error, Some(len)),
+                    Body::Verbatim => {
+                        if len < 4 {
+                            return Err(bad("a RESP verbatim string has no format tag"));
+                        }
+                        // Announced once its format tag has arrived.
+                        self.vhead_len = 0;
+                        self.vtotal = len;
+                    }
                 }
-                self.charge(len)?;
-                self.scratch.reserve(len.min(64 * 1024));
                 self.state = if len == 0 {
-                    State::PayloadEnd { body, seen_cr: false }
+                    State::PayloadEnd { seen_cr: false }
                 } else {
                     State::Payload { body, remaining: len }
                 };
                 Ok(())
             }
+            b';' => {
+                // The header of a chunk of a streamed string.
+                let n = parse_int(line)?;
+                if n < 0 {
+                    return Err(bad("a RESP streamed string chunk has a negative length"));
+                }
+                if n == 0 {
+                    self.streamed_string = false;
+                    self.string_end(sink);
+                    return self.value_complete(sink);
+                }
+                self.state = State::Payload {
+                    body: Body::Bulk,
+                    remaining: n as usize,
+                };
+                Ok(())
+            }
+            b'.' => {
+                if !line.is_empty() {
+                    return Err(bad("the end of a RESP streamed aggregate has content"));
+                }
+                match self.stack.pop() {
+                    Some(f) if f.streamed => {
+                        self.aggregate_end(sink);
+                        self.aggregate_done(f, sink)
+                    }
+                    _ => Err(bad("the end of a RESP streamed aggregate with none open")),
+                }
+            }
             b'*' | b'~' | b'>' | b'%' | b'|' => {
-                let n = parse_int(&line)?;
+                if line == b"?" {
+                    if !matches!(tag, b'*' | b'~' | b'%') {
+                        return Err(bad("only a RESP array, set or map may be streamed"));
+                    }
+                    let kind = match tag {
+                        b'*' => AggKind::Array,
+                        b'~' => AggKind::Set,
+                        _ => AggKind::Map,
+                    };
+                    if self.stack.len() >= self.limits.max_depth {
+                        return Err(bad("RESP aggregates are nested too deeply"));
+                    }
+                    self.aggregate_begin(sink, kind, None);
+                    self.stack.push(Frame {
+                        kind: Open::Agg,
+                        remaining: 0,
+                        streamed: true,
+                    });
+                    return Ok(());
+                }
+                let n = parse_int(line)?;
                 if n < 0 {
                     // RESP2's null array.
                     if tag == b'*' && n == -1 {
-                        return self.add(Value::Null, 16, sink);
+                        self.scalar(sink, Scalar::Null);
+                        return self.value_complete(sink);
                     }
                     return Err(bad("a RESP aggregate has a negative length"));
                 }
                 let n = n as usize;
-                if n > self.limits.max_aggregate {
-                    return Err(bad(format!("a RESP aggregate of {n} elements exceeds the limit")));
-                }
-                let kind = match tag {
-                    b'*' => Agg::Array,
-                    b'~' => Agg::Set,
-                    b'>' => Agg::Push,
-                    b'%' => Agg::Map,
-                    _ => Agg::Attribute,
-                };
-                let expected = if matches!(kind, Agg::Map | Agg::Attribute) { n * 2 } else { n };
                 if self.stack.len() >= self.limits.max_depth {
                     return Err(bad("RESP aggregates are nested too deeply"));
                 }
-                self.charge(16 + expected.saturating_mul(16))?;
-                if expected == 0 {
+                if tag == b'|' {
+                    // Attributes describe the value that follows; they are
+                    // read and dropped, and are not it.
+                    if n > 0 {
+                        self.stack.push(Frame {
+                            kind: Open::Attribute,
+                            remaining: n.saturating_mul(2),
+                            streamed: false,
+                        });
+                        self.muted += 1;
+                    }
+                    return Ok(());
+                }
+                let kind = match tag {
+                    b'*' => AggKind::Array,
+                    b'~' => AggKind::Set,
+                    b'>' => AggKind::Push,
+                    _ => AggKind::Map,
+                };
+                self.aggregate_begin(sink, kind, Some(n));
+                if n == 0 {
                     // An empty aggregate is complete at once.
-                    return self.complete(
-                        Frame {
-                            kind,
-                            expected,
-                            items: Vec::new(),
-                        },
-                        sink,
-                    );
+                    self.aggregate_end(sink);
+                    return self.value_complete(sink);
                 }
                 self.stack.push(Frame {
-                    kind,
-                    expected,
-                    items: Vec::with_capacity(expected.min(1024)),
+                    kind: Open::Agg,
+                    remaining: if kind == AggKind::Map { n.saturating_mul(2) } else { n },
+                    streamed: false,
                 });
                 Ok(())
             }
@@ -541,77 +949,45 @@ impl RespParser {
         }
     }
 
-    /// A length-prefixed string is complete.
-    fn payload(&mut self, body: Body, payload: Vec<u8>, sink: &mut dyn FnMut(Value)) -> Result<(), RespError> {
-        let value = match body {
-            Body::Bulk => Value::Bulk(Bytes::from(payload)),
-            Body::Error => Value::Error(ServerError::parse(&String::from_utf8_lossy(&payload))),
-            Body::Verbatim => {
-                if payload.len() < 4 || payload[3] != b':' {
-                    return Err(bad("a RESP verbatim string has no format tag"));
-                }
-                Value::Verbatim {
-                    format: String::from_utf8_lossy(&payload[..3]).into_owned(),
-                    data: Bytes::copy_from_slice(&payload[4..]),
-                }
-            }
-        };
-        self.add(value, 0, sink)
-    }
-
-    /// Count `bytes` against the limit for the reply under construction.
-    fn charge(&mut self, bytes: usize) -> Result<(), RespError> {
-        self.reply_bytes = self.reply_bytes.saturating_add(bytes);
-        if self.reply_bytes > self.limits.max_reply_bytes {
-            return Err(bad("a RESP reply exceeds the size limit"));
+    /// A length-prefixed string's payload and CRLF are complete.
+    fn payload_done(&mut self, sink: &mut dyn ReplySink) -> Result<(), RespError> {
+        if self.streamed_string {
+            // Another chunk header, or `;0`, comes next.
+            return Ok(());
         }
-        Ok(())
+        self.string_end(sink);
+        self.value_complete(sink)
     }
 
-    /// A scalar is complete.
-    fn add(&mut self, value: Value, cost: usize, sink: &mut dyn FnMut(Value)) -> Result<(), RespError> {
-        self.charge(cost)?;
-        self.place(value, sink)
-    }
-
-    /// An aggregate is complete.
-    fn complete(&mut self, frame: Frame, sink: &mut dyn FnMut(Value)) -> Result<(), RespError> {
-        let value = match frame.kind {
-            Agg::Array => Value::Array(frame.items),
-            Agg::Set => Value::Set(frame.items),
-            Agg::Push => Value::Push(frame.items),
-            Agg::Map => {
-                let mut it = frame.items.into_iter();
-                let mut pairs = Vec::new();
-                while let (Some(k), Some(v)) = (it.next(), it.next()) {
-                    pairs.push((k, v));
-                }
-                Value::Map(pairs)
+    /// A value is complete: count it in the aggregate it belongs to, closing
+    /// each that it fills, and the reply when none is left open.
+    fn value_complete(&mut self, sink: &mut dyn ReplySink) -> Result<(), RespError> {
+        loop {
+            let Some(frame) = self.stack.last_mut() else {
+                self.finish_reply(sink);
+                return Ok(());
+            };
+            if frame.streamed {
+                return Ok(());
             }
-            // Attributes describe the value that follows; they are not it.
-            Agg::Attribute => return Ok(()),
-        };
-        self.place(value, sink)
-    }
-
-    /// Put a completed value where it belongs: in the aggregate being built,
-    /// or, with none, to the sink. A filled aggregate completes in turn.
-    fn place(&mut self, value: Value, sink: &mut dyn FnMut(Value)) -> Result<(), RespError> {
-        match self.stack.last_mut() {
-            None => {
-                self.reply_bytes = 0;
-                sink(value);
-                Ok(())
+            frame.remaining -= 1;
+            if frame.remaining > 0 {
+                return Ok(());
             }
-            Some(frame) => {
-                frame.items.push(value);
-                if frame.items.len() < frame.expected {
+            let frame = self.stack.pop().expect("there is a top frame");
+            match frame.kind {
+                Open::Attribute => {
+                    self.muted -= 1;
                     return Ok(());
                 }
-                let frame = self.stack.pop().expect("there is a top frame");
-                self.complete(frame, sink)
+                Open::Agg => self.aggregate_end(sink),
             }
         }
+    }
+
+    /// A streamed aggregate has ended: it is a value of the aggregate around it.
+    fn aggregate_done(&mut self, _frame: Frame, sink: &mut dyn ReplySink) -> Result<(), RespError> {
+        self.value_complete(sink)
     }
 }
 
@@ -677,7 +1053,7 @@ mod tests {
         let mut out = Vec::new();
         for piece in wire.chunks(chunk) {
             let mut data = piece;
-            p.feed(&mut data, &mut |v| out.push(v))?;
+            p.feed_values(&mut data, &mut |v| out.push(v))?;
             assert!(data.is_empty(), "all of a chunk is consumed");
         }
         Ok(out)
@@ -821,10 +1197,10 @@ mod tests {
         let mut sink = |_v: Value| {};
         assert!(p.is_idle());
         let mut data: &[u8] = b"*2\r\n:1\r\n";
-        p.feed(&mut data, &mut sink).unwrap();
+        p.feed_values(&mut data, &mut sink).unwrap();
         assert!(!p.is_idle());
         let mut data: &[u8] = b":2\r\n";
-        p.feed(&mut data, &mut sink).unwrap();
+        p.feed_values(&mut data, &mut sink).unwrap();
         assert!(p.is_idle());
     }
 
@@ -842,9 +1218,9 @@ mod tests {
         ] {
             let mut p = RespParser::new();
             let mut data = bad_wire;
-            assert!(p.feed(&mut data, &mut |_| {}).is_err(), "{:?}", String::from_utf8_lossy(bad_wire));
+            assert!(p.feed_values(&mut data, &mut |_| {}).is_err(), "{:?}", String::from_utf8_lossy(bad_wire));
             let mut more: &[u8] = b"+OK\r\n";
-            assert!(p.feed(&mut more, &mut |_| {}).is_err(), "a failed parser stays failed");
+            assert!(p.feed_values(&mut more, &mut |_| {}).is_err(), "a failed parser stays failed");
         }
     }
 
@@ -856,23 +1232,24 @@ mod tests {
             max_depth: 2,
             max_line: 16,
             max_reply_bytes: 4096,
+            max_skip: 1 << 20,
         };
         let run = |wire: &[u8]| {
             let mut p = RespParser::with_limits(tiny);
             let mut data = wire;
-            p.feed(&mut data, &mut |_| {})
+            p.feed_values(&mut data, &mut |_| {})
         };
-        assert!(run(b"$11\r\n").is_err(), "a bulk over the limit");
+        // A string or aggregate announced over the limit is refused when it is
+        // announced, and what follows it is skipped.
+        assert!(run(b"$11\r\n01234567890\r\n").is_err(), "a bulk over the limit");
         assert!(run(b"$10\r\n0123456789\r\n").is_ok());
-        assert!(run(b"*4\r\n").is_err(), "an aggregate over the limit");
-        assert!(run(b"*1\r\n*1\r\n*1\r\n").is_err(), "nested too deep");
+        assert!(run(b"*4\r\n:1\r\n:2\r\n:3\r\n:4\r\n").is_err(), "an aggregate over the limit");
+        assert!(run(b"*1\r\n*1\r\n*1\r\n").is_err(), "nested too deeply");
         assert!(run(b"+0123456789abcdefXXXX\r\n").is_err(), "a line over the limit");
-        // The announced size is checked, not the bytes that happen to arrive.
-        assert!(run(b"$9999999999\r\n").is_err());
     }
 
     #[test]
-    fn a_reply_over_the_total_size_limit_is_refused() {
+    fn a_reply_over_the_total_size_limit_is_refused_and_the_next_is_not() {
         let limits = RespLimits {
             max_reply_bytes: 100,
             ..RespLimits::default()
@@ -885,7 +1262,7 @@ mod tests {
             wire.extend_from_slice(b"\r\n");
         }
         let mut data = &wire[..];
-        assert!(p.feed(&mut data, &mut |_| {}).is_err());
+        assert!(p.feed_values(&mut data, &mut |_| {}).is_err());
     }
 
     #[test]
@@ -903,8 +1280,579 @@ mod tests {
         }
         let mut n = 0;
         let mut data = &wire[..];
-        p.feed(&mut data, &mut |_| n += 1).unwrap();
+        p.feed_values(&mut data, &mut |_| n += 1).unwrap();
         assert_eq!(n, 10);
+    }
+
+    // ---- the event parser ----
+
+    /// What a sink was told, with adjacent chunks of one string merged so that
+    /// the same reply gives the same events however it was split.
+    #[derive(Debug, Clone, PartialEq)]
+    enum Ev {
+        Begin(ReplyKind),
+        Null,
+        Int(i64),
+        Double(f64),
+        Bool(bool),
+        Big(String),
+        Simple(String),
+        Error(String),
+        Agg(AggKind, Option<usize>),
+        EndAgg,
+        Str(StrKind, Option<usize>),
+        Chunk(Vec<u8>),
+        EndStr,
+        End(bool),
+    }
+
+    /// Records events; may be told to pause or skip at the Nth event.
+    #[derive(Default)]
+    struct Rec {
+        events: Vec<Ev>,
+        count: usize,
+        pause_at: Option<usize>,
+        skip_at: Option<usize>,
+        chunks: usize,
+    }
+
+    impl Rec {
+        fn flow(&mut self) -> Flow {
+            self.count += 1;
+            if self.skip_at == Some(self.count) {
+                return Flow::Skip;
+            }
+            if self.pause_at == Some(self.count) {
+                return Flow::Pause;
+            }
+            Flow::Continue
+        }
+        fn push(&mut self, e: Ev) -> Flow {
+            self.events.push(e);
+            self.flow()
+        }
+        /// The events with each run of chunks made one.
+        fn merged(&self) -> Vec<Ev> {
+            let mut out: Vec<Ev> = Vec::new();
+            for e in &self.events {
+                match (out.last_mut(), e) {
+                    (Some(Ev::Chunk(prev)), Ev::Chunk(more)) => prev.extend_from_slice(more),
+                    _ => out.push(e.clone()),
+                }
+            }
+            out
+        }
+    }
+
+    impl ReplySink for Rec {
+        fn begin_reply(&mut self, kind: ReplyKind) {
+            self.events.push(Ev::Begin(kind));
+        }
+        fn scalar(&mut self, v: Scalar<'_>) -> Flow {
+            self.push(match v {
+                Scalar::Null => Ev::Null,
+                Scalar::Int(n) => Ev::Int(n),
+                Scalar::Double(d) => Ev::Double(d),
+                Scalar::Bool(b) => Ev::Bool(b),
+                Scalar::BigNumber(s) => Ev::Big(s.into()),
+                Scalar::Simple(s) => Ev::Simple(s.into()),
+            })
+        }
+        fn error(&mut self, line: &str) -> Flow {
+            self.push(Ev::Error(line.into()))
+        }
+        fn begin_aggregate(&mut self, kind: AggKind, len: Option<usize>) -> Flow {
+            self.push(Ev::Agg(kind, len))
+        }
+        fn end_aggregate(&mut self) -> Flow {
+            self.push(Ev::EndAgg)
+        }
+        fn begin_string(&mut self, kind: StrKind, len: Option<usize>) -> Flow {
+            self.push(Ev::Str(kind, len))
+        }
+        fn string_chunk(&mut self, data: &[u8]) -> Flow {
+            assert!(!data.is_empty(), "a chunk is never empty");
+            self.chunks += 1;
+            self.push(Ev::Chunk(data.to_vec()))
+        }
+        fn end_string(&mut self) -> Flow {
+            self.push(Ev::EndStr)
+        }
+        fn end_reply(&mut self, skipped: bool) {
+            self.events.push(Ev::End(skipped));
+        }
+    }
+
+    /// Feed `wire` in pieces of `chunk` bytes.
+    fn events_chunked(wire: &[u8], chunk: usize) -> Vec<Ev> {
+        let mut p = RespParser::new();
+        let mut rec = Rec::default();
+        for piece in wire.chunks(chunk) {
+            let mut data = piece;
+            assert_eq!(p.feed(&mut data, &mut rec).unwrap(), Feed::Consumed);
+            assert!(data.is_empty());
+        }
+        assert!(p.is_idle(), "the wire is whole replies");
+        rec.merged()
+    }
+
+    /// The events for `wire`, checked to be the same at every split.
+    fn events(wire: &[u8]) -> Vec<Ev> {
+        let whole = events_chunked(wire, wire.len().max(1));
+        for chunk in [1, 2, 3, 4, 5, 7, 11, 16, 64] {
+            assert_eq!(events_chunked(wire, chunk), whole, "split every {chunk} bytes");
+        }
+        whole
+    }
+
+    fn st(kind: StrKind, len: usize, payload: &[u8]) -> Vec<Ev> {
+        let mut v = vec![Ev::Str(kind, Some(len))];
+        if !payload.is_empty() {
+            v.push(Ev::Chunk(payload.to_vec()));
+        }
+        v.push(Ev::EndStr);
+        v
+    }
+
+    #[test]
+    fn every_kind_of_value_is_the_events_it_should_be() {
+        use Ev::*;
+        let normal = Begin(ReplyKind::Normal);
+        assert_eq!(events(b"+OK\r\n"), vec![normal.clone(), Simple("OK".into()), End(false)]);
+        assert_eq!(events(b"-ERR boom\r\n"), vec![normal.clone(), Error("ERR boom".into()), End(false)]);
+        assert_eq!(events(b":-7\r\n"), vec![normal.clone(), Int(-7), End(false)]);
+        assert_eq!(events(b",2.5\r\n"), vec![normal.clone(), Double(2.5), End(false)]);
+        assert_eq!(events(b"#t\r\n"), vec![normal.clone(), Bool(true), End(false)]);
+        assert_eq!(events(b"_\r\n"), vec![normal.clone(), Null, End(false)]);
+        assert_eq!(events(b"$-1\r\n"), vec![normal.clone(), Null, End(false)]);
+        assert_eq!(events(b"*-1\r\n"), vec![normal.clone(), Null, End(false)]);
+        assert_eq!(events(b"(-12345678901234567890\r\n"), vec![normal.clone(), Big("-12345678901234567890".into()), End(false)]);
+
+        let mut want = vec![normal.clone()];
+        want.extend(st(StrKind::Bulk, 5, b"hello"));
+        want.push(End(false));
+        assert_eq!(events(b"$5\r\nhello\r\n"), want);
+
+        let mut want = vec![normal.clone()];
+        want.extend(st(StrKind::Bulk, 0, b""));
+        want.push(End(false));
+        assert_eq!(events(b"$0\r\n\r\n"), want);
+
+        let mut want = vec![normal.clone()];
+        want.extend(st(StrKind::Error, 3, b"bad"));
+        want.push(End(false));
+        assert_eq!(events(b"!3\r\nbad\r\n"), want);
+
+        // The format tag is not part of the text.
+        let mut want = vec![normal.clone()];
+        want.extend(st(StrKind::Verbatim { format: *b"txt" }, 5, b"hello"));
+        want.push(End(false));
+        assert_eq!(events(b"=9\r\ntxt:hello\r\n"), want);
+        let mut want = vec![normal.clone()];
+        want.extend(st(StrKind::Verbatim { format: *b"mkd" }, 0, b""));
+        want.push(End(false));
+        assert_eq!(events(b"=4\r\nmkd:\r\n"), want);
+    }
+
+    #[test]
+    fn aggregates_nest_and_hold_large_strings_between_their_events() {
+        use Ev::*;
+        let mut want = vec![
+            Begin(ReplyKind::Normal),
+            Agg(AggKind::Array, Some(3)),
+            Int(1),
+            Agg(AggKind::Map, Some(1)),
+        ];
+        want.extend(st(StrKind::Bulk, 1, b"k"));
+        want.extend(st(StrKind::Bulk, 20000, &[b'v'; 20000]));
+        want.push(EndAgg);
+        want.push(Agg(AggKind::Set, Some(0)));
+        want.push(EndAgg);
+        want.push(EndAgg);
+        want.push(End(false));
+        let mut wire = b"*3\r\n:1\r\n%1\r\n$1\r\nk\r\n$20000\r\n".to_vec();
+        wire.extend_from_slice(&[b'v'; 20000]);
+        wire.extend_from_slice(b"\r\n~0\r\n");
+        assert_eq!(events(&wire), want);
+        // An empty aggregate at the top level is a whole reply.
+        assert_eq!(
+            events(b"*0\r\n"),
+            vec![Begin(ReplyKind::Normal), Agg(AggKind::Array, Some(0)), EndAgg, End(false)]
+        );
+    }
+
+    #[test]
+    fn a_push_is_announced_as_one_and_replies_either_side_are_not() {
+        use Ev::*;
+        let got = events(b":1\r\n>2\r\n+message\r\n+hi\r\n:2\r\n");
+        assert_eq!(
+            got,
+            vec![
+                Begin(ReplyKind::Normal),
+                Int(1),
+                End(false),
+                Begin(ReplyKind::Push),
+                Agg(AggKind::Push, Some(2)),
+                Simple("message".into()),
+                Simple("hi".into()),
+                EndAgg,
+                End(false),
+                Begin(ReplyKind::Normal),
+                Int(2),
+                End(false),
+            ]
+        );
+    }
+
+    #[test]
+    fn attributes_are_discarded_wherever_they_come() {
+        use Ev::*;
+        // Before a reply, inside an aggregate before an element, and nested in
+        // an attribute: none produces an event, none counts as an element.
+        let wire = b"|1\r\n+ttl\r\n|1\r\n+x\r\n:1\r\n:3\r\n*2\r\n|1\r\n$1\r\nk\r\n$3\r\nabc\r\n:5\r\n:6\r\n";
+        let mut want = vec![Begin(ReplyKind::Normal), Agg(AggKind::Array, Some(2))];
+        want.push(Int(5));
+        want.push(Int(6));
+        want.push(EndAgg);
+        want.push(End(false));
+        assert_eq!(events(wire), want);
+        // Skipping the attribute needs no memory for what is in it: this one is
+        // 200 KB of payload.
+        let mut big = b"|1\r\n+k\r\n$200000\r\n".to_vec();
+        big.extend_from_slice(&vec![b'a'; 200_000]);
+        big.extend_from_slice(b"\r\n+OK\r\n");
+        assert_eq!(events(&big), vec![Begin(ReplyKind::Normal), Simple("OK".into()), End(false)]);
+    }
+
+    #[test]
+    fn resp3_streamed_strings_and_aggregates_are_events_without_a_length() {
+        use Ev::*;
+        let want = vec![
+            Begin(ReplyKind::Normal),
+            Str(StrKind::Bulk, None),
+            Chunk(b"Hello world".to_vec()),
+            EndStr,
+            End(false),
+        ];
+        assert_eq!(events(b"$?\r\n;4\r\nHell\r\n;5\r\no wor\r\n;2\r\nld\r\n;0\r\n"), want);
+        let want = vec![
+            Begin(ReplyKind::Normal),
+            Agg(AggKind::Array, None),
+            Int(1),
+            Agg(AggKind::Set, None),
+            Int(2),
+            EndAgg,
+            Simple("x".into()),
+            EndAgg,
+            End(false),
+        ];
+        assert_eq!(events(b"*?\r\n:1\r\n~?\r\n:2\r\n.\r\n+x\r\n.\r\n"), want);
+    }
+
+    #[test]
+    fn a_stream_that_is_not_streamed_properly_is_an_error() {
+        for wire in [
+            &b";4\r\nabcd\r\n"[..],               // a chunk outside a streamed string
+            b"$?\r\n:1\r\n",                       // something that is not a chunk inside one
+            b"$?\r\n;-1\r\n",                      // a negative chunk
+            b".\r\n",                              // an end with nothing open
+            b"*?\r\n.x\r\n",                       // an end with content
+            b"!?\r\n",                             // only bulk strings stream
+            b">?\r\n",                             // and only some aggregates
+            b"=3\r\nabc\r\n",                      // a verbatim string with no room for its tag
+            b"=5\r\nabcde\r\n",                    // and one with no colon
+        ] {
+            let mut p = RespParser::new();
+            let mut data = wire;
+            assert!(p.feed(&mut data, &mut Rec::default()).is_err(), "{:?}", String::from_utf8_lossy(wire));
+        }
+    }
+
+    #[test]
+    fn skip_discards_the_rest_of_the_reply_and_not_the_next() {
+        use Ev::*;
+        let mut wire = b"*2\r\n$100000\r\n".to_vec();
+        wire.extend_from_slice(&vec![b'x'; 100_000]);
+        wire.extend_from_slice(b"\r\n:9\r\n:7\r\n");
+        for chunk in [1, 7, 4096, wire.len()] {
+            let mut p = RespParser::new();
+            // Skip at the third event: the first chunk of the string.
+            let mut rec = Rec {
+                skip_at: Some(3),
+                ..Rec::default()
+            };
+            for piece in wire.chunks(chunk) {
+                let mut data = piece;
+                assert_eq!(p.feed(&mut data, &mut rec).unwrap(), Feed::Consumed);
+            }
+            let got = rec.merged();
+            assert_eq!(
+                got[..4],
+                [
+                    Begin(ReplyKind::Normal),
+                    Agg(AggKind::Array, Some(2)),
+                    Str(StrKind::Bulk, Some(100_000)),
+                    Chunk(got_chunk(&got)),
+                ],
+                "chunk {chunk}"
+            );
+            // Nothing after the skip but the end of that reply, then the next reply whole.
+            assert_eq!(
+                got[4..],
+                [End(true), Begin(ReplyKind::Normal), Int(7), End(false)],
+                "chunk {chunk}"
+            );
+        }
+    }
+
+    fn got_chunk(events: &[Ev]) -> Vec<u8> {
+        match &events[3] {
+            Ev::Chunk(c) => c.clone(),
+            other => panic!("not a chunk: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_reply_discarded_past_the_limit_abandons_the_stream() {
+        let limits = RespLimits {
+            max_skip: 1000,
+            ..RespLimits::default()
+        };
+        let mut wire = b"$5000\r\n".to_vec();
+        wire.extend_from_slice(&vec![b'x'; 5000]);
+        wire.extend_from_slice(b"\r\n");
+        // A sink that wants none of it.
+        let mut p = RespParser::with_limits(limits);
+        let mut rec = Rec {
+            skip_at: Some(1),
+            ..Rec::default()
+        };
+        let mut data = &wire[..];
+        assert!(p.feed(&mut data, &mut rec).is_err());
+        // Up to the limit is fine.
+        let mut wire = b"$900\r\n".to_vec();
+        wire.extend_from_slice(&vec![b'x'; 900]);
+        wire.extend_from_slice(b"\r\n");
+        let mut p = RespParser::with_limits(limits);
+        let mut rec = Rec {
+            skip_at: Some(1),
+            ..Rec::default()
+        };
+        let mut data = &wire[..];
+        assert_eq!(p.feed(&mut data, &mut rec).unwrap(), Feed::Consumed);
+        // And a reply that is not discarded has no limit at all.
+        let mut wire = b"$5000\r\n".to_vec();
+        wire.extend_from_slice(&vec![b'x'; 5000]);
+        wire.extend_from_slice(b"\r\n");
+        let mut p = RespParser::with_limits(limits);
+        let mut data = &wire[..];
+        assert_eq!(p.feed(&mut data, &mut Rec::default()).unwrap(), Feed::Consumed);
+    }
+
+    #[test]
+    fn a_pause_stops_after_the_event_leaving_the_rest_and_resuming_loses_nothing() {
+        let mut wire = b"*3\r\n:1\r\n$20\r\n01234567890123456789\r\n%1\r\n+k\r\n,1.5\r\n".to_vec();
+        wire.extend_from_slice(b"+tail\r\n");
+        let whole = events_chunked(&wire, wire.len());
+        let total_events = {
+            let mut p = RespParser::new();
+            let mut rec = Rec::default();
+            let mut data = &wire[..];
+            p.feed(&mut data, &mut rec).unwrap();
+            rec.count
+        };
+        assert!(total_events > 8);
+        for pause_at in 1..=total_events {
+            for chunk in [wire.len(), 3, 1] {
+                let mut p = RespParser::new();
+                let mut rec = Rec {
+                    pause_at: Some(pause_at),
+                    ..Rec::default()
+                };
+                let mut pauses = 0;
+                for piece in wire.chunks(chunk) {
+                    let mut data = piece;
+                    // Feed what is left until it is all taken.
+                    loop {
+                        match p.feed(&mut data, &mut rec).unwrap() {
+                            Feed::Consumed => break,
+                            Feed::Paused => {
+                                pauses += 1;
+                                // Resuming with nothing in between continues exactly.
+                            }
+                        }
+                    }
+                    assert!(data.is_empty());
+                }
+                assert_eq!(pauses, 1, "paused once, at event {pause_at}, chunk {chunk}");
+                assert_eq!(rec.merged(), whole, "paused at event {pause_at}, chunk {chunk}");
+            }
+        }
+    }
+
+    // ---- a property test against an independent reference ----
+
+    /// A deterministic generator.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn random_value(g: &mut Lcg, depth: usize) -> Value {
+        let leaf = depth == 0 || g.below(3) > 0;
+        if leaf {
+            return match g.below(9) {
+                0 => Value::Null,
+                1 => Value::Int(g.next() as i64 - (1 << 30)),
+                2 => Value::Bool(g.below(2) == 0),
+                3 => Value::Double((g.below(1000) as f64) / 8.0),
+                4 => Value::Simple(format!("s{}", g.below(1000))),
+                5 => Value::BigNumber(format!("{}", g.next() * 1_000_000_007)),
+                6 => Value::Error(ServerError::parse(&format!("ERR e{}", g.below(100)))),
+                7 => Value::Verbatim {
+                    format: "txt".into(),
+                    data: Bytes::from(random_bytes(g)),
+                },
+                _ => Value::Bulk(Bytes::from(random_bytes(g))),
+            };
+        }
+        let n = g.below(4) as usize;
+        let mut items: Vec<Value> = (0..n).map(|_| random_value(g, depth - 1)).collect();
+        match g.below(4) {
+            0 => Value::Array(items),
+            1 => Value::Set(items),
+            2 => Value::Push(items),
+            _ => Value::Map(
+                items
+                    .drain(..)
+                    .map(|k| (k, random_value(g, depth - 1)))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn random_bytes(g: &mut Lcg) -> Vec<u8> {
+        let n = match g.below(6) {
+            0 => 0,
+            1 => 1 + g.below(5),
+            2 => 100 + g.below(900),
+            _ => g.below(20),
+        } as usize;
+        (0..n).map(|_| g.next() as u8).collect()
+    }
+
+    /// Write `v` as RESP3, with an attribute sometimes in front.
+    fn encode_value(g: &mut Lcg, v: &Value, out: &mut Vec<u8>) {
+        if g.below(8) == 0 {
+            out.extend_from_slice(b"|1\r\n+attr\r\n$3\r\nabc\r\n");
+        }
+        let body = |out: &mut Vec<u8>, tag: u8, bytes: &[u8]| {
+            out.push(tag);
+            out.extend_from_slice(bytes.len().to_string().as_bytes());
+            out.extend_from_slice(b"\r\n");
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(b"\r\n");
+        };
+        match v {
+            Value::Null => out.extend_from_slice(b"_\r\n"),
+            Value::Int(n) => out.extend_from_slice(format!(":{n}\r\n").as_bytes()),
+            Value::Bool(b) => out.extend_from_slice(if *b { b"#t\r\n" } else { b"#f\r\n" }),
+            Value::Double(d) => out.extend_from_slice(format!(",{d}\r\n").as_bytes()),
+            Value::Simple(s) => out.extend_from_slice(format!("+{s}\r\n").as_bytes()),
+            Value::BigNumber(s) => out.extend_from_slice(format!("({s}\r\n").as_bytes()),
+            Value::Error(e) => out.extend_from_slice(format!("-{e}\r\n").as_bytes()),
+            Value::Bulk(b) => {
+                if g.below(5) == 0 && !b.is_empty() {
+                    // Streamed, in uneven chunks.
+                    out.extend_from_slice(b"$?\r\n");
+                    let mut rest = &b[..];
+                    while !rest.is_empty() {
+                        let n = (1 + g.below(rest.len() as u64)) as usize;
+                        body(out, b';', &rest[..n]);
+                        rest = &rest[n..];
+                    }
+                    out.extend_from_slice(b";0\r\n");
+                } else {
+                    body(out, b'$', b);
+                }
+            }
+            Value::Verbatim { format, data } => {
+                let mut text = format.as_bytes().to_vec();
+                text.push(b':');
+                text.extend_from_slice(data);
+                body(out, b'=', &text);
+            }
+            Value::Array(items) | Value::Set(items) | Value::Push(items) => {
+                let tag = match v {
+                    Value::Array(_) => b'*',
+                    Value::Set(_) => b'~',
+                    _ => b'>',
+                };
+                let streamed = tag != b'>' && g.below(5) == 0;
+                if streamed {
+                    out.push(tag);
+                    out.extend_from_slice(b"?\r\n");
+                } else {
+                    out.push(tag);
+                    out.extend_from_slice(format!("{}\r\n", items.len()).as_bytes());
+                }
+                for item in items {
+                    encode_value(g, item, out);
+                }
+                if streamed {
+                    out.extend_from_slice(b".\r\n");
+                }
+            }
+            Value::Map(pairs) => {
+                out.extend_from_slice(format!("%{}\r\n", pairs.len()).as_bytes());
+                for (k, val) in pairs {
+                    encode_value(g, k, out);
+                    encode_value(g, val, out);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn random_replies_at_random_splits_are_read_as_they_were_written() {
+        let mut g = Lcg(0x5eed);
+        for round in 0..400 {
+            let n = 1 + g.below(4) as usize;
+            let values: Vec<Value> = (0..n).map(|_| random_value(&mut g, 4)).collect();
+            let mut wire = Vec::new();
+            for v in &values {
+                encode_value(&mut g, v, &mut wire);
+            }
+            // Split at random points, from single bytes to whole.
+            let mut p = RespParser::new();
+            let mut got = Vec::new();
+            let mut rest = &wire[..];
+            while !rest.is_empty() {
+                let take = match g.below(4) {
+                    0 => 1,
+                    1 => 1 + g.below(8),
+                    2 => 1 + g.below(200),
+                    _ => rest.len() as u64,
+                }
+                .min(rest.len() as u64) as usize;
+                let mut piece = &rest[..take];
+                p.feed_values(&mut piece, &mut |v| got.push(v)).unwrap();
+                assert!(piece.is_empty());
+                rest = &rest[take..];
+            }
+            assert!(p.is_idle(), "round {round}");
+            assert_eq!(got.len(), values.len(), "round {round}");
+            for (g_, want) in got.iter().zip(&values) {
+                assert_eq!(g_, want, "round {round}");
+            }
+        }
     }
 
     #[test]

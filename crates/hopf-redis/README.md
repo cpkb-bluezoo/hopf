@@ -30,9 +30,14 @@ speaking RESP2 and RESP3.
   `wait_replicas` and `wait_aof` run `WAIT` and `WAITAOF` on the connection
   that carried the write they confirm. Works with Redis Cluster and Valkey
   Cluster.
-- **A push RESP parser** (`hopf_redis::resp`) that holds none of the stream,
-  reads every RESP2 and RESP3 type in any split, and checks every size a server
-  announces against configurable limits before reserving memory.
+- **An event-driven push RESP parser** (`hopf_redis::resp`) that holds none of
+  the stream. It tells a sink what it reads, with a string's payload as chunks
+  borrowed from the connection's ring, so nothing it parses is copied or
+  collected; a sink can pause it, or discard the rest of a reply in constant
+  memory. A reply nobody waits for, such as a timed-out command's, is discarded
+  as it arrives, however large. (Callbacks that take a whole `Value` are still
+  fed through a bounded collector; streaming sinks for commands are the next
+  step, see [#541](https://github.com/cpkb-bluezoo/hopf/issues/541).)
 
 ```rust
 use hopf_core::{Runtime, RuntimeConfig};
