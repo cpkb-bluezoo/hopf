@@ -183,16 +183,55 @@ impl Value {
 /// Append `args` to `out` as one command: an array of bulk strings, the form
 /// every Redis server accepts (RESP2 and RESP3 alike).
 pub fn encode_command(args: &[&[u8]], out: &mut Vec<u8>) {
+    encode_words(args, out);
+}
+
+/// [`encode_command`] for any words: the crate's `Command` holds `Vec<u8>`s.
+pub(crate) fn encode_words<T: AsRef<[u8]>>(args: &[T], out: &mut Vec<u8>) {
+    // One growth to the exact size, however large an argument is, and no
+    // allocation for the numbers.
+    out.reserve_exact(encoded_len(args));
     out.push(b'*');
-    out.extend_from_slice(args.len().to_string().as_bytes());
+    push_decimal(args.len(), out);
     out.extend_from_slice(b"\r\n");
     for a in args {
+        let a = a.as_ref();
         out.push(b'$');
-        out.extend_from_slice(a.len().to_string().as_bytes());
+        push_decimal(a.len(), out);
         out.extend_from_slice(b"\r\n");
         out.extend_from_slice(a);
         out.extend_from_slice(b"\r\n");
     }
+}
+
+/// How many bytes [`encode_command`] appends for `args`.
+fn encoded_len<T: AsRef<[u8]>>(args: &[T]) -> usize {
+    // `*<n>\r\n`, then `$<len>\r\n<bytes>\r\n` for each.
+    3 + decimal_len(args.len())
+        + args.iter().map(|a| 5 + decimal_len(a.as_ref().len()) + a.as_ref().len()).sum::<usize>()
+}
+
+fn decimal_len(mut n: usize) -> usize {
+    let mut digits = 1;
+    while n >= 10 {
+        n /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+fn push_decimal(mut n: usize, out: &mut Vec<u8>) {
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&digits[at..]);
 }
 
 /// Bounds on what a server may make the parser hold.
@@ -604,6 +643,29 @@ fn parse_double(line: &[u8]) -> Result<f64, RespError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The encoder reserves exactly what it writes, whatever the digit counts.
+    #[test]
+    fn encoding_is_one_exact_allocation_and_numbers_are_written_right() {
+        for len in [0usize, 1, 9, 10, 99, 100, 999, 1000, 12345, 100_000] {
+            let value = vec![b'x'; len];
+            let words: Vec<&[u8]> = vec![b"SET", b"key", &value];
+            let mut out = Vec::new();
+            encode_command(&words, &mut out);
+            assert_eq!(out.len(), encoded_len(&words), "length {len}");
+            assert_eq!(out.capacity(), out.len(), "length {len}: reserved exactly");
+            let mut expect = format!("*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n${len}\r\n").into_bytes();
+            expect.extend_from_slice(&value);
+            expect.extend_from_slice(b"\r\n");
+            assert_eq!(out, expect, "length {len}");
+        }
+        // Many arguments: the count has more than one digit.
+        let many: Vec<&[u8]> = (0..120).map(|_| &b"a"[..]).collect();
+        let mut out = Vec::new();
+        encode_command(&many, &mut out);
+        assert!(out.starts_with(b"*120\r\n$1\r\na\r\n"));
+        assert_eq!(out.len(), encoded_len(&many));
+    }
 
     fn bulk(s: &str) -> Value {
         Value::Bulk(Bytes::copy_from_slice(s.as_bytes()))

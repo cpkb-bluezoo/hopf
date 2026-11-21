@@ -29,6 +29,13 @@ getrandom = "0.2"
 [dev-dependencies]
 hopf-core = { workspace = true, features = ["testing"] }
 rcgen = { workspace = true }
+libc = "0.2"
+
+# `cargo bench -p hopf-redis --bench client`: see benches/README.md.
+[[bench]]
+name = "client"
+path = "benches/client.rs"
+harness = false
 
 [[test]]
 name = "redis_server"

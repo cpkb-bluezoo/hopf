@@ -40,7 +40,7 @@ use hopf_dns::DnsResolver;
 use crate::config::RedisConfig;
 use crate::error::RedisError;
 use crate::pubsub::{self, Desired, Push, SubscriberHandler};
-use crate::resp::{encode_command, RespParser, ServerError, Value};
+use crate::resp::{encode_command, encode_words, RespParser, ServerError, Value};
 
 /// What a command's callback is given.
 pub type Reply = Result<Value, RedisError>;
@@ -48,23 +48,25 @@ pub type Reply = Result<Value, RedisError>;
 /// A command's callback.
 pub type Callback = Box<dyn FnOnce(Reply) + Send>;
 
-/// A command written as an array of bulk strings, ready to send.
+/// A command written as an array of bulk strings, ready to send. Cloning one
+/// shares its arguments rather than copying them, so a large value is not
+/// copied when a cluster client keeps the command to send it again.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Command {
-    args: Vec<Vec<u8>>,
+    args: Arc<Vec<Vec<u8>>>,
 }
 
 impl Command {
     /// A command named `name`.
     pub fn new(name: impl AsRef<[u8]>) -> Self {
         Self {
-            args: vec![name.as_ref().to_vec()],
+            args: Arc::new(vec![name.as_ref().to_vec()]),
         }
     }
 
     /// Add an argument.
     pub fn arg(mut self, arg: impl AsRef<[u8]>) -> Self {
-        self.args.push(arg.as_ref().to_vec());
+        Arc::make_mut(&mut self.args).push(arg.as_ref().to_vec());
         self
     }
 
@@ -74,8 +76,9 @@ impl Command {
         I: IntoIterator,
         I::Item: AsRef<[u8]>,
     {
+        let own = Arc::make_mut(&mut self.args);
         for a in args {
-            self.args.push(a.as_ref().to_vec());
+            own.push(a.as_ref().to_vec());
         }
         self
     }
@@ -87,9 +90,8 @@ impl Command {
 
     /// The command as it goes on the wire.
     pub fn encode(&self) -> Vec<u8> {
-        let refs: Vec<&[u8]> = self.args.iter().map(Vec::as_slice).collect();
         let mut out = Vec::new();
-        encode_command(&refs, &mut out);
+        encode_words(&self.args, &mut out);
         out
     }
 }
@@ -662,7 +664,7 @@ fn submit_timed(inner: &Arc<Inner>, items: Vec<(Vec<u8>, Callback)>, deadline: D
                         st.last_rx = Instant::now();
                     }
                     for w in prepared {
-                        st.outbox.extend_from_slice(&w.bytes);
+                        append_to_outbox(&mut st.outbox, w.bytes);
                         st.pending.push_back(Sent {
                             qid: w.qid,
                             kind: Kind::User(Some(w.callback)),
@@ -783,6 +785,17 @@ fn arm_health(inner: &Arc<Inner>, conn_id: u64) {
             arm_health(&inner, conn_id);
         }),
     );
+}
+
+/// Add an encoded command to the outbox. When the outbox is empty, which is
+/// the usual case, the command's own buffer becomes the outbox: a large value
+/// is not copied again on its way to the connection.
+fn append_to_outbox(outbox: &mut Vec<u8>, bytes: Vec<u8>) {
+    if outbox.is_empty() {
+        *outbox = bytes;
+    } else {
+        outbox.extend_from_slice(&bytes);
+    }
 }
 
 /// Hand what is in the outbox to the connection, on the reactor.
@@ -1081,7 +1094,7 @@ impl Conn {
             st.retry_at = None;
             st.last_error = None;
             while let Some(w) = st.waiting.pop_front() {
-                st.outbox.extend_from_slice(&w.bytes);
+                append_to_outbox(&mut st.outbox, w.bytes);
                 st.pending.push_back(Sent {
                     qid: w.qid,
                     kind: Kind::User(Some(w.callback)),
@@ -1303,6 +1316,18 @@ mod tests {
         // Nothing configured, nothing sent.
         assert!(resp2_plan(&RedisConfig::new("h", 1)).is_empty());
         assert!(handshake_plan(&RedisConfig::new("h", 1).resp2_only(), false).is_empty());
+    }
+
+    #[test]
+    fn cloning_a_command_shares_its_arguments_and_extending_a_clone_leaves_the_original_alone() {
+        let original = Command::new("SET").arg("k").arg(vec![b'v'; 64 * 1024]);
+        let copy = original.clone();
+        assert!(Arc::ptr_eq(&original.args, &copy.args), "no argument was copied");
+        let longer = copy.clone().arg("EX");
+        assert_eq!(longer.words().len(), 4);
+        assert_eq!(original.words().len(), 3, "the original is not changed");
+        assert_eq!(copy, original);
+        assert_ne!(longer, original);
     }
 
     #[test]

@@ -46,4 +46,7 @@ redis.get("greeting", |r| println!("{r:?}"));
 
 Tested against Redis 7.4 and Valkey 8.1 (single node and cluster) as well as
 scripted servers; see
-[docs/redis.html](../../docs/redis.html).
+[docs/redis.html](../../docs/redis.html). `cargo bench -p hopf-redis --bench
+client` measures allocations and CPU per command, on one node and through a
+cluster, with the results and how to read them in
+[benches/README.md](benches/README.md).

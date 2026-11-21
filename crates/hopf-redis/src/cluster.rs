@@ -137,9 +137,9 @@ enum Target {
     /// The owner of its slot, or any master for a keyless command.
     Owner,
     /// This node, because `MOVED` named it.
-    Node(NodeAddr),
+    Node(Arc<NodeAddr>),
     /// This node, behind an `ASKING`.
-    Asking(NodeAddr),
+    Asking(Arc<NodeAddr>),
 }
 
 struct Job {
@@ -182,6 +182,9 @@ struct Refresh {
 struct State {
     /// Who serves each slot; `None` until the layout is known.
     slots: Vec<Option<Arc<NodeAddr>>>,
+    /// The distinct masters in `slots`, in the order the layout gave them: kept
+    /// with it, so that picking a master for a keyless command scans nothing.
+    masters: Vec<Arc<NodeAddr>>,
     /// A connection to each node in use.
     pool: HashMap<NodeAddr, RedisClient>,
     refresh: Refresh,
@@ -224,6 +227,7 @@ impl RedisCluster {
             config,
             state: Mutex::new(State {
                 slots: vec![None; SLOTS],
+                masters: Vec::new(),
                 pool: HashMap::new(),
                 refresh: Refresh::default(),
                 parked: Vec::new(),
@@ -508,7 +512,7 @@ impl RedisCluster {
         }
         let client = {
             let mut st = inner.state.lock().unwrap();
-            if master_addrs(&st).contains(node) {
+            if st.masters.iter().any(|m| **m == *node) {
                 Some(client_for(inner, &mut st, node))
             } else {
                 None
@@ -531,7 +535,7 @@ impl RedisCluster {
     /// layout; `callback` is called once for each, with the node and its reply.
     /// With no layout known yet there are no masters, and it is never called.
     pub fn send_to_masters(&self, command: &Command, callback: impl FnMut(NodeAddr, Reply) + Send + 'static) {
-        let masters = master_addrs(&self.inner.state.lock().unwrap());
+        let masters: Vec<NodeAddr> = self.inner.state.lock().unwrap().masters.iter().map(|m| (**m).clone()).collect();
         let callback = Arc::new(Mutex::new(callback));
         for node in masters {
             let callback = Arc::clone(&callback);
@@ -553,7 +557,7 @@ impl RedisCluster {
 
     /// The masters in the current layout.
     pub fn masters(&self) -> Vec<(String, u16)> {
-        master_addrs(&self.inner.state.lock().unwrap()).into_iter().map(|a| (a.host, a.port)).collect()
+        self.inner.state.lock().unwrap().masters.iter().map(|a| (a.host.clone(), a.port)).collect()
     }
 
     /// Whether the layout is known.
@@ -589,17 +593,6 @@ impl RedisCluster {
     }
 }
 
-/// The masters in the layout, each once.
-fn master_addrs(st: &State) -> Vec<NodeAddr> {
-    let mut seen: Vec<NodeAddr> = Vec::new();
-    for a in st.slots.iter().flatten() {
-        if !seen.contains(a) {
-            seen.push((**a).clone());
-        }
-    }
-    seen
-}
-
 fn crossslot() -> RedisError {
     RedisError::Server(ServerError {
         code: "CROSSSLOT".into(),
@@ -620,9 +613,12 @@ fn finish_tx(inner: &Inner, callback: TxCallback, result: Result<Option<Vec<Valu
 
 /// The connection to `addr`, made if there is none.
 fn client_for(inner: &Arc<Inner>, st: &mut State, addr: &NodeAddr) -> RedisClient {
-    st.pool
-        .entry(addr.clone())
-        .or_insert_with(|| {
+    // Looked up by reference: the common case allocates nothing.
+    if let Some(client) = st.pool.get(addr) {
+        return client.clone();
+    }
+    let client = {
+        {
             let client = RedisClient::connect(&inner.reactor, inner.config.for_node(addr));
             // A node the health check gave up on may have been replaced by a
             // failover; whether or not any command was waiting to say so, look
@@ -646,31 +642,28 @@ fn client_for(inner: &Arc<Inner>, st: &mut State, addr: &NodeAddr) -> RedisClien
                 }
             });
             client
-        })
-        .clone()
+        }
+    };
+    st.pool.insert(addr.clone(), client.clone());
+    client
 }
 
-/// Where a job goes, or `None` if the layout is not known yet.
-fn route(inner: &Arc<Inner>, target: &Target, slot: Option<u16>) -> Option<(RedisClient, NodeAddr, bool)> {
+/// Where a job goes, or `None` if the layout is not known yet. Picking the
+/// node takes a reference count and a table lookup, and allocates nothing.
+fn route(inner: &Arc<Inner>, target: &Target, slot: Option<u16>) -> Option<(RedisClient, Arc<NodeAddr>, bool)> {
     let mut st = inner.state.lock().unwrap();
     let (addr, asking) = match target {
-        Target::Node(a) => (a.clone(), false),
-        Target::Asking(a) => (a.clone(), true),
+        Target::Node(a) => (Arc::clone(a), false),
+        Target::Asking(a) => (Arc::clone(a), true),
         Target::Owner => match slot {
-            Some(s) => ((**st.slots[s as usize].as_ref()?).clone(), false),
+            Some(s) => (Arc::clone(st.slots[s as usize].as_ref()?), false),
             None => {
                 // No key: any master, in turn.
-                let mut masters: Vec<Arc<NodeAddr>> = Vec::new();
-                for a in st.slots.iter().flatten() {
-                    if !masters.iter().any(|m| **m == **a) {
-                        masters.push(Arc::clone(a));
-                    }
-                }
-                if masters.is_empty() {
+                if st.masters.is_empty() {
                     return None;
                 }
                 st.next_keyless = st.next_keyless.wrapping_add(1);
-                ((*masters[st.next_keyless % masters.len()]).clone(), false)
+                (Arc::clone(&st.masters[st.next_keyless % st.masters.len()]), false)
             }
         },
     };
@@ -735,7 +728,7 @@ fn dispatch(inner: &Arc<Inner>, mut job: Job, fresh: bool) {
 }
 
 /// A node answered, or failed to.
-fn on_reply(inner: &Arc<Inner>, mut job: Job, from: NodeAddr, reply: Reply) {
+fn on_reply(inner: &Arc<Inner>, mut job: Job, from: Arc<NodeAddr>, reply: Reply) {
     let error = match reply {
         Ok(v) => return (job.callback)(Ok(v)),
         Err(e) => e,
@@ -747,11 +740,12 @@ fn on_reply(inner: &Arc<Inner>, mut job: Job, from: NodeAddr, reply: Reply) {
                 if e.code == "MOVED" {
                     // The slot has a new owner for good: remember it, and
                     // refresh the rest of the map.
-                    inner.state.lock().unwrap().slots[slot as usize] = Some(Arc::new(node.clone()));
+                    let node = Arc::new(node);
+                    inner.state.lock().unwrap().slots[slot as usize] = Some(Arc::clone(&node));
                     request_refresh(inner);
                     job.target = Target::Node(node);
                 } else {
-                    job.target = Target::Asking(node);
+                    job.target = Target::Asking(Arc::new(node));
                 }
                 return dispatch(inner, job, true);
             }
@@ -836,7 +830,7 @@ fn dispatch_tx(inner: &Arc<Inner>, mut job: TxJob, fresh: bool) {
     }
 }
 
-fn on_tx_reply(inner: &Arc<Inner>, mut job: TxJob, from: NodeAddr, result: Result<Option<Vec<Value>>, RedisError>) {
+fn on_tx_reply(inner: &Arc<Inner>, mut job: TxJob, from: Arc<NodeAddr>, result: Result<Option<Vec<Value>>, RedisError>) {
     let error = match result {
         Ok(v) => return (job.callback)(Ok(v)),
         Err(e) => e,
@@ -846,11 +840,12 @@ fn on_tx_reply(inner: &Arc<Inner>, mut job: TxJob, from: NodeAddr, result: Resul
             if let Some((slot, node)) = parse_redirect(&e.message) {
                 job.budget -= 1;
                 if e.code == "MOVED" {
-                    inner.state.lock().unwrap().slots[slot as usize] = Some(Arc::new(node.clone()));
+                    let node = Arc::new(node);
+                    inner.state.lock().unwrap().slots[slot as usize] = Some(Arc::clone(&node));
                     request_refresh(inner);
                     job.target = Target::Node(node);
                 } else {
-                    job.target = Target::Asking(node);
+                    job.target = Target::Asking(Arc::new(node));
                 }
                 return dispatch_tx(inner, job, true);
             }
@@ -1110,6 +1105,7 @@ fn apply(inner: &Arc<Inner>, ranges: Vec<SlotRange>) {
             }
         }
         st.slots = slots;
+        st.masters = masters.clone();
         // Connections to nodes that are no longer masters are closed; those that
         // are keep theirs, and a new master is connected to when first needed.
         let keep: Vec<NodeAddr> = masters.iter().map(|m| (**m).clone()).collect();
