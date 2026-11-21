@@ -40,6 +40,7 @@ use hopf_dns::DnsResolver;
 use crate::config::RedisConfig;
 use crate::error::RedisError;
 use crate::pubsub::{self, Desired, Push, SubscriberHandler};
+use crate::argstream::{ArgFactory, ArgSource, SourceCtl, SourceRead, SourceWaker, StreamArg};
 use crate::collect::{Collector, TooLarge};
 use crate::resp::{
     encode_command, encode_words, AggKind, Feed, Flow, ReplyKind, ReplySink, RespParser, Scalar, ServerError, StrKind,
@@ -57,7 +58,10 @@ pub type Callback = Box<dyn FnOnce(Reply) + Send>;
 /// copied when a cluster client keeps the command to send it again.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Command {
+    /// The arguments, name first; a streamed argument is an empty placeholder.
     args: Arc<Vec<Vec<u8>>>,
+    /// The streamed arguments, by position in `args`.
+    streams: Option<Arc<Vec<(usize, StreamArg)>>>,
 }
 
 impl Command {
@@ -65,6 +69,7 @@ impl Command {
     pub fn new(name: impl AsRef<[u8]>) -> Self {
         Self {
             args: Arc::new(vec![name.as_ref().to_vec()]),
+            streams: None,
         }
     }
 
@@ -87,16 +92,71 @@ impl Command {
         self
     }
 
-    /// The command's words, name first.
+    /// Add an argument whose bytes are pulled from a source as the connection
+    /// takes them, so a value of any size is never held whole: see [`StreamArg`].
+    /// A streamed argument cannot be a key, which a cluster must read to route the
+    /// command, and cannot be in a transaction.
+    pub fn arg_stream(mut self, arg: StreamArg) -> Self {
+        let at = self.args.len();
+        Arc::make_mut(&mut self.args).push(Vec::new());
+        Arc::make_mut(self.streams.get_or_insert_with(Default::default)).push((at, arg));
+        self
+    }
+
+    /// The command's words, name first. A streamed argument is an empty
+    /// placeholder here: see [`is_streamed`](Self::is_streamed).
     pub fn words(&self) -> &[Vec<u8>] {
         &self.args
     }
 
-    /// The command as it goes on the wire.
-    pub fn encode(&self) -> Vec<u8> {
+    /// Whether the word at `index` is a streamed argument.
+    pub fn is_streamed(&self, index: usize) -> bool {
+        self.streams.as_ref().is_some_and(|s| s.iter().any(|(at, _)| *at == index))
+    }
+
+    /// Whether any argument is streamed.
+    pub fn has_streams(&self) -> bool {
+        self.streams.is_some()
+    }
+
+    /// The command as it goes on the wire: for one with no streamed argument.
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         encode_words(&self.args, &mut out);
         out
+    }
+
+    /// The command ready to be written: one buffer, or, with a streamed
+    /// argument, the buffers before and after it and the stream between them.
+    pub(crate) fn encoded(&self) -> Encoded {
+        let Some(streams) = &self.streams else {
+            return Encoded::Plain(self.encode());
+        };
+        let mut parts = VecDeque::new();
+        let mut head = format!("*{}\r\n", self.args.len()).into_bytes();
+        for (i, word) in self.args.iter().enumerate() {
+            match streams.iter().find(|(at, _)| *at == i) {
+                Some((_, arg)) => {
+                    head.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+                    parts.push_back(Part::Bytes(std::mem::take(&mut head), 0));
+                    parts.push_back(Part::Stream {
+                        len: arg.len(),
+                        factory: Arc::clone(arg.factory()),
+                    });
+                    // The CRLF that ends the argument follows its bytes.
+                    head.extend_from_slice(b"\r\n");
+                }
+                None => {
+                    head.extend_from_slice(format!("${}\r\n", word.len()).as_bytes());
+                    head.extend_from_slice(word);
+                    head.extend_from_slice(b"\r\n");
+                }
+            }
+        }
+        if !head.is_empty() {
+            parts.push_back(Part::Bytes(head, 0));
+        }
+        Encoded::Streamed(parts)
     }
 }
 
@@ -217,6 +277,9 @@ pub(crate) struct Cmd {
     /// The sink is being called, on the reactor.
     in_sink: AtomicBool,
     cancelled: AtomicBool,
+    /// A streamed argument of the command is being written: the connection holds
+    /// part of it, and cannot be used for anything else until it is done.
+    writing: AtomicBool,
     /// Stops the command's first timeout timer once it has ended. Set once, so
     /// no lock is needed for the commands that are only timed from issue to reply.
     timer: OnceLock<Arc<AtomicBool>>,
@@ -238,6 +301,7 @@ impl Cmd {
             flow: AtomicU8::new(FLOW_RUNNING),
             in_sink: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
+            writing: AtomicBool::new(false),
             timer: OnceLock::new(),
             rearmed: streaming.then(|| Mutex::new(None)),
         })
@@ -256,6 +320,12 @@ impl Cmd {
 
     fn take_sink(&self) -> Option<Box<dyn CmdSink>> {
         self.sink.lock().unwrap().take()
+    }
+
+    /// The command has ended (it timed out, say), so what is left of it is not
+    /// wanted.
+    fn ended(&self) -> bool {
+        self.sink.lock().unwrap().is_none()
     }
 
     fn touch(&self) {
@@ -399,7 +469,7 @@ struct Sent {
 /// Not yet written: waiting for the connection.
 struct Waiting {
     qid: u64,
-    bytes: Vec<u8>,
+    bytes: Encoded,
     cmd: Arc<Cmd>,
     held: bool,
 }
@@ -424,8 +494,13 @@ pub(crate) struct State {
     pub(crate) handle: Option<ConnHandle>,
     waiting: VecDeque<Waiting>,
     pending: VecDeque<Sent>,
-    /// Bytes for the connection not yet handed to it.
-    outbox: Vec<u8>,
+    /// What is to be written to the connection, in order.
+    wq: WriteQ,
+    /// The streamed command being written, between blocks.
+    active: Option<Box<Active>>,
+    /// A block has been written and the next waits for the outbound buffer to
+    /// drain.
+    drain_wait: bool,
     flush_scheduled: bool,
     /// Addresses still to try for this attempt.
     addrs: VecDeque<SocketAddr>,
@@ -482,7 +557,9 @@ pub(crate) fn start(reactor: &ReactorHandle, config: RedisConfig, sub: Option<Bo
             handle: None,
             waiting: VecDeque::new(),
             pending: VecDeque::new(),
-            outbox: Vec::new(),
+            wq: WriteQ::default(),
+            active: None,
+            drain_wait: false,
             flush_scheduled: false,
             addrs: VecDeque::new(),
             resp3: false,
@@ -536,12 +613,22 @@ pub(crate) fn write_raw(inner: &Arc<Inner>, bytes: Vec<u8>) {
         if st.phase != Phase::Ready {
             return;
         }
-        st.outbox.extend_from_slice(&bytes);
-        !std::mem::replace(&mut st.flush_scheduled, true)
+        st.wq.push_plain(bytes);
+        !(st.drain_wait || st.active.is_some() || std::mem::replace(&mut st.flush_scheduled, true))
     };
     if need_flush {
         flush(inner);
     }
+}
+
+/// Forget what was to be written: the connection it was for has gone.
+fn reset_writes(st: &mut State) {
+    st.wq.clear();
+    if let Some(active) = st.active.take() {
+        active.cmd.writing.store(false, Ordering::SeqCst);
+    }
+    st.drain_wait = false;
+    st.flush_scheduled = false;
 }
 
 /// Close the connection, fail what is waiting, and refuse later commands.
@@ -553,7 +640,7 @@ pub(crate) fn close(inner: &Arc<Inner>) {
         st.in_multi = false;
         st.read_paused = false;
         st.conn_id += 1;
-        st.outbox.clear();
+        reset_writes(&mut st);
         (st.handle.take(), std::mem::take(&mut st.waiting), std::mem::take(&mut st.pending))
     };
     if let Some(h) = handle {
@@ -635,7 +722,7 @@ impl RedisClient {
         }
         let mut bytes = Vec::new();
         encode_command(words, &mut bytes);
-        submit_timed(&self.inner, vec![(bytes, self.collecting(callback))], Deadline::Default, false, false);
+        submit_timed(&self.inner, vec![(Encoded::Plain(bytes), self.collecting(callback))], Deadline::Default, false, false);
     }
 
     /// Send several commands as one write, in order, with nothing from another
@@ -699,7 +786,7 @@ impl RedisClient {
     /// if `streaming`, for its handle.
     fn send_one(&self, command: &Command, sink: Box<dyn CmdSink>, deadline: Deadline, streaming: bool) -> Option<Arc<Cmd>> {
         let refused = command.words().first().is_some_and(|w| pubsub::is_subscription_command(w));
-        submit_timed(&self.inner, vec![(command.encode(), sink)], deadline, streaming, refused)
+        submit_timed(&self.inner, vec![(command.encoded(), sink)], deadline, streaming, refused)
     }
 
     /// Whether the connection is up and past its handshake.
@@ -732,7 +819,7 @@ impl RedisClient {
         let refused = commands
             .iter()
             .any(|(c, _)| c.words().first().is_some_and(|w| pubsub::is_subscription_command(w)));
-        let items = commands.into_iter().map(|(c, cb)| (c.encode(), self.collecting(cb))).collect();
+        let items = commands.into_iter().map(|(c, cb)| (c.encoded(), self.collecting(cb))).collect();
         submit_timed(&self.inner, items, deadline, false, refused);
     }
 
@@ -887,7 +974,7 @@ fn command_name(encoded: &[u8]) -> Option<Vec<u8>> {
 /// Track whether the connection is inside a transaction, from what is sent.
 fn note_transaction_state(st: &mut State, batch: &[Waiting]) {
     for w in batch {
-        match command_name(&w.bytes).as_deref() {
+        match w.bytes.name().as_deref() {
             Some(b"MULTI") => st.in_multi = true,
             Some(b"EXEC") | Some(b"DISCARD") => st.in_multi = false,
             _ => {}
@@ -900,7 +987,7 @@ fn note_transaction_state(st: &mut State, batch: &[Waiting]) {
 /// `streaming`, whether or not it was sent.
 fn submit_timed(
     inner: &Arc<Inner>,
-    items: Vec<(Vec<u8>, Box<dyn CmdSink>)>,
+    items: Vec<(Encoded, Box<dyn CmdSink>)>,
     deadline: Deadline,
     streaming: bool,
     refused: bool,
@@ -921,7 +1008,10 @@ fn submit_timed(
             Deadline::Extra(_) | Deadline::Never => true,
             Deadline::After(d) => inner.config.command_timeout.is_none_or(|t| d > t),
         };
-        let cmd = Cmd::new(sink, streaming, limit);
+        // A command with a streamed argument is timed by activity too: it may
+        // take minutes to write.
+        let by_activity = streaming || matches!(bytes, Encoded::Streamed(_));
+        let cmd = Cmd::new(sink, by_activity, limit);
         prepared.push(Waiting { qid, bytes, cmd, held });
     }
     // A streaming command is sent alone, and its caller is given it.
@@ -971,13 +1061,21 @@ fn submit_timed(
                         st.last_rx = Instant::now();
                     }
                     for w in prepared {
-                        append_to_outbox(&mut st.outbox, w.bytes);
+                        match w.bytes {
+                            Encoded::Plain(bytes) => st.wq.push_plain(bytes),
+                            Encoded::Streamed(parts) => st.wq.push_streamed(Streamed {
+                                cmd: Arc::clone(&w.cmd),
+                                parts,
+                            }),
+                        }
                         st.pending.push_back(Sent {
                             kind: Kind::User(w.cmd),
                             held: w.held,
                         });
                     }
-                    if std::mem::replace(&mut st.flush_scheduled, true) {
+                    // A block that is draining, or a streamed command being written,
+                    // carries on to what was just queued by itself.
+                    if st.drain_wait || st.active.is_some() || std::mem::replace(&mut st.flush_scheduled, true) {
                         Next::Queued
                     } else {
                         Next::Flush
@@ -1087,7 +1185,9 @@ fn arm_health(inner: &Arc<Inner>, conn_id: u64) {
                     let watched = st.phase == Phase::Handshaking
                         || (st.pending.iter().any(|s| matches!(s.kind, Kind::User(_)))
                             && !st.pending.iter().any(|s| s.held)
-                            && !st.read_paused);
+                            && !st.read_paused
+                            // The server waits for the rest of a command being written.
+                            && st.active.is_none());
                     if watched && st.last_rx.elapsed() >= interval {
                         Act::Drop
                     } else {
@@ -1116,18 +1216,347 @@ fn arm_health(inner: &Arc<Inner>, conn_id: u64) {
     );
 }
 
-/// Add an encoded command to the outbox. When the outbox is empty, which is
-/// the usual case, the command's own buffer becomes the outbox: a large value
-/// is not copied again on its way to the connection.
-fn append_to_outbox(outbox: &mut Vec<u8>, bytes: Vec<u8>) {
-    if outbox.is_empty() {
-        *outbox = bytes;
-    } else {
-        outbox.extend_from_slice(&bytes);
+/// What is written for a command.
+pub(crate) enum Encoded {
+    /// All in memory, as one buffer.
+    Plain(Vec<u8>),
+    /// With a streamed argument: the buffers and streams in the order they go.
+    Streamed(VecDeque<Part>),
+}
+
+impl Encoded {
+    /// The name of the command, in upper case.
+    fn name(&self) -> Option<Vec<u8>> {
+        match self {
+            Encoded::Plain(bytes) => command_name(bytes),
+            Encoded::Streamed(parts) => match parts.front() {
+                Some(Part::Bytes(head, _)) => command_name(head),
+                _ => None,
+            },
+        }
     }
 }
 
-/// Hand what is in the outbox to the connection, on the reactor.
+/// A piece of a command with a streamed argument.
+pub(crate) enum Part {
+    /// Bytes in memory, from an offset, which is where a large one has got to.
+    Bytes(Vec<u8>, usize),
+    /// A streamed argument of `len` bytes, opened when the command is written.
+    Stream { len: u64, factory: Arc<dyn ArgFactory> },
+}
+
+/// A command with a streamed argument, waiting to be written.
+pub(crate) struct Streamed {
+    cmd: Arc<Cmd>,
+    parts: VecDeque<Part>,
+}
+
+/// What is to be written, in order. The plain commands, which are nearly all of
+/// them, share one buffer as they always did; a command with a streamed argument
+/// splits it, and what is submitted after it waits behind it.
+#[derive(Default)]
+struct WriteQ {
+    /// Plain bytes to go first, from `from`.
+    head: Vec<u8>,
+    from: usize,
+    /// Streamed commands, each followed by the plain bytes submitted after it and
+    /// before the next.
+    rest: VecDeque<(Streamed, Vec<u8>)>,
+}
+
+impl WriteQ {
+    fn push_plain(&mut self, bytes: Vec<u8>) {
+        let target = match self.rest.back_mut() {
+            Some((_, tail)) => tail,
+            None => {
+                if self.head.is_empty() {
+                    // The common case: the command's own buffer becomes the queue,
+                    // so a large value is not copied again.
+                    self.head = bytes;
+                    self.from = 0;
+                    return;
+                }
+                &mut self.head
+            }
+        };
+        if target.is_empty() {
+            *target = bytes;
+        } else {
+            target.extend_from_slice(&bytes);
+        }
+    }
+
+    fn push_streamed(&mut self, streamed: Streamed) {
+        self.rest.push_back((streamed, Vec::new()));
+    }
+
+    fn clear(&mut self) {
+        self.head = Vec::new();
+        self.from = 0;
+        self.rest.clear();
+    }
+}
+
+/// A streamed command being written: its sources are open, and some of it has
+/// been sent.
+pub(crate) struct Active {
+    cmd: Arc<Cmd>,
+    parts: VecDeque<ActivePart>,
+    /// The streamed argument being read, and how much of it is still to come.
+    cur: Option<(Box<dyn ArgSource>, u64)>,
+    waker: SourceWaker,
+    buf: Vec<u8>,
+}
+
+enum ActivePart {
+    Bytes(Vec<u8>, usize),
+    Stream { len: u64, source: Box<dyn ArgSource> },
+}
+
+/// Plain bytes up to this much are written at once, without waiting for the
+/// connection's outbound buffer to drain.
+const SMALL_WRITE: usize = 64 * 1024;
+/// The most written before waiting for the outbound buffer to drain: well within
+/// its default limit of 4 MiB, so a large command never overflows it.
+const WRITE_BLOCK: usize = 1024 * 1024;
+/// How much of a streamed argument is read at a time.
+const STREAM_BLOCK: usize = 256 * 1024;
+
+/// Write what is queued for the connection, on the reactor.
+///
+/// Small writes go straight to the connection. A large buffer, or a streamed
+/// argument, goes a block at a time with the next not sent until the buffer has
+/// drained (`from_drain` says it has): memory stays constant however large the
+/// command, and the connection's outbound buffer is never overflowed. A streamed
+/// argument whose source has nothing yet waits to be woken.
+fn drain_writes(inner: &Arc<Inner>, conn_id: u64, ep: &mut dyn Endpoint, from_drain: bool) {
+    {
+        let mut st = inner.state.lock().unwrap();
+        if st.conn_id != conn_id || st.phase != Phase::Ready {
+            return;
+        }
+        if from_drain {
+            st.drain_wait = false;
+        } else if st.drain_wait {
+            // A block is still draining; its callback carries on.
+            return;
+        }
+        st.flush_scheduled = false;
+    }
+    loop {
+        enum Step {
+            Send(Vec<u8>, usize),
+            Active(Box<Active>),
+            Start(Streamed),
+            Done,
+        }
+        let step = {
+            let mut st = inner.state.lock().unwrap();
+            if st.conn_id != conn_id || st.phase != Phase::Ready {
+                return;
+            }
+            if let Some(active) = st.active.take() {
+                Step::Active(active)
+            } else if st.wq.head.len() > st.wq.from {
+                let from = std::mem::take(&mut st.wq.from);
+                Step::Send(std::mem::take(&mut st.wq.head), from)
+            } else if let Some((streamed, tail)) = st.wq.rest.pop_front() {
+                st.wq.head = tail;
+                st.wq.from = 0;
+                Step::Start(streamed)
+            } else {
+                Step::Done
+            }
+        };
+        match step {
+            Step::Done => return,
+            Step::Send(bytes, from) => {
+                if bytes.len() - from <= SMALL_WRITE {
+                    ep.send(&bytes[from..]);
+                    continue;
+                }
+                let n = (bytes.len() - from).min(WRITE_BLOCK);
+                ep.send(&bytes[from..from + n]);
+                let more = {
+                    let mut st = inner.state.lock().unwrap();
+                    if st.conn_id != conn_id {
+                        return;
+                    }
+                    if from + n < bytes.len() {
+                        // What is left goes first, then whatever was queued meanwhile.
+                        let newer = std::mem::replace(&mut st.wq.head, bytes);
+                        st.wq.from = from + n;
+                        st.wq.head.extend_from_slice(&newer);
+                    }
+                    !st.wq.head.is_empty() || st.active.is_some() || !st.wq.rest.is_empty()
+                };
+                if more {
+                    wait_for_drain(inner, conn_id, ep);
+                    return;
+                }
+            }
+            Step::Start(streamed) => match start_streamed(inner, streamed) {
+                Some(active) => {
+                    let mut st = inner.state.lock().unwrap();
+                    st.active = Some(active);
+                }
+                None => continue,
+            },
+            Step::Active(active) => match pump(inner, conn_id, ep, active) {
+                Pump::Finished => continue,
+                Pump::Drain(active) => {
+                    inner.state.lock().unwrap().active = Some(active);
+                    wait_for_drain(inner, conn_id, ep);
+                    return;
+                }
+                Pump::Parked(active) => {
+                    inner.state.lock().unwrap().active = Some(active);
+                    return;
+                }
+                Pump::Failed => return,
+            },
+        }
+    }
+}
+
+/// Ask to be called again when the connection's outbound buffer has drained.
+fn wait_for_drain(inner: &Arc<Inner>, conn_id: u64, ep: &mut dyn Endpoint) {
+    inner.state.lock().unwrap().drain_wait = true;
+    let inner = Arc::clone(inner);
+    ep.on_write_ready(Some(Box::new(move |ep| drain_writes(&inner, conn_id, ep, true))));
+}
+
+/// Open the sources of a streamed command and make it the one being written. If
+/// one will not open, the command fails, and nothing of it has been written.
+fn start_streamed(inner: &Arc<Inner>, streamed: Streamed) -> Option<Box<Active>> {
+    let Streamed { cmd, parts } = streamed;
+    let fail = |why: Option<RedisError>| {
+        // Its reply will never come: take its place in the queue away.
+        let mut st = inner.state.lock().unwrap();
+        st.pending.retain(|s| !matches!(&s.kind, Kind::User(c) if Arc::ptr_eq(c, &cmd)));
+        drop(st);
+        if let Some(e) = why {
+            end_cmd(inner, &cmd, Outcome::Failed(e));
+        }
+    };
+    if cmd.ended() {
+        // It timed out while it waited behind others: do not send a value for
+        // nobody.
+        fail(None);
+        return None;
+    }
+    let mut opened = VecDeque::with_capacity(parts.len());
+    for part in parts {
+        match part {
+            Part::Bytes(b, from) => opened.push_back(ActivePart::Bytes(b, from)),
+            Part::Stream { len, factory } => match factory.open() {
+                Ok(source) => opened.push_back(ActivePart::Stream { len, source }),
+                Err(e) => {
+                    fail(Some(e));
+                    return None;
+                }
+            },
+        }
+    }
+    cmd.writing.store(true, Ordering::SeqCst);
+    cmd.touch();
+    let (weak, conn_id) = (Arc::downgrade(inner), inner.state.lock().unwrap().conn_id);
+    let waker = SourceWaker::new(move || {
+        if let Some(inner) = weak.upgrade() {
+            let inner2 = Arc::clone(&inner);
+            inner.reactor.execute(Box::new(move || {
+                let handle = {
+                    let st = inner2.state.lock().unwrap();
+                    (st.conn_id == conn_id).then(|| st.handle.clone()).flatten()
+                };
+                if let Some(h) = handle {
+                    let inner3 = Arc::clone(&inner2);
+                    h.with_endpoint(move |ep| drain_writes(&inner3, conn_id, ep, false));
+                }
+            }));
+        }
+    });
+    Some(Box::new(Active {
+        cmd,
+        parts: opened,
+        cur: None,
+        waker,
+        buf: vec![0; STREAM_BLOCK],
+    }))
+}
+
+enum Pump {
+    /// All of the command is written.
+    Finished,
+    /// A block is sent: wait for the buffer to drain.
+    Drain(Box<Active>),
+    /// A source has nothing yet: wait to be woken.
+    Parked(Box<Active>),
+    /// The command failed, and the connection with it.
+    Failed,
+}
+
+/// Write the next of a streamed command: one block, then wait.
+fn pump(inner: &Arc<Inner>, conn_id: u64, ep: &mut dyn Endpoint, mut a: Box<Active>) -> Pump {
+    loop {
+        if let Some((source, left)) = a.cur.as_mut() {
+            if *left == 0 {
+                a.cur = None;
+                continue;
+            }
+            let want = (*left).min(STREAM_BLOCK as u64) as usize;
+            let mut ctl = SourceCtl::new(&a.waker);
+            match source.read(&mut a.buf[..want], &mut ctl) {
+                SourceRead::Data(n) if n > 0 && n <= want => {
+                    ep.send(&a.buf[..n]);
+                    *left -= n as u64;
+                    a.cmd.touch();
+                    return Pump::Drain(a);
+                }
+                SourceRead::Data(_) => {
+                    return fail_write(inner, conn_id, ep, &a, RedisError::Protocol("a source returned a bad length".into()))
+                }
+                SourceRead::Pending => return Pump::Parked(a),
+                SourceRead::Failed(e) => return fail_write(inner, conn_id, ep, &a, e),
+            }
+        }
+        match a.parts.pop_front() {
+            None => {
+                a.cmd.writing.store(false, Ordering::SeqCst);
+                a.cmd.touch();
+                return Pump::Finished;
+            }
+            Some(ActivePart::Bytes(bytes, from)) => {
+                let len = bytes.len() - from;
+                if len <= SMALL_WRITE {
+                    ep.send(&bytes[from..]);
+                } else {
+                    let n = len.min(WRITE_BLOCK);
+                    ep.send(&bytes[from..from + n]);
+                    if n < len {
+                        a.parts.push_front(ActivePart::Bytes(bytes, from + n));
+                    }
+                    a.cmd.touch();
+                    return Pump::Drain(a);
+                }
+            }
+            Some(ActivePart::Stream { len, source }) => a.cur = Some((source, len)),
+        }
+    }
+}
+
+/// A streamed argument failed after the start of the command was written: the
+/// command fails with why, and the connection, which can be recovered no other
+/// way, is closed.
+fn fail_write(inner: &Arc<Inner>, conn_id: u64, ep: &mut dyn Endpoint, a: &Active, why: RedisError) -> Pump {
+    a.cmd.writing.store(false, Ordering::SeqCst);
+    end_cmd(inner, &a.cmd, Outcome::Failed(why));
+    lost(inner, conn_id, "a streamed argument failed part-way, so the connection was closed");
+    ep.close();
+    Pump::Failed
+}
+
+/// Hand what is queued to the connection, on the reactor.
 fn flush(inner: &Arc<Inner>) {
     let (handle, conn_id) = {
         let st = inner.state.lock().unwrap();
@@ -1137,19 +1566,7 @@ fn flush(inner: &Arc<Inner>) {
         return;
     };
     let inner = Arc::clone(inner);
-    handle.with_endpoint(move |ep| {
-        let bytes = {
-            let mut st = inner.state.lock().unwrap();
-            if st.conn_id != conn_id {
-                return;
-            }
-            st.flush_scheduled = false;
-            std::mem::take(&mut st.outbox)
-        };
-        if !bytes.is_empty() {
-            ep.send(&bytes);
-        }
-    });
+    handle.with_endpoint(move |ep| drain_writes(&inner, conn_id, ep, false));
 }
 
 /// A command's timer fired: end it if it is still unanswered. For the caller's
@@ -1177,6 +1594,18 @@ fn expire(inner: &Arc<Inner>, cmd: &Arc<Cmd>, qid: u64) {
         }
     }
     end_cmd(inner, cmd, Outcome::Failed(RedisError::Timeout));
+    // Part of a streamed argument is on the wire and the rest will not follow:
+    // the connection cannot be used again, so it is closed.
+    if cmd.writing.swap(false, Ordering::SeqCst) {
+        let (conn_id, handle) = {
+            let st = inner.state.lock().unwrap();
+            (st.conn_id, st.handle.clone())
+        };
+        lost(inner, conn_id, "a streamed argument stopped part-way, so the connection was closed");
+        if let Some(h) = handle {
+            h.close();
+        }
+    }
 }
 
 /// The resolver for a host name: the configured one, or one made on first use.
@@ -1295,8 +1724,7 @@ fn connect_failed(inner: &Arc<Inner>, conn_id: u64, error: RedisError) {
         st.in_multi = false;
         st.read_paused = false;
         st.handle = None;
-        st.outbox.clear();
-        st.flush_scheduled = false;
+        reset_writes(&mut st);
         st.failures += 1;
         st.retry_at = Some(
             Instant::now() + backoff(inner.config.backoff_initial, inner.config.backoff_max, st.failures),
@@ -1328,8 +1756,7 @@ pub(crate) fn lost(inner: &Arc<Inner>, conn_id: u64, reason: &str) {
             st.in_multi = false;
             st.read_paused = false;
             st.handle = None;
-            st.outbox.clear();
-            st.flush_scheduled = false;
+            reset_writes(&mut st);
             st.resp3 = false;
             if was_ready && inner.sub.is_none() {
                 st.failures = 0;
@@ -1609,7 +2036,7 @@ impl Conn {
         if inner.sub.is_some() {
             return pubsub::sub_ready(inner, self.conn_id, endpoint);
         }
-        let bytes = {
+        {
             let mut st = inner.state.lock().unwrap();
             if st.conn_id != self.conn_id {
                 return;
@@ -1619,18 +2046,20 @@ impl Conn {
             st.retry_at = None;
             st.last_error = None;
             while let Some(w) = st.waiting.pop_front() {
-                append_to_outbox(&mut st.outbox, w.bytes);
+                match w.bytes {
+                    Encoded::Plain(bytes) => st.wq.push_plain(bytes),
+                    Encoded::Streamed(parts) => st.wq.push_streamed(Streamed {
+                        cmd: Arc::clone(&w.cmd),
+                        parts,
+                    }),
+                }
                 st.pending.push_back(Sent {
                     kind: Kind::User(w.cmd),
                     held: w.held,
                 });
             }
-            st.flush_scheduled = false;
-            std::mem::take(&mut st.outbox)
         };
-        if !bytes.is_empty() {
-            endpoint.send(&bytes);
-        }
+        drain_writes(inner, self.conn_id, endpoint, false);
     }
 
     /// The handshake failed for good: fail what waited and drop the connection.
@@ -2012,6 +2441,47 @@ mod tests {
         assert_eq!(original.words().len(), 3, "the original is not changed");
         assert_eq!(copy, original);
         assert_ne!(longer, original);
+    }
+
+    #[test]
+    fn a_command_with_a_streamed_argument_is_written_in_parts_that_add_up_to_the_command() {
+        let arg = StreamArg::from_fn(5, || Err(RedisError::Closed));
+        // SET k <5 streamed bytes> EX 10
+        let command = Command::new("SET").arg("k").arg_stream(arg).arg("EX").arg("10");
+        assert!(command.has_streams() && command.is_streamed(2) && !command.is_streamed(1));
+        let Encoded::Streamed(parts) = command.encoded() else {
+            panic!("streamed");
+        };
+        let shape: Vec<String> = parts
+            .iter()
+            .map(|p| match p {
+                Part::Bytes(b, 0) => format!("{:?}", String::from_utf8_lossy(b)),
+                Part::Bytes(..) => "bytes from an offset".into(),
+                Part::Stream { len, .. } => format!("<{len} streamed>"),
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                r#""*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\n""#.to_string(),
+                "<5 streamed>".to_string(),
+                r#""\r\n$2\r\nEX\r\n$2\r\n10\r\n""#.to_string(),
+            ],
+            "the CRLF that ends the streamed argument leads what follows it"
+        );
+        // One with no streamed argument is one buffer.
+        assert!(matches!(Command::new("GET").arg("k").encoded(), Encoded::Plain(_)));
+        // And what is submitted after a streamed command waits behind it, in order.
+        let mut q = WriteQ::default();
+        q.push_plain(b"one".to_vec());
+        q.push_plain(b"two".to_vec());
+        let (cmd, _) = (Cmd::new(Box::new(Streaming { sink: Nothing }), true, None), ());
+        q.push_streamed(Streamed { cmd, parts: VecDeque::new() });
+        q.push_plain(b"three".to_vec());
+        q.push_plain(b"four".to_vec());
+        assert_eq!(q.head, b"onetwo");
+        assert_eq!(q.rest.len(), 1);
+        assert_eq!(q.rest[0].1, b"threefour", "behind the stream, not before it");
     }
 
     #[test]

@@ -179,6 +179,33 @@ redis.get_stream("big", ToFile { out });</code></pre>
 <li><strong>Timeouts.</strong> The command timeout of a streaming command is for the first byte and then for silence: every chunk resets it, and it stops while the consumer is paused. A reply that takes minutes in all is fine; one that stops half-way times out. The connection's health check (<code>ping_interval</code>) likewise leaves a connection alone while the consumer has paused it.</li>
 <li><strong>Re-entrancy.</strong> A sink may close the client, or issue more commands, from inside its own callback.</li>
 </ul>
+<h2 id="streaming-arguments">Streaming large values out</h2>
+<p>The same holds for what is sent. <code>Command::arg_stream(StreamArg::new(len, factory))</code> adds an argument whose bytes are pulled from a source as the connection can take them, so a value of any size is never held whole. RESP puts an argument's length before its bytes, so the length is declared up front, and a source that gives fewer bytes fails the command.</p>
+<pre class="rust,ignore"><code>use hopf_redis::{ArgSource, Command, SourceCtl, SourceRead, StreamArg};
+
+struct FromFile { /* a file, positioned at the start */ }
+
+impl ArgSource for FromFile {
+    fn read(&amp;mut self, out: &amp;mut [u8], ctl: &amp;mut SourceCtl&lt;'_&gt;) -&gt; SourceRead {
+        // Never block the reactor. With nothing ready yet, keep ctl.waker(),
+        // arrange for waker.wake() when there is, and say so:
+        //     return SourceRead::Pending;
+        SourceRead::Data(n)   // n &gt; 0 bytes written to the start of out
+    }
+}
+
+let command = Command::new("SET").arg("key")
+    .arg_stream(StreamArg::from_fn(len, || Ok(Box::new(FromFile::open()?))));
+redis.send(&amp;command, |reply| { /* ... */ });</code></pre>
+<ul>
+<li><strong>One block at a time.</strong> A block is read from the source, written, and the next read only when the connection's outbound buffer has drained, so memory is one block (256 KiB) however large the value, and the outbound buffer is never overflowed. The same applies to a large value that is in memory: a command bigger than the outbound buffer (4 MiB by default) used to fail the connection with <code>outbound buffer overflow</code>, and is now written in blocks.</li>
+<li><strong>Pending and waking.</strong> A source runs on the reactor and must not block. One with nothing yet returns <code>Pending</code> after arranging for the <code>SourceWaker</code> from <code>ctl.waker()</code> to be woken, from any thread, when it has: the outbound mirror of a reply sink's <code>Pause</code> and <code>resume</code>. A wake that comes when there is nothing to do just reads the source again.</li>
+<li><strong>One attempt, one source.</strong> A command can be sent more than once: a cluster follows <code>MOVED</code> and <code>ASK</code>, and a client reconnects. The argument is therefore a factory that opens a fresh source for each attempt (a file reopens, a generator restarts). <code>StreamArg::once</code> takes a source that cannot be repeated: a second attempt fails with <code>NotRepeatable</code> instead of sending a short value. A source that will not open fails the command with its error, and nothing of the command was written.</li>
+<li><strong>In order.</strong> Replies come back in the order commands were sent, and so do the writes: commands submitted while a value is being written wait behind it, and a connection is occupied by an upload until it is done. Use a connection of its own for a large one.</li>
+<li><strong>A failed upload costs the connection.</strong> If a source fails, or stops, after the start of the command is on the wire, the rest cannot be sent and nothing can be taken back, so the connection is closed: the command fails with the source's error, what was pipelined behind it with <code>ConnectionLost</code>, and the next command dials afresh.</li>
+<li><strong>Timeouts.</strong> The command timeout of a command with a streamed argument is for progress, not for the whole upload: each block written resets it, and an upload that stops is a <code>Timeout</code> (and costs the connection). The health check leaves the connection alone while an upload is being written, since the server is waiting for the rest of the command.</li>
+<li><strong>In a cluster.</strong> A streamed argument cannot be a key, which the cluster reads to route the command, and cannot be in a transaction. Redirections and retries open a fresh source.</li>
+</ul>
 <h2 id="transactions-and-scripts">Transactions and scripts</h2>
 <p><code>transaction(commands, callback)</code> writes <code>MULTI</code>, the commands and <code>EXEC</code> as one batch, so nothing from another caller can come between them on the shared connection. The callback gets each command's result in order, or <code>None</code> if <code>EXEC</code> was aborted by a watched key. A command that fails when it runs is a <code>Value::Error</code> in the list; one refused when queued fails the transaction with that error.</p>
 <p><code>watch</code>, <code>unwatch</code>, <code>multi</code>, <code>exec</code> and <code>discard</code> act on the <em>connection</em>, which every user of a client shares, so another caller's commands can run in between. For a watch-then-transact sequence use a client of your own. <code>eval</code> and <code>evalsha</code> run a script; <code>EVALSHA</code> answers <code>NOSCRIPT</code> for one the server has not seen, so <code>script_load</code> it and try again.</p>

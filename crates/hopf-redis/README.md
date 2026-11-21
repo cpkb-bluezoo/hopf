@@ -36,6 +36,12 @@ speaking RESP2 and RESP3.
   collected; a sink can pause it, or discard the rest of a reply in constant
   memory. A reply nobody waits for, such as a timed-out command's, is discarded
   as it arrives, however large.
+- **Streaming values out.** `Command::arg_stream` takes an argument pulled from a
+  source a block at a time, so a value of any size is never held whole; the
+  source is opened afresh for each attempt, so redirections and reconnections
+  work, and one that cannot be repeated fails with `NotRepeatable` rather than
+  sending a short value. A command larger than the outbound buffer is written in
+  blocks too.
 - **Streaming replies.** `send_streaming` and the shape sinks (`BulkSink`,
   `ElementsSink`, `KeysSink`, `FieldsSink`) deliver a value of any size as
   chunks in constant memory, with `Pause` and `StreamHandle::resume` for

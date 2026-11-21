@@ -110,7 +110,7 @@ pub trait BulkHandler: Send {
 }
 
 /// A [`ReplySink`] for a reply that is one string, or null. See the
-/// [module documentation](self).
+/// [crate documentation](crate).
 pub struct BulkSink<H> {
     handler: H,
     common: Common,
@@ -208,7 +208,7 @@ pub trait ElementsHandler: Send {
 }
 
 /// A [`ReplySink`] for a reply that is an array of payload strings. See the
-/// [module documentation](self).
+/// [crate documentation](crate).
 pub struct ElementsSink<H> {
     handler: H,
     common: Common,
@@ -349,7 +349,7 @@ pub trait KeysHandler: Send {
 }
 
 /// A [`ReplySink`] for a reply that is an array of identifiers, each delivered
-/// whole. See the [module documentation](self).
+/// whole. See the [crate documentation](crate).
 pub struct KeysSink<H> {
     handler: H,
     common: Common,
@@ -466,7 +466,7 @@ pub trait FieldsHandler: Send {
 
 /// A [`ReplySink`] for a reply that is a map, or an array of flat pairs, from an
 /// identifier (delivered whole) to a payload (streamed): `HGETALL`. See the
-/// [module documentation](self).
+/// [crate documentation](crate).
 pub struct FieldsSink<H> {
     handler: H,
     common: Common,

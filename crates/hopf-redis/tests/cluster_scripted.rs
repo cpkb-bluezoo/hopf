@@ -11,7 +11,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use hopf_core::Bytes;
-use hopf_redis::{key_slot, ClusterConfig, Command, Deadline, NodeAddr, Push, RedisCluster, RedisError};
+use hopf_redis::{
+    key_slot, ArgSource, ClusterConfig, Command, Deadline, NodeAddr, Push, RedisCluster, RedisError, SourceCtl, SourceRead,
+    StreamArg,
+};
 
 use common::scripted_server::*;
 use common::*;
@@ -869,4 +872,94 @@ fn a_command_can_be_sent_to_a_given_master_or_to_every_one() {
     rt.shutdown();
     a.rt.shutdown();
     nb.rt.shutdown();
+}
+
+// ---- streamed arguments ----
+
+/// `left` bytes of `b`.
+struct Fill {
+    left: u64,
+}
+
+impl ArgSource for Fill {
+    fn read(&mut self, out: &mut [u8], _ctl: &mut SourceCtl<'_>) -> SourceRead {
+        let n = (self.left as usize).min(out.len());
+        out[..n].fill(b'f');
+        self.left -= n as u64;
+        SourceRead::Data(n)
+    }
+}
+
+#[test]
+fn a_streamed_command_that_is_redirected_opens_a_fresh_source_and_a_one_shot_one_is_refused() {
+    let len: u64 = 600_000;
+    let seen: Log = Arc::default();
+    let new_seen = Arc::clone(&seen);
+    let new_master = node(move |s, w| match name_of(w).as_str() {
+        "SET" => {
+            new_seen.lock().unwrap().push((w[2].len(), "new".into()));
+            s.reply("+OK\r\n");
+        }
+        other => panic!("unexpected {other}"),
+    });
+    let new_addr = new_master.addr;
+    let slot = key_slot(b"k");
+    let old_seen = Arc::clone(&seen);
+    let own: Arc<OnceLock<SocketAddr>> = Arc::default();
+    let addr = Arc::clone(&own);
+    let old_master = node(move |s, w| match name_of(w).as_str() {
+        "CLUSTER" => s.reply(slots_of(*addr.get().unwrap(), "old")),
+        "SET" => {
+            // The whole value arrived here; the slot has moved.
+            old_seen.lock().unwrap().push((w[2].len(), "old".into()));
+            s.reply(format!("-MOVED {slot} {new_addr}\r\n"));
+        }
+        other => panic!("unexpected {other}"),
+    });
+    own.set(old_master.addr).unwrap();
+    let (rt, c) = one_node_cluster(&old_master, |c| c.min_refresh_interval(Duration::from_millis(5)));
+
+    // Repeatable: the source is opened again for the node it moved to.
+    let opens = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&opens);
+    let arg = StreamArg::from_fn(len, move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(Fill { left: len }))
+    });
+    let reply = call!(|cb| c.send(&Command::new("SET").arg("k").arg_stream(arg), cb));
+    assert!(reply.is_ok(), "{reply:?}");
+    assert_eq!(opens.load(Ordering::SeqCst), 2, "once for each node it was sent to");
+    assert_eq!(*seen.lock().unwrap(), vec![(len as usize, "old".to_string()), (len as usize, "new".to_string())]);
+
+    // One-shot: the redirection needs the value again, and it is gone.
+    seen.lock().unwrap().clear();
+    let once = StreamArg::once(len, Fill { left: len });
+    let err = call!(|cb| c.send(&Command::new("SET").arg("k").arg_stream(once), cb)).unwrap_err();
+    assert_eq!(err, RedisError::NotRepeatable);
+    assert_eq!(seen.lock().unwrap().len(), 1, "it went to the old node and no further: {:?}", seen.lock().unwrap());
+    c.close();
+    rt.shutdown();
+    old_master.rt.shutdown();
+    new_master.rt.shutdown();
+}
+
+#[test]
+fn a_streamed_argument_cannot_be_a_key_or_be_in_a_transaction() {
+    let own: Arc<OnceLock<SocketAddr>> = Arc::default();
+    let addr = Arc::clone(&own);
+    let server = node(move |s, w| match name_of(w).as_str() {
+        "CLUSTER" => s.reply(slots_of(*addr.get().unwrap(), "only")),
+        other => panic!("unexpected {other}"),
+    });
+    own.set(server.addr).unwrap();
+    let (rt, c) = one_node_cluster(&server, |c| c);
+    let arg = || StreamArg::from_fn(4, || Ok(Box::new(Fill { left: 4 })));
+    // The key is the first argument of SET, and it is streamed.
+    let err = call!(|cb| c.send(&Command::new("SET").arg_stream(arg()).arg("v"), cb)).unwrap_err();
+    assert!(matches!(err, RedisError::Unexpected(_)), "{err:?}");
+    let err = call!(|cb| c.transaction(vec![Command::new("SET").arg("k").arg_stream(arg())], cb)).unwrap_err();
+    assert!(matches!(err, RedisError::Unexpected(_)), "{err:?}");
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
 }

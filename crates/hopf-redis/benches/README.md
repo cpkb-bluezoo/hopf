@@ -145,3 +145,18 @@ value waits in the socket and the server's writes are held back by TCP; it relie
 on the reactor stopping reading as soon as a handler pauses (a read loop that
 carried on until the ring was full used to fail the connection with "inbound
 buffer full", under load).
+
+## Streaming arguments out
+
+`Command::arg_stream` pulls an argument from a source a block at a time, and
+a command larger than the outbound buffer is written in blocks that wait for the
+buffer to drain, where it was written in one go and failed the connection with
+"outbound buffer overflow". The write queue this needed changes nothing for the
+small commands that are nearly all of them: every row of the table above is the
+same within noise, and the 64 KiB `SET` rows are slightly better.
+
+`tests/memory_bound.rs` sends a 256 MiB value out of a client, made by a
+generator as it is asked for, and the peak heap rises by about 770 KB (one block
+of the source and the outbound buffer), not by the size of the value. A 12 MiB
+value in memory, larger than the 4 MiB outbound buffer, is sent where it used to
+fail.

@@ -27,6 +27,9 @@
 //! told its payload chunk by chunk (see [`BulkSink`], [`ElementsSink`],
 //! [`KeysSink`], [`FieldsSink`] and [`RedisClient::send_streaming`]):
 //!
+//! A value can be streamed out as well, pulled from an [`ArgSource`] a block at a
+//! time: see [`Command::arg_stream`] and [`StreamArg`].
+//!
 //! ```no_run
 //! use hopf_redis::{BulkHandler, Flow, RedisClient, RedisError};
 //!
@@ -47,6 +50,7 @@
 //! # }
 //! ```
 
+mod argstream;
 mod client;
 mod cluster;
 mod collect;
@@ -59,6 +63,7 @@ pub mod resp;
 mod sinks;
 mod topology;
 
+pub use argstream::{ArgFactory, ArgSource, SourceCtl, SourceRead, SourceWaker, StreamArg};
 pub use client::{Callback, Command, Deadline, RedisClient, Reply, StreamHandle};
 pub use cluster::{ClusterConfig, RedisCluster};
 pub use commands::SetOptions;

@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 
 use hopf_core::{Runtime, RuntimeConfig};
 use hopf_redis::{
-    AggKind, BulkHandler, BulkSink, Command, Deadline, Feed, Flow, RedisClient, RedisConfig, RedisError, ReplySink, RespLimits,
-    RespParser, Scalar, StrKind, StreamHandle,
+    AggKind, ArgSource, BulkHandler, BulkSink, Command, Deadline, Feed, Flow, RedisClient, RedisConfig, RedisError, ReplySink,
+    RespLimits, RespParser, Scalar, SourceCtl, SourceRead, StrKind, StreamArg, StreamHandle,
 };
 
 // ---- the allocator: live bytes, and the highest they have been ----
@@ -76,6 +76,8 @@ fn peak_above(base: usize) -> usize {
 
 // ---- the server: a plain blocking one, in a child process ----
 
+const MIB: usize = 1024 * 1024;
+
 const HELLO_OK: &str = "%2\r\n$6\r\nserver\r\n$5\r\nredis\r\n$5\r\nproto\r\n:3\r\n";
 
 fn read_line(r: &mut impl BufRead) -> Option<Vec<u8>> {
@@ -93,6 +95,18 @@ fn read_command(r: &mut impl BufRead) -> Option<Vec<Vec<u8>>> {
     for _ in 0..n {
         let line = read_line(r)?;
         let len: usize = std::str::from_utf8(line.get(1..line.len().checked_sub(2)?)?).ok()?.parse().ok()?;
+        if len > MIB {
+            // Too large to hold: read it in blocks, keep none of it, and say how long it was.
+            let mut left = len + 2;
+            let mut block = vec![0u8; 64 * 1024];
+            while left > 0 {
+                let n = left.min(block.len());
+                r.read_exact(&mut block[..n]).ok()?;
+                left -= n;
+            }
+            words.push(format!("<{len} bytes>").into_bytes());
+            continue;
+        }
         let mut word = vec![0u8; len + 2];
         r.read_exact(&mut word).ok()?;
         word.truncate(len);
@@ -183,8 +197,6 @@ impl Drop for Server {
 }
 
 // ---- the checks ----
-
-const MIB: usize = 1024 * 1024;
 
 fn runtime() -> Runtime {
     Runtime::start(RuntimeConfig {
@@ -408,6 +420,60 @@ fn a_value_streams_through_a_client_in_constant_memory() {
     rt.shutdown();
 }
 
+/// A command bigger than the connection's outbound buffer (4 MiB by default) is
+/// sent in blocks, each when the last has drained, and not in one write that
+/// overflows the buffer and fails the connection.
+fn a_command_larger_than_the_outbound_buffer_is_sent() {
+    let server = Server::start();
+    let rt = runtime();
+    let c = RedisClient::connect(rt.pick_worker(), RedisConfig::new("127.0.0.1", server.port));
+    call(|cb| c.ping(move |r| cb(r))).expect("the connection is up");
+    let value = vec![b'x'; 12 * MIB];
+    let reply = call(|cb| c.set("big", &value, move |r| cb(r)));
+    assert_eq!(reply, Ok(()), "a 12 MiB value in memory");
+    assert_eq!(call(|cb| c.ping(move |r| cb(r))), Ok(()), "and the connection is still in step");
+    c.close();
+    rt.shutdown();
+}
+
+/// Makes `left` bytes as it is asked for them, and holds none.
+struct Generator {
+    left: u64,
+}
+
+impl ArgSource for Generator {
+    fn read(&mut self, out: &mut [u8], _ctl: &mut SourceCtl<'_>) -> SourceRead {
+        let n = (out.len() as u64).min(self.left) as usize;
+        out[..n].fill(b'u');
+        self.left -= n as u64;
+        SourceRead::Data(n)
+    }
+}
+
+/// A 256 MiB value out of a client, made as it is sent: the client holds a block
+/// of it at a time, not the value.
+fn a_value_streams_out_of_a_client_in_constant_memory() {
+    const SIZE: u64 = 256 * MIB as u64;
+    let server = Server::start();
+    let rt = runtime();
+    let c = RedisClient::connect(rt.pick_worker(), RedisConfig::new("127.0.0.1", server.port));
+    call(|cb| c.ping(move |r| cb(r))).expect("the connection is up");
+    let base = reset_peak();
+    let started = Instant::now();
+    let command = Command::new("SET").arg("k").arg_stream(StreamArg::once(SIZE, Generator { left: SIZE }));
+    let reply = call(|cb| c.send(&command, move |r| cb(r)));
+    assert!(reply.is_ok(), "{reply:?}");
+    let above = peak_above(base);
+    println!(
+        "a 256 MiB value streamed out: peak heap {above} bytes above baseline, {:.1} s",
+        started.elapsed().as_secs_f64()
+    );
+    assert!(above < 2 * MIB, "the heap rose by {above} bytes sending a {SIZE} byte value");
+    assert_eq!(call(|cb| c.ping(move |r| cb(r))), Ok(()), "and the connection is in step");
+    c.close();
+    rt.shutdown();
+}
+
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("--serve") {
         return serve();
@@ -415,5 +481,7 @@ fn main() {
     the_parser_holds_a_constant_amount_however_large_the_reply();
     a_late_reply_to_a_timed_out_command_is_discarded_in_constant_memory();
     a_value_streams_through_a_client_in_constant_memory();
+    a_command_larger_than_the_outbound_buffer_is_sent();
+    a_value_streams_out_of_a_client_in_constant_memory();
     println!("memory_bound: ok");
 }

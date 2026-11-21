@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use hopf_core::Runtime;
 use hopf_redis::{
-    BulkHandler, Command, Deadline, ElementsHandler, FieldsHandler, Flow, KeysHandler, KeysSink, RedisClient, RedisConfig,
-    RedisError, RespLimits, StreamHandle, Value,
+    ArgSource, BulkHandler, Command, Deadline, ElementsHandler, FieldsHandler, Flow, KeysHandler, KeysSink, RedisClient,
+    RedisConfig, RedisError, RespLimits, SourceCtl, SourceRead, SourceWaker, StreamArg, StreamHandle, Value,
 };
 
 use common::*;
@@ -1533,6 +1533,261 @@ fn a_sink_may_close_the_client_from_inside_its_own_callback() {
     // And once it is closed, later commands fail the same way.
     assert_eq!(call!(|cb| c.ping(cb)).unwrap_err(), RedisError::Closed);
     cell.lock().unwrap().take();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+// ---- streamed arguments ----
+
+/// A source of `left` bytes that gives at most `step` at a time, and can be made
+/// to have nothing for a while.
+struct Source {
+    left: u64,
+    step: usize,
+    byte: u8,
+    /// Say `Pending` once, at this many bytes from the end, and wake from another thread.
+    stall_at: Option<u64>,
+    /// Fail with this when this many bytes are left.
+    fail_at: Option<(u64, RedisError)>,
+    /// Give the next piece only after waiting this long (by saying Pending and waking).
+    pace: Option<Duration>,
+    ready: Arc<AtomicUsize>,
+    waker: Option<SourceWaker>,
+}
+
+impl Source {
+    fn new(len: u64) -> Self {
+        Self {
+            left: len,
+            step: 64 * 1024,
+            byte: b'a',
+            stall_at: None,
+            fail_at: None,
+            pace: None,
+            ready: Arc::default(),
+            waker: None,
+        }
+    }
+}
+
+impl ArgSource for Source {
+    fn read(&mut self, out: &mut [u8], ctl: &mut SourceCtl<'_>) -> SourceRead {
+        if let Some((at, e)) = &self.fail_at {
+            if self.left <= *at {
+                return SourceRead::Failed(e.clone());
+            }
+        }
+        if self.stall_at.is_some_and(|at| self.left <= at) {
+            // Nothing yet: wake the connection from another thread in a while.
+            self.stall_at = None;
+            let waker = ctl.waker();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(150));
+                waker.wake();
+            });
+            return SourceRead::Pending;
+        }
+        if let Some(pace) = self.pace {
+            // One piece per wake: the connection is kept waiting between them.
+            if self.ready.swap(0, Ordering::SeqCst) == 0 {
+                let waker = ctl.waker();
+                self.waker = Some(waker.clone());
+                let ready = Arc::clone(&self.ready);
+                thread::spawn(move || {
+                    thread::sleep(pace);
+                    ready.store(1, Ordering::SeqCst);
+                    waker.wake();
+                });
+                return SourceRead::Pending;
+            }
+        }
+        let n = (self.left as usize).min(out.len()).min(self.step);
+        out[..n].fill(self.byte);
+        self.left -= n as u64;
+        SourceRead::Data(n)
+    }
+}
+
+fn value_seen(w: &[Vec<u8>]) -> (usize, bool) {
+    let v = &w[2];
+    (v.len(), v.iter().all(|b| *b == b'a'))
+}
+
+#[test]
+fn a_streamed_argument_goes_out_in_order_with_what_was_sent_behind_it() {
+    // The value takes a pause in the middle; a PING sent while it is being written
+    // must not overtake it, and its reply comes after the SET's.
+    let log: Arc<Mutex<Vec<String>>> = Arc::default();
+    let seen = Arc::clone(&log);
+    let server = serve(move |s, w| {
+        let name = name_of(w);
+        match name.as_str() {
+            "HELLO" => s.reply(HELLO_OK),
+            "SET" => {
+                let (len, pure) = value_seen(w);
+                seen.lock().unwrap().push(format!("SET {len} {pure}"));
+                s.reply("+OK\r\n");
+            }
+            "PING" => {
+                seen.lock().unwrap().push("PING".into());
+                s.reply("+PONG\r\n");
+            }
+            _ => s.reply("+OK\r\n"),
+        }
+    });
+    let (rt, c) = client(&server, |c| c);
+    let mut source = Source::new(3 * 1024 * 1024);
+    source.stall_at = Some(1024 * 1024);
+    let command = Command::new("SET").arg("k").arg_stream(StreamArg::once(3 * 1024 * 1024, source));
+    let (tx, rx) = mpsc::channel();
+    let txa = tx.clone();
+    c.send(&command, move |r| txa.send(("set", r)).unwrap());
+    c.send(&Command::new("PING"), move |r| tx.send(("ping", r)).unwrap());
+    let first = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let second = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(first.0, "set");
+    assert!(first.1.is_ok(), "{:?}", first.1);
+    assert_eq!(second.0, "ping");
+    assert!(second.1.is_ok());
+    assert_eq!(*log.lock().unwrap(), vec!["SET 3145728 true".to_string(), "PING".to_string()]);
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_source_that_cannot_open_fails_its_command_and_nothing_of_it_is_written() {
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let log = Arc::clone(&seen);
+    let server = serve(move |s, w| {
+        log.lock().unwrap().push(name_of(w));
+        match name_of(w).as_str() {
+            "HELLO" => s.reply(HELLO_OK),
+            _ => s.reply("+OK\r\n"),
+        }
+    });
+    let (rt, c) = client(&server, |c| c);
+    let arg = StreamArg::from_fn(10, || Err(RedisError::Unexpected("no such file".into())));
+    let err = call!(|cb| c.send(&Command::new("SET").arg("k").arg_stream(arg), cb)).unwrap_err();
+    assert_eq!(err, RedisError::Unexpected("no such file".into()));
+    // The connection is untouched, and the server never heard of the command.
+    call!(|cb| c.send(&Command::new("PING"), cb)).unwrap();
+    assert_eq!(*seen.lock().unwrap(), vec!["HELLO".to_string(), "PING".to_string()]);
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_one_shot_source_is_sent_once_and_never_short() {
+    let server = serve(move |s, w| match name_of(w).as_str() {
+        "HELLO" => s.reply(HELLO_OK),
+        _ => s.reply("+OK\r\n"),
+    });
+    let (rt, c) = client(&server, |c| c);
+    let command = Command::new("SET").arg("k").arg_stream(StreamArg::once(1000, Source::new(1000)));
+    call!(|cb| c.send(&command, cb)).unwrap();
+    // The same command again: its source is gone.
+    let err = call!(|cb| c.send(&command, cb)).unwrap_err();
+    assert_eq!(err, RedisError::NotRepeatable);
+    call!(|cb| c.send(&Command::new("PING"), cb)).unwrap();
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1, "refusing it cost no connection");
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_source_that_fails_part_way_closes_the_connection_and_the_next_command_redials() {
+    let server = serve(move |s, w| match name_of(w).as_str() {
+        "HELLO" => s.reply(HELLO_OK),
+        "SET" => {} // never answered: it never arrives whole
+        _ => s.reply("+PONG\r\n"),
+    });
+    let (rt, c) = client(&server, |c| c);
+    let mut source = Source::new(1024 * 1024);
+    source.fail_at = Some((512 * 1024, RedisError::Unexpected("the file went away".into())));
+    let command = Command::new("SET").arg("k").arg_stream(StreamArg::once(1024 * 1024, source));
+    let (tx, rx) = mpsc::channel();
+    let txa = tx.clone();
+    c.send(&command, move |r| txa.send(("set", r)).unwrap());
+    // Pipelined behind it: part of the SET is on the wire, so this cannot go.
+    c.send(&Command::new("PING"), move |r| tx.send(("ping", r)).unwrap());
+    let mut got: Vec<_> = (0..2).map(|_| rx.recv_timeout(Duration::from_secs(10)).unwrap()).collect();
+    got.sort_by_key(|(n, _)| *n);
+    assert_eq!(got[1].1.clone().unwrap_err(), RedisError::Unexpected("the file went away".into()), "{got:?}");
+    assert!(matches!(got[0].1, Err(RedisError::ConnectionLost(_))), "{got:?}");
+    call!(|cb| c.send(&Command::new("PING"), cb)).expect("the next command dials again");
+    assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn an_upload_is_timed_by_progress_and_the_health_check_leaves_it_alone() {
+    // 20 pieces, 80 ms apart: 1.6 s in all, to a client with a 300 ms command
+    // timeout and a 200 ms health check.
+    let server = serve(move |s, w| match name_of(w).as_str() {
+        "HELLO" => s.reply(HELLO_OK),
+        "SET" => s.reply("+OK\r\n"),
+        _ => s.reply("+PONG\r\n"),
+    });
+    let (rt, c) = client(&server, |c| {
+        c.command_timeout(Some(Duration::from_millis(300))).ping_interval(Some(Duration::from_millis(200)))
+    });
+    let mut source = Source::new(20 * 1000);
+    source.step = 1000;
+    source.pace = Some(Duration::from_millis(80));
+    let started = Instant::now();
+    let command = Command::new("SET").arg("k").arg_stream(StreamArg::once(20 * 1000, source));
+    call!(|cb| c.send(&command, cb)).unwrap();
+    assert!(started.elapsed() > Duration::from_millis(1200), "{:?}", started.elapsed());
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+
+    // An upload that stops is a timeout, and the half-written command costs the connection.
+    let mut stalled = Source::new(1000);
+    stalled.stall_at = Some(1000);
+    stalled.pace = Some(Duration::from_secs(60));
+    let command = Command::new("SET").arg("k").arg_stream(StreamArg::once(1000, stalled));
+    let started = Instant::now();
+    let err = call!(|cb| c.send(&command, cb)).unwrap_err();
+    assert_eq!(err, RedisError::Timeout);
+    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    call!(|cb| c.send(&Command::new("PING"), cb)).expect("the next command dials again");
+    assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_streamed_argument_may_be_first_last_empty_or_beside_large_ones_in_memory() {
+    let seen: Arc<Mutex<Vec<Vec<usize>>>> = Arc::default();
+    let log = Arc::clone(&seen);
+    let server = serve(move |s, w| {
+        if name_of(w) == "HELLO" {
+            return s.reply(HELLO_OK);
+        }
+        log.lock().unwrap().push(w.iter().map(Vec::len).collect());
+        s.reply("+OK\r\n");
+    });
+    let (rt, c) = client(&server, |c| c);
+    let big = vec![b'm'; 2 * 1024 * 1024];
+    let cases: Vec<Command> = vec![
+        Command::new("A").arg_stream(StreamArg::from_fn(5, || Ok(Box::new(Source::new(5))))),
+        Command::new("B").arg("x").arg_stream(StreamArg::from_fn(0, || Ok(Box::new(Source::new(0))))).arg("y"),
+        Command::new("C").arg(&big).arg_stream(StreamArg::from_fn(70_000, || Ok(Box::new(Source::new(70_000))))).arg(&big),
+    ];
+    for command in &cases {
+        call!(|cb| c.send(command, cb)).unwrap();
+    }
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![vec![1, 5], vec![1, 1, 0, 1], vec![1, 2 * 1024 * 1024, 70_000, 2 * 1024 * 1024]]
+    );
+    c.close();
     rt.shutdown();
     server.rt.shutdown();
 }

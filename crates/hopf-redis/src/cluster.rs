@@ -53,7 +53,7 @@ use crate::commands::{
 };
 use crate::config::RedisConfig;
 use crate::error::RedisError;
-use crate::keys::{command_slot, key_slot, SLOTS};
+use crate::keys::{command_slot, key_indexes, key_slot, SLOTS};
 use crate::pubsub::{is_subscription_command, Push};
 use crate::resp::{ServerError, Value};
 use crate::topology::{parse_redirect, parse_shards, parse_slots, NodeAddr, SlotRange};
@@ -296,6 +296,14 @@ impl RedisCluster {
                 )),
             );
         }
+        // A cluster reads a command's keys to route it, so a key cannot be streamed.
+        if command.has_streams() && key_indexes(command.words()).into_iter().any(|i| command.is_streamed(i)) {
+            return finish(
+                inner,
+                callback,
+                Err(RedisError::Unexpected("a streamed argument cannot be a key".into())),
+            );
+        }
         if command.words().first().is_some_and(|w| is_connection_scoped(w)) {
             return match routed {
                 Some(slot) => {
@@ -437,6 +445,13 @@ impl RedisCluster {
     ) {
         let inner = &self.inner;
         let mut slot: Option<u16> = None;
+        if commands.iter().any(Command::has_streams) {
+            return finish_tx(
+                inner,
+                Box::new(callback),
+                Err(RedisError::Unexpected("a transaction cannot hold a streamed argument".into())),
+            );
+        }
         for c in &commands {
             match command_slot(c.words()) {
                 Err(_) => return finish_tx(inner, Box::new(callback), Err(crossslot())),
