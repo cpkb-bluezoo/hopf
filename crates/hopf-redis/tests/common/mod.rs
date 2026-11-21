@@ -4,6 +4,7 @@
 
 #![allow(dead_code)]
 
+pub mod collect;
 pub mod scripted_server;
 
 use std::sync::atomic::{AtomicUsize, Ordering};

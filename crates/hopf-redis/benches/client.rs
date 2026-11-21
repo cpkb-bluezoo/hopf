@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 
 use hopf_core::{Bytes, ClientTlsBuilder, Endpoint, ProtocolHandler, Runtime, RuntimeConfig, SharedTlsConnector, TcpListenerConfig};
 use hopf_redis::{
-    AggKind, ClusterConfig, Command, Flow, RedisClient, RedisCluster, RedisConfig, ReplySink, RespParser, Scalar, StrKind,
-    Value,
+    AggKind, BulkHandler, ClusterConfig, Command, Flow, RedisClient, RedisCluster, RedisConfig, RedisError, ReplySink,
+    RespParser, Scalar, StrKind,
 };
 
 // ---- counting allocator ----
@@ -149,7 +149,45 @@ impl ServerCfg {
 
 struct Conn {
     parser: RespParser,
+    commands: Commands,
     cfg: Arc<ServerCfg>,
+}
+
+/// Reads the commands a client sends: each an array of bulk strings.
+#[derive(Default)]
+struct Commands {
+    words: Vec<Vec<u8>>,
+    current: Vec<u8>,
+    out: Vec<Vec<Vec<u8>>>,
+}
+
+impl ReplySink for Commands {
+    fn scalar(&mut self, _v: Scalar<'_>) -> Flow {
+        Flow::Continue
+    }
+    fn error(&mut self, _line: &str) -> Flow {
+        Flow::Continue
+    }
+    fn begin_aggregate(&mut self, _kind: AggKind, _len: Option<usize>) -> Flow {
+        self.words.clear();
+        Flow::Continue
+    }
+    fn end_aggregate(&mut self) -> Flow {
+        self.out.push(std::mem::take(&mut self.words));
+        Flow::Continue
+    }
+    fn begin_string(&mut self, _kind: StrKind, _len: Option<usize>) -> Flow {
+        self.current.clear();
+        Flow::Continue
+    }
+    fn string_chunk(&mut self, data: &[u8]) -> Flow {
+        self.current.extend_from_slice(data);
+        Flow::Continue
+    }
+    fn end_string(&mut self) -> Flow {
+        self.words.push(std::mem::take(&mut self.current));
+        Flow::Continue
+    }
 }
 
 const HELLO_OK: &str = "%2\r\n$6\r\nserver\r\n$5\r\nredis\r\n$5\r\nproto\r\n:3\r\n";
@@ -160,30 +198,30 @@ impl ProtocolHandler for Conn {
         let mut out = Vec::new();
         let cfg = Arc::clone(&self.cfg);
         hopf_core::with_slice(buf, |data| {
-            let _ = self.parser.feed_values(data, &mut |v| {
-                let Value::Array(words) = v else { return };
-                let name = words[0].as_bytes().unwrap_or(b"");
-                if name.eq_ignore_ascii_case(b"HELLO") {
-                    out.extend_from_slice(HELLO_OK.as_bytes());
-                } else if cfg.silent {
-                    // Nothing after the handshake: a black hole.
-                } else if name.eq_ignore_ascii_case(b"GET") {
-                    out.extend_from_slice(&cfg.get_reply);
-                } else if name.eq_ignore_ascii_case(b"PUBLISH") {
-                    out.extend_from_slice(b":0\r\n");
-                } else if name.eq_ignore_ascii_case(b"PING") {
-                    out.extend_from_slice(b"+PONG\r\n");
-                } else if name.eq_ignore_ascii_case(b"CLUSTER") {
-                    if words.get(1).and_then(Value::as_bytes).is_some_and(|w| w.eq_ignore_ascii_case(b"SHARDS")) {
-                        out.extend_from_slice(b"-ERR unknown subcommand 'SHARDS'\r\n");
-                    } else {
-                        out.extend_from_slice(cfg.slots().as_bytes());
-                    }
-                } else {
-                    out.extend_from_slice(b"+OK\r\n");
-                }
-            });
+            let _ = self.parser.feed(data, &mut self.commands);
         });
+        for words in std::mem::take(&mut self.commands.out) {
+            let name = words[0].as_slice();
+            if name.eq_ignore_ascii_case(b"HELLO") {
+                out.extend_from_slice(HELLO_OK.as_bytes());
+            } else if cfg.silent {
+                // Nothing after the handshake: a black hole.
+            } else if name.eq_ignore_ascii_case(b"GET") {
+                out.extend_from_slice(&cfg.get_reply);
+            } else if name.eq_ignore_ascii_case(b"PUBLISH") {
+                out.extend_from_slice(b":0\r\n");
+            } else if name.eq_ignore_ascii_case(b"PING") {
+                out.extend_from_slice(b"+PONG\r\n");
+            } else if name.eq_ignore_ascii_case(b"CLUSTER") {
+                if words.get(1).is_some_and(|w| w.eq_ignore_ascii_case(b"SHARDS")) {
+                    out.extend_from_slice(b"-ERR unknown subcommand 'SHARDS'\r\n");
+                } else {
+                    out.extend_from_slice(cfg.slots().as_bytes());
+                }
+            } else {
+                out.extend_from_slice(b"+OK\r\n");
+            }
+        }
         if !out.is_empty() {
             endpoint.send(&out);
         }
@@ -227,6 +265,7 @@ fn serve(args: &[String]) {
         let mut listener = TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
             Box::new(Conn {
                 parser: RespParser::new(),
+                commands: Commands::default(),
                 cfg: Arc::clone(&c),
             }) as Box<dyn ProtocolHandler>
         });
@@ -308,6 +347,47 @@ impl Target {
             Target::Cluster(c) => c.send(command, callback),
         }
     }
+
+    fn get(&self, key: &str, handler: impl BulkHandler + 'static) {
+        match self {
+            Target::Single(c) => {
+                c.get(key, handler);
+            }
+            Target::Cluster(c) => {
+                c.get(key, handler);
+            }
+        }
+    }
+}
+
+/// What a `GET` is read by: it counts the bytes and keeps none, as an
+/// application streaming a value to somewhere else would, and ends the operation.
+struct CountingGet {
+    run: Arc<Run>,
+    bytes: usize,
+}
+
+impl BulkHandler for CountingGet {
+    fn chunk(&mut self, data: &[u8]) -> Flow {
+        self.bytes += data.len();
+        Flow::Continue
+    }
+    fn finished(&mut self, outcome: Result<(), RedisError>) {
+        std::hint::black_box(self.bytes);
+        complete(&self.run, outcome.is_ok());
+    }
+}
+
+/// An operation is over: count it, and start the next or say all are done.
+fn complete(run: &Arc<Run>, ok: bool) {
+    if !ok {
+        run.errors.fetch_add(1, Ordering::Relaxed);
+    }
+    if run.done.fetch_add(1, Ordering::Relaxed) + 1 == run.total {
+        let _ = run.finished.try_send(());
+    } else {
+        issue(run);
+    }
 }
 
 struct Run {
@@ -328,22 +408,18 @@ fn issue(run: &Arc<Run>) {
         return;
     }
     let key = &run.keys[i % run.keys.len()];
-    let command = match run.op {
-        Op::Get => Command::new("GET").arg(key),
-        Op::Set(_) => Command::new("SET").arg(key).arg(&run.value),
-        Op::Publish => Command::new("PUBLISH").arg(key).arg("m"),
-    };
     let next = Arc::clone(run);
-    run.target.send(&command, move |reply| {
-        if reply.is_err() {
-            next.errors.fetch_add(1, Ordering::Relaxed);
-        }
-        if next.done.fetch_add(1, Ordering::Relaxed) + 1 == next.total {
-            let _ = next.finished.try_send(());
-        } else {
-            issue(&next);
-        }
-    });
+    match run.op {
+        // A string is read by a sink, whose chunks are counted.
+        Op::Get => run.target.get(key, CountingGet { run: next, bytes: 0 }),
+        // The rest have a single value for a reply.
+        Op::Set(_) => run
+            .target
+            .send(&Command::new("SET").arg(key).arg(&run.value), move |reply| complete(&next, reply.is_ok())),
+        Op::Publish => run
+            .target
+            .send(&Command::new("PUBLISH").arg(key).arg("m"), move |reply| complete(&next, reply.is_ok())),
+    }
 }
 
 /// Run `total` operations with `depth` in flight, and say what the client spent.
@@ -428,7 +504,6 @@ enum Kind {
     /// `reply` is the size of the value a `GET` returns.
     Single { op: Op, depth: usize, reply: usize },
     Cluster { op: Op, depth: usize },
-    Parse { size: usize, chunk: usize },
     /// A reply streamed through a sink that keeps nothing.
     Stream { size: usize, chunk: usize },
     Timeouts { pending: usize },
@@ -458,13 +533,6 @@ fn scenarios() -> Vec<Scenario> {
     add("tls single get 16B depth 16", Kind::Single { op: Op::Get, depth: 16, reply: 16 }, true, 100_000);
     add("tls single set 64KiB depth 16", Kind::Single { op: Op::Set(64 * 1024), depth: 16, reply: 16 }, true, 10_000);
     add("tls cluster publish depth 16", Kind::Cluster { op: Op::Publish, depth: 16 }, true, 100_000);
-    for size in [1024, 64 * 1024, 1024 * 1024] {
-        for chunk in [512, usize::MAX] {
-            let label = if chunk == usize::MAX { "one read".to_string() } else { format!("{chunk}B reads") };
-            let ops = if size >= 1024 * 1024 { 500 } else if size >= 64 * 1024 { 5_000 } else { 100_000 };
-            add(&format!("parse {} reply, {label}", human(size)), Kind::Parse { size, chunk }, false, ops);
-        }
-    }
     for size in [64 * 1024, 1024 * 1024, 64 * 1024 * 1024] {
         let ops = if size >= 64 * 1024 * 1024 { 20 } else if size >= 1024 * 1024 { 500 } else { 5_000 };
         add(&format!("stream {} reply, 512B reads", human(size)), Kind::Stream { size, chunk: 512 }, false, ops);
@@ -483,34 +551,6 @@ fn human(n: usize) -> String {
     } else {
         format!("{n}B")
     }
-}
-
-fn parse_bench(size: usize, chunk: usize, ops: usize) -> Row {
-    let mut reply = format!("${size}\r\n").into_bytes();
-    reply.extend(std::iter::repeat_n(b'v', size));
-    reply.extend_from_slice(b"\r\n");
-    let mut parser = RespParser::new();
-    let mut seen = 0usize;
-    let one = |parser: &mut RespParser, seen: &mut usize| {
-        for piece in reply.chunks(chunk.min(reply.len())) {
-            let mut data: &[u8] = piece;
-            parser.feed_values(&mut data, &mut |v| {
-                std::hint::black_box(&v);
-                *seen += 1;
-            })
-            .unwrap();
-        }
-    };
-    for _ in 0..(ops / 10).max(10) {
-        one(&mut parser, &mut seen);
-    }
-    let window = Window::open();
-    for _ in 0..ops {
-        one(&mut parser, &mut seen);
-    }
-    let row = window.close(ops as u64);
-    assert!(seen >= ops);
-    row
 }
 
 /// Keeps nothing of what it is given.
@@ -571,6 +611,18 @@ fn stream_bench(size: usize, chunk: usize, ops: usize) -> Row {
     window.close(ops as u64)
 }
 
+/// Ends the wait for a `GET` that timed out.
+struct GetDone(mpsc::Sender<()>);
+
+impl BulkHandler for GetDone {
+    fn chunk(&mut self, _data: &[u8]) -> Flow {
+        Flow::Continue
+    }
+    fn finished(&mut self, _outcome: Result<(), RedisError>) {
+        let _ = self.0.send(());
+    }
+}
+
 /// `pending` commands sent to a server that answers nothing after its handshake,
 /// each with a 300 ms timeout: the time and work spent failing them all.
 fn timeouts_bench(rt: &Runtime, pending: usize) -> Row {
@@ -588,10 +640,7 @@ fn timeouts_bench(rt: &Runtime, pending: usize) -> Row {
     let _ = up.1.recv_timeout(Duration::from_secs(2)); // times out at 300 ms: the server is silent
     let window = Window::open();
     for _ in 0..pending {
-        let tx = tx.clone();
-        c.get("k", move |_| {
-            let _ = tx.send(());
-        });
+        c.get("k", GetDone(tx.clone()));
     }
     for _ in 0..pending {
         rx.recv_timeout(Duration::from_secs(60)).expect("every command timed out");
@@ -618,7 +667,6 @@ fn run(s: &Scenario, scale: f64, rt: &Runtime) -> Row {
             drop(server);
             row
         }
-        Kind::Parse { size, chunk } => parse_bench(*size, *chunk, ops),
         Kind::Stream { size, chunk } => stream_bench(*size, *chunk, ops),
         Kind::Timeouts { pending } => timeouts_bench(rt, *pending),
     }

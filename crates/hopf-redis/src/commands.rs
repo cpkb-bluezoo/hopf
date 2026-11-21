@@ -2,17 +2,19 @@
 
 //! Typed helpers for the commonly used commands.
 //!
-//! Each is [`RedisClient::send`] with the arguments laid out and the reply
-//! read as the type the command returns. Anything not here goes through
-//! [`RedisClient::send`] or [`RedisClient::command`] and the reply comes back as
-//! a [`Value`]. All of them return at once and call their callback on the
-//! client's reactor.
+//! A helper that hands the caller a value exists only where the reply cannot
+//! be larger than a line: a count, a flag, `OK`. Each is a command with the
+//! arguments laid out and the reply read as the type the command returns, under
+//! a cap that refuses anything bigger (see [`ScalarValue`](crate::ScalarValue)).
+//! A command whose reply is a string or a collection, whose size is the
+//! application's data (`GET`, `LRANGE`, `EVAL`), is sent with a sink instead
+//! (`get`, `lrange`, `eval`, `send_streaming`), so that nothing holds it whole.
+//! All of them return at once and call back on the client's reactor.
 
-use hopf_core::Bytes;
-
-use crate::client::{Callback, Command, Deadline, RedisClient};
+use crate::client::{Command, Deadline, RedisClient, StreamHandle, ValueReply};
+use crate::collect::Cap;
 use crate::error::RedisError;
-use crate::resp::Value;
+use crate::resp::{ReplySink, Value};
 
 /// Options for [`RedisClient::set_with`] (`SET`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -82,47 +84,18 @@ fn boolean(v: Value) -> Result<bool, RedisError> {
     }
 }
 
-fn opt_bytes(v: Value) -> Result<Option<Bytes>, RedisError> {
-    match v {
-        Value::Null => Ok(None),
-        Value::Bulk(b) => Ok(Some(b)),
-        Value::Simple(s) => Ok(Some(Bytes::from(s.into_bytes()))),
-        Value::Verbatim { data, .. } => Ok(Some(data)),
-        other => unexpected("a string or nil", &other),
-    }
-}
-
-fn bytes(v: Value) -> Result<Bytes, RedisError> {
-    match opt_bytes(v)? {
-        Some(b) => Ok(b),
-        None => Err(RedisError::Unexpected("expected a string, got nil".into())),
-    }
-}
-
 fn text(v: Value) -> Result<String, RedisError> {
-    let b = bytes(v)?;
-    String::from_utf8(b.to_vec()).map_err(|_| RedisError::Unexpected("the reply is not UTF-8".into()))
+    match v {
+        Value::Bulk(b) => String::from_utf8(b.to_vec()).map_err(|_| RedisError::Unexpected("the reply is not UTF-8".into())),
+        Value::Simple(s) => Ok(s),
+        other => unexpected("a string", &other),
+    }
 }
 
 fn array(v: Value) -> Result<Vec<Value>, RedisError> {
     match v.into_array() {
         Some(items) => Ok(items),
         None => Err(RedisError::Unexpected("expected an array".into())),
-    }
-}
-
-fn bytes_vec(v: Value) -> Result<Vec<Bytes>, RedisError> {
-    array(v)?.into_iter().map(bytes).collect()
-}
-
-fn opt_bytes_vec(v: Value) -> Result<Vec<Option<Bytes>>, RedisError> {
-    array(v)?.into_iter().map(opt_bytes).collect()
-}
-
-fn pairs(v: Value) -> Result<Vec<(Bytes, Bytes)>, RedisError> {
-    match v.into_pairs() {
-        Some(p) => p.into_iter().map(|(k, v)| Ok((bytes(k)?, bytes(v)?))).collect(),
-        None => Err(RedisError::Unexpected("expected a map".into())),
     }
 }
 
@@ -143,30 +116,6 @@ fn float(v: Value) -> Result<f64, RedisError> {
     }
 }
 
-/// Members with scores: RESP2 sends one flat array, RESP3 an array of
-/// `[member, score]` pairs.
-fn scored(v: Value) -> Result<Vec<(Bytes, f64)>, RedisError> {
-    let items = array(v)?;
-    let nested = items.first().is_some_and(|i| i.as_array().is_some());
-    let mut out = Vec::new();
-    if nested {
-        for item in items {
-            let mut pair = array(item)?.into_iter();
-            match (pair.next(), pair.next()) {
-                (Some(m), Some(s)) => out.push((bytes(m)?, float(s)?)),
-                _ => return Err(RedisError::Unexpected("a member without a score".into())),
-            }
-        }
-    } else {
-        let mut it = items.into_iter();
-        while let Some(member) = it.next() {
-            let score = it.next().ok_or_else(|| RedisError::Unexpected("a member without a score".into()))?;
-            out.push((bytes(member)?, float(score)?));
-        }
-    }
-    Ok(out)
-}
-
 fn keyed(name: &str, keys: &[impl AsRef<[u8]>]) -> Command {
     Command::new(name).args(keys)
 }
@@ -182,7 +131,6 @@ macro_rules! typed_commands {
         pub fn ping(&self, callback: impl FnOnce(Result<(), RedisError>) + Send + 'static) {
             self.typed(Command::new("PING"), |v| match &v {
                 Value::Simple(s) if s == "PONG" => Ok(()),
-                Value::Bulk(_) => Ok(()),
                 other => unexpected("PONG", other),
             }, callback);
         }
@@ -191,11 +139,6 @@ macro_rules! typed_commands {
 
 
         // ---- strings ----
-
-        /// `GET`: the value, or `None` for a missing key.
-        pub fn get(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<Option<Bytes>, RedisError>) + Send + 'static) {
-            self.typed(Command::new("GET").arg(key), opt_bytes, callback);
-        }
 
         /// `SET key value`.
         pub fn set(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>, callback: impl FnOnce(Result<(), RedisError>) + Send + 'static) {
@@ -225,16 +168,6 @@ macro_rules! typed_commands {
         /// `SETNX`: whether the key was set.
         pub fn setnx(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>, callback: impl FnOnce(Result<bool, RedisError>) + Send + 'static) {
             self.typed(Command::new("SETNX").arg(key).arg(value), boolean, callback);
-        }
-
-        /// `GETDEL`.
-        pub fn getdel(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<Option<Bytes>, RedisError>) + Send + 'static) {
-            self.typed(Command::new("GETDEL").arg(key), opt_bytes, callback);
-        }
-
-        /// `MGET`.
-        pub fn mget(&self, keys: &[impl AsRef<[u8]>], callback: impl FnOnce(Result<Vec<Option<Bytes>>, RedisError>) + Send + 'static) {
-            self.typed(keyed("MGET", keys), opt_bytes_vec, callback);
         }
 
         /// `MSET`.
@@ -329,26 +262,6 @@ macro_rules! typed_commands {
             self.typed(cmd, int, callback);
         }
 
-        /// `HGET`.
-        pub fn hget(&self, key: impl AsRef<[u8]>, field: impl AsRef<[u8]>, callback: impl FnOnce(Result<Option<Bytes>, RedisError>) + Send + 'static) {
-            self.typed(Command::new("HGET").arg(key).arg(field), opt_bytes, callback);
-        }
-
-        /// `HMGET`.
-        pub fn hmget(
-            &self,
-            key: impl AsRef<[u8]>,
-            fields: &[impl AsRef<[u8]>],
-            callback: impl FnOnce(Result<Vec<Option<Bytes>>, RedisError>) + Send + 'static,
-        ) {
-            self.typed(Command::new("HMGET").arg(key).args(fields), opt_bytes_vec, callback);
-        }
-
-        /// `HGETALL`, in the order the server sent.
-        pub fn hgetall(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<Vec<(Bytes, Bytes)>, RedisError>) + Send + 'static) {
-            self.typed(Command::new("HGETALL").arg(key), pairs, callback);
-        }
-
         /// `HDEL`: how many fields were removed.
         pub fn hdel(&self, key: impl AsRef<[u8]>, fields: &[impl AsRef<[u8]>], callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
             self.typed(Command::new("HDEL").arg(key).args(fields), int, callback);
@@ -381,29 +294,9 @@ macro_rules! typed_commands {
             self.typed(Command::new("RPUSH").arg(key).args(values), int, callback);
         }
 
-        /// `LPOP`.
-        pub fn lpop(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<Option<Bytes>, RedisError>) + Send + 'static) {
-            self.typed(Command::new("LPOP").arg(key), opt_bytes, callback);
-        }
-
-        /// `RPOP`.
-        pub fn rpop(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<Option<Bytes>, RedisError>) + Send + 'static) {
-            self.typed(Command::new("RPOP").arg(key), opt_bytes, callback);
-        }
-
         /// `LLEN`.
         pub fn llen(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
             self.typed(Command::new("LLEN").arg(key), int, callback);
-        }
-
-        /// `LRANGE`.
-        pub fn lrange(&self, key: impl AsRef<[u8]>, start: i64, stop: i64, callback: impl FnOnce(Result<Vec<Bytes>, RedisError>) + Send + 'static) {
-            self.typed(Command::new("LRANGE").arg(key).arg(start.to_string()).arg(stop.to_string()), bytes_vec, callback);
-        }
-
-        /// `LINDEX`.
-        pub fn lindex(&self, key: impl AsRef<[u8]>, index: i64, callback: impl FnOnce(Result<Option<Bytes>, RedisError>) + Send + 'static) {
-            self.typed(Command::new("LINDEX").arg(key).arg(index.to_string()), opt_bytes, callback);
         }
 
         // ---- sets ----
@@ -416,11 +309,6 @@ macro_rules! typed_commands {
         /// `SREM`.
         pub fn srem(&self, key: impl AsRef<[u8]>, members: &[impl AsRef<[u8]>], callback: impl FnOnce(Result<i64, RedisError>) + Send + 'static) {
             self.typed(Command::new("SREM").arg(key).args(members), int, callback);
-        }
-
-        /// `SMEMBERS`.
-        pub fn smembers(&self, key: impl AsRef<[u8]>, callback: impl FnOnce(Result<Vec<Bytes>, RedisError>) + Send + 'static) {
-            self.typed(Command::new("SMEMBERS").arg(key), bytes_vec, callback);
         }
 
         /// `SISMEMBER`.
@@ -449,34 +337,14 @@ macro_rules! typed_commands {
             self.typed(Command::new("ZREM").arg(key).args(members), int, callback);
         }
 
-        /// `ZRANGE start stop`: members by rank.
-        pub fn zrange(&self, key: impl AsRef<[u8]>, start: i64, stop: i64, callback: impl FnOnce(Result<Vec<Bytes>, RedisError>) + Send + 'static) {
-            self.typed(Command::new("ZRANGE").arg(key).arg(start.to_string()).arg(stop.to_string()), bytes_vec, callback);
-        }
-
-        /// `ZRANGE start stop WITHSCORES`.
-        pub fn zrange_withscores(
-            &self,
-            key: impl AsRef<[u8]>,
-            start: i64,
-            stop: i64,
-            callback: impl FnOnce(Result<Vec<(Bytes, f64)>, RedisError>) + Send + 'static,
-        ) {
-            self.typed(
-                Command::new("ZRANGE").arg(key).arg(start.to_string()).arg(stop.to_string()).arg("WITHSCORES"),
-                scored,
-                callback,
-            );
-        }
-
         /// `ZSCORE`.
         pub fn zscore(&self, key: impl AsRef<[u8]>, member: impl AsRef<[u8]>, callback: impl FnOnce(Result<Option<f64>, RedisError>) + Send + 'static) {
-            self.typed(Command::new("ZSCORE").arg(key).arg(member), opt_f64, callback);
+            self.typed_cap(Command::new("ZSCORE").arg(key).arg(member), Cap::SHORT, opt_f64, callback);
         }
 
         /// `ZINCRBY`: the member's new score.
         pub fn zincrby(&self, key: impl AsRef<[u8]>, by: f64, member: impl AsRef<[u8]>, callback: impl FnOnce(Result<f64, RedisError>) + Send + 'static) {
-            self.typed(Command::new("ZINCRBY").arg(key).arg(by.to_string()).arg(member), float, callback);
+            self.typed_cap(Command::new("ZINCRBY").arg(key).arg(by.to_string()).arg(member), Cap::SHORT, float, callback);
         }
 
         /// `ZCARD`.
@@ -499,35 +367,9 @@ macro_rules! typed_commands {
 
         // ---- scripts ----
 
-        /// `EVAL script numkeys key... arg...`: the script's result, as sent.
-        pub fn eval(
-            &self,
-            script: impl AsRef<[u8]>,
-            keys: &[impl AsRef<[u8]>],
-            args: &[impl AsRef<[u8]>],
-            callback: impl FnOnce(Result<Value, RedisError>) + Send + 'static,
-        ) {
-            let cmd = Command::new("EVAL").arg(script).arg(keys.len().to_string()).args(keys).args(args);
-            self.send(&cmd, callback);
-        }
-
-        /// `EVALSHA sha1 numkeys key... arg...`. A server that has not seen the
-        /// script answers a `NOSCRIPT` error: load it with [`script_load`](Self::script_load)
-        /// and try again.
-        pub fn evalsha(
-            &self,
-            sha1: impl AsRef<[u8]>,
-            keys: &[impl AsRef<[u8]>],
-            args: &[impl AsRef<[u8]>],
-            callback: impl FnOnce(Result<Value, RedisError>) + Send + 'static,
-        ) {
-            let cmd = Command::new("EVALSHA").arg(sha1).arg(keys.len().to_string()).args(keys).args(args);
-            self.send(&cmd, callback);
-        }
-
         /// `SCRIPT LOAD`: the script's SHA-1, as hex.
         pub fn script_load(&self, script: impl AsRef<[u8]>, callback: impl FnOnce(Result<String, RedisError>) + Send + 'static) {
-            self.typed(Command::new("SCRIPT").arg("LOAD").arg(script), text, callback);
+            self.typed_cap(Command::new("SCRIPT").arg("LOAD").arg(script), Cap::SHORT, text, callback);
         }
 
     };
@@ -535,20 +377,32 @@ macro_rules! typed_commands {
 
 macro_rules! typed_fn {
     () => {
-        /// Send `cmd` and read its reply with `read`.
+        /// Send `cmd` and read its reply, which must be a single value, with `read`.
         pub(crate) fn typed<T: Send + 'static>(
             &self,
             cmd: Command,
             read: fn(Value) -> Result<T, RedisError>,
             callback: impl FnOnce(Result<T, RedisError>) + Send + 'static,
         ) {
-            self.send(&cmd, move |reply| callback(reply.and_then(read)));
+            self.typed_cap(cmd, Cap::SCALAR, read, callback);
         }
     };
 }
 
 impl RedisClient {
     typed_fn!();
+
+    /// Send `cmd` and read its reply, assembled under `cap`, with `read`.
+    pub(crate) fn typed_cap<T: Send + 'static>(
+        &self,
+        cmd: Command,
+        cap: Cap,
+        read: fn(Value) -> Result<T, RedisError>,
+        callback: impl FnOnce(Result<T, RedisError>) + Send + 'static,
+    ) {
+        self.send_value(&cmd, Deadline::Default, cap, move |reply: ValueReply| callback(reply.and_then(read)));
+    }
+
     typed_commands!();
 
     /// `AUTH password`, on the current connection. A client configured with a
@@ -578,67 +432,21 @@ impl RedisClient {
 
     /// Run `commands` as one transaction: `MULTI`, the commands, `EXEC`, written
     /// together so no other command can come between them on this connection.
-    /// The callback gets each command's result in order, or `None` when `EXEC`
-    /// was aborted because a key watched with [`watch`](Self::watch) changed.
-    /// A command that fails when it runs is a [`Value::Error`] in the list; one
-    /// refused when queued (a syntax error) fails the transaction with that
-    /// error.
-    pub fn transaction(
-        &self,
-        commands: Vec<Command>,
-        callback: impl FnOnce(Result<Option<Vec<Value>>, RedisError>) + Send + 'static,
-    ) {
-        self.transaction_asking(false, commands, callback);
-    }
-
-    /// [`transaction`](Self::transaction), led by an `ASKING` when `asking`: a
-    /// cluster sending it to the node a slot is being migrated to.
-    pub(crate) fn transaction_asking(
-        &self,
-        asking: bool,
-        commands: Vec<Command>,
-        callback: impl FnOnce(Result<Option<Vec<Value>>, RedisError>) + Send + 'static,
-    ) {
-        use std::sync::{Arc, Mutex};
-        // The first error a queued command is refused with, for EXECABORT to
-        // be explained by.
-        let first_error: Arc<Mutex<Option<RedisError>>> = Arc::default();
-        let note = |slot: &Arc<Mutex<Option<RedisError>>>| {
-            let slot = Arc::clone(slot);
-            Box::new(move |reply: Result<Value, RedisError>| {
-                if let Err(e) = reply {
-                    slot.lock().unwrap().get_or_insert(e);
-                }
-            }) as Callback
-        };
-        let mut batch: Vec<(Command, Callback)> = Vec::with_capacity(commands.len() + 3);
-        if asking {
-            batch.push((Command::new("ASKING"), Box::new(|_| {})));
-        }
-        batch.push((Command::new("MULTI"), note(&first_error)));
-        for c in commands {
-            batch.push((c, note(&first_error)));
-        }
-        let slot = Arc::clone(&first_error);
-        batch.push((
-            Command::new("EXEC"),
-            Box::new(move |reply| {
-                callback(match reply {
-                    Ok(Value::Null) => Ok(None),
-                    Ok(Value::Array(results)) => Ok(Some(results)),
-                    Ok(other) => unexpected("the results", &other),
-                    Err(RedisError::Server(e)) if e.code == "EXECABORT" => {
-                        Err(slot.lock().unwrap().take().unwrap_or(RedisError::Server(e)))
-                    }
-                    Err(e) => Err(e),
-                })
-            }),
-        ));
-        self.send_batch(batch);
+    /// `sink` is told the reply to `EXEC`, as the events of a reply, as it
+    /// arrives: an array with the result of each command in order (a command
+    /// that fails when it runs is an error element of it), or nil if `EXEC` was
+    /// aborted because a key watched with [`watch`](Self::watch) changed. The
+    /// replies to `MULTI` and to the queued commands are read by the client, and
+    /// a command refused when queued (a syntax error) is the error `sink` is
+    /// told in place of `EXECABORT`. See
+    /// [`send_streaming`](RedisClient::send_streaming) for flow control,
+    /// cancellation and timeouts.
+    pub fn transaction(&self, commands: Vec<Command>, sink: impl ReplySink + Send + 'static) -> StreamHandle {
+        self.transaction_streaming(false, commands, Deadline::Default, sink)
     }
 
     /// `WATCH`: have the next `EXEC` on this connection abort if one of `keys`
-    /// changes first. Like [`multi`](Self::multi), [`exec`](Self::exec) and
+    /// changes first. Like [`multi`](Self::multi) and
     /// [`discard`](Self::discard) it acts on the **connection**, and a client's
     /// connection is shared by everything that uses it, so another caller's
     /// commands can run between yours. Use a client of your own for a
@@ -659,19 +467,6 @@ impl RedisClient {
         self.typed(Command::new("MULTI"), ok, callback);
     }
 
-    /// `EXEC`: run the queued commands. `None` if a watched key changed.
-    pub fn exec(&self, callback: impl FnOnce(Result<Option<Vec<Value>>, RedisError>) + Send + 'static) {
-        self.typed(
-            Command::new("EXEC"),
-            |v| match v {
-                Value::Null => Ok(None),
-                Value::Array(results) => Ok(Some(results)),
-                other => unexpected("the results", &other),
-            },
-            callback,
-        );
-    }
-
     /// `DISCARD`.
     pub fn discard(&self, callback: impl FnOnce(Result<(), RedisError>) + Send + 'static) {
         self.typed(Command::new("DISCARD"), ok, callback);
@@ -680,6 +475,18 @@ impl RedisClient {
 
 impl crate::cluster::RedisCluster {
     typed_fn!();
+
+    /// Send `cmd` and read its reply, assembled under `cap`, with `read`.
+    pub(crate) fn typed_cap<T: Send + 'static>(
+        &self,
+        cmd: Command,
+        cap: Cap,
+        read: fn(Value) -> Result<T, RedisError>,
+        callback: impl FnOnce(Result<T, RedisError>) + Send + 'static,
+    ) {
+        self.submit(&cmd, None, Deadline::Default, cap, Box::new(move |reply: ValueReply| callback(reply.and_then(read))));
+    }
+
     typed_commands!();
 }
 
@@ -770,7 +577,7 @@ impl RedisClient {
         callback: impl FnOnce(Result<u32, RedisError>) + Send + 'static,
     ) {
         let _ = slot_key;
-        self.wait_typed(wait_command(num_replicas, timeout_ms), timeout_ms, wait_count, callback);
+        self.wait_typed(wait_command(num_replicas, timeout_ms), timeout_ms, Cap::SCALAR, wait_count, callback);
     }
 
     /// `WAITAOF numlocal numreplicas timeout_ms`: block until this connection's
@@ -788,13 +595,14 @@ impl RedisClient {
         callback: impl FnOnce(Result<(u32, u32), RedisError>) + Send + 'static,
     ) {
         let _ = slot_key;
-        self.wait_typed(waitaof_command(num_local, num_replicas, timeout_ms), timeout_ms, aof_counts, callback);
+        self.wait_typed(waitaof_command(num_local, num_replicas, timeout_ms), timeout_ms, Cap::PAIR, aof_counts, callback);
     }
 
     fn wait_typed<T: Send + 'static>(
         &self,
         command: Command,
         timeout_ms: u64,
+        cap: Cap,
         read: fn(Value) -> Result<T, RedisError>,
         callback: impl FnOnce(Result<T, RedisError>) + Send + 'static,
     ) {
@@ -802,7 +610,7 @@ impl RedisClient {
             self.inner.reactor.execute(Box::new(move || callback(Err(wait_in_multi()))));
             return;
         }
-        self.send_with_deadline(&command, wait_deadline(timeout_ms), move |reply| callback(reply.and_then(read)));
+        self.send_value(&command, wait_deadline(timeout_ms), cap, move |reply| callback(reply.and_then(read)));
     }
 }
 
@@ -811,21 +619,7 @@ mod tests {
     use super::*;
 
     fn bulk(s: &str) -> Value {
-        Value::Bulk(Bytes::copy_from_slice(s.as_bytes()))
-    }
-
-    #[test]
-    fn scored_reads_both_the_flat_resp2_form_and_the_nested_resp3_form() {
-        let flat = Value::Array(vec![bulk("a"), bulk("1.5"), bulk("b"), bulk("2")]);
-        let nested = Value::Array(vec![
-            Value::Array(vec![bulk("a"), Value::Double(1.5)]),
-            Value::Array(vec![bulk("b"), Value::Double(2.0)]),
-        ]);
-        let want = vec![(Bytes::from_static(b"a"), 1.5), (Bytes::from_static(b"b"), 2.0)];
-        assert_eq!(scored(flat).unwrap(), want);
-        assert_eq!(scored(nested).unwrap(), want);
-        assert!(scored(Value::Array(vec![bulk("a")])).is_err());
-        assert_eq!(scored(Value::Array(vec![])).unwrap(), vec![]);
+        Value::Bulk(hopf_core::Bytes::copy_from_slice(s.as_bytes()))
     }
 
     #[test]
@@ -833,22 +627,16 @@ mod tests {
         assert!(ok(Value::Simple("OK".into())).is_ok());
         assert!(ok(Value::Simple("QUEUED".into())).is_err());
         assert_eq!(int(Value::Int(4)).unwrap(), 4);
-        assert_eq!(int(bulk("7")).unwrap(), 7);
+        assert_eq!(int(bulk("7")).unwrap(), 7, "a number sent as a string, which a short cap allows");
         assert!(int(Value::Null).is_err());
         assert!(boolean(Value::Int(1)).unwrap());
         assert!(!boolean(Value::Bool(false)).unwrap());
         assert!(!boolean(Value::Int(0)).unwrap());
-        assert_eq!(opt_bytes(Value::Null).unwrap(), None);
-        assert_eq!(opt_bytes(bulk("x")).unwrap(), Some(Bytes::from_static(b"x")));
         assert_eq!(opt_f64(Value::Null).unwrap(), None);
         assert_eq!(opt_f64(bulk("3.5")).unwrap(), Some(3.5));
         assert_eq!(opt_f64(Value::Double(3.5)).unwrap(), Some(3.5));
-        assert_eq!(
-            pairs(Value::Map(vec![(bulk("f"), bulk("v"))])).unwrap(),
-            vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))]
-        );
-        assert_eq!(pairs(Value::Array(vec![bulk("f"), bulk("v")])).unwrap().len(), 1);
-        assert_eq!(opt_bytes_vec(Value::Array(vec![bulk("a"), Value::Null])).unwrap(), vec![Some(Bytes::from_static(b"a")), None]);
+        assert_eq!(text(bulk("abc")).unwrap(), "abc");
+        assert!(text(Value::Int(1)).is_err());
     }
 
     #[test]

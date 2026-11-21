@@ -96,7 +96,7 @@ fn a_command_pipelined_behind_the_layout_survives_the_node_being_retired() {
         std::thread::sleep(Duration::from_millis(5));
     }
     // Still routed to the old master, behind the layout request.
-    let got = call!(|cb| c.get("k", cb));
+    let got = collect::get(&c, "k");
     assert_eq!(got.unwrap(), Some(b("old")), "the command was owed a reply by the node being retired");
 
     // The layout moved on, and the next command goes to the new master.
@@ -105,7 +105,7 @@ fn a_command_pipelined_behind_the_layout_survives_the_node_being_retired() {
         assert!(std::time::Instant::now() < deadline, "the new layout was not taken");
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert_eq!(call!(|cb| c.get("k", cb)).unwrap(), Some(b("new")));
+    assert_eq!(collect::get(&c, "k").unwrap(), Some(b("new")));
     c.close();
     rt.shutdown();
     old_master.rt.shutdown();
@@ -372,12 +372,12 @@ fn a_keyless_wait_is_refused_and_one_routed_by_a_key_is_bound_like_wait_replicas
     assert_eq!(count(&log, "WAIT") + count(&log, "WAITAOF"), 0, "nothing was sent");
 
     let reply = call!(|cb| c.command_for_key("k", &Command::new("WAIT").arg("1").arg("10"), cb)).unwrap();
-    assert_eq!(reply, hopf_redis::Value::Int(1));
+    assert_eq!(reply, hopf_redis::ScalarValue::Int(1));
     assert_eq!(count(&log, "WAIT"), 1);
 
     // An ordinary keyless command is routed by the key it is given.
     let reply = call!(|cb| c.command_for_key("k", &Command::new("PING"), cb)).unwrap();
-    assert_eq!(reply, hopf_redis::Value::Simple("PONG".into()));
+    assert_eq!(reply, hopf_redis::ScalarValue::Simple("PONG".into()));
     c.close();
     rt.shutdown();
     server.rt.shutdown();
@@ -449,7 +449,7 @@ fn a_command_whose_slot_is_unserved_in_one_layout_waits_for_the_next() {
     let c = RedisCluster::connect(rt.pick_worker(), config);
     // Asked before any layout is known, for a slot the first layout leaves out.
     let key = key_with_slot(8192..=16383);
-    let got = call!(|cb| c.get(&key, cb));
+    let got = collect::get(&c, &key);
     assert_eq!(got.unwrap(), Some(b("v")), "the layout that followed serves it");
     assert!(layouts.load(Ordering::SeqCst) >= 2);
     c.close();
@@ -473,7 +473,7 @@ fn a_slot_that_stays_unserved_fails_with_clusterdown_after_the_retries_are_spent
     let c = RedisCluster::connect(rt.pick_worker(), config);
     let key = key_with_slot(8192..=16383);
     let started = Instant::now();
-    let err = call!(|cb| c.get(&key, cb)).unwrap_err();
+    let err = collect::get(&c, &key).unwrap_err();
     assert_eq!(err.server_code(), Some("CLUSTERDOWN"), "{err:?}");
     assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
     c.close();
@@ -500,7 +500,7 @@ fn clusterdown_and_tryagain_are_retried_for_an_ordinary_command_since_nothing_ra
     });
     own.set(server.addr).unwrap();
     let (rt, c) = one_node_cluster(&server, |c| c.min_refresh_interval(Duration::from_millis(20)));
-    assert_eq!(call!(|cb| c.get("k", cb)).unwrap(), Some(b("v")));
+    assert_eq!(collect::get(&c, "k").unwrap(), Some(b("v")));
     assert_eq!(answers.load(Ordering::SeqCst), 3);
     c.close();
     rt.shutdown();
@@ -523,7 +523,7 @@ fn clusterdown_that_does_not_go_away_reaches_the_caller_once_the_retries_are_spe
     });
     own.set(server.addr).unwrap();
     let (rt, c) = one_node_cluster(&server, |c| c.min_refresh_interval(Duration::from_millis(20)).max_redirects(3));
-    let err = call!(|cb| c.get("k", cb)).unwrap_err();
+    let err = collect::get(&c, "k").unwrap_err();
     assert_eq!(err.server_code(), Some("CLUSTERDOWN"), "{err:?}");
     assert_eq!(gets.load(Ordering::SeqCst), 4, "the first try and three retries");
     c.close();
@@ -591,12 +591,12 @@ fn a_black_holed_master_is_dropped_its_commands_fail_and_the_layout_is_fetched_a
     let (rt, c, a, node_b) = dark_master_cluster(Duration::from_secs(30), Duration::from_millis(150));
     let refreshes = c.refresh_count();
     let started = Instant::now();
-    let err = call!(|cb| c.get("k", cb)).unwrap_err();
+    let err = collect::get(&c, "k").unwrap_err();
     assert!(matches!(err, RedisError::ConnectionLost(_)), "{err:?}");
     assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
     wait_for_master(&c, &node_b);
     assert!(c.refresh_count() > refreshes, "the layout was fetched again");
-    assert_eq!(call!(|cb| c.get("k", cb)).unwrap(), Some(b("B")), "new commands go to the new master");
+    assert_eq!(collect::get(&c, "k").unwrap(), Some(b("B")), "new commands go to the new master");
     c.close();
     rt.shutdown();
     a.rt.shutdown();
@@ -608,10 +608,10 @@ fn the_layout_is_fetched_again_even_when_every_command_had_already_timed_out() {
     // The command gives up at 100 ms, long before the connection is judged dead
     // at 400 ms; at that point nothing is waiting to hear that it was lost.
     let (rt, c, a, node_b) = dark_master_cluster(Duration::from_millis(100), Duration::from_millis(400));
-    let err = call!(|cb| c.get("k", cb)).unwrap_err();
+    let err = collect::get(&c, "k").unwrap_err();
     assert_eq!(err, RedisError::Timeout);
     wait_for_master(&c, &node_b);
-    assert_eq!(call!(|cb| c.get("k", cb)).unwrap(), Some(b("B")));
+    assert_eq!(collect::get(&c, "k").unwrap(), Some(b("B")));
     c.close();
     rt.shutdown();
     a.rt.shutdown();
@@ -636,7 +636,7 @@ fn a_command_that_merely_times_out_does_not_ask_for_a_new_layout() {
     });
     let before = c.refresh_count();
     for _ in 0..3 {
-        assert_eq!(call!(|cb| c.get("k", cb)).unwrap_err(), RedisError::Timeout);
+        assert_eq!(collect::get(&c, "k").unwrap_err(), RedisError::Timeout);
     }
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(c.refresh_count(), before, "no refresh was asked for");
@@ -652,7 +652,7 @@ fn a_command_sent_through_the_cluster_can_have_a_deadline_of_its_own() {
     let server = node(move |s, w| match name_of(w).as_str() {
         "CLUSTER" => s.reply(slots_of(*addr.get().unwrap(), "only")),
         "GET" if arg(w, 1) == "never" => {}
-        "GET" => s.reply_after(Duration::from_millis(400), "$4\r\nslow\r\n"),
+        "GET" => s.reply_after(Duration::from_millis(400), ":7\r\n"),
         other => panic!("unexpected {other}"),
     });
     own.set(server.addr).unwrap();
@@ -662,10 +662,10 @@ fn a_command_sent_through_the_cluster_can_have_a_deadline_of_its_own() {
     // The node default gives up on the slow reply; a longer deadline of its own waits for it.
     assert_eq!(call!(|cb| c.send(&get("slow"), cb)).unwrap_err(), RedisError::Timeout);
     let slow = call!(|cb| c.send_with_deadline(&get("slow"), Deadline::After(Duration::from_secs(5)), cb));
-    assert_eq!(slow.unwrap(), hopf_redis::Value::Bulk(b("slow")));
+    assert_eq!(slow.unwrap(), hopf_redis::ScalarValue::Int(7));
     assert_eq!(
         call!(|cb| c.send_with_deadline(&get("slow"), Deadline::Never, cb)).unwrap(),
-        hopf_redis::Value::Bulk(b("slow"))
+        hopf_redis::ScalarValue::Int(7)
     );
     // And a shorter one fails sooner than the default.
     let started = Instant::now();
@@ -700,6 +700,7 @@ fn two_masters() -> (hopf_core::Runtime, RedisCluster, Server, Server) {
                     s.reply(format!("-MOVED {} {b}\r\n", key_slot(b"moved")));
                 }
                 "GET" => s.reply("$2\r\nok\r\n"),
+                "INCR" => s.reply(":1\r\n"),
                 other => panic!("unexpected {other}"),
             }
         }
@@ -770,7 +771,7 @@ fn a_push_on_a_node_connection_reaches_the_sink_made_for_that_node() {
     assert_eq!(key, nb.addr.port().to_string());
 
     // Replies stay in step with their commands around the pushes.
-    assert_eq!(call!(|cb| c.get("moved", cb)).unwrap(), Some(b("ok")));
+    assert_eq!(collect::get(&c, "moved").unwrap(), Some(b("ok")));
     c.close();
     rt.shutdown();
     a.rt.shutdown();
@@ -813,7 +814,7 @@ fn pushes_still_arrive_from_a_node_first_reached_through_a_moved() {
     let (tx, rx) = std::sync::mpsc::channel();
     tell(&c, tx);
     // `a` answers this with MOVED to `b`, which is where the connection to `b` comes from.
-    assert_eq!(call!(|cb| c.get("moved", cb)).unwrap(), Some(b("ok")));
+    assert_eq!(collect::get(&c, "moved").unwrap(), Some(b("ok")));
     call!(|cb| c.send_to_node(&addr_of(&nb), &tracking(), cb)).unwrap();
     let (from, _) = rx.recv_timeout(Duration::from_secs(5)).expect("a push");
     assert_eq!(from, addr_of(&nb));
@@ -828,7 +829,7 @@ fn pushes_are_dropped_without_a_sink_and_after_it_is_cleared() {
     let (rt, c, a, nb) = two_masters();
     // No sink: the push is dropped and the reply behind it is still the reply.
     call!(|cb| c.send_to_node(&addr_of(&a), &tracking(), cb)).unwrap();
-    assert_eq!(call!(|cb| c.get("k", cb)).unwrap(), Some(b("ok")));
+    assert_eq!(collect::get(&c, "k").unwrap(), Some(b("ok")));
 
     let (tx, rx) = std::sync::mpsc::channel();
     tell(&c, tx);
@@ -903,7 +904,7 @@ fn a_command_can_be_sent_to_a_given_master_or_to_every_one() {
     assert!(matches!(err, RedisError::Unexpected(_)), "{err:?}");
 
     let (tx, rx) = std::sync::mpsc::channel();
-    c.send_to_masters(&Command::new("GET").arg("k"), move |node, reply| tx.send((node, reply)).unwrap());
+    c.send_to_masters(&Command::new("INCR").arg("k"), move |node, reply| tx.send((node, reply)).unwrap());
     let mut got: Vec<(NodeAddr, bool)> =
         (0..2).map(|_| rx.recv_timeout(Duration::from_secs(5)).expect("a reply per master")).map(|(n, r)| (n, r.is_ok())).collect();
     got.sort_by_key(|(n, _)| n.port);
@@ -1000,7 +1001,7 @@ fn a_streamed_argument_cannot_be_a_key_or_be_in_a_transaction() {
     // The key is the first argument of SET, and it is streamed.
     let err = call!(|cb| c.send(&Command::new("SET").arg_stream(arg()).arg("v"), cb)).unwrap_err();
     assert!(matches!(err, RedisError::Unexpected(_)), "{err:?}");
-    let err = call!(|cb| c.transaction(vec![Command::new("SET").arg("k").arg_stream(arg())], cb)).unwrap_err();
+    let err = collect::transaction(&c, vec![Command::new("SET").arg("k").arg_stream(arg())]).unwrap_err();
     assert!(matches!(err, RedisError::Unexpected(_)), "{err:?}");
     c.close();
     rt.shutdown();
@@ -1130,11 +1131,11 @@ fn a_streamed_get_goes_to_the_owner_of_its_slot() {
         |c| c,
     );
     let (h, told) = Bulk::new();
-    c.get_stream(key_with_slot(0..=8191), h);
+    c.get(key_with_slot(0..=8191), h);
     wait_outcome(&told).unwrap();
     assert_eq!(told.lock().unwrap().bytes, 1, "a's value");
     let (h, told) = Bulk::new();
-    c.get_stream(key_with_slot(8192..=16383), h);
+    c.get(key_with_slot(8192..=16383), h);
     wait_outcome(&told).unwrap();
     let t = told.lock().unwrap();
     assert_eq!((t.bytes, t.begun, t.ended), (BULK, 1, true), "b's, in chunks");
@@ -1170,7 +1171,7 @@ fn a_streamed_reply_that_is_redirected_is_heard_once_from_the_node_it_moved_to()
     );
     new_addr.set(nb.addr).unwrap();
     let (h, told) = Bulk::new();
-    c.get_stream(&moved, h);
+    c.get(&moved, h);
     wait_outcome(&told).unwrap();
     let t = told.lock().unwrap();
     assert_eq!((t.bytes, t.begun, t.ended), (BULK, 1, true), "the sink heard one reply, the second node's");
@@ -1207,7 +1208,7 @@ fn an_ask_sends_the_command_behind_an_asking_to_the_other_node() {
     );
     new_addr.set(nb.addr).unwrap();
     let (h, told) = Bulk::new();
-    c.get_stream(&key, h);
+    c.get(&key, h);
     wait_outcome(&told).unwrap();
     assert_eq!(told.lock().unwrap().bytes, BULK);
     let names: Vec<String> = seen.lock().unwrap().iter().map(|(_, n)| n.clone()).collect();
@@ -1237,7 +1238,7 @@ fn a_streamed_command_is_tried_again_when_the_slot_is_between_masters() {
         |c| c,
     );
     let (h, told) = Bulk::new();
-    c.get_stream(key_with_slot(0..=8191), h);
+    c.get(key_with_slot(0..=8191), h);
     wait_outcome(&told).unwrap();
     assert_eq!(told.lock().unwrap().bytes, BULK);
     assert_eq!(tries.load(Ordering::SeqCst), 2);
@@ -1311,7 +1312,7 @@ fn an_error_that_is_not_a_redirection_reaches_the_sink_as_the_error_reply_it_is(
     );
     // A shape sink reports it as a server error, as it would from a single node.
     let (h, told) = Bulk::new();
-    c.get_stream(key_with_slot(0..=8191), h);
+    c.get(key_with_slot(0..=8191), h);
     let err = wait_outcome(&told).unwrap_err();
     assert_eq!(err.server_code(), Some("WRONGTYPE"), "{err:?}");
     // And a sink of any other shape is told it as an error reply.
@@ -1354,7 +1355,7 @@ fn redirections_run_out_with_the_error_for_the_sink_and_a_lost_connection_is_not
     addrs.set((a.addr, nb.addr)).unwrap();
     // a says b, b says a: one redirection is allowed, the second is the answer.
     let (h, told) = Bulk::new();
-    c.get_stream(&a_key, h);
+    c.get(&a_key, h);
     let err = wait_outcome(&told).unwrap_err();
     assert_eq!(err.server_code(), Some("MOVED"), "{err:?}");
     c.close();
@@ -1379,7 +1380,7 @@ fn redirections_run_out_with_the_error_for_the_sink_and_a_lost_connection_is_not
         |c| c,
     );
     let (h, told) = Bulk::new();
-    c.get_stream(key_with_slot(0..=8191), h);
+    c.get(key_with_slot(0..=8191), h);
     let err = wait_outcome(&told).unwrap_err();
     assert!(matches!(err, RedisError::ConnectionLost(_)), "{err:?}");
     assert_eq!(told.lock().unwrap().bytes, 3);
@@ -1406,7 +1407,7 @@ fn the_handle_of_a_cluster_command_pauses_resumes_and_cancels_the_reply() {
     // Paused for far longer than the command timeout and the health check.
     let (mut h, told) = Bulk::new();
     h.pause_first = true;
-    let stream = c.get_stream(&key, h);
+    let stream = c.get(&key, h);
     for _ in 0..500 {
         if told.lock().unwrap().chunks >= 1 {
             break;
@@ -1425,7 +1426,7 @@ fn the_handle_of_a_cluster_command_pauses_resumes_and_cancels_the_reply() {
     // Cancelled while paused.
     let (mut h, told) = Bulk::new();
     h.pause_first = true;
-    let stream = c.get_stream(&key, h);
+    let stream = c.get(&key, h);
     for _ in 0..500 {
         if told.lock().unwrap().chunks >= 1 {
             break;
@@ -1458,7 +1459,7 @@ fn a_command_cancelled_before_its_reply_begins_is_not_sent_again() {
         |c| c,
     );
     let (h, told) = Bulk::new();
-    let stream = c.get_stream(key_with_slot(0..=8191), h);
+    let stream = c.get(key_with_slot(0..=8191), h);
     std::thread::sleep(Duration::from_millis(100));
     stream.cancel();
     assert_eq!(wait_outcome(&told).unwrap_err(), RedisError::Cancelled);

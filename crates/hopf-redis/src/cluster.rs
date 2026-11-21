@@ -56,7 +56,8 @@ use std::time::{Duration, Instant};
 
 use hopf_core::ReactorHandle;
 
-use crate::client::{Callback, ClusterStream, Command, Deadline, RedisClient, Reply, StreamHandle};
+use crate::client::{scalar, ClusterStream, Command, Deadline, RedisClient, Reply, StreamHandle, ValueCallback, ValueReply};
+use crate::collect::Cap;
 use crate::commands::{
     aof_counts, is_connection_scoped, server_timeout_ms, wait_command, wait_count, wait_deadline, waitaof_command,
 };
@@ -64,7 +65,7 @@ use crate::config::RedisConfig;
 use crate::error::RedisError;
 use crate::keys::{command_slot, key_indexes, key_slot, SLOTS};
 use crate::pubsub::is_subscription_command;
-use crate::resp::{AggKind, Flow, ReplyKind, ReplySink, Scalar, ServerError, StrKind, Value};
+use crate::resp::{AggKind, Flow, ReplyKind, ReplySink, Scalar, ServerError, StrKind};
 use crate::topology::{parse_redirect, parse_shards, parse_slots, NodeAddr, SlotRange};
 
 /// Settings for a [`RedisCluster`].
@@ -163,12 +164,16 @@ struct Job {
     track: Option<Arc<Track>>,
     /// How long each try may go unanswered.
     deadline: Deadline,
+    /// How much of a reply that is taken as a value is read.
+    cap: Cap,
+    /// For a transaction, the commands it runs; `command` is then its `EXEC`.
+    txn: Option<Vec<Command>>,
 }
 
 /// Where a command's reply goes.
 enum JobReply {
     /// A callback that takes the reply as a value.
-    Value(Callback),
+    Value(ValueCallback),
     /// A sink of the caller's own, told the reply as it arrives.
     Stream(StreamJob),
 }
@@ -215,22 +220,6 @@ fn fail_sink(inner: &Inner, sink: Option<Box<dyn ReplySink + Send>>, error: Redi
     }));
 }
 
-/// Work that cannot go anywhere until the layout is known.
-enum Parked {
-    Command(Job),
-    Tx(TxJob),
-}
-
-impl Parked {
-    /// Fail it with `error`.
-    fn fail(self, inner: &Arc<Inner>, error: RedisError) {
-        match self {
-            Parked::Command(j) => j.fail(inner, error),
-            Parked::Tx(j) => finish_tx(inner, j.callback, Err(error)),
-        }
-    }
-}
-
 #[derive(Default)]
 struct Refresh {
     running: bool,
@@ -249,7 +238,7 @@ struct State {
     refresh: Refresh,
     /// Work waiting for a layout, and the error to give it if there is none to
     /// be had.
-    parked: Vec<(Parked, Option<RedisError>)>,
+    parked: Vec<(Job, Option<RedisError>)>,
     /// Turns keyless commands over the masters.
     next_keyless: usize,
     /// The last command submitted for each slot, until it is answered.
@@ -389,7 +378,7 @@ impl RedisCluster {
     /// module for how redirections, failures and commands with several keys are
     /// handled.
     pub fn send(&self, command: &Command, callback: impl FnOnce(Reply) + Send + 'static) {
-        self.submit(command, None, Deadline::Default, Box::new(callback));
+        self.submit(command, None, Deadline::Default, Cap::SCALAR, Box::new(scalar(callback)));
     }
 
     /// [`send`](Self::send) with a deadline of its own instead of the node
@@ -400,13 +389,13 @@ impl RedisCluster {
     /// `WAIT` and `WAITAOF` keep the deadline [`wait_replicas`](Self::wait_replicas)
     /// gives them.
     pub fn send_with_deadline(&self, command: &Command, deadline: Deadline, callback: impl FnOnce(Reply) + Send + 'static) {
-        self.submit(command, None, deadline, Box::new(callback));
+        self.submit(command, None, deadline, Cap::SCALAR, Box::new(scalar(callback)));
     }
 
     /// [`send`](Self::send) for the command made of `words`.
     pub fn command(&self, words: &[&[u8]], callback: impl FnOnce(Reply) + Send + 'static) {
         let command = Command::new(words.first().copied().unwrap_or(b"")).args(words.iter().skip(1));
-        self.submit(&command, None, Deadline::Default, Box::new(callback));
+        self.submit(&command, None, Deadline::Default, Cap::SCALAR, Box::new(scalar(callback)));
     }
 
     /// [`send`](Self::send) to the master that owns `routing_key`'s slot,
@@ -420,10 +409,10 @@ impl RedisCluster {
     /// and one sent here behaves as [`wait_replicas`](Self::wait_replicas)
     /// does: it is bound to the last command submitted for the key's slot.
     pub fn command_for_key(&self, routing_key: impl AsRef<[u8]>, command: &Command, callback: impl FnOnce(Reply) + Send + 'static) {
-        self.submit(command, Some(key_slot(routing_key.as_ref())), Deadline::Default, Box::new(callback));
+        self.submit(command, Some(key_slot(routing_key.as_ref())), Deadline::Default, Cap::SCALAR, Box::new(scalar(callback)));
     }
 
-    fn submit(&self, command: &Command, routed: Option<u16>, deadline: Deadline, callback: Callback) {
+    pub(crate) fn submit(&self, command: &Command, routed: Option<u16>, deadline: Deadline, cap: Cap, callback: ValueCallback) {
         let inner = &self.inner;
         if inner.closed.load(Ordering::SeqCst) {
             return finish(inner, callback, Err(RedisError::Closed));
@@ -449,7 +438,7 @@ impl RedisCluster {
             return match routed {
                 Some(slot) => {
                     let deadline = wait_deadline(server_timeout_ms(command.words()));
-                    self.bound(slot, command.clone(), deadline, callback)
+                    self.bound(slot, command.clone(), deadline, cap, callback)
                 }
                 None => finish(
                     inner,
@@ -482,6 +471,8 @@ impl RedisCluster {
                 reply: JobReply::Value(callback),
                 track,
                 deadline,
+                cap,
+                txn: None,
             },
             true,
         );
@@ -575,6 +566,8 @@ impl RedisCluster {
                 }),
                 track,
                 deadline,
+                cap: Cap::SCALAR,
+                txn: None,
             },
             true,
         );
@@ -614,7 +607,7 @@ impl RedisCluster {
     ) {
         let slot = key_slot(slot_key.as_ref());
         let command = wait_command(num_replicas, timeout_ms);
-        self.bound(slot, command, wait_deadline(timeout_ms), Box::new(move |r| callback(r.and_then(wait_count))));
+        self.bound(slot, command, wait_deadline(timeout_ms), Cap::SCALAR, Box::new(move |r| callback(r.and_then(wait_count))));
     }
 
     /// `WAITAOF num_local num_replicas timeout_ms`, bound to the slot of
@@ -631,13 +624,13 @@ impl RedisCluster {
     ) {
         let slot = key_slot(slot_key.as_ref());
         let command = waitaof_command(num_local, num_replicas, timeout_ms);
-        self.bound(slot, command, wait_deadline(timeout_ms), Box::new(move |r| callback(r.and_then(aof_counts))));
+        self.bound(slot, command, wait_deadline(timeout_ms), Cap::PAIR, Box::new(move |r| callback(r.and_then(aof_counts))));
     }
 
     /// Send a connection-scoped `command` for `slot`: behind the command in
     /// flight for it, on its connection, or to the slot's owner if there is
     /// none.
-    fn bound(&self, slot: u16, command: Command, deadline: Deadline, callback: Callback) {
+    fn bound(&self, slot: u16, command: Command, deadline: Deadline, cap: Cap, callback: ValueCallback) {
         let inner = &self.inner;
         if inner.closed.load(Ordering::SeqCst) {
             return finish(inner, callback, Err(RedisError::Closed));
@@ -649,6 +642,7 @@ impl RedisCluster {
                 let wait = Arc::new(Wait {
                     command,
                     deadline,
+                    cap,
                     sent: AtomicU64::new(0),
                     callback: Mutex::new(Some(callback)),
                 });
@@ -664,7 +658,7 @@ impl RedisCluster {
             None => finish(inner, callback, Err(unserved())),
             Some((client, _, _)) => {
                 let inner2 = Arc::clone(inner);
-                client.send_with_deadline(&command, deadline, move |reply| callback(unsent_closed(&inner2, reply)));
+                client.send_value(&command, deadline, cap, move |reply| callback(unsent_closed(&inner2, reply)));
             }
         }
     }
@@ -672,57 +666,57 @@ impl RedisCluster {
     /// Run `commands` as one transaction on the master that owns their slot:
     /// `MULTI`, the commands and `EXEC` written together. Their keys must share
     /// a slot (use hash tags), or it fails with `CROSSSLOT` without touching the
-    /// network. See [`RedisClient::transaction`] for the results.
-    pub fn transaction(
-        &self,
-        commands: Vec<Command>,
-        callback: impl FnOnce(Result<Option<Vec<Value>>, RedisError>) + Send + 'static,
-    ) {
+    /// network. `sink` is told the reply to `EXEC` as it arrives (see
+    /// [`RedisClient::transaction`] for what that is), with redirections and
+    /// retries followed as for [`send_streaming`](Self::send_streaming): the sink
+    /// hears nothing of an attempt that was redirected, and a transaction
+    /// cannot hold a streamed argument.
+    pub fn transaction(&self, commands: Vec<Command>, sink: impl ReplySink + Send + 'static) -> StreamHandle {
         let inner = &self.inner;
+        let control = Arc::new(ClusterStream::default());
+        let handle = StreamHandle::cluster(Arc::clone(&control));
+        let sink: Box<dyn ReplySink + Send> = Box::new(sink);
+        let refuse = |why: RedisError, sink: Box<dyn ReplySink + Send>| {
+            fail_sink(inner, Some(sink), why);
+            StreamHandle::cluster(Arc::new(ClusterStream::default()))
+        };
         let mut slot: Option<u16> = None;
         if commands.iter().any(Command::has_streams) {
-            return finish_tx(
-                inner,
-                Box::new(callback),
-                Err(RedisError::Unexpected("a transaction cannot hold a streamed argument".into())),
-            );
+            return refuse(RedisError::Unexpected("a transaction cannot hold a streamed argument".into()), sink);
         }
         for c in &commands {
             match command_slot(c.words()) {
-                Err(_) => return finish_tx(inner, Box::new(callback), Err(crossslot())),
+                Err(_) => return refuse(crossslot(), sink),
                 Ok(None) => {}
                 Ok(Some(s)) => match slot {
-                    Some(prev) if prev != s => return finish_tx(inner, Box::new(callback), Err(crossslot())),
+                    Some(prev) if prev != s => return refuse(crossslot(), sink),
                     _ => slot = Some(s),
                 },
             }
         }
         if inner.closed.load(Ordering::SeqCst) {
-            return finish_tx(inner, Box::new(callback), Err(RedisError::Closed));
+            return refuse(RedisError::Closed, sink);
         }
         let track = slot.map(|s| register(inner, s));
-        let callback: TxCallback = match &track {
-            Some(t) => {
-                let (inner2, track2) = (Arc::clone(inner), Arc::clone(t));
-                Box::new(move |result| {
-                    complete(&inner2, &track2, result.as_ref().err());
-                    callback(result)
-                })
-            }
-            None => Box::new(callback),
-        };
-        dispatch_tx(
+        dispatch(
             inner,
-            TxJob {
-                commands,
+            Job {
+                command: Command::new("EXEC"),
                 slot,
                 target: Target::Owner,
                 budget: inner.config.max_redirects,
-                callback,
+                reply: JobReply::Stream(StreamJob {
+                    sink: Some(sink),
+                    control,
+                }),
                 track,
+                deadline: Deadline::Default,
+                cap: Cap::SCALAR,
+                txn: Some(commands),
             },
             true,
         );
+        handle
     }
 
     /// Receive the RESP3 pushes the connections to the nodes get: key
@@ -775,6 +769,7 @@ impl RedisCluster {
     /// nothing is sent. The command is neither redirected nor sent again.
     pub fn send_to_node(&self, node: &NodeAddr, command: &Command, callback: impl FnOnce(Reply) + Send + 'static) {
         let inner = &self.inner;
+        let callback = scalar(callback);
         if inner.closed.load(Ordering::SeqCst) {
             return finish(inner, Box::new(callback), Err(RedisError::Closed));
         }
@@ -794,7 +789,7 @@ impl RedisCluster {
             ),
             Some(client) => {
                 let inner2 = Arc::clone(inner);
-                client.send(command, move |reply| callback(unsent_closed(&inner2, reply)));
+                client.send_value(command, Deadline::Default, Cap::SCALAR, move |reply| callback(unsent_closed(&inner2, reply)));
             }
         }
     }
@@ -869,14 +864,8 @@ fn crossslot() -> RedisError {
 }
 
 /// Run `callback` on the reactor, never inline.
-fn finish(inner: &Inner, callback: Callback, reply: Reply) {
+fn finish(inner: &Inner, callback: ValueCallback, reply: ValueReply) {
     inner.reactor.execute(Box::new(move || callback(reply)));
-}
-
-type TxCallback = Box<dyn FnOnce(Result<Option<Vec<Value>>, RedisError>) + Send>;
-
-fn finish_tx(inner: &Inner, callback: TxCallback, result: Result<Option<Vec<Value>>, RedisError>) {
-    inner.reactor.execute(Box::new(move || callback(result)));
 }
 
 /// The connection to `addr`, made if there is none.
@@ -936,7 +925,7 @@ fn route(inner: &Arc<Inner>, target: &Target, slot: Option<u16>) -> Option<(Redi
 }
 
 /// Park `work` until a layout is known, and ask for one.
-fn park(inner: &Arc<Inner>, work: Parked, why: Option<RedisError>) {
+fn park(inner: &Arc<Inner>, work: Job, why: Option<RedisError>) {
     inner.state.lock().unwrap().parked.push((work, why));
     request_refresh(inner);
 }
@@ -961,41 +950,46 @@ fn dispatch(inner: &Arc<Inner>, mut job: Job, fresh: bool) {
     }
     let Some((client, addr, asking)) = route(inner, &job.target, job.slot) else {
         return if fresh {
-            park(inner, Parked::Command(job), None)
+            park(inner, job, None)
         } else if job.budget > 0 {
             // The layout just fetched has no master for the slot: a failover
             // is probably under way. Wait for the next layout.
             job.budget -= 1;
-            park(inner, Parked::Command(job), Some(unserved()))
+            park(inner, job, Some(unserved()))
         } else {
             job.fail(inner, unserved())
         };
     };
     let sent = job.command.clone();
+    let txn = job.txn.clone();
     let deadline = job.deadline;
     let track = job.track.clone();
     let inner2 = Arc::clone(inner);
     match &job.reply {
         JobReply::Value(_) => {
-            let reply = move |reply: Reply| on_reply(&inner2, job, addr, reply);
+            let cap = job.cap;
+            let reply = move |reply: ValueReply| on_reply(&inner2, job, addr, reply);
             if asking {
                 // ASKING applies to the next command on the connection and no other, so
                 // the two go in one batch with nothing between them.
-                client.send_batch_with_deadline(
-                    vec![(Command::new("ASKING"), Box::new(|_: Reply| {})), (sent, Box::new(reply))],
+                client.send_batch_value(
+                    vec![
+                        (Command::new("ASKING"), Cap::SCALAR, Box::new(|_: ValueReply| {})),
+                        (sent, cap, Box::new(reply)),
+                    ],
                     deadline,
                 );
             } else {
-                client.send_with_deadline(&sent, deadline, reply);
+                client.send_value(&sent, deadline, cap, reply);
             }
         }
         JobReply::Stream(stream) => {
             let control = Arc::clone(&stream.control);
             let gate = Gate::new(inner2, job, addr);
-            let handle = if asking {
-                client.send_asking_streaming(&sent, deadline, gate)
-            } else {
-                client.send_streaming_with_deadline(&sent, deadline, gate)
+            let handle = match txn {
+                Some(commands) => client.transaction_streaming(asking, commands, deadline, gate),
+                None if asking => client.send_asking_streaming(&sent, deadline, gate),
+                None => client.send_streaming_with_deadline(&sent, deadline, gate),
             };
             *control.current.lock().unwrap() = Some(handle.clone());
             if control.cancelled.load(Ordering::SeqCst) {
@@ -1009,7 +1003,7 @@ fn dispatch(inner: &Arc<Inner>, mut job: Job, fresh: bool) {
 }
 
 /// A node answered, or failed to.
-fn on_reply(inner: &Arc<Inner>, job: Job, from: Arc<NodeAddr>, reply: Reply) {
+fn on_reply(inner: &Arc<Inner>, job: Job, from: Arc<NodeAddr>, reply: ValueReply) {
     match reply {
         Ok(v) => {
             if let JobReply::Value(callback) = job.reply {
@@ -1045,7 +1039,7 @@ fn on_failure(inner: &Arc<Inner>, mut job: Job, from: Arc<NodeAddr>, error: Redi
         RedisError::Server(e) if (e.code == "CLUSTERDOWN" || e.code == "TRYAGAIN") && job.budget > 0 => {
             job.budget -= 1;
             job.target = Target::Owner;
-            return park(inner, Parked::Command(job), Some(error));
+            return park(inner, job, Some(error));
         }
         RedisError::Server(e) if e.code == "CLUSTERDOWN" => request_refresh(inner),
         // Nothing was sent: the node is unreachable. Find out where the slot
@@ -1054,7 +1048,7 @@ fn on_failure(inner: &Arc<Inner>, mut job: Job, from: Arc<NodeAddr>, error: Redi
             job.budget -= 1;
             job.target = Target::Owner;
             forget_node(inner, &from);
-            return park(inner, Parked::Command(job), Some(error));
+            return park(inner, job, Some(error));
         }
         // Sent, and the connection went: not repeated, but the layout has
         // probably changed. The same goes for a connection closed because its
@@ -1246,81 +1240,6 @@ fn forget_node(inner: &Arc<Inner>, addr: &NodeAddr) {
     }
 }
 
-struct TxJob {
-    commands: Vec<Command>,
-    slot: Option<u16>,
-    target: Target,
-    budget: u32,
-    callback: TxCallback,
-    track: Option<Arc<Track>>,
-}
-
-fn dispatch_tx(inner: &Arc<Inner>, mut job: TxJob, fresh: bool) {
-    if let Some(t) = &job.track {
-        detach(t);
-    }
-    let Some((client, addr, asking)) = route(inner, &job.target, job.slot) else {
-        return if fresh {
-            park(inner, Parked::Tx(job), None)
-        } else if job.budget > 0 {
-            job.budget -= 1;
-            park(inner, Parked::Tx(job), Some(unserved()))
-        } else {
-            finish_tx(inner, job.callback, Err(unserved()))
-        };
-    };
-    let inner2 = Arc::clone(inner);
-    let commands = job.commands.clone();
-    let track = job.track.clone();
-    client.transaction_asking(asking, commands, move |result| on_tx_reply(&inner2, job, addr, result));
-    if let Some(t) = track {
-        attach(inner, &t, &client);
-    }
-}
-
-fn on_tx_reply(inner: &Arc<Inner>, mut job: TxJob, from: Arc<NodeAddr>, result: Result<Option<Vec<Value>>, RedisError>) {
-    let error = match result {
-        Ok(v) => return (job.callback)(Ok(v)),
-        Err(e) => e,
-    };
-    match &error {
-        RedisError::Server(e) if (e.code == "MOVED" || e.code == "ASK") && job.budget > 0 => {
-            if let Some((slot, node)) = parse_redirect(&e.message) {
-                job.budget -= 1;
-                if e.code == "MOVED" {
-                    let node = Arc::new(node);
-                    inner.state.lock().unwrap().slots[slot as usize] = Some(Arc::clone(&node));
-                    request_refresh(inner);
-                    job.target = Target::Node(node);
-                } else {
-                    job.target = Target::Asking(Arc::new(node));
-                }
-                return dispatch_tx(inner, job, true);
-            }
-        }
-        RedisError::Server(e) if (e.code == "CLUSTERDOWN" || e.code == "TRYAGAIN") && job.budget > 0 => {
-            job.budget -= 1;
-            job.target = Target::Owner;
-            return park(inner, Parked::Tx(job), Some(error));
-        }
-        RedisError::Server(e) if e.code == "CLUSTERDOWN" => request_refresh(inner),
-        RedisError::Connect(_) if job.budget > 0 => {
-            job.budget -= 1;
-            job.target = Target::Owner;
-            forget_node(inner, &from);
-            return park(inner, Parked::Tx(job), Some(error));
-        }
-        RedisError::ConnectionLost(_) => request_refresh(inner),
-        RedisError::Closed if job.budget > 0 && !inner.closed.load(Ordering::SeqCst) => {
-            job.budget -= 1;
-            job.target = Target::Owner;
-            return dispatch_tx(inner, job, true);
-        }
-        _ => {}
-    }
-    (job.callback)(Err(error));
-}
-
 // ---- commands bound to the connection of a write ----
 
 /// The last command submitted for a slot, while it is unanswered: what a `WAIT`
@@ -1344,11 +1263,12 @@ struct TrackState {
 struct Wait {
     command: Command,
     deadline: Deadline,
+    cap: Cap,
     /// The sending of this `WAIT` whose reply counts, or 0 when it is not
     /// sent: an answer to an earlier sending, from before the command was
     /// redirected, is not an answer.
     sent: AtomicU64,
-    callback: Mutex<Option<Callback>>,
+    callback: Mutex<Option<ValueCallback>>,
 }
 
 /// Make `slot`'s new last command.
@@ -1363,7 +1283,7 @@ fn register(inner: &Arc<Inner>, slot: u16) -> Arc<Track> {
 
 /// `callback`, preceded by the end of `track`: a `WAIT` made from `callback`
 /// finds nothing in flight.
-fn on_completion(inner: &Arc<Inner>, track: &Arc<Track>, callback: Callback) -> Callback {
+fn on_completion(inner: &Arc<Inner>, track: &Arc<Track>, callback: ValueCallback) -> ValueCallback {
     let (inner, track) = (Arc::clone(inner), Arc::clone(track));
     Box::new(move |reply| {
         complete(&inner, &track, reply.as_ref().err());
@@ -1425,7 +1345,7 @@ fn send_wait(inner: &Arc<Inner>, track: &Arc<Track>, wait: &Arc<Wait>, client: &
     let id = inner.wait_sends.fetch_add(1, Ordering::SeqCst) + 1;
     wait.sent.store(id, Ordering::SeqCst);
     let (inner2, track2, wait2) = (Arc::clone(inner), Arc::clone(track), Arc::clone(wait));
-    client.send_with_deadline(&wait.command, wait.deadline, move |reply| {
+    client.send_value(&wait.command, wait.deadline, wait.cap, move |reply| {
         // Not this sending's reply: the command was redirected since, and the
         // `WAIT` has been sent again where it went.
         if wait2.sent.load(Ordering::SeqCst) != id {
@@ -1440,7 +1360,7 @@ fn send_wait(inner: &Arc<Inner>, track: &Arc<Track>, wait: &Arc<Wait>, client: &
 
 /// A node's client that refuses a command because it is being let go of has
 /// not sent it, but a `WAIT` cannot go anywhere else: say that, not `Closed`.
-fn unsent_closed(inner: &Inner, reply: Reply) -> Reply {
+fn unsent_closed(inner: &Inner, reply: ValueReply) -> ValueReply {
     match reply {
         Err(RedisError::Closed) if !inner.closed.load(Ordering::SeqCst) => Err(RedisError::ConnectionLost(
             "the node left the cluster layout before the command was sent".into(),
@@ -1515,7 +1435,8 @@ fn ask(inner: &Arc<Inner>, candidates: Vec<NodeAddr>, i: usize, slots_form: bool
     let tls = inner.config.node.tls.is_some();
     let inner2 = Arc::clone(inner);
     let sub: &[u8] = if slots_form { b"SLOTS" } else { b"SHARDS" };
-    client.command(&[b"CLUSTER", sub], move |reply| {
+    let command = Command::new("CLUSTER").arg(sub);
+    client.send_value(&command, Deadline::Default, Cap::CONTROL, move |reply| {
         let ranges = reply.and_then(|v| {
             if slots_form {
                 parse_slots(v, &addr)
@@ -1571,8 +1492,7 @@ fn apply(inner: &Arc<Inner>, ranges: Vec<SlotRange>) {
     }
     for (work, _) in parked {
         match work {
-            Parked::Command(job) => dispatch(inner, job, false),
-            Parked::Tx(job) => dispatch_tx(inner, job, false),
+            job => dispatch(inner, job, false),
         }
     }
 }

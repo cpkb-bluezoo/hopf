@@ -41,17 +41,89 @@ use crate::config::RedisConfig;
 use crate::error::RedisError;
 use crate::pubsub::{self, Desired, Dispatch, SubSink, SubscriberHandler};
 use crate::argstream::{ArgFactory, ArgSource, SourceCtl, SourceRead, SourceWaker, StreamArg};
-use crate::collect::{Collector, TooLarge};
+use crate::collect::{Cap, Collector, TooLarge};
 use crate::resp::{
     encode_command, encode_words, AggKind, Feed, Flow, ReplyKind, ReplySink, RespParser, Scalar, ServerError, StrKind,
     Value,
 };
 
+/// A reply that is a single value, of a size that does not depend on what the
+/// server holds: what [`RedisClient::send`] and [`RedisClient::command`] hand to
+/// their callbacks. A string or a collection (`GET`, `LRANGE`, `EVAL`) can be of
+/// any size, so it is never given whole: it goes to a sink, with
+/// [`send_streaming`](RedisClient::send_streaming).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScalarValue {
+    /// Nil.
+    Null,
+    /// An integer.
+    Int(i64),
+    /// A simple string, such as `OK` or `PONG`.
+    Simple(String),
+    /// A double (RESP3).
+    Double(f64),
+    /// A boolean (RESP3).
+    Bool(bool),
+    /// A number too large for `i64` (RESP3), as its decimal digits.
+    BigNumber(String),
+}
+
+impl ScalarValue {
+    /// The integer, if this is one.
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            Self::Int(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// The text, if this is a simple string.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Simple(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Whether this is nil.
+    pub fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+
+    fn from_value(v: Value) -> Result<Self, RedisError> {
+        Ok(match v {
+            Value::Null => Self::Null,
+            Value::Int(n) => Self::Int(n),
+            Value::Simple(s) => Self::Simple(s),
+            Value::Double(d) => Self::Double(d),
+            Value::Bool(b) => Self::Bool(b),
+            Value::BigNumber(s) => Self::BigNumber(s),
+            other => {
+                return Err(RedisError::Unexpected(format!(
+                    "expected a single value, got {other:?}: read it with send_streaming and a sink"
+                )))
+            }
+        })
+    }
+}
+
 /// What a command's callback is given.
-pub type Reply = Result<Value, RedisError>;
+pub type Reply = Result<ScalarValue, RedisError>;
 
 /// A command's callback.
 pub type Callback = Box<dyn FnOnce(Reply) + Send>;
+
+/// What the crate's own callbacks are given: the reply as a value, assembled
+/// under a [`Cap`].
+pub(crate) type ValueReply = Result<Value, RedisError>;
+
+/// A callback of the crate's own.
+pub(crate) type ValueCallback = Box<dyn FnOnce(ValueReply) + Send>;
+
+/// A callback for a scalar reply, as one for the crate's own sending.
+pub(crate) fn scalar(callback: impl FnOnce(Reply) + Send + 'static) -> impl FnOnce(ValueReply) + Send + 'static {
+    move |reply| callback(reply.and_then(ScalarValue::from_value))
+}
 
 /// A command written as an array of bulk strings, ready to send. Cloning one
 /// shares its arguments rather than copying them, so a large value is not
@@ -193,13 +265,13 @@ pub(crate) trait CmdSink: Send {
 }
 
 /// A callback that takes the reply as a [`Value`]: the events are assembled by a
-/// [`Collector`] under the configured limits.
+/// [`Collector`] under a [`Cap`], and a reply that exceeds it fails the command.
 struct Collecting<F> {
     collector: Collector,
     callback: F,
 }
 
-impl<F: FnOnce(Reply) + Send> CmdSink for Collecting<F> {
+impl<F: FnOnce(ValueReply) + Send> CmdSink for Collecting<F> {
     fn events(&mut self) -> &mut dyn ReplySink {
         &mut self.collector
     }
@@ -209,10 +281,85 @@ impl<F: FnOnce(Reply) + Send> CmdSink for Collecting<F> {
         callback(match outcome {
             Outcome::Complete { .. } => match collector.take() {
                 Ok(value) => into_reply(value),
-                Err(TooLarge(why)) => Err(RedisError::Protocol(why)),
+                Err(TooLarge(why)) => Err(RedisError::Unexpected(why)),
             },
             Outcome::Failed(e) => Err(e),
         });
+    }
+}
+
+/// Notes the error a command queued in a transaction is refused with.
+struct QueueNote(Arc<Mutex<Option<RedisError>>>);
+
+impl ReplySink for QueueNote {
+    fn scalar(&mut self, _v: Scalar<'_>) -> Flow {
+        Flow::Continue
+    }
+    fn error(&mut self, line: &str) -> Flow {
+        self.0.lock().unwrap().get_or_insert(RedisError::Server(ServerError::parse(line)));
+        Flow::Continue
+    }
+    fn begin_aggregate(&mut self, _kind: AggKind, _len: Option<usize>) -> Flow {
+        Flow::Continue
+    }
+    fn end_aggregate(&mut self) -> Flow {
+        Flow::Continue
+    }
+    fn begin_string(&mut self, _kind: StrKind, _len: Option<usize>) -> Flow {
+        Flow::Continue
+    }
+    fn string_chunk(&mut self, _data: &[u8]) -> Flow {
+        Flow::Continue
+    }
+    fn end_string(&mut self) -> Flow {
+        Flow::Continue
+    }
+}
+
+/// Stands in front of the sink of a transaction's `EXEC`: what it hears is the
+/// reply, except that `EXECABORT` ("discarded because of previous errors") is
+/// replaced by the error a queued command was refused with, if the client saw
+/// one, which says what was wrong.
+struct TxExec<S> {
+    sink: S,
+    first_error: Arc<Mutex<Option<RedisError>>>,
+}
+
+impl<S: ReplySink> ReplySink for TxExec<S> {
+    fn begin_reply(&mut self, kind: ReplyKind) {
+        self.sink.begin_reply(kind);
+    }
+    fn scalar(&mut self, v: Scalar<'_>) -> Flow {
+        self.sink.scalar(v)
+    }
+    fn error(&mut self, line: &str) -> Flow {
+        if ServerError::parse(line).code == "EXECABORT" {
+            if let Some(RedisError::Server(e)) = self.first_error.lock().unwrap().take() {
+                return self.sink.error(&e.to_string());
+            }
+        }
+        self.sink.error(line)
+    }
+    fn begin_aggregate(&mut self, kind: AggKind, len: Option<usize>) -> Flow {
+        self.sink.begin_aggregate(kind, len)
+    }
+    fn end_aggregate(&mut self) -> Flow {
+        self.sink.end_aggregate()
+    }
+    fn begin_string(&mut self, kind: StrKind, len: Option<usize>) -> Flow {
+        self.sink.begin_string(kind, len)
+    }
+    fn string_chunk(&mut self, data: &[u8]) -> Flow {
+        self.sink.string_chunk(data)
+    }
+    fn end_string(&mut self) -> Flow {
+        self.sink.end_string()
+    }
+    fn end_reply(&mut self, skipped: bool) {
+        self.sink.end_reply(skipped);
+    }
+    fn finished(&mut self, outcome: Result<(), RedisError>) {
+        self.sink.finished(outcome);
     }
 }
 
@@ -830,27 +977,63 @@ impl RedisClient {
         *self.inner.push.lock().unwrap() = None;
     }
 
-    /// Send `command` and call `callback` with the reply. Returns at once.
+    /// Send `command` and call `callback` with the reply, which must be a single
+    /// value (an integer, `OK`, nil): see [`ScalarValue`]. A string or a
+    /// collection is refused with [`RedisError::Unexpected`], having been
+    /// discarded as it arrived, since it can be of any size; read it with
+    /// [`send_streaming`](Self::send_streaming). Returns at once.
     pub fn send(&self, command: &Command, callback: impl FnOnce(Reply) + Send + 'static) {
-        self.send_one(command, self.collecting(callback), Deadline::Default, false);
+        self.send_value(command, Deadline::Default, Cap::SCALAR, scalar(callback));
     }
 
     /// Send the command made of `words` (the name first) and call `callback`
-    /// with the reply. Returns at once.
+    /// with the reply, as [`send`](Self::send) does. Returns at once.
     pub fn command(&self, words: &[&[u8]], callback: impl FnOnce(Reply) + Send + 'static) {
         if words.first().is_some_and(|w| pubsub::is_subscription_command(w)) {
-            return self.refuse(self.collecting(callback));
+            return self.refuse(self.collecting(Cap::SCALAR, scalar(callback)));
         }
         let mut bytes = Vec::new();
         encode_command(words, &mut bytes);
-        submit_timed(&self.inner, vec![(Encoded::Plain(bytes), self.collecting(callback))], Deadline::Default, false, false);
+        submit_timed(
+            &self.inner,
+            vec![(Encoded::Plain(bytes), self.collecting(Cap::SCALAR, scalar(callback)))],
+            Deadline::Default,
+            false,
+            false,
+        );
     }
 
     /// Send several commands as one write, in order, with nothing from another
     /// caller between them. Each has its own callback, called in the order the
-    /// commands were given.
+    /// commands were given, and each reply must be a single value.
     pub fn send_batch(&self, commands: Vec<(Command, Callback)>) {
-        self.send_batch_with_deadline(commands, Deadline::Default);
+        let items = commands
+            .into_iter()
+            .map(|(c, cb)| (c, Cap::SCALAR, Box::new(scalar(cb)) as ValueCallback))
+            .collect();
+        self.send_batch_value(items, Deadline::Default);
+    }
+
+    /// Send `command` and call `callback` with the reply assembled as a value
+    /// under `cap`, for the crate's own use.
+    pub(crate) fn send_value(
+        &self,
+        command: &Command,
+        deadline: Deadline,
+        cap: Cap,
+        callback: impl FnOnce(ValueReply) + Send + 'static,
+    ) {
+        self.send_one(command, self.collecting(cap, callback), deadline, false);
+    }
+
+    /// [`send_batch`](Self::send_batch) for the crate's own use, with each reply
+    /// under its own cap and one deadline for them all.
+    pub(crate) fn send_batch_value(&self, commands: Vec<(Command, Cap, ValueCallback)>, deadline: Deadline) {
+        let refused = commands
+            .iter()
+            .any(|(c, _, _)| c.words().first().is_some_and(|w| pubsub::is_subscription_command(w)));
+        let items = commands.into_iter().map(|(c, cap, cb)| (c.encoded(), self.collecting(cap, cb))).collect();
+        submit_timed(&self.inner, items, deadline, false, refused);
     }
 
     /// Send `command` and tell `sink` what its reply is, as the reply arrives:
@@ -895,18 +1078,54 @@ impl RedisClient {
         deadline: Deadline,
         sink: impl ReplySink + Send + 'static,
     ) -> StreamHandle {
-        let asking = self.collecting(|_: Reply| {});
+        let asking = self.collecting(Cap::SCALAR, |_: ValueReply| {});
         let streamed: Box<dyn CmdSink> = Box::new(Streaming { sink });
         let items = vec![(Command::new("ASKING").encoded(), asking), (command.encoded(), streamed)];
         let cmd = submit_timed(&self.inner, items, deadline, true, false).expect("a streaming command is returned");
         StreamHandle::command(cmd, Arc::downgrade(&self.inner))
     }
 
-    /// A sink that assembles the reply as a value, under the configured limits,
-    /// for `callback`.
-    fn collecting<F: FnOnce(Reply) + Send + 'static>(&self, callback: F) -> Box<dyn CmdSink> {
+    /// [`transaction`](RedisClient::transaction), led by an `ASKING` when
+    /// `asking`: a cluster sending it to the node a slot is being migrated to.
+    pub(crate) fn transaction_streaming(
+        &self,
+        asking: bool,
+        commands: Vec<Command>,
+        deadline: Deadline,
+        sink: impl ReplySink + Send + 'static,
+    ) -> StreamHandle {
+        // The first error a queued command is refused with, for `EXECABORT` to be
+        // explained by.
+        let first_error: Arc<Mutex<Option<RedisError>>> = Arc::default();
+        // Noted as the events arrive, not when each command's callback runs: a
+        // pipeline's replies come in one read, and `EXEC`'s reply is being told
+        // to its sink before the callbacks of the commands before it have.
+        let note = |slot: &Arc<Mutex<Option<RedisError>>>| -> Box<dyn CmdSink> {
+            Box::new(Streaming {
+                sink: QueueNote(Arc::clone(slot)),
+            })
+        };
+        let mut items: Vec<(Encoded, Box<dyn CmdSink>)> = Vec::with_capacity(commands.len() + 3);
+        if asking {
+            items.push((Command::new("ASKING").encoded(), self.collecting(Cap::SCALAR, |_: ValueReply| {})));
+        }
+        items.push((Command::new("MULTI").encoded(), note(&first_error)));
+        let refused = commands.iter().any(|c| c.words().first().is_some_and(|w| pubsub::is_subscription_command(w)));
+        for c in &commands {
+            items.push((c.encoded(), note(&first_error)));
+        }
+        let exec: Box<dyn CmdSink> = Box::new(Streaming {
+            sink: TxExec { sink, first_error },
+        });
+        items.push((Command::new("EXEC").encoded(), exec));
+        let cmd = submit_timed(&self.inner, items, deadline, true, refused).expect("a streaming command is returned");
+        StreamHandle::command(cmd, Arc::downgrade(&self.inner))
+    }
+
+    /// A sink that assembles the reply as a value, under `cap`, for `callback`.
+    fn collecting<F: FnOnce(ValueReply) + Send + 'static>(&self, cap: Cap, callback: F) -> Box<dyn CmdSink> {
         Box::new(Collecting {
-            collector: Collector::new(&self.inner.config.limits),
+            collector: Collector::new(cap),
             callback,
         })
     }
@@ -945,16 +1164,7 @@ impl RedisClient {
     /// likes. A command that is not answered in time calls back with
     /// [`RedisError::Timeout`]; its reply, if it comes later, is dropped.
     pub fn send_with_deadline(&self, command: &Command, deadline: Deadline, callback: impl FnOnce(Reply) + Send + 'static) {
-        self.send_one(command, self.collecting(callback), deadline, false);
-    }
-
-    /// [`send_batch`](Self::send_batch) with one deadline for every command.
-    pub(crate) fn send_batch_with_deadline(&self, commands: Vec<(Command, Callback)>, deadline: Deadline) {
-        let refused = commands
-            .iter()
-            .any(|(c, _)| c.words().first().is_some_and(|w| pubsub::is_subscription_command(w)));
-        let items = commands.into_iter().map(|(c, cb)| (c.encoded(), self.collecting(cb))).collect();
-        submit_timed(&self.inner, items, deadline, false, refused);
+        self.send_value(command, deadline, Cap::SCALAR, scalar(callback));
     }
 
     /// Call `f` when the health check closes a connection because the server
@@ -983,7 +1193,7 @@ fn subscription_refused() -> RedisError {
 }
 
 /// An error reply is an error; anything else is the reply.
-fn into_reply(value: Value) -> Reply {
+fn into_reply(value: Value) -> ValueReply {
     match value {
         Value::Error(e) => Err(RedisError::Server(e)),
         v => Ok(v),
@@ -1824,7 +2034,7 @@ fn dial_next(inner: &Arc<Inner>, conn_id: u64) {
                 inner: Arc::clone(&handler_inner),
                 conn_id,
                 parser: RespParser::with_limits(handler_inner.config.limits),
-                collector: Collector::new(&handler_inner.config.limits),
+                collector: Collector::new(Cap::CONTROL),
                 completed: Vec::new(),
                 target: Target::None,
                 dispatch: Dispatch::new(handler_inner.config.max_field),

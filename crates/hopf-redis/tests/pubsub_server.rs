@@ -187,7 +187,7 @@ fn a_subscriber_reconnects_and_subscribes_again_on_its_own() {
     rec.wait_for("the subscription", |e| e.iter().any(|x| matches!(x, Event::Change(_))));
 
     // Kill its connection from outside.
-    let listing = call!(|cb| admin.command(&[b"CLIENT", b"LIST"], cb)).unwrap();
+    let listing = collect::command(&admin, &[b"CLIENT", b"LIST"]).unwrap();
     let text = String::from_utf8_lossy(listing.as_bytes().unwrap()).into_owned();
     let line = text.lines().find(|l| l.contains(&format!("name={name}"))).expect("the subscriber is listed");
     let id = line.split_whitespace().find_map(|w| w.strip_prefix("id=")).unwrap().to_string();
@@ -250,7 +250,7 @@ fn a_command_connection_receives_invalidation_pushes_for_tracked_keys() {
     call!(|cb| tracker.command(&[b"CLIENT", b"TRACKING", b"on"], cb)).unwrap();
     call!(|cb| writer.set(&key, "1", cb)).unwrap();
     // Reading a key is what makes the server track it for this connection.
-    assert_eq!(call!(|cb| tracker.get(&key, cb)).unwrap(), Some(b("1")));
+    assert_eq!(collect::get(&tracker, &key).unwrap(), Some(b("1")));
     call!(|cb| writer.set(&key, "2", cb)).unwrap();
     for _ in 0..500 {
         if !seen.seen().is_empty() {
@@ -260,7 +260,7 @@ fn a_command_connection_receives_invalidation_pushes_for_tracked_keys() {
     }
     assert_eq!(seen.seen(), vec![key.clone()]);
     // Replies are still matched to their commands around the push.
-    assert_eq!(call!(|cb| tracker.get(&key, cb)).unwrap(), Some(b("2")));
+    assert_eq!(collect::get(&tracker, &key).unwrap(), Some(b("2")));
     let _ = call!(|cb| writer.del(&[&key], cb));
     rt.shutdown();
 }

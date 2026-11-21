@@ -1,8 +1,7 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! RESP2 and RESP3: the command encoder, the incremental [`RespParser`] and the
-//! events it produces ([`ReplySink`]), and the reply [`Value`] the crate's
-//! callbacks still receive.
+//! RESP2 and RESP3: the command encoder, and the incremental [`RespParser`] and
+//! the events it produces ([`ReplySink`]).
 //!
 //! The parser is push-fed, event-driven and holds none of the stream.
 //! [`RespParser::feed`] is given whatever bytes have arrived, in any split, and
@@ -22,10 +21,10 @@
 //! aggregates have no announced length and are events like any other; attributes
 //! are read and dropped.
 //!
-//! [`Value`] is a reply assembled whole, for the callbacks that take one. It is
-//! built outside the parser, from the events, under [`RespLimits::max_bulk`] and
-//! [`RespLimits::max_reply_bytes`]: a string announced as longer than the limit
-//! is not buffered, not even its first chunk.
+//! The crate builds no value out of these events for its callers: a reply is told
+//! to a [`ReplySink`] and what it holds is the sink's to keep or not. (A few
+//! small replies the crate reads for itself, such as the handshake and the
+//! cluster's layout, are assembled privately under a fixed cap.)
 
 use hopf_core::Bytes;
 
@@ -76,10 +75,11 @@ impl std::fmt::Display for ServerError {
     }
 }
 
-/// One reply. RESP2 replies use `Null`, `Int`, `Simple`, `Bulk`, `Array` and
-/// `Error`; the rest are RESP3.
+/// One reply, assembled whole under a cap, for the crate's own use. RESP2
+/// replies use `Null`, `Int`, `Simple`, `Bulk`, `Array` and `Error`; the rest are
+/// RESP3.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Value {
+pub(crate) enum Value {
     /// Nil: a missing key, or a timed-out blocking command.
     Null,
     /// An integer.
@@ -118,13 +118,8 @@ pub enum Value {
 }
 
 impl Value {
-    /// Whether this is `Null`.
-    pub fn is_null(&self) -> bool {
-        matches!(self, Value::Null)
-    }
-
     /// The bytes of a bulk, simple or verbatim string.
-    pub fn as_bytes(&self) -> Option<&[u8]> {
+    pub(crate) fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             Value::Bulk(b) => Some(b),
             Value::Simple(s) => Some(s.as_bytes()),
@@ -134,12 +129,12 @@ impl Value {
     }
 
     /// A bulk, simple or verbatim string as text, if it is valid UTF-8.
-    pub fn as_str(&self) -> Option<&str> {
+    pub(crate) fn as_str(&self) -> Option<&str> {
         self.as_bytes().and_then(|b| std::str::from_utf8(b).ok())
     }
 
     /// An integer, or a string or double that is one.
-    pub fn as_int(&self) -> Option<i64> {
+    pub(crate) fn as_int(&self) -> Option<i64> {
         match self {
             Value::Int(n) => Some(*n),
             Value::Double(d) if d.fract() == 0.0 && d.is_finite() => Some(*d as i64),
@@ -149,7 +144,7 @@ impl Value {
     }
 
     /// A double, or an integer or string that is one.
-    pub fn as_f64(&self) -> Option<f64> {
+    pub(crate) fn as_f64(&self) -> Option<f64> {
         match self {
             Value::Double(d) => Some(*d),
             Value::Int(n) => Some(*n as f64),
@@ -158,7 +153,7 @@ impl Value {
     }
 
     /// The elements of an array, set or push.
-    pub fn as_array(&self) -> Option<&[Value]> {
+    pub(crate) fn as_array(&self) -> Option<&[Value]> {
         match self {
             Value::Array(v) | Value::Set(v) | Value::Push(v) => Some(v),
             _ => None,
@@ -166,7 +161,7 @@ impl Value {
     }
 
     /// Take the elements of an array, set or push.
-    pub fn into_array(self) -> Option<Vec<Value>> {
+    pub(crate) fn into_array(self) -> Option<Vec<Value>> {
         match self {
             Value::Array(v) | Value::Set(v) | Value::Push(v) => Some(v),
             _ => None,
@@ -175,7 +170,7 @@ impl Value {
 
     /// A map as pairs. A flat RESP2 array of alternating keys and values (as
     /// `HGETALL` returns) is read as one.
-    pub fn into_pairs(self) -> Option<Vec<(Value, Value)>> {
+    pub(crate) fn into_pairs(self) -> Option<Vec<(Value, Value)>> {
         match self {
             Value::Map(m) => Some(m),
             Value::Array(v) if v.len() % 2 == 0 => {
@@ -247,24 +242,16 @@ fn push_decimal(mut n: usize, out: &mut Vec<u8>) {
 
 /// Bounds on what a server may make the client hold.
 ///
-/// The parser itself holds only `max_line`, `max_depth` and what it takes to
-/// discard a reply (`max_skip`); the rest bound the crate's own assembly of a
-/// whole [`Value`] for a command's callback, and go away with it.
+/// The parser holds a line, a stack of at most `max_depth` counts and what it
+/// takes to discard a reply, and nothing proportional to a reply: a payload goes
+/// to the sink as chunks and is not held, so there is no limit on how large a
+/// string or an aggregate may be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RespLimits {
-    /// The largest bulk string, verbatim string or bulk error assembled into a
-    /// value. A longer one is not buffered, not even its first chunk: it is
-    /// skipped, and its command fails.
-    pub max_bulk: usize,
-    /// The most elements one aggregate assembled into a value may announce.
-    pub max_aggregate: usize,
     /// The most levels of aggregate inside aggregate.
     pub max_depth: usize,
     /// The longest header or simple-string line.
     pub max_line: usize,
-    /// The most memory one reply assembled into a value may take, counting bulk
-    /// payloads and a small overhead per element.
-    pub max_reply_bytes: usize,
     /// The most bytes of one reply that may be discarded (a sink that chose
     /// [`Flow::Skip`], a reply nobody waits for, an attribute): past it the
     /// stream is abandoned and the connection should be closed, since
@@ -275,11 +262,8 @@ pub struct RespLimits {
 impl Default for RespLimits {
     fn default() -> Self {
         Self {
-            max_bulk: 512 * 1024 * 1024,
-            max_aggregate: 1 << 26,
             max_depth: 32,
             max_line: 64 * 1024,
-            max_reply_bytes: 1024 * 1024 * 1024,
             max_skip: 256 * 1024 * 1024,
         }
     }
@@ -491,7 +475,8 @@ pub struct RespParser {
     vhead: [u8; 4],
     vhead_len: usize,
     vtotal: usize,
-    /// Assembles `Value`s for [`feed_values`](Self::feed_values).
+    /// Assembles `Value`s for the tests' `feed_values`.
+    #[cfg(test)]
     values: Option<Box<crate::collect::Collector>>,
 }
 
@@ -518,6 +503,7 @@ impl RespParser {
             vhead: [0; 4],
             vhead_len: 0,
             vtotal: 0,
+            #[cfg(test)]
             values: None,
         }
     }
@@ -545,12 +531,17 @@ impl RespParser {
         result
     }
 
-    /// Transitional, and removed with [`Value`]: feed `data` and hand each
-    /// reply, assembled whole under [`RespLimits`], to `sink`. A reply over a
-    /// limit is an error here, and poisons the parser.
-    #[doc(hidden)]
-    pub fn feed_values(&mut self, data: &mut &[u8], sink: &mut dyn FnMut(Value)) -> Result<(), RespError> {
-        let mut collector = self.values.take().unwrap_or_else(|| Box::new(crate::collect::Collector::new(&self.limits)));
+    /// For the tests: feed `data` and hand each reply, assembled whole under
+    /// `cap`, to `sink`. A reply over the cap is an error here, and poisons the
+    /// parser.
+    #[cfg(test)]
+    pub(crate) fn feed_values_with(
+        &mut self,
+        cap: crate::collect::Cap,
+        data: &mut &[u8],
+        sink: &mut dyn FnMut(Value),
+    ) -> Result<(), RespError> {
+        let mut collector = self.values.take().unwrap_or_else(|| Box::new(crate::collect::Collector::new(cap)));
         let mut adapter = crate::collect::Adapter {
             collector: &mut *collector,
             out: sink,
@@ -565,6 +556,12 @@ impl RespParser {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// [`feed_values_with`](Self::feed_values_with) a generous cap.
+    #[cfg(test)]
+    pub(crate) fn feed_values(&mut self, data: &mut &[u8], sink: &mut dyn FnMut(Value)) -> Result<(), RespError> {
+        self.feed_values_with(crate::collect::Cap::TEST, data, sink)
     }
 
     fn run(&mut self, data: &mut &[u8], sink: &mut dyn ReplySink) -> Result<Feed, RespError> {
@@ -1234,11 +1231,8 @@ mod tests {
     #[test]
     fn limits_are_enforced_before_memory_is_reserved() {
         let tiny = RespLimits {
-            max_bulk: 10,
-            max_aggregate: 3,
             max_depth: 2,
             max_line: 16,
-            max_reply_bytes: 4096,
             max_skip: 1 << 20,
         };
         let run = |wire: &[u8]| {
@@ -1246,49 +1240,11 @@ mod tests {
             let mut data = wire;
             p.feed_values(&mut data, &mut |_| {})
         };
-        // A string or aggregate announced over the limit is refused when it is
-        // announced, and what follows it is skipped.
-        assert!(run(b"$11\r\n01234567890\r\n").is_err(), "a bulk over the limit");
-        assert!(run(b"$10\r\n0123456789\r\n").is_ok());
-        assert!(run(b"*4\r\n:1\r\n:2\r\n:3\r\n:4\r\n").is_err(), "an aggregate over the limit");
         assert!(run(b"*1\r\n*1\r\n*1\r\n").is_err(), "nested too deeply");
         assert!(run(b"+0123456789abcdefXXXX\r\n").is_err(), "a line over the limit");
-    }
-
-    #[test]
-    fn a_reply_over_the_total_size_limit_is_refused_and_the_next_is_not() {
-        let limits = RespLimits {
-            max_reply_bytes: 100,
-            ..RespLimits::default()
-        };
-        let mut p = RespParser::with_limits(limits);
-        let mut wire = b"*3\r\n".to_vec();
-        for _ in 0..3 {
-            wire.extend_from_slice(b"$60\r\n");
-            wire.extend_from_slice(&[b'x'; 60]);
-            wire.extend_from_slice(b"\r\n");
-        }
-        let mut data = &wire[..];
-        assert!(p.feed_values(&mut data, &mut |_| {}).is_err());
-    }
-
-    #[test]
-    fn the_size_budget_is_per_reply() {
-        let limits = RespLimits {
-            max_reply_bytes: 100,
-            ..RespLimits::default()
-        };
-        let mut p = RespParser::with_limits(limits);
-        let mut wire = Vec::new();
-        for _ in 0..10 {
-            wire.extend_from_slice(b"$60\r\n");
-            wire.extend_from_slice(&[b'x'; 60]);
-            wire.extend_from_slice(b"\r\n");
-        }
-        let mut n = 0;
-        let mut data = &wire[..];
-        p.feed_values(&mut data, &mut |_| n += 1).unwrap();
-        assert_eq!(n, 10);
+        // A string or an aggregate of any size is not a parser's concern: it holds none of it.
+        assert!(run(b"$11\r\n01234567890\r\n").is_ok());
+        assert!(run(b"*4\r\n:1\r\n:2\r\n:3\r\n:4\r\n").is_ok());
     }
 
     // ---- the event parser ----
@@ -1891,7 +1847,7 @@ mod tests {
         assert_eq!(Value::Double(3.0).as_int(), Some(3));
         assert_eq!(bulk("2.5").as_f64(), Some(2.5));
         assert_eq!(Value::Simple("OK".into()).as_str(), Some("OK"));
-        assert!(Value::Null.is_null());
+        assert_eq!(Value::Null, Value::Null);
         let pairs = Value::Array(vec![bulk("a"), Value::Int(1), bulk("b"), Value::Int(2)]).into_pairs().unwrap();
         assert_eq!(pairs.len(), 2);
         assert!(Value::Array(vec![Value::Int(1)]).into_pairs().is_none());

@@ -18,9 +18,10 @@ use std::time::{Duration, Instant};
 use hopf_core::Runtime;
 use hopf_redis::{
     ArgSource, BulkHandler, Command, Deadline, ElementsHandler, FieldsHandler, Flow, KeysHandler, KeysSink, RedisClient,
-    RedisConfig, RedisError, RespLimits, SourceCtl, SourceRead, SourceWaker, StreamArg, StreamHandle, Value,
+    RedisConfig, RedisError, RespLimits, SourceCtl, SourceRead, SourceWaker, StreamArg, StreamHandle,
 };
 
+use common::collect::Tree;
 use common::*;
 
 fn client(server: &Server, config: impl FnOnce(RedisConfig) -> RedisConfig) -> (Runtime, RedisClient) {
@@ -43,7 +44,7 @@ fn a_server_without_hello_gets_resp2_with_auth_and_select() {
         }
     });
     let (rt, c) = client(&server, |c| c.password("pw").database(1).client_name("me"));
-    let got = call!(|cb| c.get("k", cb)).unwrap();
+    let got = collect::get(&c, "k").unwrap();
     assert_eq!(got.map(|b| b.to_vec()), Some(b"v".to_vec()));
     assert!(!c.is_resp3());
     let words: Vec<String> = seen.lock().unwrap().iter().map(|w| w.join(" ")).collect();
@@ -116,7 +117,7 @@ fn commands_wait_for_the_handshake_and_go_out_in_order_afterwards() {
     let (tx, rx) = mpsc::channel();
     for k in ["first", "second", "third"] {
         let tx = tx.clone();
-        c.get(k, move |r| {
+        collect::get_with(&c, k, move |r| {
             let _ = tx.send((k, r.is_ok()));
         });
     }
@@ -155,7 +156,7 @@ fn commands_are_written_without_waiting_for_earlier_replies() {
     let (tx, rx) = mpsc::channel();
     for i in 0..50 {
         let tx = tx.clone();
-        c.get(format!("k{i}"), move |r| {
+        collect::get_with(&c, format!("k{i}"), move |r| {
             let _ = tx.send(r.unwrap().map(|b| String::from_utf8_lossy(&b).into_owned()));
         });
     }
@@ -179,7 +180,7 @@ fn a_connection_dropped_mid_pipeline_fails_the_rest_once_each() {
     let (tx, rx) = mpsc::channel();
     for i in 1..=3 {
         let tx = tx.clone();
-        c.get(format!("k{i}"), move |r| {
+        collect::get_with(&c, format!("k{i}"), move |r| {
             let _ = tx.send((i, r));
         });
     }
@@ -237,12 +238,12 @@ fn a_command_that_timed_out_does_not_steal_the_reply_of_the_one_behind_it() {
     });
     let (rt, c) = client(&server, |c| c.command_timeout(Some(Duration::from_millis(400))));
     let (tx1, rx1) = mpsc::channel();
-    c.get("one", move |r| {
+    collect::get_with(&c, "one", move |r| {
         let _ = tx1.send(r);
     });
     thread::sleep(Duration::from_millis(150));
     let (tx2, rx2) = mpsc::channel();
-    c.get("two", move |r| {
+    collect::get_with(&c, "two", move |r| {
         let _ = tx2.send(r);
     });
     assert_eq!(rx1.recv_timeout(Duration::from_secs(5)).unwrap().unwrap_err(), RedisError::Timeout);
@@ -308,7 +309,7 @@ fn tls_to_a_server_with_a_trusted_certificate() {
     let rt = runtime();
     let trusted = ClientTlsBuilder::new().trust_anchors([hopf_core::Bytes::copy_from_slice(cert.der())]).build();
     let c = RedisClient::connect(rt.pick_worker(), RedisConfig::from_addr(server.addr).tls(trusted, "redis.test"));
-    assert_eq!(call!(|cb| c.get("k", cb)).unwrap().map(|b| b.to_vec()), Some(b"secret".to_vec()));
+    assert_eq!(collect::get(&c, "k").unwrap().map(|b| b.to_vec()), Some(b"secret".to_vec()));
     c.close();
 
     // The public WebPKI does not know this certificate: the connect fails.
@@ -473,8 +474,8 @@ fn a_push_of_a_kind_nobody_knows_reaches_the_sink_as_events_and_replies_keep_the
     let (rt, c) = client(&server, |c| c);
     let pushes = Arc::new(Mutex::new(Vec::new()));
     c.set_push_sink(PushEvents::new(&pushes));
-    assert_eq!(call!(|cb| c.get("a", cb)).unwrap().map(|v| v.to_vec()), Some(b"1".to_vec()));
-    assert_eq!(call!(|cb| c.get("b", cb)).unwrap().map(|v| v.to_vec()), Some(b"2".to_vec()));
+    assert_eq!(collect::get(&c, "a").unwrap().map(|v| v.to_vec()), Some(b"1".to_vec()));
+    assert_eq!(collect::get(&c, "b").unwrap().map(|v| v.to_vec()), Some(b"2".to_vec()));
     assert_eq!(
         *pushes.lock().unwrap(),
         vec![
@@ -506,12 +507,12 @@ fn invalidations_between_replies_reach_the_sink_and_a_replaced_sink_takes_the_ne
     let (rt, c) = client(&server, |c| c);
     let first = Invalidated::default();
     c.set_push_sink(InvalidationSink::new(first.clone()));
-    assert_eq!(call!(|cb| c.get("k", cb)).unwrap().map(|v| v.to_vec()), Some(b"1".to_vec()));
-    assert_eq!(call!(|cb| c.get("k", cb)).unwrap().map(|v| v.to_vec()), Some(b"2".to_vec()));
+    assert_eq!(collect::get(&c, "k").unwrap().map(|v| v.to_vec()), Some(b"1".to_vec()));
+    assert_eq!(collect::get(&c, "k").unwrap().map(|v| v.to_vec()), Some(b"2".to_vec()));
     assert_eq!(first.seen(), vec!["a", "b", "*"]);
     let second = Invalidated::default();
     c.set_push_sink(InvalidationSink::new(second.clone()));
-    assert_eq!(call!(|cb| c.get("k", cb)).unwrap().map(|v| v.to_vec()), Some(b"3".to_vec()));
+    assert_eq!(collect::get(&c, "k").unwrap().map(|v| v.to_vec()), Some(b"3".to_vec()));
     assert_eq!(second.seen(), vec!["c"]);
     assert_eq!(first.seen(), vec!["a", "b", "*"], "the old sink heard nothing more");
     c.close();
@@ -982,7 +983,7 @@ fn a_black_holed_connection_is_closed_and_what_it_owed_fails_with_connection_los
     let (tx, rx) = mpsc::channel();
     for k in ["k1", "k2"] {
         let tx = tx.clone();
-        c.get(k, move |r| tx.send(r).unwrap());
+        collect::get_with(&c, k, move |r| tx.send(r).unwrap());
     }
     for _ in 0..2 {
         let err = wait_for_reply(&rx, "a command on the black-holed connection").unwrap_err();
@@ -993,7 +994,7 @@ fn a_black_holed_connection_is_closed_and_what_it_owed_fails_with_connection_los
     assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "each callback ran once");
 
     // The next command dials afresh and is answered.
-    assert_eq!(call!(|cb| c.get("k3", cb)).unwrap().map(|b| b.to_vec()), Some(b"ok".to_vec()));
+    assert_eq!(collect::get(&c, "k3").unwrap().map(|b| b.to_vec()), Some(b"ok".to_vec()));
     assert_eq!(server.connections.load(Ordering::SeqCst), 2);
     c.close();
     rt.shutdown();
@@ -1007,7 +1008,7 @@ fn a_connection_that_never_finishes_its_handshake_is_given_up_on() {
         c.ping_interval(Some(Duration::from_millis(100))).command_timeout(Some(Duration::from_secs(30)))
     });
     let (tx, rx) = mpsc::channel();
-    c.get("k", move |r| tx.send(r).unwrap());
+    collect::get_with(&c, "k", move |r| tx.send(r).unwrap());
     let err = wait_for_reply(&rx, "a command waiting for the handshake").unwrap_err();
     assert!(matches!(err, RedisError::Connect(_)), "{err:?}");
     c.close();
@@ -1033,7 +1034,7 @@ fn traffic_of_any_kind_counts_as_life() {
     let (tx, rx) = mpsc::channel();
     for _ in 0..5 {
         let tx = tx.clone();
-        c.get("k", move |r| tx.send(r).unwrap());
+        collect::get_with(&c, "k", move |r| tx.send(r).unwrap());
     }
     let got: Vec<_> = (0..5).map(|_| wait_for_reply(&rx, "a slow but steady server").unwrap()).collect();
     assert_eq!(got.len(), 5);
@@ -1083,7 +1084,7 @@ fn a_command_the_server_may_hold_is_not_taken_for_a_dead_connection() {
     // No command timeout: nothing says how long a command may take.
     let (rt, unbounded) = client(&server, |c| c.ping_interval(Some(Duration::from_millis(50))).command_timeout(None));
     let (tx, rx) = mpsc::channel();
-    unbounded.get("k", move |r| tx.send(r).unwrap());
+    collect::get_with(&unbounded, "k", move |r| tx.send(r).unwrap());
     // A WAIT is held by the server for up to its own timeout.
     let waiting = RedisClient::connect(
         rt.pick_worker(),
@@ -1118,7 +1119,7 @@ fn a_silent_connection_in_the_middle_of_a_transaction_is_dropped_without_a_probe
         c.ping_interval(Some(Duration::from_millis(100))).command_timeout(Some(Duration::from_secs(30)))
     });
     let (tx, rx) = mpsc::channel();
-    c.transaction(vec![hopf_redis::Command::new("SET").arg("k").arg("v")], move |r| tx.send(r).unwrap());
+    c.transaction(vec![hopf_redis::Command::new("SET").arg("k").arg("v")], collect::TreeSink::new(move |r| tx.send(r).unwrap()));
     let err = wait_for_reply(&rx, "a transaction on the black-holed connection").unwrap_err();
     assert!(matches!(err, RedisError::ConnectionLost(_)), "{err:?}");
     assert_eq!(seen_count(&seen, 0, "PING"), 0, "nothing was slipped into the transaction");
@@ -1128,16 +1129,35 @@ fn a_silent_connection_in_the_middle_of_a_transaction_is_dropped_without_a_probe
 }
 
 #[test]
+fn a_transaction_refused_when_queued_reports_that_error_even_when_every_reply_arrives_in_one_read() {
+    // The replies to MULTI, the refused command and EXEC come together, in one
+    // write: EXEC's reply is being read before the callbacks of the replies
+    // before it have run, so the refusal has to be noted as it is read.
+    let server = serve(move |s, w| match name_of(w).as_str() {
+        "HELLO" => s.reply(HELLO_OK),
+        "MULTI" | "NOSUCHCOMMAND" => {}
+        "EXEC" => s.reply("+OK\r\n-ERR unknown command 'NOSUCHCOMMAND'\r\n-EXECABORT Transaction discarded because of previous errors.\r\n"),
+        _ => s.reply("+OK\r\n"),
+    });
+    let (rt, c) = client(&server, |c| c);
+    let err = collect::transaction(&c, vec![Command::new("NOSUCHCOMMAND")]).unwrap_err();
+    assert!(matches!(&err, RedisError::Server(e) if e.code == "ERR" && e.message.contains("unknown command")), "{err:?}");
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
 fn one_command_can_have_a_timeout_of_its_own_with_the_client_default_set_or_unset() {
-    // GET "slow" is answered after 400 ms, "never" not at all.
+    // GET "slow" is answered (with 7) after 400 ms, "never" not at all.
     let server = serve(move |s, w| match name_of(w).as_str() {
         "HELLO" => s.reply(HELLO_OK),
         "GET" if arg(w, 1) == "never" => {}
-        "GET" => s.reply_after(Duration::from_millis(400), "$4\r\nslow\r\n"),
+        "GET" => s.reply_after(Duration::from_millis(400), ":7\r\n"),
         _ => s.reply("+OK\r\n"),
     });
     let get = |key: &str| Command::new("GET").arg(key);
-    let is_slow = |v: Value| matches!(v, Value::Bulk(b) if &b[..] == b"slow");
+    let is_slow = |v: hopf_redis::ScalarValue| v == hopf_redis::ScalarValue::Int(7);
     for default in [Some(Duration::from_millis(150)), None] {
         let (rt, c) = client(&server, |c| c.command_timeout(default));
         let label = format!("default {default:?}");
@@ -1190,9 +1210,9 @@ fn a_reply_that_arrives_in_several_reads_is_one_reply() {
         _ => s.reply("+OK\r\n"),
     });
     let (rt, c) = client(&server, |c| c);
-    assert_eq!(call!(|cb| c.get("split", cb)).unwrap().map(|b| b.to_vec()), Some(b"0123456789".to_vec()));
-    let got = call!(|cb| c.send(&Command::new("MGET").arg("a").arg("b"), cb)).unwrap();
-    assert_eq!(got, Value::Array(vec![Value::Bulk(b"abcde".to_vec().into()), Value::Int(7)]));
+    assert_eq!(collect::get(&c, "split").unwrap().map(|b| b.to_vec()), Some(b"0123456789".to_vec()));
+    let got = collect::tree(&c, &Command::new("MGET").arg("a").arg("b")).unwrap();
+    assert_eq!(got, Tree::Array(vec![Tree::bulk("abcde"), Tree::Int(7)]));
     assert_eq!(server.connections.load(Ordering::SeqCst), 1);
     c.close();
     rt.shutdown();
@@ -1200,36 +1220,34 @@ fn a_reply_that_arrives_in_several_reads_is_one_reply() {
 }
 
 #[test]
-fn a_reply_over_the_budget_is_skipped_and_fails_only_its_own_command() {
-    let limits = RespLimits {
-        max_bulk: 1000,
-        ..RespLimits::default()
-    };
+fn a_reply_that_is_not_a_single_value_is_skipped_and_fails_only_its_own_command() {
+    // A callback that takes a single value is never given a string or a collection,
+    // however small: it fails with `Unexpected`, and the reply is discarded as it arrives.
     let bulk = |n: usize| format!("${n}\r\n{}\r\n", "x".repeat(n));
     let server = serve(move |s, w| match (name_of(w).as_str(), arg(w, 1).as_str()) {
         ("HELLO", _) => s.reply(HELLO_OK),
-        ("GET", "big") => s.reply(bulk(5000)),
-        ("MGET", _) => s.reply(format!("*3\r\n{}{}{}", bulk(2), bulk(5000), bulk(2))),
-        ("GET", _) => s.reply(bulk(2)),
+        ("INCR", "big") => s.reply(bulk(5000)),
+        ("INCR", "list") => s.reply(format!("*3\r\n{}{}{}", bulk(2), bulk(5000), bulk(2))),
+        ("INCR", _) => s.reply(":5\r\n"),
         _ => s.reply("+OK\r\n"),
     });
-    let (rt, c) = client(&server, |c| c.limits(limits));
-    // Pipelined: the one in the middle is too large, the ones either side are not.
+    let (rt, c) = client(&server, |c| c);
+    // Pipelined: the one in the middle is a string, the ones either side are numbers.
     let (tx, rx) = mpsc::channel();
     for (i, k) in ["small", "big", "small"].into_iter().enumerate() {
         let tx = tx.clone();
-        c.get(k, move |r| tx.send((i, r)).unwrap());
+        c.incr(k, move |r| tx.send((i, r)).unwrap());
     }
     let mut got: Vec<_> = (0..3).map(|_| rx.recv_timeout(Duration::from_secs(5)).unwrap()).collect();
     got.sort_by_key(|(i, _)| *i);
     assert!(got[0].1.is_ok() && got[2].1.is_ok(), "{got:?}");
     let err = got[1].1.clone().unwrap_err();
-    assert!(matches!(&err, RedisError::Protocol(m) if m.contains("exceeds")), "{err:?}");
+    assert!(matches!(&err, RedisError::Unexpected(m) if m.contains("send_streaming")), "{err:?}");
 
-    // The same inside an array: the whole command fails, and nothing after it is disturbed.
-    let err = call!(|cb| c.send(&Command::new("MGET").arg("a").arg("b").arg("c"), cb)).unwrap_err();
-    assert!(matches!(err, RedisError::Protocol(_)), "{err:?}");
-    assert!(call!(|cb| c.get("small", cb)).unwrap().is_some());
+    // The same for a collection: that command fails, and nothing after it is disturbed.
+    let err = call!(|cb| c.incr("list", cb)).unwrap_err();
+    assert!(matches!(err, RedisError::Unexpected(_)), "{err:?}");
+    assert_eq!(call!(|cb| c.incr("small", cb)).unwrap(), 5);
     assert_eq!(server.connections.load(Ordering::SeqCst), 1, "the connection was never dropped");
     c.close();
     rt.shutdown();
@@ -1259,7 +1277,7 @@ fn a_reply_discarded_past_the_limit_closes_the_connection_and_the_next_command_r
     let (rt, c) = client(&server, |c| {
         c.limits(limits).command_timeout(Some(Duration::from_millis(100))).ping_interval(None)
     });
-    assert_eq!(call!(|cb| c.get("k", cb)).unwrap_err(), RedisError::Timeout);
+    assert_eq!(collect::get(&c, "k").unwrap_err(), RedisError::Timeout);
     // The PING waits behind the reply being discarded; when the discard is
     // abandoned the connection goes, and it with it.
     let err = call!(|cb| c.send_with_deadline(&Command::new("PING"), Deadline::After(Duration::from_secs(10)), cb)).unwrap_err();
@@ -1364,12 +1382,7 @@ fn bulk_reply(n: usize) -> Vec<u8> {
 
 #[test]
 fn a_reply_streams_to_a_bulk_handler_as_chunks_without_a_limit_on_its_size() {
-    // Far over the budget the collecting callbacks keep: no limit applies here.
-    let limits = RespLimits {
-        max_bulk: 1000,
-        max_reply_bytes: 2000,
-        ..RespLimits::default()
-    };
+    // Far over anything a callback could be given: no limit applies here.
     let server = serve(move |s, w| match (name_of(w).as_str(), a1(w).as_str()) {
         ("HELLO", _) => s.reply(HELLO_OK),
         ("GET", "big") => s.stream("$3145728\r\n", 3 * 1024 * 1024, "\r\n"),
@@ -1379,10 +1392,10 @@ fn a_reply_streams_to_a_bulk_handler_as_chunks_without_a_limit_on_its_size() {
         ("PING", _) => s.reply("+PONG\r\n"),
         _ => s.reply("+OK\r\n"),
     });
-    let (rt, c) = client(&server, |c| c.limits(limits));
+    let (rt, c) = client(&server, |c| c);
 
     let (h, told) = Bulk::new();
-    c.get_stream("big", h);
+    c.get("big", h);
     wait_outcome(&told).unwrap();
     {
         let t = told.lock().unwrap();
@@ -1393,17 +1406,17 @@ fn a_reply_streams_to_a_bulk_handler_as_chunks_without_a_limit_on_its_size() {
     }
 
     let (h, told) = Bulk::new();
-    c.get_stream("none", h);
+    c.get("none", h);
     wait_outcome(&told).unwrap();
     assert!(told.lock().unwrap().nil);
 
     let (h, told) = Bulk::new();
-    c.get_stream("wrongtype", h);
+    c.get("wrongtype", h);
     let err = wait_outcome(&told).unwrap_err();
     assert_eq!(err.server_code(), Some("WRONGTYPE"), "{err:?}");
 
     let (h, told) = Bulk::new();
-    c.get_stream("number", h);
+    c.get("number", h);
     let err = wait_outcome(&told).unwrap_err();
     assert!(matches!(err, RedisError::Unexpected(_)), "a reply of the wrong shape: {err:?}");
 
@@ -1454,7 +1467,7 @@ fn an_array_of_payloads_streams_each_element_in_its_place() {
     });
     let (rt, c) = client(&server, |c| c);
     let told: Shared = Arc::default();
-    c.mget_stream(&["a", "b", "c"], Elements(Arc::clone(&told)));
+    c.mget(&["a", "b", "c"], Elements(Arc::clone(&told)));
     wait_outcome(&told).unwrap();
     {
         let t = told.lock().unwrap();
@@ -1466,7 +1479,7 @@ fn an_array_of_payloads_streams_each_element_in_its_place() {
     }
     // An element that is not a string is a reply of the wrong shape, and it is reported, not guessed at.
     let told: Shared = Arc::default();
-    c.smembers_stream("k", Elements(Arc::clone(&told)));
+    c.smembers("k", Elements(Arc::clone(&told)));
     assert!(matches!(wait_outcome(&told).unwrap_err(), RedisError::Unexpected(_)));
     call!(|cb| c.ping(cb)).unwrap();
     c.close();
@@ -1500,7 +1513,7 @@ fn identifiers_arrive_whole_and_one_that_is_too_long_fails_only_its_reply() {
     });
     let (rt, c) = client(&server, |c| c);
     let told: Shared = Arc::default();
-    c.keys_stream("short", Keys(Arc::clone(&told)));
+    c.keys("short", Keys(Arc::clone(&told)));
     wait_outcome(&told).unwrap();
     assert_eq!(told.lock().unwrap().keys, vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
 
@@ -1561,7 +1574,7 @@ fn a_hash_streams_its_fields_whole_and_its_values_in_chunks_in_either_protocol()
         let (rt, c) = client(&server, |c| if resp2 { c.resp2_only() } else { c });
         // Connection 0 is RESP3, connection 1 RESP2: the reply form follows.
         let told: Shared = Arc::default();
-        c.hgetall_stream("h", Fields(Arc::clone(&told)));
+        c.hgetall("h", Fields(Arc::clone(&told)));
         wait_outcome(&told).unwrap();
         let t = told.lock().unwrap();
         assert_eq!(t.pairs, Some(Some(2)), "resp2: {resp2}");
@@ -1601,7 +1614,7 @@ fn a_paused_reply_stops_all_reading_and_neither_timeout_nor_health_check_fires_m
     });
     let (mut h, told) = Bulk::new();
     h.pause_first = true;
-    let stream: StreamHandle = c.get_stream("k", h);
+    let stream: StreamHandle = c.get("k", h);
     wait_chunks(&told, 1);
     thread::sleep(Duration::from_millis(100));
     let chunks_then = told.lock().unwrap().chunks;
@@ -1661,7 +1674,7 @@ fn a_resume_before_the_pause_has_taken_effect_leaves_no_pause() {
     }
     let told: Shared = Arc::default();
     let cell: Arc<Mutex<Option<StreamHandle>>> = Arc::default();
-    let h = c.get_stream("k", Eager { told: Arc::clone(&told), handle: Arc::clone(&cell) });
+    let h = c.get("k", Eager { told: Arc::clone(&told), handle: Arc::clone(&cell) });
     *cell.lock().unwrap() = Some(h);
     wait_outcome(&told).unwrap();
     assert_eq!(told.lock().unwrap().bytes, 1024 * 1024);
@@ -1690,7 +1703,7 @@ fn a_streaming_command_is_timed_by_silence_not_by_how_long_the_reply_takes() {
     let (rt, c) = client(&server, |c| c.command_timeout(Some(Duration::from_millis(250))).ping_interval(None));
     let (h, told) = Bulk::new();
     let started = Instant::now();
-    c.get_stream("slow", h);
+    c.get("slow", h);
     wait_outcome(&told).unwrap();
     assert!(started.elapsed() > Duration::from_millis(1000), "it took longer than the timeout: {:?}", started.elapsed());
     assert_eq!(told.lock().unwrap().bytes, 20);
@@ -1698,7 +1711,7 @@ fn a_streaming_command_is_timed_by_silence_not_by_how_long_the_reply_takes() {
     // A reply that stops half-way is a timeout, 250 ms after the last of it.
     let (h, told) = Bulk::new();
     let started = Instant::now();
-    c.get_stream("stall", h);
+    c.get("stall", h);
     let err = wait_outcome(&told).unwrap_err();
     assert_eq!(err, RedisError::Timeout);
     let waited = started.elapsed();
@@ -1721,7 +1734,7 @@ fn a_sink_that_skips_or_a_consumer_that_cancels_ends_its_command_and_nothing_els
     // Skip, from inside the sink.
     let (mut h, told) = Bulk::new();
     h.skip_first = true;
-    c.get_stream("a", h);
+    c.get("a", h);
     assert_eq!(wait_outcome(&told).unwrap_err(), RedisError::Cancelled);
     assert_eq!(told.lock().unwrap().chunks, 1, "nothing was delivered after Skip");
     call!(|cb| c.ping(cb)).unwrap();
@@ -1729,7 +1742,7 @@ fn a_sink_that_skips_or_a_consumer_that_cancels_ends_its_command_and_nothing_els
     // Cancel, from outside, while the reply is paused.
     let (mut h, told) = Bulk::new();
     h.pause_first = true;
-    let stream = c.get_stream("b", h);
+    let stream = c.get("b", h);
     wait_chunks(&told, 1);
     thread::sleep(Duration::from_millis(100));
     stream.cancel();
@@ -1756,7 +1769,7 @@ fn a_connection_lost_in_the_middle_of_a_streamed_reply_is_told_to_its_sink_once(
     });
     let (rt, c) = client(&server, |c| c);
     let (h, told) = Bulk::new();
-    c.get_stream("k", h);
+    c.get("k", h);
     let err = wait_outcome(&told).unwrap_err();
     assert!(matches!(err, RedisError::ConnectionLost(_)), "{err:?}");
     assert_eq!(told.lock().unwrap().bytes, 3, "what arrived was delivered");
@@ -1801,7 +1814,7 @@ fn a_sink_may_close_the_client_from_inside_its_own_callback() {
     }
     let told: Shared = Arc::default();
     let cell: Arc<Mutex<Option<RedisClient>>> = Arc::new(Mutex::new(Some(c.clone())));
-    c.get_stream("k", Closer { told: Arc::clone(&told), client: Arc::clone(&cell) });
+    c.get("k", Closer { told: Arc::clone(&told), client: Arc::clone(&cell) });
     let err = wait_outcome(&told).unwrap_err();
     assert_eq!(err, RedisError::Closed, "{err:?}");
     // And once it is closed, later commands fail the same way.

@@ -29,7 +29,8 @@ Scenarios:
   values.
 - The same on a three-master cluster, keyed, and keyless (`PUBLISH`).
 - A few of them over TLS.
-- Parsing a 1 KiB, 64 KiB and 1 MiB bulk reply fed in 512-byte reads and in one.
+- A 64 KiB, 1 MiB and 64 MiB reply streamed to a sink that keeps nothing, fed in
+  512-byte reads.
 - Failing 1024, 4096 and 16384 pipelined commands that all time out against a
   server that has stopped answering.
 
@@ -59,12 +60,6 @@ run.
 | tls single get 16B depth 16 | 247925 -> 278962 | 21.1 -> 15.1 | 1006 -> 927 | 2.35 -> 2.02 |
 | tls single set 64KiB depth 16 | 14936 -> 16299 | 36.5 -> 27.5 | 850882 -> 712844 | 51.55 -> 48.02 |
 | tls cluster publish depth 16 | 11159 -> 151361 | 39.3 -> 21.9 | 1574 -> 1218 | 89.51 -> 6.57 |
-| parse 1KiB reply, 512B reads | 5340549 -> 5418879 | 2.0 -> 2.0 | 1032 -> 1032 | 0.19 -> 0.18 |
-| parse 1KiB reply, one read | 6287809 -> 6008261 | 2.0 -> 2.0 | 1032 -> 1032 | 0.16 -> 0.17 |
-| parse 64KiB reply, 512B reads | 307276 -> 310205 | 2.0 -> 2.0 | 65544 -> 65544 | 3.25 -> 3.22 |
-| parse 64KiB reply, one read | 753490 -> 774893 | 2.0 -> 2.0 | 65544 -> 65544 | 1.32 -> 1.29 |
-| parse 1MiB reply, 512B reads | 11990 -> 13390 | 6.0 -> 6.0 | 2031625 -> 2031625 | 83.35 -> 74.68 |
-| parse 1MiB reply, one read | 38677 -> 38718 | 3.0 -> 3.0 | 1114121 -> 1114121 | 25.84 -> 25.83 |
 | timeouts 1024 pending | 322740 -> 250357 | 19.7 -> 14.1 | 1300 -> 1248 | 9.29 -> 10.41 |
 | timeouts 4096 pending | 245141 -> 273860 | 19.8 -> 14.1 | 1351 -> 1296 | 10.29 -> 8.20 |
 | timeouts 16384 pending | 141515 -> 144226 | 19.8 -> 14.2 | 1356 -> 1302 | 11.84 -> 11.05 |
@@ -89,7 +84,8 @@ What the figures show:
 - **The parser used to buffer whole replies, which was a defect.** It collected a
   bulk string's payload until it was complete and only then handed it on, so a
   reply was held in full: up to 512 MiB for one string, with the buffer growing
-  by doubling on the way. It is now event-driven (see below).
+  by doubling on the way (the `parse` rows that measured it are gone with it). It
+  is now event-driven (see below).
 
 ## The streaming core
 
@@ -186,3 +182,41 @@ to a command connection with no sink, discarded as it arrives, raises it by
 about 3 KB, and the reply behind it is the reply. (A discard past `max_skip`,
 256 MiB by default, closes the connection, so a push larger than that is not
 discarded in this way.)
+
+## No unbounded API
+
+The last step of #541 removed everything that returned a value of unbounded size:
+`Value`, the collector that built it for a callback, and the limits that existed
+to size a buffer. A `GET` is now read by a sink, so the `get` rows above are
+driven through a counting `BulkSink` (the application's own sink, which counts
+the bytes and keeps none), where they were driven through a callback that was
+given the value; `SET` and `PUBLISH` have a single-value reply and still take a
+callback. Apple M4, release build, loopback, one reactor thread:
+
+| scenario | ops/s | allocs/op | bytes/op | cpu us/op |
+|---|---:|---:|---:|---:|
+| single get 16B depth 1 | 29338 | 19.1 | 1261 | 15.80 |
+| single get 16B depth 16 | 272649 | 15.5 | 1062 | 2.29 |
+| single get 16B depth 256 | 574329 | 15.1 | 1047 | 1.44 |
+| single set 16B depth 16 | 268660 | 16.5 | 1189 | 2.25 |
+| single get 64KiB depth 16 | 69812 | 16.5 | 1089 | 9.19 |
+| cluster get 16B depth 16 | 154404 | 23.8 | 1657 | 6.39 |
+| cluster get 16B depth 256 | 441891 | 22.3 | 1600 | 2.26 |
+| cluster publish depth 16 | 158456 | 18.9 | 1405 | 6.27 |
+| cluster publish depth 256 | 570764 | 17.3 | 1378 | 1.75 |
+| tls single get 16B depth 16 | 251059 | 15.9 | 1221 | 2.45 |
+| tls cluster publish depth 16 | 147343 | 22.2 | 1617 | 6.75 |
+
+- **A single connection is unchanged**: the same allocations per operation as
+  when the `GET` was given a value (19.1, 15.5, 15.1 at depths 1, 16 and 256),
+  and throughput within the noise of a machine that is not otherwise idle. The
+  events reach the application's sink instead of a collector; nothing is built.
+- **A `GET` through a cluster costs about one and a half more allocations** than
+  it did (23.8 against 22.4 at depth 16): the gate in front of the sink, which
+  holds back the first event so a redirection can be followed, and the sink's own
+  box. The keyless `PUBLISH` rows, which still take a callback, are unchanged.
+- **A 64 KiB `GET` is allocation-free of the value**: 1089 bytes per operation,
+  where the callback form copied the 64 KiB into a `Bytes`.
+- **The whole-reply `parse` rows are gone**, with the parser that made them: the
+  `stream` rows measure what replaced it, and stay at no allocations however
+  large the reply is.

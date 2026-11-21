@@ -617,18 +617,18 @@ fn keyed(name: &str, key: impl AsRef<[u8]>) -> Command {
 macro_rules! stream_methods {
     ($ty:ty) => {
         impl $ty {
-        /// `GET`, streamed: the value goes to `handler` as chunks, whatever its size.
-        pub fn get_stream(&self, key: impl AsRef<[u8]>, handler: impl BulkHandler + 'static) -> StreamHandle {
+        /// `GET`: the value goes to `handler` as chunks, whatever its size.
+        pub fn get(&self, key: impl AsRef<[u8]>, handler: impl BulkHandler + 'static) -> StreamHandle {
             self.send_streaming(&keyed("GET", key), BulkSink::new(handler))
         }
 
-        /// `GETDEL`, streamed.
-        pub fn getdel_stream(&self, key: impl AsRef<[u8]>, handler: impl BulkHandler + 'static) -> StreamHandle {
+        /// `GETDEL`: the value goes to `handler` as chunks.
+        pub fn getdel(&self, key: impl AsRef<[u8]>, handler: impl BulkHandler + 'static) -> StreamHandle {
             self.send_streaming(&keyed("GETDEL", key), BulkSink::new(handler))
         }
 
-        /// `GETRANGE key start end`, streamed.
-        pub fn getrange_stream(
+        /// `GETRANGE key start end`: the bytes go to `handler` as chunks.
+        pub fn getrange(
             &self,
             key: impl AsRef<[u8]>,
             start: i64,
@@ -639,8 +639,8 @@ macro_rules! stream_methods {
             self.send_streaming(&command, BulkSink::new(handler))
         }
 
-        /// `HGET`, streamed.
-        pub fn hget_stream(
+        /// `HGET`: the value goes to `handler` as chunks.
+        pub fn hget(
             &self,
             key: impl AsRef<[u8]>,
             field: impl AsRef<[u8]>,
@@ -649,29 +649,39 @@ macro_rules! stream_methods {
             self.send_streaming(&keyed("HGET", key).arg(field), BulkSink::new(handler))
         }
 
-        /// `LINDEX`, streamed.
-        pub fn lindex_stream(&self, key: impl AsRef<[u8]>, index: i64, handler: impl BulkHandler + 'static) -> StreamHandle {
+        /// `LINDEX`: the value goes to `handler` as chunks.
+        pub fn lindex(&self, key: impl AsRef<[u8]>, index: i64, handler: impl BulkHandler + 'static) -> StreamHandle {
             self.send_streaming(&keyed("LINDEX", key).arg(index.to_string()), BulkSink::new(handler))
         }
 
-        /// `LPOP`, streamed.
-        pub fn lpop_stream(&self, key: impl AsRef<[u8]>, handler: impl BulkHandler + 'static) -> StreamHandle {
+        /// `LPOP`: the value goes to `handler` as chunks.
+        pub fn lpop(&self, key: impl AsRef<[u8]>, handler: impl BulkHandler + 'static) -> StreamHandle {
             self.send_streaming(&keyed("LPOP", key), BulkSink::new(handler))
         }
 
-        /// `RPOP`, streamed.
-        pub fn rpop_stream(&self, key: impl AsRef<[u8]>, handler: impl BulkHandler + 'static) -> StreamHandle {
+        /// `RPOP`: the value goes to `handler` as chunks.
+        pub fn rpop(&self, key: impl AsRef<[u8]>, handler: impl BulkHandler + 'static) -> StreamHandle {
             self.send_streaming(&keyed("RPOP", key), BulkSink::new(handler))
         }
 
-        /// `MGET`, streamed: each value goes to `handler` as chunks, in key order.
-        pub fn mget_stream(&self, keys: &[impl AsRef<[u8]>], handler: impl ElementsHandler + 'static) -> StreamHandle {
+        /// `MGET`: each value goes to `handler` as chunks, in key order.
+        pub fn mget(&self, keys: &[impl AsRef<[u8]>], handler: impl ElementsHandler + 'static) -> StreamHandle {
             let command = Command::new("MGET").args(keys);
             self.send_streaming(&command, ElementsSink::new(handler))
         }
 
-        /// `LRANGE`, streamed.
-        pub fn lrange_stream(
+        /// `HMGET`: each value goes to `handler` as chunks, in field order.
+        pub fn hmget(
+            &self,
+            key: impl AsRef<[u8]>,
+            fields: &[impl AsRef<[u8]>],
+            handler: impl ElementsHandler + 'static,
+        ) -> StreamHandle {
+            self.send_streaming(&keyed("HMGET", key).args(fields), ElementsSink::new(handler))
+        }
+
+        /// `LRANGE`: each element goes to `handler` as chunks.
+        pub fn lrange(
             &self,
             key: impl AsRef<[u8]>,
             start: i64,
@@ -682,13 +692,13 @@ macro_rules! stream_methods {
             self.send_streaming(&command, ElementsSink::new(handler))
         }
 
-        /// `SMEMBERS`, streamed: each member goes to `handler` as chunks.
-        pub fn smembers_stream(&self, key: impl AsRef<[u8]>, handler: impl ElementsHandler + 'static) -> StreamHandle {
+        /// `SMEMBERS`: each member goes to `handler` as chunks.
+        pub fn smembers(&self, key: impl AsRef<[u8]>, handler: impl ElementsHandler + 'static) -> StreamHandle {
             self.send_streaming(&keyed("SMEMBERS", key), ElementsSink::new(handler))
         }
 
-        /// `ZRANGE key start stop`, streamed: each member goes to `handler` as chunks.
-        pub fn zrange_stream(
+        /// `ZRANGE key start stop`: each member goes to `handler` as chunks.
+        pub fn zrange(
             &self,
             key: impl AsRef<[u8]>,
             start: i64,
@@ -699,18 +709,48 @@ macro_rules! stream_methods {
             self.send_streaming(&command, ElementsSink::new(handler))
         }
 
-        /// `HGETALL`, streamed: each field name whole, each value as chunks.
-        pub fn hgetall_stream(&self, key: impl AsRef<[u8]>, handler: impl FieldsHandler + 'static) -> StreamHandle {
+        /// `HGETALL`: each field name whole, each value as chunks.
+        pub fn hgetall(&self, key: impl AsRef<[u8]>, handler: impl FieldsHandler + 'static) -> StreamHandle {
             self.send_streaming(&keyed("HGETALL", key), FieldsSink::new(handler))
         }
 
+        /// `EVAL script numkeys key... arg...`: the script's result is told to
+        /// `sink` as the events of a reply, however large and of whatever shape.
+        /// Use a [`ReplySink`] of your own, or one of the shapes if the script
+        /// returns one.
+        pub fn eval(
+            &self,
+            script: impl AsRef<[u8]>,
+            keys: &[impl AsRef<[u8]>],
+            args: &[impl AsRef<[u8]>],
+            sink: impl ReplySink + Send + 'static,
+        ) -> StreamHandle {
+            let command = Command::new("EVAL").arg(script).arg(keys.len().to_string()).args(keys).args(args);
+            self.send_streaming(&command, sink)
+        }
+
+        /// `EVALSHA sha1 numkeys key... arg...`, as [`eval`](Self::eval). A server
+        /// that has not seen the script answers a `NOSCRIPT` error, which the
+        /// sink is told as an error reply: load the script with
+        /// [`script_load`](Self::script_load) and try again.
+        pub fn evalsha(
+            &self,
+            sha1: impl AsRef<[u8]>,
+            keys: &[impl AsRef<[u8]>],
+            args: &[impl AsRef<[u8]>],
+            sink: impl ReplySink + Send + 'static,
+        ) -> StreamHandle {
+            let command = Command::new("EVALSHA").arg(sha1).arg(keys.len().to_string()).args(keys).args(args);
+            self.send_streaming(&command, sink)
+        }
+
         /// `KEYS pattern`, each key whole.
-        pub fn keys_stream(&self, pattern: impl AsRef<[u8]>, handler: impl KeysHandler + 'static) -> StreamHandle {
+        pub fn keys(&self, pattern: impl AsRef<[u8]>, handler: impl KeysHandler + 'static) -> StreamHandle {
             self.send_streaming(&keyed("KEYS", pattern), KeysSink::new(handler))
         }
 
-        /// [`get_stream`](Self::get_stream) with a deadline of its own.
-        pub fn get_stream_with_deadline(
+        /// [`get`](Self::get) with a deadline of its own.
+        pub fn get_with_deadline(
             &self,
             key: impl AsRef<[u8]>,
             deadline: Deadline,

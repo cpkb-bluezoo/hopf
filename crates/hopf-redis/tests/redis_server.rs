@@ -18,8 +18,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hopf_core::Bytes;
-use hopf_redis::{Command, RedisClient, RedisConfig, RedisError, SetOptions, Value};
+use hopf_redis::{Command, RedisClient, RedisConfig, RedisError, SetOptions};
 
+use common::collect::Tree;
 use common::*;
 
 macro_rules! server_or_skip {
@@ -56,15 +57,15 @@ fn works_in_resp2_too() {
     let c = RedisClient::connect(rt.pick_worker(), RedisConfig::new(host, port).resp2_only());
     let k = unique("resp2");
     call!(|cb| c.set(&k, "v", cb)).unwrap();
-    assert_eq!(call!(|cb| c.get(&k, cb)).unwrap(), Some(b("v")));
+    assert_eq!(collect::get(&c, &k).unwrap(), Some(b("v")));
     assert!(!c.is_resp3());
     // Types whose reply shape differs between the protocols.
     let z = unique("resp2-z");
     call!(|cb| c.zadd(&z, &[(1.5, "a"), (2.0, "b")], cb)).unwrap();
-    assert_eq!(call!(|cb| c.zrange_withscores(&z, 0, -1, cb)).unwrap(), vec![(b("a"), 1.5), (b("b"), 2.0)]);
+    assert_eq!(collect::zrange_withscores(&c, &z, 0, -1).unwrap(), vec![(b("a"), 1.5), (b("b"), 2.0)]);
     let h = unique("resp2-h");
     call!(|cb| c.hset(&h, &[("f", "v")], cb)).unwrap();
-    assert_eq!(call!(|cb| c.hgetall(&h, cb)).unwrap(), vec![(b("f"), b("v"))]);
+    assert_eq!(collect::hgetall(&c, &h).unwrap(), vec![(b("f"), b("v"))]);
     let _ = call!(|cb| c.del(&[&k, &z, &h], cb));
     rt.shutdown();
 }
@@ -78,30 +79,30 @@ fn the_typed_helpers_round_trip() {
     let key = |s: &str| format!("{p}:{s}");
 
     // Strings.
-    assert_eq!(call!(|cb| c.get(key("missing"), cb)).unwrap(), None);
+    assert_eq!(collect::get(&c, key("missing")).unwrap(), None);
     call!(|cb| c.set(key("s"), "hello", cb)).unwrap();
-    assert_eq!(call!(|cb| c.get(key("s"), cb)).unwrap(), Some(b("hello")));
+    assert_eq!(collect::get(&c, key("s")).unwrap(), Some(b("hello")));
     assert_eq!(call!(|cb| c.append(key("s"), " world", cb)).unwrap(), 11);
     assert_eq!(call!(|cb| c.strlen(key("s"), cb)).unwrap(), 11);
     assert!(call!(|cb| c.setnx(key("nx"), "1", cb)).unwrap());
     assert!(!call!(|cb| c.setnx(key("nx"), "2", cb)).unwrap());
     call!(|cb| c.mset(&[(key("m1"), "a"), (key("m2"), "b")], cb)).unwrap();
     assert_eq!(
-        call!(|cb| c.mget(&[key("m1"), key("none"), key("m2")], cb)).unwrap(),
+        collect::mget(&c, &[key("m1"), key("none"), key("m2")]).unwrap(),
         vec![Some(b("a")), None, Some(b("b"))]
     );
     assert_eq!(call!(|cb| c.incr(key("n"), cb)).unwrap(), 1);
     assert_eq!(call!(|cb| c.incrby(key("n"), 9, cb)).unwrap(), 10);
     assert_eq!(call!(|cb| c.decr(key("n"), cb)).unwrap(), 9);
     assert_eq!(call!(|cb| c.decrby(key("n"), 4, cb)).unwrap(), 5);
-    assert_eq!(call!(|cb| c.getdel(key("s"), cb)).unwrap(), Some(b("hello world")));
-    assert_eq!(call!(|cb| c.get(key("s"), cb)).unwrap(), None);
+    assert_eq!(collect::getdel(&c, key("s")).unwrap(), Some(b("hello world")));
+    assert_eq!(collect::get(&c, key("s")).unwrap(), None);
 
     // Hashes.
     assert_eq!(call!(|cb| c.hset(key("h"), &[("a", "1"), ("b", "2")], cb)).unwrap(), 2);
-    assert_eq!(call!(|cb| c.hget(key("h"), "a", cb)).unwrap(), Some(b("1")));
-    assert_eq!(call!(|cb| c.hmget(key("h"), &["a", "zz"], cb)).unwrap(), vec![Some(b("1")), None]);
-    let mut all = call!(|cb| c.hgetall(key("h"), cb)).unwrap();
+    assert_eq!(collect::hget(&c, key("h"), "a").unwrap(), Some(b("1")));
+    assert_eq!(collect::hmget(&c, key("h"), &["a", "zz"]).unwrap(), vec![Some(b("1")), None]);
+    let mut all = collect::hgetall(&c, key("h")).unwrap();
     all.sort();
     assert_eq!(all, vec![(b("a"), b("1")), (b("b"), b("2"))]);
     assert!(call!(|cb| c.hexists(key("h"), "a", cb)).unwrap());
@@ -112,26 +113,26 @@ fn the_typed_helpers_round_trip() {
     // Lists.
     assert_eq!(call!(|cb| c.rpush(key("l"), &["a", "b", "c"], cb)).unwrap(), 3);
     assert_eq!(call!(|cb| c.lpush(key("l"), &["z"], cb)).unwrap(), 4);
-    assert_eq!(call!(|cb| c.lrange(key("l"), 0, -1, cb)).unwrap(), vec![b("z"), b("a"), b("b"), b("c")]);
-    assert_eq!(call!(|cb| c.lindex(key("l"), 1, cb)).unwrap(), Some(b("a")));
-    assert_eq!(call!(|cb| c.lpop(key("l"), cb)).unwrap(), Some(b("z")));
-    assert_eq!(call!(|cb| c.rpop(key("l"), cb)).unwrap(), Some(b("c")));
+    assert_eq!(collect::lrange(&c, key("l"), 0, -1).unwrap(), vec![b("z"), b("a"), b("b"), b("c")]);
+    assert_eq!(collect::lindex(&c, key("l"), 1).unwrap(), Some(b("a")));
+    assert_eq!(collect::lpop(&c, key("l")).unwrap(), Some(b("z")));
+    assert_eq!(collect::rpop(&c, key("l")).unwrap(), Some(b("c")));
     assert_eq!(call!(|cb| c.llen(key("l"), cb)).unwrap(), 2);
 
     // Sets.
     assert_eq!(call!(|cb| c.sadd(key("set"), &["x", "y", "x"], cb)).unwrap(), 2);
     assert!(call!(|cb| c.sismember(key("set"), "x", cb)).unwrap());
     assert_eq!(call!(|cb| c.scard(key("set"), cb)).unwrap(), 2);
-    let mut members = call!(|cb| c.smembers(key("set"), cb)).unwrap();
+    let mut members = collect::smembers(&c, key("set")).unwrap();
     members.sort();
     assert_eq!(members, vec![b("x"), b("y")]);
     assert_eq!(call!(|cb| c.srem(key("set"), &["x"], cb)).unwrap(), 1);
 
     // Sorted sets.
     assert_eq!(call!(|cb| c.zadd(key("z"), &[(1.0, "a"), (3.0, "c"), (2.0, "b")], cb)).unwrap(), 3);
-    assert_eq!(call!(|cb| c.zrange(key("z"), 0, -1, cb)).unwrap(), vec![b("a"), b("b"), b("c")]);
+    assert_eq!(collect::zrange(&c, key("z"), 0, -1).unwrap(), vec![b("a"), b("b"), b("c")]);
     assert_eq!(
-        call!(|cb| c.zrange_withscores(key("z"), 0, 1, cb)).unwrap(),
+        collect::zrange_withscores(&c, key("z"), 0, 1).unwrap(),
         vec![(b("a"), 1.0), (b("b"), 2.0)]
     );
     assert_eq!(call!(|cb| c.zscore(key("z"), "b", cb)).unwrap(), Some(2.0));
@@ -168,7 +169,7 @@ fn set_with_options() {
     };
     assert!(call!(|cb| c.set_with(&k, "1", &nx, cb)).unwrap(), "set a missing key");
     assert!(!call!(|cb| c.set_with(&k, "2", &nx, cb)).unwrap(), "NX leaves an existing key alone");
-    assert_eq!(call!(|cb| c.get(&k, cb)).unwrap(), Some(b("1")));
+    assert_eq!(collect::get(&c, &k).unwrap(), Some(b("1")));
     let ttl = call!(|cb| c.ttl(&k, cb)).unwrap();
     assert!((1..=100).contains(&ttl));
     let xx = SetOptions {
@@ -242,7 +243,7 @@ fn replies_arrive_in_the_order_commands_were_issued() {
         c.set(&k, i.to_string(), move |r| {
             r.unwrap();
         });
-        c.get(&k, move |r| {
+        collect::get_with(&c, &k, move |r| {
             order.lock().unwrap().push(r.unwrap().unwrap());
             if i == 199 {
                 let _ = tx.send(());
@@ -269,10 +270,7 @@ fn a_transaction_runs_together_and_reports_each_result() {
         let (c, a, bk) = (c.clone(), a.clone(), bk.clone());
         handles.push(std::thread::spawn(move || {
             for _ in 0..50 {
-                let r = call!(|cb| c.transaction(
-                    vec![Command::new("INCR").arg(&a), Command::new("INCR").arg(&bk), Command::new("GET").arg(&a)],
-                    cb
-                ))
+                let r = collect::transaction(&c, vec![Command::new("INCR").arg(&a), Command::new("INCR").arg(&bk), Command::new("GET").arg(&a)])
                 .unwrap()
                 .expect("not aborted");
                 assert_eq!(r.len(), 3);
@@ -286,15 +284,15 @@ fn a_transaction_runs_together_and_reports_each_result() {
     for h in handles {
         h.join().unwrap();
     }
-    assert_eq!(call!(|cb| c.get(&a, cb)).unwrap(), Some(b("100")));
+    assert_eq!(collect::get(&c, &a).unwrap(), Some(b("100")));
     // A command that fails when run is an error element, not a failed transaction.
-    let r = call!(|cb| c.transaction(vec![Command::new("SET").arg(&a).arg("x"), Command::new("LPUSH").arg(&a).arg("y")], cb))
+    let r = collect::transaction(&c, vec![Command::new("SET").arg(&a).arg("x"), Command::new("LPUSH").arg(&a).arg("y")])
         .unwrap()
         .unwrap();
-    assert_eq!(r[0], Value::Simple("OK".into()));
-    assert!(matches!(&r[1], Value::Error(e) if e.code == "WRONGTYPE"), "{:?}", r[1]);
+    assert_eq!(r[0], Tree::Simple("OK".into()));
+    assert!(matches!(&r[1], Tree::Error(e) if e.code == "WRONGTYPE"), "{:?}", r[1]);
     // A command refused when queued fails the transaction with its own error.
-    let err = call!(|cb| c.transaction(vec![Command::new("NOSUCHCOMMAND")], cb)).unwrap_err();
+    let err = collect::transaction(&c, vec![Command::new("NOSUCHCOMMAND")]).unwrap_err();
     assert!(matches!(&err, RedisError::Server(e) if e.code == "ERR"), "{err}");
     let _ = call!(|cb| c.del(&[&a, &bk], cb));
     rt.shutdown();
@@ -313,8 +311,8 @@ fn watch_aborts_an_exec_when_the_key_changed() {
     call!(|cb| other.set(&k, "2", cb)).unwrap();
     call!(|cb| c.multi(cb)).unwrap();
     let _queued = call!(|cb| c.command(&[b"SET", k.as_bytes(), b"3"], cb)).unwrap();
-    assert_eq!(call!(|cb| c.exec(cb)).unwrap(), None, "the watched key changed");
-    assert_eq!(call!(|cb| c.get(&k, cb)).unwrap(), Some(b("2")));
+    assert_eq!(collect::exec(&c).unwrap(), None, "the watched key changed");
+    assert_eq!(collect::get(&c, &k).unwrap(), Some(b("2")));
     let _ = call!(|cb| c.del(&[&k], cb));
     rt.shutdown();
 }
@@ -326,13 +324,13 @@ fn scripts_run_and_are_cached_by_hash() {
     let c = client(&rt, &host, port);
     let k = unique("script");
     let script = "redis.call('SET', KEYS[1], ARGV[1]); return redis.call('GET', KEYS[1])";
-    let v = call!(|cb| c.eval(script, &[&k], &["payload"], cb)).unwrap();
+    let v = collect::eval(&c, script, &[&k], &["payload"]).unwrap();
     assert_eq!(v.as_str(), Some("payload"));
     let sha = call!(|cb| c.script_load(script, cb)).unwrap();
     assert_eq!(sha.len(), 40);
-    let v = call!(|cb| c.evalsha(&sha, &[&k], &["again"], cb)).unwrap();
+    let v = collect::evalsha(&c, &sha, &[&k], &["again"]).unwrap();
     assert_eq!(v.as_str(), Some("again"));
-    let err = call!(|cb| c.evalsha("0000000000000000000000000000000000000000", &[&k], &[] as &[&str], cb)).unwrap_err();
+    let err = collect::evalsha(&c, "0000000000000000000000000000000000000000", &[&k], &[] as &[&str]).unwrap_err();
     assert_eq!(err.server_code(), Some("NOSCRIPT"));
     let _ = call!(|cb| c.del(&[&k], cb));
     rt.shutdown();
@@ -372,14 +370,14 @@ fn a_database_is_selected_and_a_name_is_set() {
     let in_db0 = client(&rt, &host, port);
     let k = unique("db");
     call!(|cb| in_db2.set(&k, "here", cb)).unwrap();
-    assert_eq!(call!(|cb| in_db2.get(&k, cb)).unwrap(), Some(b("here")));
-    assert_eq!(call!(|cb| in_db0.get(&k, cb)).unwrap(), None, "database 0 does not have it");
-    let list = call!(|cb| in_db0.command(&[b"CLIENT", b"LIST"], cb)).unwrap();
+    assert_eq!(collect::get(&in_db2, &k).unwrap(), Some(b("here")));
+    assert_eq!(collect::get(&in_db0, &k).unwrap(), None, "database 0 does not have it");
+    let list = collect::command(&in_db0, &[b"CLIENT", b"LIST"]).unwrap();
     let text = String::from_utf8_lossy(list.as_bytes().unwrap()).into_owned();
     assert!(text.contains(&name.replace(':', "-")), "the connection name is set: {text}");
     // The same under RESP2, which does the SELECT itself.
     let resp2 = RedisClient::connect(rt.pick_worker(), RedisConfig::new(&host, port).database(2).resp2_only());
-    assert_eq!(call!(|cb| resp2.get(&k, cb)).unwrap(), Some(b("here")));
+    assert_eq!(collect::get(&resp2, &k).unwrap(), Some(b("here")));
     let _ = call!(|cb| in_db2.del(&[&k], cb));
     rt.shutdown();
 }
@@ -401,7 +399,7 @@ fn large_values_round_trip() {
     let k = unique("large");
     let value: Vec<u8> = (0..3_000_000u32).map(|i| (i % 253) as u8).collect();
     call!(|cb| c.set(&k, &value, cb)).unwrap();
-    let got = call!(|cb| c.get(&k, cb)).unwrap().unwrap();
+    let got = collect::get(&c, &k).unwrap().unwrap();
     assert_eq!(got.len(), value.len());
     assert_eq!(&got[..], &value[..]);
     let _ = call!(|cb| c.del(&[&k], cb));
@@ -461,7 +459,7 @@ fn a_killed_connection_fails_what_was_in_flight_once_and_the_next_command_reconn
     std::thread::sleep(Duration::from_millis(200));
 
     // Find and kill the connection by its name.
-    let listing = call!(|cb| admin.command(&[b"CLIENT", b"LIST"], cb)).unwrap();
+    let listing = collect::command(&admin, &[b"CLIENT", b"LIST"]).unwrap();
     let text = String::from_utf8_lossy(listing.as_bytes().unwrap()).into_owned();
     let line = text.lines().find(|l| l.contains(&format!("name={name}"))).expect("the client is listed");
     let id = line.split_whitespace().find_map(|w| w.strip_prefix("id=")).unwrap().to_string();

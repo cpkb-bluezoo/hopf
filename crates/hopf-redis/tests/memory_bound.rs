@@ -261,7 +261,17 @@ fn a_late_reply_to_a_timed_out_command_is_discarded_in_constant_memory() {
     let base = reset_peak();
 
     let started = Instant::now();
-    let err = call(|cb| c.get(size.to_string(), move |r| cb(r))).unwrap_err();
+    let (tx, rx) = mpsc::channel();
+    c.get(
+        size.to_string(),
+        Drain {
+            bytes: Arc::new(AtomicUsize::new(0)),
+            chunks: Arc::new(AtomicUsize::new(0)),
+            pause_at_first: false,
+            done: tx,
+        },
+    );
+    let err = rx.recv_timeout(Duration::from_secs(120)).expect("the command finished").unwrap_err();
     assert_eq!(err, RedisError::Timeout);
     // The PING is answered after the whole of the reply to the GET, so when it
     // arrives the 256 MiB has been read.

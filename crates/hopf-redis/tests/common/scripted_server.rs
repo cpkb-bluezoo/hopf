@@ -12,7 +12,7 @@ use std::thread;
 use std::time::Duration;
 
 use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, Runtime, TcpListenerConfig};
-use hopf_redis::{RespParser, Value};
+use hopf_redis::{AggKind, Flow, ReplySink, RespParser, Scalar, StrKind};
 
 use super::runtime;
 
@@ -64,12 +64,51 @@ fn pump(ep: &mut dyn Endpoint, left: usize, suffix: String) {
     ep.on_write_ready(Some(Box::new(move |ep| pump(ep, left, suffix))));
 }
 
+/// Reads the commands a client sends: each an array of bulk strings.
+#[derive(Default)]
+struct Commands {
+    words: Vec<Vec<u8>>,
+    current: Vec<u8>,
+    out: Vec<Vec<Vec<u8>>>,
+}
+
+impl ReplySink for Commands {
+    fn scalar(&mut self, _v: Scalar<'_>) -> Flow {
+        Flow::Continue
+    }
+    fn error(&mut self, _line: &str) -> Flow {
+        Flow::Continue
+    }
+    fn begin_aggregate(&mut self, _kind: AggKind, _len: Option<usize>) -> Flow {
+        self.words.clear();
+        Flow::Continue
+    }
+    fn end_aggregate(&mut self) -> Flow {
+        self.out.push(std::mem::take(&mut self.words));
+        Flow::Continue
+    }
+    fn begin_string(&mut self, _kind: StrKind, _len: Option<usize>) -> Flow {
+        self.current.clear();
+        Flow::Continue
+    }
+    fn string_chunk(&mut self, data: &[u8]) -> Flow {
+        self.current.extend_from_slice(data);
+        Flow::Continue
+    }
+    fn end_string(&mut self) -> Flow {
+        self.words.push(std::mem::take(&mut self.current));
+        Flow::Continue
+    }
+}
+
 pub type Script = dyn Fn(&mut Session, &[Vec<u8>]) + Send + Sync;
 
 pub struct Scripted {
     script: Arc<Script>,
     pub conn: usize,
     parser: RespParser,
+    /// The command being read, which may take several reads.
+    commands: Commands,
     pub seq: usize,
     pub held: Vec<Vec<Vec<u8>>>,
 }
@@ -77,17 +116,10 @@ pub struct Scripted {
 impl ProtocolHandler for Scripted {
     fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
     fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut hopf_core::LoopBuf) {
-        let mut commands = Vec::new();
         hopf_core::with_slice(buf, |data| {
-            self.parser
-                .feed_values(data, &mut |v| {
-                    if let Value::Array(words) = v {
-                        commands.push(words.iter().map(|w| w.as_bytes().unwrap().to_vec()).collect::<Vec<_>>());
-                    }
-                })
-                .unwrap();
+            self.parser.feed(data, &mut self.commands).unwrap();
         });
-        for words in commands {
+        for words in std::mem::take(&mut self.commands.out) {
             let mut session = Session {
                 endpoint,
                 conn: self.conn,
@@ -126,6 +158,7 @@ pub fn serve_on(
             script: Arc::clone(&sc),
             conn: cn.fetch_add(1, Ordering::SeqCst),
             parser: RespParser::new(),
+            commands: Commands::default(),
             seq: 0,
             held: Vec::new(),
         }) as Box<dyn ProtocolHandler>

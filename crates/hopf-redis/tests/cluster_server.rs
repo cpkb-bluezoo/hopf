@@ -24,8 +24,9 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use hopf_core::{Bytes, Runtime};
-use hopf_redis::{ClusterConfig, Command, RedisClient, RedisCluster, RedisConfig, RedisError, Value};
+use hopf_redis::{ClusterConfig, Command, RedisClient, RedisCluster, RedisConfig, RedisError};
 
+use common::collect::Tree;
 use common::*;
 
 /// Every test holds this shared while it runs; the one that fails a master over
@@ -104,14 +105,14 @@ fn admin(rt: &Runtime, host: &str, port: u16) -> RedisClient {
     client(rt, host, port)
 }
 
-fn run(c: &RedisClient, words: &[&str]) -> Result<Value, RedisError> {
+fn run(c: &RedisClient, words: &[&str]) -> Result<Tree, RedisError> {
     let words: Vec<&[u8]> = words.iter().map(|w| w.as_bytes()).collect();
-    call!(|cb| c.command(&words, cb))
+    collect::command(c, &words)
 }
 
 fn node_id(c: &RedisClient) -> String {
     match run(c, &["CLUSTER", "MYID"]).unwrap() {
-        Value::Bulk(id) => String::from_utf8(id.to_vec()).unwrap(),
+        Tree::Bulk(id) => String::from_utf8(id.to_vec()).unwrap(),
         other => panic!("CLUSTER MYID answered {other:?}"),
     }
 }
@@ -148,7 +149,7 @@ fn routes_each_key_to_the_master_that_owns_it() {
         call!(|cb| c.set(k, format!("v{n}"), cb)).unwrap();
     }
     for (n, k) in keys.iter().enumerate() {
-        assert_eq!(call!(|cb| c.get(k, cb)).unwrap(), Some(b(&format!("v{n}"))));
+        assert_eq!(collect::get(&c, k).unwrap(), Some(b(&format!("v{n}"))));
     }
     assert_eq!(c.refresh_count(), before, "a settled cluster needs no refresh");
     // The keys really are spread over the three masters.
@@ -168,7 +169,7 @@ fn a_command_with_several_keys_works_when_they_share_a_hash_tag() {
     let tag = unique("tag");
     let (a, bk, ck) = (format!("{{{tag}}}a"), format!("{{{tag}}}b"), format!("{{{tag}}}c"));
     call!(|cb| c.mset(&[(&a, "1"), (&bk, "2"), (&ck, "3")], cb)).unwrap();
-    let got = call!(|cb| c.mget(&[&a, &bk, &ck, &format!("{{{tag}}}missing")], cb)).unwrap();
+    let got = collect::mget(&c, &[&a, &bk, &ck, &format!("{{{tag}}}missing")]).unwrap();
     assert_eq!(got, vec![Some(b("1")), Some(b("2")), Some(b("3")), None]);
     assert_eq!(call!(|cb| c.del(&[&a, &bk, &ck], cb)).unwrap(), 3);
     rt.shutdown();
@@ -181,17 +182,14 @@ fn keys_in_different_slots_fail_with_crossslot_and_never_touch_the_network() {
     let c = connect(&rt, &seed);
     let k1 = key_in(0..=100, "cross1");
     let k2 = key_in(16000..=16383, "cross2");
-    let err = call!(|cb| c.mget(&[&k1, &k2], cb)).unwrap_err();
+    let err = collect::mget(&c, &[&k1, &k2]).unwrap_err();
     assert_eq!(code(&err), "CROSSSLOT", "{err:?}");
-    let err = call!(|cb| c.transaction(
-        vec![Command::new("SET").arg(&k1).arg("x"), Command::new("SET").arg(&k2).arg("y")],
-        cb
-    ))
+    let err = collect::transaction(&c, vec![Command::new("SET").arg(&k1).arg("x"), Command::new("SET").arg(&k2).arg("y")])
     .unwrap_err();
     assert_eq!(code(&err), "CROSSSLOT", "{err:?}");
     // Neither reached a server, so neither wrote.
-    assert_eq!(call!(|cb| c.get(&k1, cb)).unwrap(), None);
-    assert_eq!(call!(|cb| c.get(&k2, cb)).unwrap(), None);
+    assert_eq!(collect::get(&c, &k1).unwrap(), None);
+    assert_eq!(collect::get(&c, &k2).unwrap(), None);
     rt.shutdown();
 }
 
@@ -203,11 +201,11 @@ fn a_script_runs_on_the_node_that_owns_its_keys() {
     let tag = unique("script");
     let (k1, k2) = (format!("{{{tag}}}1"), format!("{{{tag}}}2"));
     let script = "redis.call('SET', KEYS[1], ARGV[1]); redis.call('SET', KEYS[2], ARGV[2]); return redis.call('MGET', KEYS[1], KEYS[2])";
-    let got = call!(|cb| c.eval(script, &[&k1, &k2], &["a", "b"], cb)).unwrap();
-    assert_eq!(got, Value::Array(vec![Value::Bulk(b("a")), Value::Bulk(b("b"))]));
+    let got = collect::eval(&c, script, &[&k1, &k2], &["a", "b"]).unwrap();
+    assert_eq!(got, Tree::Array(vec![Tree::bulk("a"), Tree::bulk("b")]));
     // Keys in two slots: the script cannot be run at all.
     let (x, y) = (key_in(0..=100, "s1"), key_in(16000..=16383, "s2"));
-    let err = call!(|cb| c.eval(script, &[&x, &y], &["a", "b"], cb)).unwrap_err();
+    let err = collect::eval(&c, script, &[&x, &y], &["a", "b"]).unwrap_err();
     assert_eq!(code(&err), "CROSSSLOT", "{err:?}");
     call!(|cb| c.del(&[&k1, &k2], cb)).unwrap();
     rt.shutdown();
@@ -220,17 +218,14 @@ fn a_transaction_runs_on_the_master_of_its_slot() {
     let c = connect(&rt, &seed);
     let tag = unique("tx");
     let (k1, k2) = (format!("{{{tag}}}1"), format!("{{{tag}}}2"));
-    let out = call!(|cb| c.transaction(
-        vec![
+    let out = collect::transaction(&c, vec![
             Command::new("SET").arg(&k1).arg("one"),
             Command::new("INCR").arg(&k2),
             Command::new("GET").arg(&k1),
-        ],
-        cb
-    ))
+        ])
     .unwrap()
     .expect("EXEC was not aborted");
-    assert_eq!(out, vec![Value::Simple("OK".into()), Value::Int(1), Value::Bulk(b("one"))]);
+    assert_eq!(out, vec![Tree::Simple("OK".into()), Tree::Int(1), Tree::bulk("one")]);
     call!(|cb| c.del(&[&k1, &k2], cb)).unwrap();
     rt.shutdown();
 }
@@ -254,9 +249,15 @@ fn command_for_key_runs_a_keyless_command_where_the_key_lives() {
     let k = key_in(10923..=16383, "routed");
     let (host, port) = c.owner_of(c.slot_of(&k)).unwrap();
     // `CLUSTER MYID` has no key, so only the routing key says where it runs.
-    let reply = call!(|cb| c.command_for_key(&k, &Command::new("CLUSTER").arg("MYID"), cb)).unwrap();
-    let id = match reply {
-        Value::Bulk(id) => String::from_utf8(id.to_vec()).unwrap(),
+    // (A string reply is not a single value, so it is read into a sink of the test's own.)
+    let (tx, rx) = std::sync::mpsc::channel();
+    c.send_streaming_for_key(
+        &k,
+        &Command::new("CLUSTER").arg("MYID"),
+        collect::TreeSink::new(move |r| tx.send(r).unwrap()),
+    );
+    let id = match rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap() {
+        Tree::Bulk(id) => String::from_utf8(id.to_vec()).unwrap(),
         other => panic!("{other:?}"),
     };
     let direct = admin(&rt, &host, port);
@@ -297,7 +298,7 @@ fn a_moved_reply_updates_the_layout_and_the_command_is_retried() {
     // The client still believes `a` owns the slot: its first try meets MOVED,
     // and the command succeeds anyway.
     call!(|cb| c.set(&k, "after", cb)).unwrap();
-    assert_eq!(call!(|cb| c.get(&k, cb)).unwrap(), Some(b("after")));
+    assert_eq!(collect::get(&c, &k).unwrap(), Some(b("after")));
     wait_until("the layout is fetched again", || c.refresh_count() > refreshes);
     wait_until("the client knows the new owner", || c.owner_of(slot) == Some((b_host.clone(), b_port)));
 
@@ -305,7 +306,7 @@ fn a_moved_reply_updates_the_layout_and_the_command_is_retried() {
     call!(|cb| c.del(&[&k], cb)).unwrap();
     move_empty_slot(&bn, &a, slot);
     call!(|cb| c.set(&k, "home", cb)).unwrap();
-    assert_eq!(call!(|cb| c.get(&k, cb)).unwrap(), Some(b("home")));
+    assert_eq!(collect::get(&c, &k).unwrap(), Some(b("home")));
     wait_until("the client knows the owner is back", || c.owner_of(slot) == Some((a_host.clone(), a_port)));
     call!(|cb| c.del(&[&k], cb)).unwrap();
     rt.shutdown();
@@ -334,10 +335,10 @@ fn an_ask_reply_is_followed_for_that_command_only() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // The key is on neither node. `a` answers ASK, and `b`, asked with
         // ASKING first, says it does not have it either.
-        assert_eq!(call!(|cb| c.get(&k, cb)).unwrap(), None);
+        assert_eq!(collect::get(&c, &k).unwrap(), None);
         // A write to a key `a` does not have is sent to `b`, where it lands.
         call!(|cb| c.set(&k, "asked", cb)).unwrap();
-        assert_eq!(call!(|cb| c.get(&k, cb)).unwrap(), Some(b("asked")));
+        assert_eq!(collect::get(&c, &k).unwrap(), Some(b("asked")));
         // ASK is not MOVED: the layout is not touched on its account.
         assert_eq!(c.owner_of(slot), Some((a_host.clone(), a_port)));
         assert_eq!(c.refresh_count(), refreshes);
@@ -372,10 +373,10 @@ fn a_transaction_follows_an_ask_with_asking_in_the_same_batch() {
     run(&a, &["CLUSTER", "SETSLOT", &s, "MIGRATING", &b_id]).unwrap();
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let out = call!(|cb| c.transaction(vec![Command::new("SET").arg(&k).arg("tx"), Command::new("GET").arg(&k)], cb))
+        let out = collect::transaction(&c, vec![Command::new("SET").arg(&k).arg("tx"), Command::new("GET").arg(&k)])
             .unwrap()
             .expect("EXEC was not aborted");
-        assert_eq!(out, vec![Value::Simple("OK".into()), Value::Bulk(b("tx"))]);
+        assert_eq!(out, vec![Tree::Simple("OK".into()), Tree::bulk("tx")]);
     }));
 
     run(&bn, &["ASKING"]).ok();
@@ -411,7 +412,7 @@ fn close_fails_what_is_asked_afterwards() {
     let rt = runtime();
     let c = connect(&rt, &seed);
     c.close();
-    let err = call!(|cb| c.get("anything", cb)).unwrap_err();
+    let err = collect::get(&c, "anything").unwrap_err();
     assert!(matches!(err, RedisError::Closed), "{err:?}");
     rt.shutdown();
 }
@@ -437,7 +438,7 @@ fn a_node_config_is_applied_to_every_node_connection() {
     wait_until("the layout is known", || c.is_ready());
     let k = unique("resp2");
     call!(|cb| c.set(&k, "v", cb)).unwrap();
-    assert_eq!(call!(|cb| c.get(&k, cb)).unwrap(), Some(b("v")));
+    assert_eq!(collect::get(&c, &k).unwrap(), Some(b("v")));
     call!(|cb| c.del(&[&k], cb)).unwrap();
     rt.shutdown();
 }
@@ -455,7 +456,7 @@ fn named(rt: &Runtime, seed: &(String, u16), name: &str) -> RedisCluster {
 /// What `CLIENT LIST` says of the connections named `name` on one node.
 fn connections_named(node: &RedisClient, name: &str) -> Vec<String> {
     let listing = match run(node, &["CLIENT", "LIST"]).unwrap() {
-        Value::Bulk(t) | Value::Verbatim { data: t, .. } => String::from_utf8(t.to_vec()).unwrap(),
+        Tree::Bulk(t) => String::from_utf8(t.to_vec()).unwrap(),
         other => panic!("{other:?}"),
     };
     listing.lines().filter(|l| l.contains(&format!(" name={name} "))).map(str::to_string).collect()
@@ -557,7 +558,7 @@ fn a_wait_for_a_write_that_was_redirected_is_answered_by_the_node_that_took_the_
         let n = call!(|cb| c.wait_replicas(&k, 1, 1000, cb)).unwrap();
         assert!(n >= 1, "{n}");
         rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
-        assert_eq!(call!(|cb| c.get(&k, cb)).unwrap(), Some(b("moved")));
+        assert_eq!(collect::get(&c, &k).unwrap(), Some(b("moved")));
     }));
 
     let _ = call!(|cb| c.del(&[&k], cb));
@@ -570,21 +571,21 @@ fn a_wait_for_a_write_that_was_redirected_is_answered_by_the_node_that_took_the_
 
 /// Who `node` believes owns `slot`, from its own `CLUSTER SLOTS`.
 fn owner_according_to(node: &RedisClient, slot: u16) -> Option<(String, u16)> {
-    let Value::Array(ranges) = run(node, &["CLUSTER", "SLOTS"]).ok()? else {
+    let Tree::Array(ranges) = run(node, &["CLUSTER", "SLOTS"]).ok()? else {
         return None;
     };
     for r in ranges {
-        let Value::Array(parts) = r else { continue };
-        let (Some(Value::Int(lo)), Some(Value::Int(hi)), Some(Value::Array(master))) = (parts.first(), parts.get(1), parts.get(2)) else {
+        let Tree::Array(parts) = r else { continue };
+        let (Some(Tree::Int(lo)), Some(Tree::Int(hi)), Some(Tree::Array(master))) = (parts.first(), parts.get(1), parts.get(2)) else {
             continue;
         };
         if (*lo..=*hi).contains(&i64::from(slot)) {
             let host = match master.first() {
-                Some(Value::Bulk(h)) => String::from_utf8(h.to_vec()).ok()?,
+                Some(Tree::Bulk(h)) => String::from_utf8(h.to_vec()).ok()?,
                 _ => return None,
             };
             return match master.get(1) {
-                Some(Value::Int(port)) => Some((host, *port as u16)),
+                Some(Tree::Int(port)) => Some((host, *port as u16)),
                 _ => None,
             };
         }
@@ -595,7 +596,7 @@ fn owner_according_to(node: &RedisClient, slot: u16) -> Option<(String, u16)> {
 /// Whether `node`'s own `CLUSTER NODES` has `master` as a master and `replica`
 /// as its replica.
 fn roles_according_to(node: &RedisClient, master: &(String, u16), replica: &(String, u16)) -> bool {
-    let Ok(Value::Bulk(text) | Value::Verbatim { data: text, .. }) = run(node, &["CLUSTER", "NODES"]) else {
+    let Ok(Tree::Bulk(text)) = run(node, &["CLUSTER", "NODES"]) else {
         return false;
     };
     let text = String::from_utf8_lossy(&text).into_owned();
@@ -653,7 +654,7 @@ fn a_failover_is_followed() {
 
     // Find this master's replica from the master's own view.
     let nodes = match run(&master, &["CLUSTER", "NODES"]).unwrap() {
-        Value::Bulk(t) | Value::Verbatim { data: t, .. } => String::from_utf8(t.to_vec()).unwrap(),
+        Tree::Bulk(t) => String::from_utf8(t.to_vec()).unwrap(),
         other => panic!("{other:?}"),
     };
     let replica_addr = nodes
@@ -683,7 +684,7 @@ fn a_failover_is_followed() {
         let _ = run(&replica, &["CLUSTER", "FAILOVER"]);
         let settle = Instant::now() + Duration::from_secs(4);
         while Instant::now() < settle {
-            match call!(|cb| c.get(&k, cb)) {
+            match collect::get(&c, &k) {
                 Ok(v) => assert_eq!(v, Some(b("kept"))),
                 Err(e) => panic!("a caller saw {e:?} during a failover"),
             }
@@ -705,7 +706,7 @@ fn a_failover_is_followed() {
         let settle = Instant::now() + Duration::from_secs(3);
         while Instant::now() < settle {
             // Keep the client busy so it meets the redirection.
-            match call!(|cb| c.get(&k, cb)) {
+            match collect::get(&c, &k) {
                 Ok(v) => assert_eq!(v, Some(b("kept"))),
                 Err(e) => panic!("a caller saw {e:?} while the roles were put back"),
             }

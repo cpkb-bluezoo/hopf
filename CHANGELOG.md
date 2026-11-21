@@ -10,18 +10,21 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
 - **hopf-redis (new crate):** an async Redis and Valkey client (#527), behind
   the `redis` feature of `hopf`. `RedisClient::connect(&reactor, RedisConfig)`
   is one pipelined connection bound to a reactor: commands from any thread, each
-  reply a callback on the reactor, exactly once and in issue order. It negotiates
+  reply told to a callback or a sink on the reactor, exactly once and in issue
+  order. It negotiates
   RESP3 (`HELLO 3`) and falls back to RESP2, authenticates (password, or ACL
   user and password), selects a database, resolves host names through
-  `hopf-dns` and speaks TLS through a `hopf-core` connector. Typed helpers cover
-  strings, keys, hashes, lists, sets, sorted sets and scripts, `SetOptions`
-  covers `SET`, `transaction` writes `MULTI`..`EXEC` as one batch, and `command`
-  and `send` carry anything else. A command in flight when the connection is
-  lost fails with `ConnectionLost` and is not sent again; a timed-out command's
-  late reply is discarded in its place; after a failed connect commands fail
-  fast for a growing time. `hopf_redis::resp` has the `Value` type, the command
-  encoder and `RespParser`, an incremental parser with limits on bulk size,
-  aggregate size, depth, line length and total reply size.
+  `hopf-dns` and speaks TLS through a `hopf-core` connector. Helpers cover
+  strings, keys, hashes, lists, sets, sorted sets and scripts (those with a
+  single-value reply take a callback, those with a string or a collection take a
+  sink; see below), `SetOptions` covers `SET`, `transaction` writes
+  `MULTI`..`EXEC` as one batch, and `command` and `send` carry any single-value
+  command. A command in flight when the connection is lost fails with
+  `ConnectionLost` and is not sent again; a timed-out command's late reply is
+  discarded in its place; after a failed connect commands fail fast for a
+  growing time. `hopf_redis::resp` has the command encoder and `RespParser`, an
+  event-driven push parser that holds none of the stream (limits on depth, line
+  length and bytes discarded only).
   `RedisSubscriber` is a connection for publish/subscribe (channels, patterns
   and shard channels) that reconnects by itself, subscribes again to everything,
   watches the connection with a keepalive and tells a `SubscriberHandler` of
@@ -46,6 +49,32 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
   command by an explicit key, and `ClusterConfig::node_config` gives every node
   connection its password, TLS and timeouts. Tested against Redis 7.4 and
   Valkey 8.1, including slot migration and master failover.
+- **hopf-redis: streaming only** (#541). The crate offers no call that returns,
+  or passes to a callback, a value whose size depends on what the server holds;
+  this is the framework's rule that nothing buffers a message or a stream, and a
+  scalability matter, not a tuning one. A string or a collection (`GET`, `MGET`,
+  `LRANGE`, `HGETALL`, `EVAL`, the `EXEC` reply of `transaction`, a pub/sub
+  message) is told to a sink as chunks that borrow from the connection's buffer,
+  in constant memory, with `Flow::Pause` and `StreamHandle::resume` for flow
+  control in both directions and `Flow::Skip` and `StreamHandle::cancel` to give
+  up on a reply (the rest is discarded in constant memory, the connection stays
+  usable). Shape sinks (`BulkSink`, `ElementsSink`, `KeysSink`, `FieldsSink`)
+  cover the common replies. An identifier (a key, a hash field, a channel) is
+  delivered whole up to `max_field` (64 KiB); a scalar is a value. A command's
+  arguments stream out too (`Command::arg_stream`, with the source opened afresh
+  for each attempt), and a command larger than the outbound buffer is written in
+  blocks instead of failing the connection. Streamed commands go through a
+  cluster, following `MOVED`, `ASK` and retries without the sink hearing of a
+  redirected attempt. Timeouts for a stream are for silence, and a consumer that
+  has paused is not mistaken for a dead connection. `Value`, the whole-reply
+  callbacks and the limits that existed to size a buffer are gone; a connection
+  costs its ring, one line and one identifier, whatever the data. A reply nobody
+  waits for is discarded in constant memory (it used to be built in full and then
+  dropped). Measured with a counting allocator: 256 MiB through a client, out of
+  a client, through a cluster and to a subscriber raises the peak heap by a few
+  kilobytes at most. `tests/api_audit.rs` fails if a public signature
+  reintroduces an unbounded type. `hopf-core` gained a `pause_read` fix so a
+  paused connection is held by TCP and loses nothing.
 - **hopf-redis:** `WAIT` and `WAITAOF` bound to the connection of the write
   (#532). `RedisCluster::wait_replicas(slot_key, n, timeout_ms, cb)` and
   `wait_aof(...)` send the command behind the last command submitted for the
