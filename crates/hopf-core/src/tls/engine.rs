@@ -262,9 +262,9 @@ pub(crate) fn check_client_chain(
         return Some((o.0)(chain));
     }
     if let Some(src) = source {
-        return Some((src.0)().verify_server_chain(chain, None).is_ok());
+        return Some((src.0)().verify_client_chain(chain).is_ok());
     }
-    store.map(|s| s.verify_server_chain(chain, None).is_ok())
+    store.map(|s| s.verify_client_chain(chain).is_ok())
 }
 
 /// Signature of a [`ServerCredentialsResolver`] callback.

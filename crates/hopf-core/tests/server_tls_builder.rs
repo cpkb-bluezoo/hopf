@@ -52,6 +52,16 @@ fn issue(issuer: &Issued, names: &[&str]) -> Issued {
     Issued { cert, key }
 }
 
+/// A certificate for `names` carrying `usages` as its `extendedKeyUsage`,
+/// signed by `issuer`.
+fn issue_for(issuer: &Issued, names: &[&str], usages: Vec<rcgen::ExtendedKeyUsagePurpose>) -> Issued {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut params = rcgen::CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>()).unwrap();
+    params.extended_key_usages = usages;
+    let cert = params.signed_by(&key, &issuer.cert, &issuer.key).unwrap();
+    Issued { cert, key }
+}
+
 fn self_signed(names: &[&str]) -> Issued {
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
     let cert = rcgen::CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
@@ -369,4 +379,65 @@ fn client_tls_builder_combines_anchors_a_client_certificate_and_a_verifier() {
     assert!(s.dial(&by_leaf, "localhost").echoed, "no anchors needed when the verifier accepts the leaf");
     assert_eq!(names.lock().unwrap().as_slice(), [Some("localhost".to_string())]);
     s.stop();
+}
+
+/// A client certificate must be usable for client authentication: one whose
+/// `extendedKeyUsage` lists only `serverAuth` is refused, on both versions.
+#[test]
+fn a_server_auth_only_client_certificate_is_refused_and_a_client_auth_one_admitted() {
+    use rcgen::ExtendedKeyUsagePurpose as Eku;
+    for tls12 in [false, true] {
+        let server_ca = ca();
+        let server = issue(&server_ca, &["localhost"]);
+        let client_ca = ca();
+        let client_auth = client_of(&server_ca, &issue_for(&client_ca, &[], vec![Eku::ClientAuth]), tls12);
+        let server_auth = client_of(&server_ca, &issue_for(&client_ca, &[], vec![Eku::ServerAuth]), tls12);
+        let unrestricted = client_of(&server_ca, &issue_for(&client_ca, &[], vec![]), tls12);
+
+        let mut builder = ServerTlsBuilder::new()
+            .credentials(server.credentials())
+            .client_auth(ClientAuthPolicy::Require)
+            .client_trust_store(trust_of(&[&client_ca]));
+        if tls12 {
+            builder = builder.tcp_version_policy(TcpTlsVersionPolicy::Tls12Only);
+        }
+        let s = Server::start(builder);
+
+        assert!(s.dial(&client_auth, "localhost").echoed, "clientAuth admitted (tls12: {tls12})");
+        assert!(s.dial(&unrestricted, "localhost").echoed, "no extension admitted (tls12: {tls12})");
+        let refused = s.dial(&server_auth, "localhost");
+        assert!(!refused.echoed, "serverAuth-only refused (tls12: {tls12})");
+        assert!(refused.failed || refused.gone, "the refusal is reported (tls12: {tls12})");
+        s.stop();
+    }
+}
+
+/// And the converse: a connecting client refuses a server certificate that
+/// is not usable for server authentication.
+#[test]
+fn a_client_auth_only_server_certificate_is_refused_by_the_connecting_client() {
+    use rcgen::ExtendedKeyUsagePurpose as Eku;
+    for tls12 in [false, true] {
+        let server_ca = ca();
+        let client_ca = ca();
+        let anyone = issue(&client_ca, &[]);
+        let connector = client_of(&server_ca, &anyone, tls12);
+
+        for (usages, admitted) in [
+            (vec![Eku::ServerAuth], true),
+            (vec![], true),
+            (vec![Eku::Any], true),
+            (vec![Eku::ClientAuth], false),
+        ] {
+            let label = format!("{usages:?} (tls12: {tls12})");
+            let server = issue_for(&server_ca, &["localhost"], usages);
+            let mut builder = ServerTlsBuilder::new().credentials(server.credentials());
+            if tls12 {
+                builder = builder.tcp_version_policy(TcpTlsVersionPolicy::Tls12Only);
+            }
+            let s = Server::start(builder);
+            assert_eq!(s.dial(&connector, "localhost").echoed, admitted, "server certificate {label}");
+            s.stop();
+        }
+    }
 }

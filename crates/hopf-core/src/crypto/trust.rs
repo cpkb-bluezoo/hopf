@@ -7,7 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 
 use super::cert::SpkiDer;
-use super::x509::{matches_hostname, parse_certificate, verify_cert_signature, ParsedCertificate};
+use super::x509::{
+    matches_hostname, parse_certificate, verify_cert_signature, ParsedCertificate, OID_KP_CLIENT_AUTH,
+    OID_KP_SERVER_AUTH,
+};
 
 /// A certificate's Subject field, DER-encoded (RDNSequence). Distinct from
 /// [`SpkiDer`] so [`TrustStore::add_component_anchor`]'s two same-shaped
@@ -66,6 +69,21 @@ pub enum VerifyError {
     Expired,
     /// SNI hostname does not match the leaf certificate.
     HostnameMismatch,
+    /// The certificate's `extendedKeyUsage` does not permit the role it is
+    /// being used in (for example a `serverAuth`-only certificate presented
+    /// as a client certificate).
+    ExtendedKeyUsageMismatch,
+}
+
+/// Which side of the connection the verified certificate authenticates.
+/// Decides the `extendedKeyUsage` purpose the chain must permit
+/// (RFC 5280 section 4.2.1.12; RFC 8446 section 4.4.2.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainRole {
+    /// The certificate authenticates a server (`id-kp-serverAuth`).
+    Server,
+    /// The certificate authenticates a client (`id-kp-clientAuth`).
+    Client,
 }
 
 impl std::fmt::Display for VerifyError {
@@ -78,6 +96,9 @@ impl std::fmt::Display for VerifyError {
             Self::NotYetValid => write!(f, "certificate not yet valid"),
             Self::Expired => write!(f, "certificate expired"),
             Self::HostnameMismatch => write!(f, "hostname mismatch"),
+            Self::ExtendedKeyUsageMismatch => {
+                write!(f, "certificate extended key usage does not permit this role")
+            }
         }
     }
 }
@@ -131,6 +152,12 @@ impl TrustStore {
     ) -> Result<(), VerifyError> {
         verify_server_chain(self, chain, server_name, SystemTime::now())
     }
+
+    /// Verify a TLS client certificate chain (no hostname check). The leaf
+    /// must be permitted to authenticate a client: see [`ChainRole::Client`].
+    pub fn verify_client_chain(&self, chain: &[Bytes]) -> Result<(), VerifyError> {
+        verify_chain(self, chain, None, ChainRole::Client, SystemTime::now())
+    }
 }
 
 /// The public WebPKI root set: the OS's own trust store
@@ -169,11 +196,31 @@ pub fn public_trust_store_from(native_certs: Vec<Bytes>) -> TrustStore {
     store
 }
 
+impl ChainRole {
+    fn purpose(self) -> &'static [u8] {
+        match self {
+            Self::Server => &OID_KP_SERVER_AUTH,
+            Self::Client => &OID_KP_CLIENT_AUTH,
+        }
+    }
+}
+
 /// Verify a TLS server chain against `store` at `now`.
 pub fn verify_server_chain(
     store: &TrustStore,
     chain: &[Bytes],
     server_name: Option<&str>,
+    now: SystemTime,
+) -> Result<(), VerifyError> {
+    verify_chain(store, chain, server_name, ChainRole::Server, now)
+}
+
+/// Verify a certificate chain against `store` at `now` for `role`.
+pub fn verify_chain(
+    store: &TrustStore,
+    chain: &[Bytes],
+    server_name: Option<&str>,
+    role: ChainRole,
     now: SystemTime,
 ) -> Result<(), VerifyError> {
     if chain.is_empty() {
@@ -195,6 +242,9 @@ pub fn verify_server_chain(
         if !name.is_empty() && !matches_hostname(&leaf, name) {
             return Err(VerifyError::HostnameMismatch);
         }
+    }
+    if !leaf.permits_ext_key_usage(role.purpose()) {
+        return Err(VerifyError::ExtendedKeyUsageMismatch);
     }
 
     let intermediates: Vec<ParsedCertificate> = chain[1..]
@@ -221,7 +271,7 @@ pub fn verify_server_chain(
         }))
         .collect();
 
-    build_and_verify_chain(&leaf, &intermediates, &anchors)?;
+    build_and_verify_chain(&leaf, &intermediates, &anchors, role)?;
     Ok(())
 }
 
@@ -248,6 +298,7 @@ fn build_and_verify_chain(
     leaf: &ParsedCertificate,
     intermediates: &[ParsedCertificate],
     anchors: &[AnchorRef<'_>],
+    role: ChainRole,
 ) -> Result<(), VerifyError> {
     let mut current = leaf;
     let mut pool: Vec<&ParsedCertificate> = intermediates.iter().collect();
@@ -266,6 +317,15 @@ fn build_and_verify_chain(
                 return Ok(());
             }
             Some(Issuer::Intermediate(cert)) => {
+                // RFC 5280 section 4.2.1.12: a CA that restricts its
+                // issuance with `extendedKeyUsage` cannot vouch for a
+                // certificate in a role it does not list. Trust anchors are
+                // exempt: they are trusted out of band, not by their fields (and so is an
+                // intermediate the store holds as an anchor).
+                let pinned = anchors.iter().any(|a| a.full_der == Some(cert.der.as_ref()));
+                if !pinned && !cert.permits_ext_key_usage(role.purpose()) {
+                    return Err(VerifyError::ExtendedKeyUsageMismatch);
+                }
                 if !verify_cert_signature(current, &cert.spki_der) {
                     return Err(VerifyError::SignatureInvalid);
                 }
@@ -452,5 +512,135 @@ mod tests {
             store.verify_server_chain(&[Bytes::copy_from_slice(&bad_leaf)], Some("bad.example")),
             Err(VerifyError::UnknownIssuer)
         );
+    }
+
+    /// A root CA, and a leaf it signs carrying `usages` as its
+    /// `extendedKeyUsage` (empty means the extension is absent).
+    fn leaf_with_usages(usages: Vec<rcgen::ExtendedKeyUsagePurpose>) -> (TrustStore, Bytes) {
+        let root_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut root_params = rcgen::CertificateParams::new(vec![]).unwrap();
+        root_params.distinguished_name = rcgen::DistinguishedName::new();
+        root_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Hopf Test Root CA");
+        root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let root = root_params.self_signed(&root_key).unwrap();
+
+        let leaf_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut leaf_params = rcgen::CertificateParams::new(vec!["peer.example".into()]).unwrap();
+        leaf_params.extended_key_usages = usages;
+        let leaf = leaf_params.signed_by(&leaf_key, &root, &root_key).unwrap();
+
+        let mut store = TrustStore::new();
+        store.add_anchor(Bytes::copy_from_slice(root.der()));
+        (store, Bytes::copy_from_slice(leaf.der()))
+    }
+
+    fn server_ok(usages: Vec<rcgen::ExtendedKeyUsagePurpose>) -> Result<(), VerifyError> {
+        let (store, leaf) = leaf_with_usages(usages);
+        store.verify_server_chain(&[leaf], Some("peer.example"))
+    }
+
+    fn client_ok(usages: Vec<rcgen::ExtendedKeyUsagePurpose>) -> Result<(), VerifyError> {
+        let (store, leaf) = leaf_with_usages(usages);
+        store.verify_client_chain(&[leaf])
+    }
+
+    #[test]
+    fn server_role_requires_server_auth_when_the_extension_is_present() {
+        use rcgen::ExtendedKeyUsagePurpose as Eku;
+        assert_eq!(server_ok(vec![Eku::ServerAuth]), Ok(()));
+        assert_eq!(server_ok(vec![Eku::ClientAuth, Eku::ServerAuth]), Ok(()));
+        assert_eq!(
+            server_ok(vec![Eku::ClientAuth]),
+            Err(VerifyError::ExtendedKeyUsageMismatch)
+        );
+        assert_eq!(
+            server_ok(vec![Eku::CodeSigning]),
+            Err(VerifyError::ExtendedKeyUsageMismatch)
+        );
+    }
+
+    #[test]
+    fn client_role_requires_client_auth_when_the_extension_is_present() {
+        use rcgen::ExtendedKeyUsagePurpose as Eku;
+        assert_eq!(client_ok(vec![Eku::ClientAuth]), Ok(()));
+        assert_eq!(client_ok(vec![Eku::ClientAuth, Eku::ServerAuth]), Ok(()));
+        assert_eq!(
+            client_ok(vec![Eku::ServerAuth]),
+            Err(VerifyError::ExtendedKeyUsageMismatch)
+        );
+        assert_eq!(
+            client_ok(vec![Eku::EmailProtection]),
+            Err(VerifyError::ExtendedKeyUsageMismatch)
+        );
+    }
+
+    #[test]
+    fn absent_extension_or_any_extended_key_usage_is_accepted_in_either_role() {
+        use rcgen::ExtendedKeyUsagePurpose as Eku;
+        assert_eq!(server_ok(vec![]), Ok(()));
+        assert_eq!(client_ok(vec![]), Ok(()));
+        assert_eq!(server_ok(vec![Eku::Any]), Ok(()));
+        assert_eq!(client_ok(vec![Eku::Any]), Ok(()));
+    }
+
+    /// root -> intermediate (with `ca_usages`) -> leaf (no extension).
+    fn chain_with_ca_usages(
+        ca_usages: Vec<rcgen::ExtendedKeyUsagePurpose>,
+    ) -> (TrustStore, Vec<Bytes>) {
+        let root_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut root_params = rcgen::CertificateParams::new(vec![]).unwrap();
+        root_params.distinguished_name = rcgen::DistinguishedName::new();
+        root_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Hopf Test Root CA");
+        root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let root = root_params.self_signed(&root_key).unwrap();
+
+        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(vec![]).unwrap();
+        ca_params.distinguished_name = rcgen::DistinguishedName::new();
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Hopf Test Intermediate CA");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+        ca_params.extended_key_usages = ca_usages;
+        let ca = ca_params.signed_by(&ca_key, &root, &root_key).unwrap();
+
+        let leaf_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let leaf_params = rcgen::CertificateParams::new(vec!["peer.example".into()]).unwrap();
+        let leaf = leaf_params.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+
+        let mut store = TrustStore::new();
+        store.add_anchor(Bytes::copy_from_slice(root.der()));
+        (
+            store,
+            vec![Bytes::copy_from_slice(leaf.der()), Bytes::copy_from_slice(ca.der())],
+        )
+    }
+
+    /// The intersection rule: an intermediate that carries the extension
+    /// without the role's purpose cannot vouch for a leaf in that role.
+    #[test]
+    fn intermediate_extended_key_usage_must_permit_the_role() {
+        use rcgen::ExtendedKeyUsagePurpose as Eku;
+        let (store, chain) = chain_with_ca_usages(vec![Eku::ClientAuth]);
+        assert_eq!(
+            store.verify_server_chain(&chain, Some("peer.example")),
+            Err(VerifyError::ExtendedKeyUsageMismatch)
+        );
+        assert_eq!(store.verify_client_chain(&chain), Ok(()));
+
+        let (store, chain) = chain_with_ca_usages(vec![Eku::ServerAuth]);
+        assert_eq!(
+            store.verify_client_chain(&chain),
+            Err(VerifyError::ExtendedKeyUsageMismatch)
+        );
+        assert_eq!(store.verify_server_chain(&chain, Some("peer.example")), Ok(()));
+
+        let (store, chain) = chain_with_ca_usages(vec![]);
+        assert_eq!(store.verify_server_chain(&chain, Some("peer.example")), Ok(()));
+        assert_eq!(store.verify_client_chain(&chain), Ok(()));
     }
 }

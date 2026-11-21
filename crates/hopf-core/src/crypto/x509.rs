@@ -37,7 +37,35 @@ pub struct ParsedCertificate {
     pub dns_names: Vec<String>,
     /// Common Name from subject (fallback).
     pub common_name: Option<String>,
+    /// Purposes listed in the `extendedKeyUsage` extension, as raw OID
+    /// content bytes; `None` when the extension is absent. A present but
+    /// malformed extension yields `Some` with an empty list, which permits
+    /// nothing.
+    pub ext_key_usage: Option<Vec<Bytes>>,
 }
+
+impl ParsedCertificate {
+    /// Whether the certificate may be used for `purpose` (`id-kp-serverAuth`
+    /// or `id-kp-clientAuth` OID content bytes) under RFC 5280 section
+    /// 4.2.1.12: no `extendedKeyUsage` extension means any purpose, and
+    /// `anyExtendedKeyUsage` permits every purpose.
+    pub fn permits_ext_key_usage(&self, purpose: &[u8]) -> bool {
+        match &self.ext_key_usage {
+            None => true,
+            Some(list) => list
+                .iter()
+                .any(|oid| oid.as_ref() == purpose || oid.as_ref() == OID_ANY_EXT_KEY_USAGE),
+        }
+    }
+}
+
+/// `id-kp-serverAuth` (1.3.6.1.5.5.7.3.1) OID content bytes.
+pub const OID_KP_SERVER_AUTH: [u8; 8] = [0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+/// `id-kp-clientAuth` (1.3.6.1.5.5.7.3.2) OID content bytes.
+pub const OID_KP_CLIENT_AUTH: [u8; 8] = [0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
+/// `anyExtendedKeyUsage` (2.5.29.37.0) OID content bytes.
+const OID_ANY_EXT_KEY_USAGE: [u8; 4] = [0x55, 0x1d, 0x25, 0x00];
+const OID_EXT_KEY_USAGE: [u8; 3] = [0x55, 0x1d, 0x25];
 
 /// Parse a DER X.509 certificate.
 pub fn parse_certificate(der: &[u8]) -> Option<ParsedCertificate> {
@@ -59,6 +87,7 @@ pub fn parse_certificate(der: &[u8]) -> Option<ParsedCertificate> {
 
     let (not_before, not_after) = parse_validity(validity)?;
     let mut dns_names = Vec::new();
+    let mut ext_key_usage = None;
 
     if tbs.peek_tag() == Some(0xa3) {
         let ext_wrapper = tbs.next()?;
@@ -74,6 +103,12 @@ pub fn parse_certificate(der: &[u8]) -> Option<ParsedCertificate> {
                         let extn_value = ext.next()?;
                         if oid == OID_SUBJECT_ALT_NAME {
                             dns_names = parse_subject_alt_names(read_tlv_content(extn_value, 0x04)?);
+                        } else if oid == OID_EXT_KEY_USAGE {
+                            ext_key_usage = Some(
+                                read_tlv_content(extn_value, 0x04)
+                                    .map(parse_ext_key_usage)
+                                    .unwrap_or_default(),
+                            );
                         }
                     }
                 }
@@ -96,7 +131,27 @@ pub fn parse_certificate(der: &[u8]) -> Option<ParsedCertificate> {
         not_after,
         dns_names,
         common_name,
+        ext_key_usage,
     })
+}
+
+/// The OIDs of an `ExtKeyUsageSyntax` (`SEQUENCE OF KeyPurposeId`). A
+/// malformed value yields an empty list.
+fn parse_ext_key_usage(ext_value: &[u8]) -> Vec<Bytes> {
+    let mut out = Vec::new();
+    let Some(mut seq) = parse_sequence(ext_value) else {
+        return Vec::new();
+    };
+    while seq.peek_tag().is_some() {
+        let Some(elem) = seq.next() else {
+            return Vec::new();
+        };
+        let Some(oid) = read_oid(elem) else {
+            return Vec::new();
+        };
+        out.push(Bytes::copy_from_slice(oid));
+    }
+    out
 }
 
 /// TLS `SignatureScheme` codes (RFC 8446 §4.2.3) for every certificate

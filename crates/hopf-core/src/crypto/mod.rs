@@ -48,6 +48,6 @@ pub use signature::{
     Ed25519PrivateKey, Ed25519PublicKey, KeyError, MlDsaLevel, MlDsaPrivateKey, RsaPrivateKey, RsaPublicKeyComponents, SignError, SignatureBytes,
 };
 pub use trust::{
-    public_trust_store, public_trust_store_from, verify_server_chain, ComponentAnchor, TrustStore,
-    VerifyError,
+    public_trust_store, public_trust_store_from, verify_chain, verify_server_chain, ChainRole,
+    ComponentAnchor, TrustStore, VerifyError,
 };
