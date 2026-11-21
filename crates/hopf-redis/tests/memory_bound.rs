@@ -128,6 +128,12 @@ fn write_bulk(s: &mut TcpStream, size: usize) -> std::io::Result<()> {
     s.write_all(b"\r\n")
 }
 
+/// A pub/sub message to channel `c` whose body is `size` bytes, written block by block.
+fn write_message(s: &mut TcpStream, size: usize) -> std::io::Result<()> {
+    s.write_all(b">3\r\n$7\r\nmessage\r\n$1\r\nc\r\n")?;
+    write_bulk(s, size)
+}
+
 fn handle(mut s: TcpStream) {
     let mut reader = BufReader::new(s.try_clone().unwrap());
     while let Some(words) = read_command(&mut reader) {
@@ -145,6 +151,20 @@ fn handle(mut s: TcpStream) {
                 write_bulk(&mut s, size)
             }
             "PING" => s.write_all(b"+PONG\r\n"),
+            // `SUBSCRIBE c <size>`: acknowledged, then a message of that size,
+            // then a small one.
+            "SUBSCRIBE" => {
+                // The names are sent in sorted order, so which one is the size is found, not assumed.
+                let size: usize = words[1..].iter().find_map(|w| String::from_utf8_lossy(w).parse().ok()).unwrap();
+                s.write_all(b">3\r\n$9\r\nsubscribe\r\n$1\r\nc\r\n:1\r\n")
+                    .and_then(|_| write_message(&mut s, size))
+                    .and_then(|_| write_message(&mut s, 2))
+            }
+            // `PUSHME <size>`: a push of that size, which nobody asked for, then `+OK`.
+            "PUSHME" => {
+                let size: usize = String::from_utf8_lossy(&words[1]).parse().unwrap();
+                write_message(&mut s, size).and_then(|_| s.write_all(b"+OK\r\n"))
+            }
             // A cluster of one node, this one, serving every slot.
             "CLUSTER" if words.get(1).is_some_and(|w| w.eq_ignore_ascii_case(b"SHARDS")) => {
                 s.write_all(b"-ERR unknown subcommand 'SHARDS'\r\n")
@@ -525,6 +545,119 @@ fn a_value_streams_out_of_a_client_in_constant_memory() {
     rt.shutdown();
 }
 
+/// A subscriber's handler that counts and keeps none of what it is given.
+struct Tally {
+    bytes: Arc<AtomicUsize>,
+    chunks: Arc<AtomicUsize>,
+    pause_at_first: bool,
+    paused: bool,
+    done: mpsc::Sender<usize>,
+    up: mpsc::Sender<()>,
+}
+
+impl hopf_redis::SubscriberHandler for Tally {
+    fn on_connected(&mut self, _reconnect: bool) {
+        let _ = self.up.send(());
+    }
+    fn message_begin(&mut self, _header: &hopf_redis::MessageHeader<'_>, _len: Option<u64>) -> Flow {
+        Flow::Continue
+    }
+    fn message_chunk(&mut self, data: &[u8]) -> Flow {
+        self.bytes.fetch_add(data.len(), Ordering::SeqCst);
+        self.chunks.fetch_add(1, Ordering::SeqCst);
+        if self.pause_at_first && !self.paused {
+            self.paused = true;
+            return Flow::Pause;
+        }
+        Flow::Continue
+    }
+    fn message_end(&mut self) {
+        let _ = self.done.send(self.bytes.load(Ordering::SeqCst));
+    }
+}
+
+/// A 256 MiB message to a subscriber: given to its handler in chunks, held for
+/// no longer than a chunk, with or without the handler pausing in the middle.
+fn a_message_streams_through_a_subscriber_in_constant_memory() {
+    const SIZE: usize = 256 * MIB;
+    for pause in [false, true] {
+        let server = Server::start();
+        let rt = runtime();
+        let (tx, rx) = mpsc::channel();
+        let (up_tx, up) = mpsc::channel();
+        let (bytes, chunks) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let sub = hopf_redis::RedisSubscriber::connect(
+            rt.pick_worker(),
+            RedisConfig::new("127.0.0.1", server.port).ping_interval(None),
+            Tally {
+                bytes: Arc::clone(&bytes),
+                chunks: Arc::clone(&chunks),
+                pause_at_first: pause,
+                paused: false,
+                done: tx,
+                up: up_tx,
+            },
+        );
+        // The connection is up before the baseline is taken, as the other checks
+        // do: it is the message that is measured.
+        up.recv_timeout(Duration::from_secs(30)).expect("the subscriber connected");
+        let base = reset_peak();
+        let started = Instant::now();
+        sub.subscribe(&["c", SIZE.to_string().as_str()]);
+        if pause {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while bytes.load(Ordering::SeqCst) == 0 {
+                assert!(Instant::now() < deadline, "the message never began");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Stalled in the middle of a 256 MiB message: still nothing held.
+            std::thread::sleep(Duration::from_millis(500));
+            let held = bytes.load(Ordering::SeqCst);
+            assert!(held < SIZE / 4, "{held} bytes were read while the handler was paused");
+            sub.resume();
+        }
+        let got = rx.recv_timeout(Duration::from_secs(120)).expect("the message ended");
+        assert_eq!(got, SIZE);
+        // And the small one after it.
+        assert_eq!(rx.recv_timeout(Duration::from_secs(30)).expect("the next message"), SIZE + 2);
+        let above = peak_above(base);
+        println!(
+            "a 256 MiB message to a subscriber{}: {} chunks, peak heap {above} bytes above baseline, {:.1} s",
+            if pause { ", paused in the middle" } else { "" },
+            chunks.load(Ordering::SeqCst),
+            started.elapsed().as_secs_f64()
+        );
+        assert!(above < 256 * 1024, "the heap rose by {above} bytes receiving a {SIZE} byte message (paused: {pause})");
+        sub.close();
+        rt.shutdown();
+    }
+}
+
+/// A 128 MiB push on a command connection with no sink to hear it is discarded as
+/// it arrives, and the reply behind it is still the reply. (Discarding is bounded
+/// by `max_skip`, 256 MiB by default; past that the connection is closed.)
+fn a_push_nobody_wants_is_discarded_in_constant_memory() {
+    const SIZE: usize = 128 * MIB;
+    let server = Server::start();
+    let rt = runtime();
+    let c = RedisClient::connect(rt.pick_worker(), RedisConfig::new("127.0.0.1", server.port).ping_interval(None));
+    call(|cb| c.ping(move |r| cb(r))).expect("the connection is up");
+    let base = reset_peak();
+    let started = Instant::now();
+    let reply = call(|cb| {
+        c.send_with_deadline(&Command::new("PUSHME").arg(SIZE.to_string()), Deadline::After(Duration::from_secs(120)), move |r| cb(r))
+    });
+    assert!(reply.is_ok(), "{reply:?}");
+    let above = peak_above(base);
+    println!(
+        "a 128 MiB push nobody wanted: peak heap {above} bytes above baseline, {:.1} s",
+        started.elapsed().as_secs_f64()
+    );
+    assert!(above < 256 * 1024, "the heap rose by {above} bytes discarding a {SIZE} byte push");
+    c.close();
+    rt.shutdown();
+}
+
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("--serve") {
         return serve();
@@ -535,5 +668,7 @@ fn main() {
     a_command_larger_than_the_outbound_buffer_is_sent();
     a_value_streams_out_of_a_client_in_constant_memory();
     a_value_streams_through_a_cluster_in_constant_memory();
+    a_message_streams_through_a_subscriber_in_constant_memory();
+    a_push_nobody_wants_is_discarded_in_constant_memory();
     println!("memory_bound: ok");
 }

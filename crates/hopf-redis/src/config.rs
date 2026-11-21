@@ -29,6 +29,7 @@ pub struct RedisConfig {
     pub(crate) command_timeout: Option<Duration>,
     pub(crate) max_pending: usize,
     pub(crate) limits: RespLimits,
+    pub(crate) max_field: usize,
     pub(crate) backoff_initial: Duration,
     pub(crate) backoff_max: Duration,
     pub(crate) ping_interval: Option<Duration>,
@@ -53,6 +54,7 @@ impl RedisConfig {
             command_timeout: Some(Duration::from_secs(10)),
             max_pending: 0,
             limits: RespLimits::default(),
+            max_field: crate::DEFAULT_MAX_FIELD,
             backoff_initial: Duration::from_millis(100),
             backoff_max: Duration::from_secs(5),
             ping_interval: Some(Duration::from_secs(30)),
@@ -140,6 +142,19 @@ impl RedisConfig {
     /// Bounds on what a reply may make the client hold.
     pub fn limits(mut self, limits: RespLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// The longest identifier a [`RedisSubscriber`](crate::RedisSubscriber)
+    /// delivers whole: a channel or pattern name, an acknowledgement's name, the
+    /// kind of a push. A message whose channel is longer is dropped, and the
+    /// handler told with `on_dropped`; the connection is unaffected. Message
+    /// bodies are payloads and have no such limit, being streamed. Default
+    /// [`DEFAULT_MAX_FIELD`](crate::DEFAULT_MAX_FIELD) (64 KiB). The shape sinks
+    /// ([`KeysSink`](crate::KeysSink), [`FieldsSink`](crate::FieldsSink)) take
+    /// theirs with `with_max_field`.
+    pub fn max_field(mut self, max: usize) -> Self {
+        self.max_field = max;
         self
     }
 

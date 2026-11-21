@@ -309,18 +309,23 @@ impl<H: ElementsHandler> ReplySink for ElementsSink<H> {
 // ---- identifiers, whole ----
 
 /// An identifier being assembled, whole, under a limit.
-struct Whole {
+pub(crate) struct Whole {
     buf: Vec<u8>,
     max: usize,
 }
 
 impl Whole {
-    fn new(max: usize) -> Self {
+    pub(crate) fn new(max: usize) -> Self {
         Self { buf: Vec::new(), max }
     }
 
+    /// What has been assembled.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.buf
+    }
+
     /// An identifier begins; `Err` if it is announced as too long.
-    fn begin(&mut self, len: Option<usize>) -> Result<(), RedisError> {
+    pub(crate) fn begin(&mut self, len: Option<usize>) -> Result<(), RedisError> {
         self.buf.clear();
         if len.is_some_and(|n| n > self.max) {
             return Err(RedisError::FieldTooLong { limit: self.max });
@@ -329,7 +334,7 @@ impl Whole {
         Ok(())
     }
 
-    fn push(&mut self, data: &[u8]) -> Result<(), RedisError> {
+    pub(crate) fn push(&mut self, data: &[u8]) -> Result<(), RedisError> {
         if self.buf.len() + data.len() > self.max {
             return Err(RedisError::FieldTooLong { limit: self.max });
         }

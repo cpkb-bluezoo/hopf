@@ -168,3 +168,21 @@ for each attempt, holding back only the first event of a reply to see if it is
 an error to follow. The cluster rows above are unchanged, and a 256 MiB value
 streamed through a cluster client to a sink that keeps nothing raises the peak
 heap by about 3.6 KB, the same as through one connection.
+
+## Pub/sub and pushes
+
+A subscriber's messages and a command connection's pushes were built whole and
+then handed on; they are now events, routed during the parse. A message reaches
+the handler as a header (the channel, whole, under `max_field`) and the body in
+chunks, and a push reaches the application's sink as the events of a reply, or
+is skipped as it arrives if there is none. The single-node and cluster rows above
+are unchanged (allocations per operation are identical, row for row), since the
+extra routing arms are not on the path of an ordinary reply.
+
+`tests/memory_bound.rs` sends a 256 MiB message to a subscriber whose handler
+keeps nothing: the peak heap rises by about 1 KB, with the handler paused for
+half a second in the middle of the message as well as without. A 128 MiB push
+to a command connection with no sink, discarded as it arrives, raises it by
+about 3 KB, and the reply behind it is the reply. (A discard past `max_skip`,
+256 MiB by default, closes the connection, so a push larger than that is not
+discarded in this way.)

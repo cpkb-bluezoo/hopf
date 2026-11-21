@@ -347,7 +347,7 @@ fn a_command_issued_while_a_callback_holds_a_lock_is_not_reentered() {
 
 // ---- publish/subscribe and push messages ----
 
-use hopf_redis::{Message, RedisSubscriber, SubscriptionChange, SubscriptionKind};
+use hopf_redis::{AggKind, InvalidationSink, ReplyKind, ReplySink, RedisSubscriber, Scalar, StrKind, SubscriptionChange, SubscriptionKind};
 
 fn b(s: &str) -> hopf_core::Bytes {
     hopf_core::Bytes::copy_from_slice(s.as_bytes())
@@ -395,10 +395,7 @@ fn a_resp2_server_delivers_messages_as_arrays_and_they_are_read_as_such() {
                 name: b("b"),
                 count: 2
             }),
-            Event::Message(Message::Channel {
-                channel: b("a"),
-                payload: b("hi")
-            }),
+            Event::Message(Msg::channel("a", "hi")),
         ]
     );
     sub.close();
@@ -406,8 +403,66 @@ fn a_resp2_server_delivers_messages_as_arrays_and_they_are_read_as_such() {
     server.rt.shutdown();
 }
 
+/// A sink that writes down the events of the pushes it is given, with each
+/// string whole.
+struct PushEvents {
+    log: Arc<Mutex<Vec<String>>>,
+    text: String,
+}
+
+impl PushEvents {
+    fn new(log: &Arc<Mutex<Vec<String>>>) -> Self {
+        Self {
+            log: Arc::clone(log),
+            text: String::new(),
+        }
+    }
+
+    fn note(&self, s: String) {
+        self.log.lock().unwrap().push(s);
+    }
+}
+
+impl ReplySink for PushEvents {
+    fn begin_reply(&mut self, kind: ReplyKind) {
+        self.note(format!("begin {kind:?}"));
+    }
+    fn scalar(&mut self, v: Scalar<'_>) -> Flow {
+        self.note(format!("{v:?}"));
+        Flow::Continue
+    }
+    fn error(&mut self, line: &str) -> Flow {
+        self.note(format!("error {line}"));
+        Flow::Continue
+    }
+    fn begin_aggregate(&mut self, kind: AggKind, len: Option<usize>) -> Flow {
+        self.note(format!("agg {kind:?} {len:?}"));
+        Flow::Continue
+    }
+    fn end_aggregate(&mut self) -> Flow {
+        self.note("end agg".into());
+        Flow::Continue
+    }
+    fn begin_string(&mut self, _kind: StrKind, len: Option<usize>) -> Flow {
+        self.text.clear();
+        self.note(format!("str {len:?}"));
+        Flow::Continue
+    }
+    fn string_chunk(&mut self, data: &[u8]) -> Flow {
+        self.text.push_str(&String::from_utf8_lossy(data));
+        Flow::Continue
+    }
+    fn end_string(&mut self) -> Flow {
+        self.note(format!("text {}", self.text));
+        Flow::Continue
+    }
+    fn end_reply(&mut self, skipped: bool) {
+        self.note(format!("end {skipped}"));
+    }
+}
+
 #[test]
-fn a_push_of_a_kind_nobody_knows_is_delivered_and_replies_keep_their_place() {
+fn a_push_of_a_kind_nobody_knows_reaches_the_sink_as_events_and_replies_keep_their_place() {
     // GET, then an unknown push, then the second GET's reply.
     let server = serve(move |s, w| match (name_of(w).as_str(), s.seq) {
         ("HELLO", _) => s.reply(HELLO_OK),
@@ -417,14 +472,48 @@ fn a_push_of_a_kind_nobody_knows_is_delivered_and_replies_keep_their_place() {
     });
     let (rt, c) = client(&server, |c| c);
     let pushes = Arc::new(Mutex::new(Vec::new()));
-    let log = Arc::clone(&pushes);
-    c.set_push_handler(move |p| log.lock().unwrap().push(p));
+    c.set_push_sink(PushEvents::new(&pushes));
     assert_eq!(call!(|cb| c.get("a", cb)).unwrap().map(|v| v.to_vec()), Some(b"1".to_vec()));
     assert_eq!(call!(|cb| c.get("b", cb)).unwrap().map(|v| v.to_vec()), Some(b"2".to_vec()));
-    let got = pushes.lock().unwrap().clone();
-    assert_eq!(got.len(), 1);
-    assert_eq!(got[0].kind, "weird");
-    assert_eq!(got[0].data, vec![Value::Int(7), Value::Bulk(b("x"))]);
+    assert_eq!(
+        *pushes.lock().unwrap(),
+        vec![
+            "begin Push",
+            "agg Push Some(3)",
+            "str Some(5)",
+            "text weird",
+            "Int(7)",
+            "str Some(1)",
+            "text x",
+            "end agg",
+            "end false",
+        ]
+    );
+    c.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn invalidations_between_replies_reach_the_sink_and_a_replaced_sink_takes_the_next_push() {
+    let server = serve(move |s, w| match (name_of(w).as_str(), s.seq) {
+        ("HELLO", _) => s.reply(HELLO_OK),
+        ("GET", 1) => s.reply(">2\r\n$10\r\ninvalidate\r\n*2\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\n1\r\n"),
+        ("GET", 2) => s.reply(">2\r\n$10\r\ninvalidate\r\n_\r\n$1\r\n2\r\n"),
+        ("GET", _) => s.reply(">2\r\n$10\r\ninvalidate\r\n*1\r\n$1\r\nc\r\n$1\r\n3\r\n"),
+        _ => s.reply("+OK\r\n"),
+    });
+    let (rt, c) = client(&server, |c| c);
+    let first = Invalidated::default();
+    c.set_push_sink(InvalidationSink::new(first.clone()));
+    assert_eq!(call!(|cb| c.get("k", cb)).unwrap().map(|v| v.to_vec()), Some(b"1".to_vec()));
+    assert_eq!(call!(|cb| c.get("k", cb)).unwrap().map(|v| v.to_vec()), Some(b"2".to_vec()));
+    assert_eq!(first.seen(), vec!["a", "b", "*"]);
+    let second = Invalidated::default();
+    c.set_push_sink(InvalidationSink::new(second.clone()));
+    assert_eq!(call!(|cb| c.get("k", cb)).unwrap().map(|v| v.to_vec()), Some(b"3".to_vec()));
+    assert_eq!(second.seen(), vec!["c"]);
+    assert_eq!(first.seen(), vec!["a", "b", "*"], "the old sink heard nothing more");
     c.close();
     rt.shutdown();
     server.rt.shutdown();
@@ -479,6 +568,191 @@ fn a_subscriber_whose_connection_goes_silent_notices_and_comes_back() {
     assert!(log.contains(&(0, "PING".into())), "it pinged the quiet connection: {log:?}");
     assert!(log.contains(&(1, "SUBSCRIBE".into())), "and subscribed again on the new one: {log:?}");
     sub.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+/// A server that acknowledges a subscription to `c`, then sends `after`.
+fn subscribed_then(after: impl Fn(&mut Session) + Send + Sync + 'static) -> Server {
+    serve(move |s, w| match name_of(w).as_str() {
+        "HELLO" => s.reply(HELLO_OK),
+        "SUBSCRIBE" => {
+            s.reply(">3\r\n$9\r\nsubscribe\r\n$1\r\nc\r\n:1\r\n");
+            after(s);
+        }
+        _ => s.reply("+PONG\r\n"),
+    })
+}
+
+#[test]
+fn a_subscriber_is_given_a_huge_message_in_chunks_and_the_next_one_whole() {
+    const SIZE: usize = 64 * 1024 * 1024;
+    let server = subscribed_then(|s| {
+        s.stream(
+            &format!(">3\r\n$7\r\nmessage\r\n$1\r\nc\r\n${SIZE}\r\n"),
+            SIZE,
+            "\r\n>3\r\n$7\r\nmessage\r\n$1\r\nc\r\n$2\r\nok\r\n",
+        )
+    });
+    let rt = runtime();
+    let counter = Counter::default();
+    let sub = RedisSubscriber::connect(rt.pick_worker(), RedisConfig::from_addr(server.addr), counter.clone());
+    sub.subscribe(&["c"]);
+    wait_until("both messages", || counter.messages.load(Ordering::SeqCst) == 2);
+    assert_eq!(counter.bytes.load(Ordering::SeqCst), SIZE + 2);
+    assert!(counter.chunks.load(Ordering::SeqCst) > 100, "it arrived in many chunks");
+    assert_eq!(*counter.lengths.lock().unwrap(), vec![Some(SIZE as u64), Some(2)]);
+    sub.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_handler_that_pauses_holds_the_connection_and_it_is_not_taken_for_dead() {
+    const SIZE: usize = 16 * 1024 * 1024;
+    let server = subscribed_then(|s| {
+        s.stream(
+            &format!(">3\r\n$7\r\nmessage\r\n$1\r\nc\r\n${SIZE}\r\n"),
+            SIZE,
+            "\r\n>3\r\n$7\r\nmessage\r\n$1\r\nc\r\n$2\r\nok\r\n",
+        )
+    });
+    let rt = runtime();
+    let counter = Counter::default();
+    counter.pause_next.store(true, Ordering::SeqCst);
+    let sub = RedisSubscriber::connect(
+        rt.pick_worker(),
+        RedisConfig::from_addr(server.addr).ping_interval(Some(Duration::from_millis(100))),
+        counter.clone(),
+    );
+    sub.subscribe(&["c"]);
+    wait_until("the handler to pause", || counter.paused.load(Ordering::SeqCst) == 1);
+    // Held for several times the time after which a silent connection is dropped.
+    thread::sleep(Duration::from_millis(100));
+    let held_at = counter.bytes.load(Ordering::SeqCst);
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(counter.bytes.load(Ordering::SeqCst), held_at, "nothing is read while it is paused");
+    assert!(held_at < SIZE, "the message is not all in: {held_at}");
+    assert_eq!(counter.disconnects.load(Ordering::SeqCst), 0, "the connection was not dropped for being quiet");
+    assert!(sub.is_connected());
+
+    sub.resume();
+    wait_until("both messages", || counter.messages.load(Ordering::SeqCst) == 2);
+    assert_eq!(counter.bytes.load(Ordering::SeqCst), SIZE + 2, "and nothing was lost");
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+    // A resume with nothing paused does nothing.
+    sub.resume();
+    sub.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_message_the_handler_skips_is_dropped_alone() {
+    let server = subscribed_then(|s| {
+        s.reply(
+            ">3\r\n$7\r\nmessage\r\n$1\r\nc\r\n$3\r\none\r\n\
+             >3\r\n$7\r\nmessage\r\n$4\r\nskip\r\n$11\r\nnot-wanted!\r\n\
+             >3\r\n$7\r\nmessage\r\n$1\r\nc\r\n$3\r\ntwo\r\n",
+        )
+    });
+    let rt = runtime();
+    let rec = Recorder::default();
+    *rec.skip_channel.lock().unwrap() = Some(b"skip".to_vec());
+    let sub = RedisSubscriber::connect(rt.pick_worker(), RedisConfig::from_addr(server.addr), rec.clone());
+    sub.subscribe(&["c"]);
+    rec.wait_for("the two wanted messages", |e| e.iter().filter(|x| matches!(x, Event::Message(_))).count() == 2);
+    assert_eq!(rec.messages(), vec![Msg::channel("c", "one"), Msg::channel("c", "two")]);
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1, "the connection was not redialled");
+    assert!(!rec.events().iter().any(|e| matches!(e, Event::Dropped(_) | Event::Disconnected)));
+    sub.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_channel_over_the_limit_is_dropped_and_reported_and_the_connection_goes_on() {
+    let long = "x".repeat(40);
+    let server = subscribed_then(move |s| {
+        s.reply(format!(
+            ">3\r\n$7\r\nmessage\r\n$1\r\nc\r\n$1\r\n1\r\n\
+             >3\r\n$7\r\nmessage\r\n${}\r\n{long}\r\n$1\r\n2\r\n\
+             >3\r\n$7\r\nmessage\r\n$1\r\nc\r\n$1\r\n3\r\n",
+            long.len()
+        ))
+    });
+    let rt = runtime();
+    let rec = Recorder::default();
+    let sub = RedisSubscriber::connect(rt.pick_worker(), RedisConfig::from_addr(server.addr).max_field(16), rec.clone());
+    sub.subscribe(&["c"]);
+    rec.wait_for("both ordinary messages", |e| e.iter().filter(|x| matches!(x, Event::Message(_))).count() == 2);
+    assert_eq!(rec.messages(), vec![Msg::channel("c", "1"), Msg::channel("c", "3")]);
+    let dropped: Vec<_> = rec.events().into_iter().filter(|e| matches!(e, Event::Dropped(_))).collect();
+    assert_eq!(dropped, vec![Event::Dropped("an identifier in the reply is longer than 16 bytes".into())]);
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+    sub.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_subscribers_handler_can_take_an_invalidate_push_through_a_sink_and_ignores_other_pushes() {
+    let server = subscribed_then(|s| {
+        s.reply(
+            ">3\r\n$5\r\nweird\r\n:7\r\n$1\r\nx\r\n\
+             >2\r\n$10\r\ninvalidate\r\n*2\r\n$1\r\na\r\n$1\r\nb\r\n\
+             >3\r\n$7\r\nmessage\r\n$1\r\nc\r\n$2\r\nhi\r\n",
+        )
+    });
+    let rt = runtime();
+    let mut rec = Recorder::default();
+    let inv = Invalidated::default();
+    rec.invalidations = Some(inv.clone());
+    let sub = RedisSubscriber::connect(rt.pick_worker(), RedisConfig::from_addr(server.addr), rec.clone());
+    sub.subscribe(&["c"]);
+    rec.wait_for("the message", |e| e.iter().any(|x| matches!(x, Event::Message(_))));
+    assert_eq!(inv.seen(), vec!["a", "b"]);
+    assert_eq!(rec.messages(), vec![Msg::channel("c", "hi")]);
+    sub.close();
+    rt.shutdown();
+    server.rt.shutdown();
+}
+
+#[test]
+fn a_handler_may_close_its_own_subscriber_from_inside_a_callback() {
+    struct Closer(Arc<Mutex<Option<RedisSubscriber>>>, Arc<AtomicUsize>);
+    impl hopf_redis::SubscriberHandler for Closer {
+        fn message_begin(&mut self, _h: &hopf_redis::MessageHeader<'_>, _len: Option<u64>) -> Flow {
+            Flow::Continue
+        }
+        fn message_chunk(&mut self, _data: &[u8]) -> Flow {
+            Flow::Continue
+        }
+        fn message_end(&mut self) {
+            if let Some(sub) = self.0.lock().unwrap().as_ref() {
+                sub.close();
+            }
+            self.1.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let server = subscribed_then(|s| {
+        s.reply(
+            ">3\r\n$7\r\nmessage\r\n$1\r\nc\r\n$1\r\n1\r\n\
+             >3\r\n$7\r\nmessage\r\n$1\r\nc\r\n$1\r\n2\r\n",
+        )
+    });
+    let rt = runtime();
+    let slot: Arc<Mutex<Option<RedisSubscriber>>> = Arc::default();
+    let ends = Arc::new(AtomicUsize::new(0));
+    let sub = RedisSubscriber::connect(
+        rt.pick_worker(),
+        RedisConfig::from_addr(server.addr),
+        Closer(Arc::clone(&slot), Arc::clone(&ends)),
+    );
+    *slot.lock().unwrap() = Some(sub.clone());
+    sub.subscribe(&["c"]);
+    wait_until("the handler to have run", || ends.load(Ordering::SeqCst) >= 1);
+    wait_until("the subscriber to be closed", || !sub.is_connected());
     rt.shutdown();
     server.rt.shutdown();
 }

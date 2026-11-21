@@ -20,9 +20,12 @@ speaking RESP2 and RESP3.
   a growing time.
 - **Publish/subscribe:** `RedisSubscriber` is a dedicated connection that
   reconnects by itself and subscribes again to everything (channels, patterns,
-  shard channels), notices a dead connection with a keepalive, and delivers
-  messages, acknowledgements and unknown push kinds to a handler. A command
-  connection takes a push handler for RESP3 pushes such as key invalidations.
+  shard channels), notices a dead connection with a keepalive, and streams each
+  message to a handler: the channel whole (bounded by `max_field`), the body in
+  chunks of any size, with `Flow::Skip` to drop one message and `Flow::Pause`
+  (then `resume()`) to hold the connection. A message that cannot be delivered
+  is dropped alone and reported. A command connection takes a push sink for RESP3
+  pushes, `InvalidationSink` being the ready one for key invalidations.
 - **Cluster:** `RedisCluster` learns the layout from `CLUSTER SHARDS` (or
   `CLUSTER SLOTS`), sends each command to the master of its key's slot, follows
   `MOVED` and `ASK`, refreshes the layout when nodes fail or slots move, and

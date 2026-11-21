@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use hopf_core::Bytes;
 use hopf_redis::{
-    key_slot, ArgSource, BulkHandler, ClusterConfig, Command, Deadline, Flow, NodeAddr, Push, RedisCluster, RedisError,
+    key_slot, ArgSource, BulkHandler, ClusterConfig, Command, Deadline, Flow, NodeAddr, RedisCluster, RedisError,
     ReplyKind, ReplySink, Scalar, SourceCtl, SourceRead, StreamArg, StrKind, AggKind,
 };
 
@@ -731,30 +731,43 @@ fn tracking() -> Command {
     Command::new("CLIENT").arg("TRACKING").arg("on")
 }
 
-fn invalidated(push: &Push) -> String {
-    match push.invalidation() {
-        Some(hopf_redis::Invalidation::Keys(keys)) => String::from_utf8_lossy(&keys[0]).into_owned(),
-        other => panic!("not a key invalidation: {other:?}"),
+/// Tells a channel which node an invalidated key came from.
+struct Tell(NodeAddr, std::sync::mpsc::Sender<(NodeAddr, String)>);
+
+impl hopf_redis::InvalidationHandler for Tell {
+    fn key(&mut self, key: &[u8]) {
+        let _ = self.1.send((self.0.clone(), String::from_utf8_lossy(key).into_owned()));
+    }
+    fn all(&mut self) {
+        let _ = self.1.send((self.0.clone(), "*".into()));
     }
 }
 
+/// Make each node's push sink an invalidation sink that tells `tx`.
+fn tell(c: &RedisCluster, tx: std::sync::mpsc::Sender<(NodeAddr, String)>) {
+    let tx = Mutex::new(tx);
+    c.set_push_sinks(move |node| {
+        Box::new(hopf_redis::InvalidationSink::new(Tell(node.clone(), tx.lock().unwrap().clone())))
+    });
+}
+
 #[test]
-fn a_push_on_a_node_connection_reaches_the_handler_with_the_nodes_address() {
+fn a_push_on_a_node_connection_reaches_the_sink_made_for_that_node() {
     let (rt, c, a, nb) = two_masters();
     let (tx, rx) = std::sync::mpsc::channel();
-    c.set_push_handler(move |node, push| tx.send((node.clone(), push)).unwrap());
+    tell(&c, tx);
 
-    // The connection to `a` was made before the handler was set.
+    // The connection to `a` was made before the sink was set.
     call!(|cb| c.send_to_node(&addr_of(&a), &tracking(), cb)).unwrap();
-    let (from, push) = rx.recv_timeout(Duration::from_secs(5)).expect("a push from a");
+    let (from, key) = rx.recv_timeout(Duration::from_secs(5)).expect("a push from a");
     assert_eq!(from, addr_of(&a));
-    assert_eq!(invalidated(&push), a.addr.port().to_string());
+    assert_eq!(key, a.addr.port().to_string());
 
     // The connection to `b` is made now, after it.
     call!(|cb| c.send_to_node(&addr_of(&nb), &tracking(), cb)).unwrap();
-    let (from, push) = rx.recv_timeout(Duration::from_secs(5)).expect("a push from b");
+    let (from, key) = rx.recv_timeout(Duration::from_secs(5)).expect("a push from b");
     assert_eq!(from, addr_of(&nb));
-    assert_eq!(invalidated(&push), nb.addr.port().to_string());
+    assert_eq!(key, nb.addr.port().to_string());
 
     // Replies stay in step with their commands around the pushes.
     assert_eq!(call!(|cb| c.get("moved", cb)).unwrap(), Some(b("ok")));
@@ -765,10 +778,40 @@ fn a_push_on_a_node_connection_reaches_the_handler_with_the_nodes_address() {
 }
 
 #[test]
+fn the_sink_of_a_node_is_made_once_and_again_only_when_the_cluster_is_told_to_make_another() {
+    let (rt, c, a, nb) = two_masters();
+    let made = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let counted = Arc::clone(&made);
+    let tx2 = Mutex::new(tx.clone());
+    c.set_push_sinks(move |node| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        Box::new(hopf_redis::InvalidationSink::new(Tell(node.clone(), tx2.lock().unwrap().clone())))
+    });
+    for _ in 0..3 {
+        call!(|cb| c.send_to_node(&addr_of(&a), &tracking(), cb)).unwrap();
+        rx.recv_timeout(Duration::from_secs(5)).expect("a push");
+    }
+    assert_eq!(made.load(Ordering::SeqCst), 1, "one sink for one node connection, however many pushes");
+    call!(|cb| c.send_to_node(&addr_of(&nb), &tracking(), cb)).unwrap();
+    rx.recv_timeout(Duration::from_secs(5)).expect("a push from b");
+    assert_eq!(made.load(Ordering::SeqCst), 2, "and one for the other node");
+    // Telling the cluster again makes each node's sink afresh, when its next push comes.
+    tell(&c, tx);
+    call!(|cb| c.send_to_node(&addr_of(&a), &tracking(), cb)).unwrap();
+    rx.recv_timeout(Duration::from_secs(5)).expect("a push through the new sink");
+    assert_eq!(made.load(Ordering::SeqCst), 2, "the old maker is not called again");
+    c.close();
+    rt.shutdown();
+    a.rt.shutdown();
+    nb.rt.shutdown();
+}
+
+#[test]
 fn pushes_still_arrive_from_a_node_first_reached_through_a_moved() {
     let (rt, c, a, nb) = two_masters();
     let (tx, rx) = std::sync::mpsc::channel();
-    c.set_push_handler(move |node, push| tx.send((node.clone(), push)).unwrap());
+    tell(&c, tx);
     // `a` answers this with MOVED to `b`, which is where the connection to `b` comes from.
     assert_eq!(call!(|cb| c.get("moved", cb)).unwrap(), Some(b("ok")));
     call!(|cb| c.send_to_node(&addr_of(&nb), &tracking(), cb)).unwrap();
@@ -781,18 +824,18 @@ fn pushes_still_arrive_from_a_node_first_reached_through_a_moved() {
 }
 
 #[test]
-fn pushes_are_dropped_without_a_handler_and_after_it_is_cleared() {
+fn pushes_are_dropped_without_a_sink_and_after_it_is_cleared() {
     let (rt, c, a, nb) = two_masters();
-    // No handler: the push is dropped and the reply behind it is still the reply.
+    // No sink: the push is dropped and the reply behind it is still the reply.
     call!(|cb| c.send_to_node(&addr_of(&a), &tracking(), cb)).unwrap();
     assert_eq!(call!(|cb| c.get("k", cb)).unwrap(), Some(b("ok")));
 
     let (tx, rx) = std::sync::mpsc::channel();
-    c.set_push_handler(move |node, push| tx.send((node.clone(), push)).unwrap());
+    tell(&c, tx);
     call!(|cb| c.send_to_node(&addr_of(&a), &tracking(), cb)).unwrap();
-    rx.recv_timeout(Duration::from_secs(5)).expect("delivered once a handler is set");
+    rx.recv_timeout(Duration::from_secs(5)).expect("delivered once a sink is set");
 
-    c.clear_push_handler();
+    c.clear_push_sinks();
     call!(|cb| c.send_to_node(&addr_of(&a), &tracking(), cb)).unwrap();
     assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "nothing after it is cleared");
     c.close();
@@ -802,7 +845,7 @@ fn pushes_are_dropped_without_a_handler_and_after_it_is_cleared() {
 }
 
 #[test]
-fn a_node_that_replaces_another_in_a_new_layout_pushes_to_the_same_handler() {
+fn a_node_that_replaces_another_in_a_new_layout_pushes_to_a_sink_made_for_it() {
     // `old` serves everything until it is asked for the layout a second time,
     // when it says `new` does; `old` is then let go of and `new` connected to.
     let new_addr: Arc<OnceLock<SocketAddr>> = Arc::default();
@@ -830,7 +873,7 @@ fn a_node_that_replaces_another_in_a_new_layout_pushes_to_the_same_handler() {
     old_addr.set(old.addr).unwrap();
     let (rt, c) = one_node_cluster(&old, |c| c.min_refresh_interval(Duration::from_millis(5)));
     let (tx, rx) = std::sync::mpsc::channel();
-    c.set_push_handler(move |node, push| tx.send((node.clone(), push)).unwrap());
+    tell(&c, tx);
 
     c.refresh();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -839,9 +882,9 @@ fn a_node_that_replaces_another_in_a_new_layout_pushes_to_the_same_handler() {
         std::thread::sleep(Duration::from_millis(5));
     }
     call!(|cb| c.send_to_node(&addr_of(&new), &tracking(), cb)).unwrap();
-    let (from, push) = rx.recv_timeout(Duration::from_secs(5)).expect("a push from the new node");
+    let (from, key) = rx.recv_timeout(Duration::from_secs(5)).expect("a push from the new node");
     assert_eq!(from, addr_of(&new));
-    assert_eq!(invalidated(&push), "from-new");
+    assert_eq!(key, "from-new");
     c.close();
     rt.shutdown();
     old.rt.shutdown();

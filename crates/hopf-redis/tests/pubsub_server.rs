@@ -8,7 +8,7 @@ mod common;
 use std::time::Duration;
 
 use hopf_core::Bytes;
-use hopf_redis::{Invalidation, Message, RedisConfig, RedisError, RedisSubscriber, SubscriptionChange, SubscriptionKind};
+use hopf_redis::{InvalidationSink, RedisConfig, RedisError, RedisSubscriber, SubscriptionChange, SubscriptionKind};
 
 use common::*;
 
@@ -29,10 +29,7 @@ fn b(s: &str) -> Bytes {
 }
 
 fn channel_message(channel: &str, payload: &str) -> Event {
-    Event::Message(Message::Channel {
-        channel: b(channel),
-        payload: b(payload),
-    })
+    Event::Message(Msg::channel(channel, payload))
 }
 
 /// Subscribe, publish and receive, in one protocol or the other.
@@ -97,14 +94,17 @@ fn patterns_and_shard_channels_are_delivered_as_what_they_are() {
     call!(|cb| publisher.spublish(&shard, "s", cb)).unwrap();
     rec.wait_for("both messages", |e| e.iter().filter(|x| matches!(x, Event::Message(_))).count() == 2);
     let msgs = rec.messages();
-    assert!(msgs.contains(&Message::Pattern {
-        pattern: b(&pattern),
-        channel: b(&channel),
-        payload: b("p")
+    assert!(msgs.contains(&Msg {
+        kind: SubscriptionKind::Pattern,
+        pattern: Some(pattern.as_bytes().to_vec()),
+        channel: channel.as_bytes().to_vec(),
+        payload: b"p".to_vec()
     }));
-    assert!(msgs.contains(&Message::Shard {
-        channel: b(&shard),
-        payload: b("s")
+    assert!(msgs.contains(&Msg {
+        kind: SubscriptionKind::Shard,
+        pattern: None,
+        channel: shard.as_bytes().to_vec(),
+        payload: b"s".to_vec()
     }));
     sub.close();
     rt.shutdown();
@@ -162,9 +162,9 @@ fn messages_arrive_in_the_order_they_were_published_and_a_large_one_whole() {
     rec.wait_for("all messages", |e| e.iter().filter(|x| matches!(x, Event::Message(_))).count() == 501);
     let msgs = rec.messages();
     for (i, m) in msgs[..500].iter().enumerate() {
-        assert!(matches!(m, Message::Channel { payload, .. } if payload == &b(&i.to_string())), "message {i}: {m:?}");
+        assert_eq!(m.payload, i.to_string().into_bytes(), "message {i}: {m:?}");
     }
-    assert!(matches!(&msgs[500], Message::Channel { payload, .. } if payload.len() == 2_000_000 && payload.iter().all(|&x| x == b'z')));
+    assert!(msgs[500].payload.len() == 2_000_000 && msgs[500].payload.iter().all(|&x| x == b'z'));
     sub.close();
     rt.shutdown();
 }
@@ -243,9 +243,8 @@ fn a_command_connection_receives_invalidation_pushes_for_tracked_keys() {
     let rt = runtime();
     let tracker = client(&rt, &host, port);
     let writer = client(&rt, &host, port);
-    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let log = std::sync::Arc::clone(&seen);
-    tracker.set_push_handler(move |p| log.lock().unwrap().push(p));
+    let seen = Invalidated::default();
+    tracker.set_push_sink(InvalidationSink::new(seen.clone()));
 
     let key = unique("tracked");
     call!(|cb| tracker.command(&[b"CLIENT", b"TRACKING", b"on"], cb)).unwrap();
@@ -254,14 +253,12 @@ fn a_command_connection_receives_invalidation_pushes_for_tracked_keys() {
     assert_eq!(call!(|cb| tracker.get(&key, cb)).unwrap(), Some(b("1")));
     call!(|cb| writer.set(&key, "2", cb)).unwrap();
     for _ in 0..500 {
-        if !seen.lock().unwrap().is_empty() {
+        if !seen.seen().is_empty() {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let pushes = seen.lock().unwrap().clone();
-    assert_eq!(pushes.len(), 1, "{pushes:?}");
-    assert_eq!(pushes[0].invalidation(), Some(Invalidation::Keys(vec![b(&key)])));
+    assert_eq!(seen.seen(), vec![key.clone()]);
     // Replies are still matched to their commands around the push.
     assert_eq!(call!(|cb| tracker.get(&key, cb)).unwrap(), Some(b("2")));
     let _ = call!(|cb| writer.del(&[&key], cb));
@@ -281,5 +278,87 @@ fn a_command_connection_refuses_subscriptions_instead_of_losing_step() {
     assert!(matches!(err, RedisError::Unexpected(_)));
     // Nothing was sent, so the connection is as it was.
     call!(|cb| c.ping(cb)).unwrap();
+    rt.shutdown();
+}
+
+#[test]
+fn a_handler_that_pauses_holds_a_real_server_back_and_nothing_is_lost() {
+    use std::sync::atomic::Ordering::SeqCst;
+    const SIZE: usize = 16_000_000;
+    let (host, port) = server_or_skip!(real_server());
+    let rt = runtime();
+    let counter = Counter::default();
+    counter.pause_next.store(true, SeqCst);
+    let sub = RedisSubscriber::connect(rt.pick_worker(), RedisConfig::new(&host, port), counter.clone());
+    let publisher = client(&rt, &host, port);
+    let ch = unique("pause");
+    sub.subscribe(&[&ch]);
+    for _ in 0..500 {
+        if sub.is_connected() && !sub.subscriptions().0.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(200)); // the subscription is acknowledged
+    publisher.publish(&ch, vec![b'q'; SIZE], |r| {
+        r.unwrap();
+    });
+    publisher.publish(&ch, "end", |r| {
+        r.unwrap();
+    });
+    for _ in 0..1000 {
+        if counter.paused.load(SeqCst) == 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(counter.paused.load(SeqCst), 1, "the handler paused");
+    std::thread::sleep(Duration::from_millis(200));
+    let held_at = counter.bytes.load(SeqCst);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(counter.bytes.load(SeqCst), held_at, "nothing is read while it is paused");
+    assert!(held_at < SIZE);
+
+    sub.resume();
+    for _ in 0..1000 {
+        if counter.messages.load(SeqCst) == 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(counter.messages.load(SeqCst), 2);
+    assert_eq!(counter.bytes.load(SeqCst), SIZE + 3);
+    assert_eq!(counter.disconnects.load(SeqCst), 0);
+    sub.close();
+    rt.shutdown();
+}
+
+#[test]
+fn a_real_servers_message_to_a_channel_over_the_limit_is_dropped_alone() {
+    let (host, port) = server_or_skip!(real_server());
+    let rt = runtime();
+    let rec = Recorder::default();
+    let sub = RedisSubscriber::connect(rt.pick_worker(), RedisConfig::new(&host, port).max_field(16), rec.clone());
+    let publisher = client(&rt, &host, port);
+    let short = format!("t{}", std::process::id());
+    let long = unique("a-channel-name-longer-than-sixteen-bytes");
+    assert!(short.len() <= 16 && long.len() > 16);
+    sub.subscribe(&[&short, &long]);
+    // Both are acknowledged by the server; only the short name is delivered whole.
+    rec.wait_for("the short subscription", |e| {
+        e.iter().any(|x| matches!(x, Event::Change(SubscriptionChange::Subscribed { name, .. }) if name == &b(&short)))
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    call!(|cb| publisher.publish(&long, "lost", cb)).unwrap();
+    call!(|cb| publisher.publish(&short, "kept", cb)).unwrap();
+    rec.wait_for("the message on the short channel", |e| e.contains(&channel_message(&short, "kept")));
+    let events = rec.events();
+    assert!(
+        events.iter().any(|e| matches!(e, Event::Dropped(why) if why.contains("longer than 16 bytes"))),
+        "the long one was dropped and reported: {events:?}"
+    );
+    assert!(!events.iter().any(|e| matches!(e, Event::Message(m) if m.payload == b"lost")));
+    assert!(!events.contains(&Event::Disconnected), "and the connection went on");
+    sub.close();
     rt.shutdown();
 }

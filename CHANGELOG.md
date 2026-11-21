@@ -24,11 +24,16 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
   aggregate size, depth, line length and total reply size.
   `RedisSubscriber` is a connection for publish/subscribe (channels, patterns
   and shard channels) that reconnects by itself, subscribes again to everything,
-  watches the connection with a keepalive and delivers messages,
-  acknowledgements and push kinds it does not know to a `SubscriberHandler`;
-  `RedisClient::publish` and `spublish` publish, and `set_push_handler`
-  receives the RESP3 pushes (key invalidations, for one) a command connection
-  gets. A command connection refuses `SUBSCRIBE` and its relatives.
+  watches the connection with a keepalive and tells a `SubscriberHandler` of
+  each message, as a header (the channel, and the pattern, whole and bounded by
+  `max_field`) then the body in chunks, however large, which the handler may
+  skip or pause on; a message that cannot be delivered is dropped alone and
+  reported with `on_dropped`. `RedisClient::publish` and `spublish` publish.
+  The RESP3 pushes a command connection gets (key invalidations, for one) go to
+  a sink of the application's own, `set_push_sink`, as the events of a reply,
+  with `InvalidationSink` ready for `CLIENT TRACKING`; a cluster makes one for
+  each node, `set_push_sinks`. A command connection refuses `SUBSCRIBE` and its
+  relatives.
   `RedisCluster` is the cluster client: it learns the layout from `CLUSTER
   SHARDS` (or `CLUSTER SLOTS`), keeps one connection per master, sends each
   command to the master of the slot its key hashes to (CRC16 with hash tags,

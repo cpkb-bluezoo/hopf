@@ -63,7 +63,7 @@ use crate::commands::{
 use crate::config::RedisConfig;
 use crate::error::RedisError;
 use crate::keys::{command_slot, key_indexes, key_slot, SLOTS};
-use crate::pubsub::{is_subscription_command, Push};
+use crate::pubsub::is_subscription_command;
 use crate::resp::{AggKind, Flow, ReplyKind, ReplySink, Scalar, ServerError, StrKind, Value};
 use crate::topology::{parse_redirect, parse_shards, parse_slots, NodeAddr, SlotRange};
 
@@ -256,7 +256,89 @@ struct State {
     last: HashMap<u16, Arc<Track>>,
 }
 
-type PushHandler = Box<dyn FnMut(&NodeAddr, Push) + Send>;
+/// Makes the sink that hears the pushes of one node's connection.
+type PushFactory = dyn Fn(&NodeAddr) -> Box<dyn ReplySink + Send> + Send + Sync;
+
+/// What the cluster has been asked to do with its nodes' pushes. The generation
+/// counts changes, so a node's connection, which keeps its own sink, knows to
+/// make another.
+#[derive(Default)]
+struct PushSinks {
+    generation: u64,
+    make: Option<Arc<PushFactory>>,
+}
+
+/// The sink of one node's connection: it makes the application's sink for the
+/// node when a push first arrives, or when the application has since changed
+/// what it wants, so a sink set or cleared later, and a node connected later,
+/// all work. A node that is not wanted pushes into nothing.
+struct NodePush {
+    cluster: std::sync::Weak<Inner>,
+    node: NodeAddr,
+    generation: u64,
+    sink: Option<Box<dyn ReplySink + Send>>,
+}
+
+impl NodePush {
+    fn with(&mut self, f: impl FnOnce(&mut dyn ReplySink) -> Flow) -> Flow {
+        match self.sink.as_mut() {
+            Some(sink) => f(&mut **sink),
+            None => Flow::Skip,
+        }
+    }
+}
+
+impl ReplySink for NodePush {
+    fn begin_reply(&mut self, kind: ReplyKind) {
+        let wanted = self.cluster.upgrade().map(|inner| {
+            let sinks = inner.push.lock().unwrap();
+            (sinks.generation, sinks.make.clone())
+        });
+        if let Some((generation, make)) = wanted {
+            if generation != self.generation || (self.sink.is_none() && make.is_some()) {
+                self.generation = generation;
+                self.sink = make.map(|make| make(&self.node));
+            }
+        }
+        if let Some(sink) = self.sink.as_mut() {
+            sink.begin_reply(kind);
+        }
+    }
+
+    fn scalar(&mut self, v: Scalar<'_>) -> Flow {
+        self.with(|s| s.scalar(v))
+    }
+
+    fn error(&mut self, line: &str) -> Flow {
+        self.with(|s| s.error(line))
+    }
+
+    fn begin_aggregate(&mut self, kind: AggKind, len: Option<usize>) -> Flow {
+        self.with(|s| s.begin_aggregate(kind, len))
+    }
+
+    fn end_aggregate(&mut self) -> Flow {
+        self.with(|s| s.end_aggregate())
+    }
+
+    fn begin_string(&mut self, kind: StrKind, len: Option<usize>) -> Flow {
+        self.with(|s| s.begin_string(kind, len))
+    }
+
+    fn string_chunk(&mut self, data: &[u8]) -> Flow {
+        self.with(|s| s.string_chunk(data))
+    }
+
+    fn end_string(&mut self) -> Flow {
+        self.with(|s| s.end_string())
+    }
+
+    fn end_reply(&mut self, skipped: bool) {
+        if let Some(sink) = self.sink.as_mut() {
+            sink.end_reply(skipped);
+        }
+    }
+}
 
 struct Inner {
     reactor: ReactorHandle,
@@ -264,7 +346,7 @@ struct Inner {
     state: Mutex<State>,
     closed: AtomicBool,
     /// Where the nodes' RESP3 pushes go.
-    push: Mutex<Option<Arc<Mutex<PushHandler>>>>,
+    push: Mutex<PushSinks>,
     refreshes: AtomicUsize,
     /// Numbers each sending of a `WAIT`.
     wait_sends: AtomicU64,
@@ -294,7 +376,7 @@ impl RedisCluster {
                 last: HashMap::new(),
             }),
             closed: AtomicBool::new(false),
-            push: Mutex::new(None),
+            push: Mutex::new(PushSinks::default()),
             refreshes: AtomicUsize::new(0),
             wait_sends: AtomicU64::new(0),
         });
@@ -644,12 +726,26 @@ impl RedisCluster {
     }
 
     /// Receive the RESP3 pushes the connections to the nodes get: key
-    /// invalidations after `CLIENT TRACKING`, and anything else a server pushes,
-    /// of whatever kind (see [`Push`]). `handler` is given the node the push
-    /// came from, and runs on the cluster's reactor. It applies to every node
-    /// connection, those made before it was set and those made after (a node
-    /// found by a refresh, or reached through `MOVED` or `ASK`), and to one
-    /// that replaces another. Without a handler, pushes are discarded.
+    /// invalidations after `CLIENT TRACKING`, and anything else a server pushes.
+    /// `make` is given the node and returns the sink for its pushes, each of
+    /// which it hears as the events of a reply (see
+    /// [`RedisClient::set_push_sink`](crate::RedisClient::set_push_sink)); it is
+    /// called once for each node connection that gets a push, on the cluster's
+    /// reactor, and again for each connection after the next call to this method
+    /// or to [`clear_push_sinks`](Self::clear_push_sinks). So it applies to every
+    /// node connection, those made before it was set and those made after (a
+    /// node found by a refresh, or reached through `MOVED` or `ASK`), and to one
+    /// that replaces another. Without it, pushes are discarded, in constant
+    /// memory.
+    ///
+    /// ```no_run
+    /// # use hopf_redis::{InvalidationHandler, InvalidationSink, RedisCluster};
+    /// # struct Evict;
+    /// # impl InvalidationHandler for Evict { fn key(&mut self, _: &[u8]) {} fn all(&mut self) {} }
+    /// # fn example(cluster: &RedisCluster) {
+    /// cluster.set_push_sinks(|_node| Box::new(InvalidationSink::new(Evict)));
+    /// # }
+    /// ```
     ///
     /// Tracking belongs to a connection, not to the cluster: the application
     /// enables it on the connections it wants, with
@@ -659,13 +755,17 @@ impl RedisCluster {
     /// one. A node that stops being a master is let go of, and with it what was
     /// tracked on it. Pushes that carry subscription messages belong to a
     /// [`RedisSubscriber`](crate::RedisSubscriber), not here.
-    pub fn set_push_handler(&self, handler: impl FnMut(&NodeAddr, Push) + Send + 'static) {
-        *self.inner.push.lock().unwrap() = Some(Arc::new(Mutex::new(Box::new(handler))));
+    pub fn set_push_sinks(&self, make: impl Fn(&NodeAddr) -> Box<dyn ReplySink + Send> + Send + Sync + 'static) {
+        let mut sinks = self.inner.push.lock().unwrap();
+        sinks.generation += 1;
+        sinks.make = Some(Arc::new(make));
     }
 
-    /// Stop passing pushes to the handler.
-    pub fn clear_push_handler(&self) {
-        *self.inner.push.lock().unwrap() = None;
+    /// Stop passing pushes to sinks: they are discarded.
+    pub fn clear_push_sinks(&self) {
+        let mut sinks = self.inner.push.lock().unwrap();
+        sinks.generation += 1;
+        sinks.make = None;
     }
 
     /// [`send`](Self::send) to the master at `node`, whatever the command's
@@ -797,17 +897,13 @@ fn client_for(inner: &Arc<Inner>, st: &mut State, addr: &NodeAddr) -> RedisClien
                     request_refresh(&inner);
                 }
             });
-            // Pushes go to whatever handler the cluster has when they arrive, so
-            // a handler set or cleared later, and a client made later, all work.
-            let (weak, node) = (Arc::downgrade(inner), addr.clone());
-            client.set_push_handler(move |push| {
-                let Some(inner) = weak.upgrade() else {
-                    return;
-                };
-                let handler = inner.push.lock().unwrap().clone();
-                if let Some(handler) = handler {
-                    (handler.lock().unwrap())(&node, push);
-                }
+            // The node's pushes go to whatever sink the cluster wants when they
+            // arrive.
+            client.set_push_sink(NodePush {
+                cluster: Arc::downgrade(inner),
+                node: addr.clone(),
+                generation: 0,
+                sink: None,
             });
             client
         }

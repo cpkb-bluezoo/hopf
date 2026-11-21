@@ -76,7 +76,8 @@ pub use error::RedisError;
 pub use keys::{command_slot, crc16, key_indexes, key_slot, CrossSlot, SLOTS};
 pub use topology::NodeAddr;
 pub use pubsub::{
-    Invalidation, Message, Push, RedisSubscriber, SubscriberHandler, SubscriptionChange, SubscriptionKind,
+    InvalidationHandler, InvalidationSink, MessageHeader, RedisSubscriber, SubscriberHandler, SubscriptionChange,
+    SubscriptionKind,
 };
 pub use resp::{
     encode_command, AggKind, Feed, Flow, ReplyKind, ReplySink, RespError, RespLimits, RespParser, Scalar, ServerError,
