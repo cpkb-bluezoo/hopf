@@ -44,6 +44,7 @@ members = [
     "examples/smtp-local",
     "examples/smtp-send",
     "examples/pop3",
+    "examples/nntp",
     "examples/pop3-fetch",
     "examples/imap",
     "examples/imap-fetch",

@@ -1,7 +1,34 @@
 # hopf-nntp
 
-NNTP / NNTPS **async client** for [Hopf](https://cpkb-bluezoo.github.io/hopf/)
-(RFC 3977, with STARTTLS per RFC 4642 and AUTHINFO per RFC 4643).
+NNTP / NNTPS **news reader server** and **async client** for
+[Hopf](https://cpkb-bluezoo.github.io/hopf/) (RFC 3977, with STARTTLS per RFC
+4642 and AUTHINFO per RFC 4643).
+
+## Server features
+
+- **Newsgroups from a mailbox store:** each mailbox is a group, each UID an
+  article number; or implement `ReaderHandler` for any other source
+- **Commands:** CAPABILITIES, MODE READER, DATE, HELP, QUIT, GROUP, LISTGROUP,
+  LAST, NEXT, ARTICLE, HEAD, BODY, STAT, LIST (ACTIVE, NEWSGROUPS,
+  OVERVIEW.FMT), NEWGROUPS, OVER and HDR (and XOVER, XHDR), POST, with wildmats
+- **Constant memory:** articles are dot-stuffed by a state machine that holds no
+  line and travel through a bounded pipe, so a slow client slows the read of
+  the store; a posted article reaches a `PostSink` in pieces of at most 64 KiB
+  and one write at a time. A 192 MiB article peaks at about 127 KiB of heap
+- **Security:** STARTTLS and implicit TLS, AUTHINFO USER/PASS and SASL against a
+  `CredentialStore`, `require_authentication`, passwords refused in the clear
+  by default
+- **Telemetry:** OTLP metrics and per-connection traces through
+  `NntpService::with_telemetry`
+
+```rust,ignore
+let service = NntpService::new(
+    NntpConfig::new("0.0.0.0:119".parse()?, "news.example.com").with_tls(acceptor),
+    runtime,
+    Arc::new(MaildirFactory::new("/var/spool/news")),
+);
+service.start()?;
+```
 
 ## Client features
 

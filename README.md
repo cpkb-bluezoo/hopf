@@ -37,7 +37,7 @@ AEAD-only, and an opt-in FIPS profile is available (the `fips` feature).
 | Transport | `hopf-core` (TCP, UNIX sockets, UDP, TLS, DTLS), `hopf-quic` | both |
 | Web | `hopf-http` (HTTP/1.1, HTTP/2, HTTP/3), `hopf-websocket`, `hopf-grpc`, `hopf-webdav`, `hopf-masque` | both (WebDAV: server) |
 | Naming | `hopf-dns` (resolver, forwarder, authoritative server; DoT, DoQ, DoH), `hopf-mdns` | both |
-| Mail and news | `hopf-smtp`, `hopf-pop3`, `hopf-imap`, `hopf-mailbox` (storage), `hopf-nntp` | server and client (NNTP: client) |
+| Mail and news | `hopf-smtp`, `hopf-pop3`, `hopf-imap`, `hopf-mailbox` (storage), `hopf-nntp` | server and client |
 | File transfer | `hopf-ftp` | both |
 | Messaging and data | `hopf-mqtt`, `hopf-amqp` (0-9-1), `hopf-amqp1` (1.0), `hopf-redis` | MQTT: both; others: client |
 | Proxying | `hopf-socks` (SOCKS4/4a/5), `hopf-masque` | both |

@@ -439,6 +439,108 @@ impl Pop3ServerMetrics {
     }
 }
 
+/// NNTP server metrics instruments (OTLP export).
+pub struct NntpServerMetrics {
+    export: ExportHandle,
+    active_connections: AtomicI64,
+}
+
+impl NntpServerMetrics {
+    /// Create with export handle.
+    pub fn new(export: ExportHandle) -> Arc<Self> {
+        Arc::new(Self {
+            export,
+            active_connections: AtomicI64::new(0),
+        })
+    }
+
+    /// Connection accepted.
+    pub fn connection_opened(&self) {
+        let v = self.active_connections.fetch_add(1, Ordering::Relaxed) + 1;
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "nntp.server.connections",
+            attributes: Vec::new(),
+            value: 1,
+        });
+        self.export.try_send_metric(MetricPoint::UpDown {
+            name: "nntp.server.active_connections",
+            attributes: Vec::new(),
+            value: v,
+        });
+    }
+
+    /// Connection closed after `duration`, having been sent `bytes_sent` octets.
+    pub fn connection_closed(&self, duration: std::time::Duration, bytes_sent: u64) {
+        let v = self.active_connections.fetch_sub(1, Ordering::Relaxed) - 1;
+        self.export.try_send_metric(MetricPoint::UpDown {
+            name: "nntp.server.active_connections",
+            attributes: Vec::new(),
+            value: v.max(0),
+        });
+        self.export.try_send_metric(MetricPoint::Histogram {
+            name: "nntp.server.session.duration",
+            unit: "ms",
+            attributes: Vec::new(),
+            value: duration.as_secs_f64() * 1000.0,
+        });
+        if bytes_sent > 0 {
+            self.export.try_send_metric(MetricPoint::Counter {
+                name: "nntp.server.bytes_sent",
+                attributes: Vec::new(),
+                value: bytes_sent,
+            });
+        }
+    }
+
+    /// A command was received. `command` is its upper-case name.
+    pub fn command(&self, command: &str) {
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "nntp.server.commands",
+            attributes: vec![("nntp.command".into(), command.into())],
+            value: 1,
+        });
+    }
+
+    /// An authentication attempt finished. `mechanism` is `USER` for
+    /// `AUTHINFO USER`/`PASS`, or the SASL mechanism.
+    pub fn auth(&self, mechanism: &str, ok: bool) {
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "nntp.server.auth",
+            attributes: vec![
+                ("mechanism".into(), mechanism.into()),
+                ("result".into(), if ok { "ok" } else { "fail" }.into()),
+            ],
+            value: 1,
+        });
+    }
+
+    /// An article, head or body was sent, or one was posted (`kind` is
+    /// `retrieved` or `posted`), taking `duration`.
+    pub fn article(&self, kind: &str, outcome: &str, duration: std::time::Duration) {
+        let attrs = vec![("nntp.article".into(), kind.into()), ("outcome".into(), outcome.into())];
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "nntp.server.articles",
+            attributes: attrs.clone(),
+            value: 1,
+        });
+        self.export.try_send_metric(MetricPoint::Histogram {
+            name: "nntp.server.article.duration",
+            unit: "ms",
+            attributes: attrs,
+            value: duration.as_secs_f64() * 1000.0,
+        });
+    }
+
+    /// STARTTLS upgrade completed.
+    pub fn starttls(&self) {
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "nntp.server.starttls",
+            attributes: Vec::new(),
+            value: 1,
+        });
+    }
+}
+
 /// IMAP server metrics instruments (OTLP export).
 pub struct ImapServerMetrics {
     export: ExportHandle,
@@ -940,6 +1042,38 @@ mod tests {
             body.contains("pop3.server.retrieve.duration"),
             "missing duration metric: {body}"
         );
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn nntp_metrics_reach_the_jsonl_file() {
+        let dir = std::env::temp_dir().join(format!("hopf-otel-nntp-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        let cfg = OtelConfig::new("nntp-test").with_jsonl_metrics(&dir);
+        let (handle, join, _running) = spawn_worker(cfg);
+        let metrics = NntpServerMetrics::new(handle.clone());
+        metrics.connection_opened();
+        metrics.command("ARTICLE");
+        metrics.auth("SCRAM-SHA-256", true);
+        metrics.article("retrieved", "ok", std::time::Duration::from_millis(3));
+        metrics.starttls();
+        metrics.connection_closed(std::time::Duration::from_millis(40), 1234);
+        handle.flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        handle.shutdown();
+        let _ = join.join();
+        let body = std::fs::read_to_string(&dir).unwrap_or_default();
+        for name in [
+            "nntp.server.connections",
+            "nntp.server.commands",
+            "nntp.server.auth",
+            "nntp.server.article.duration",
+            "nntp.server.starttls",
+            "nntp.server.session.duration",
+            "nntp.server.bytes_sent",
+        ] {
+            assert!(body.contains(name), "missing {name}: {body}");
+        }
         let _ = std::fs::remove_file(&dir);
     }
 

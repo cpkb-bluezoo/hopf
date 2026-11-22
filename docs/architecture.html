@@ -448,9 +448,9 @@
 <tr><td><code>hopf-http</code></td><td>both</td><td>HTTP/1.1, HTTP/2, HTTP/3 behind the version-agnostic Stream API; content coding, caching, HSTS</td></tr>
 <tr><td><code>hopf-webdav</code>, <code>hopf-websocket</code>, <code>hopf-grpc</code>, <code>hopf-masque</code></td><td>mixed</td><td>Built on HTTP Streams: WebDAV filesystem handler, WebSocket framing and upgrades, gRPC, CONNECT-UDP and CONNECT-IP</td></tr>
 <tr><td><code>hopf-dns</code>, <code>hopf-mdns</code></td><td>both</td><td>Resolver and forwarder, authoritative server, DoT/DoQ/DoH; multicast DNS and DNS-SD</td></tr>
-<tr><td><code>hopf-ftp</code>, <code>hopf-smtp</code>, <code>hopf-pop3</code>, <code>hopf-imap</code>, <code>hopf-mqtt</code></td><td>both</td><td>Server and client for each protocol</td></tr>
+<tr><td><code>hopf-ftp</code>, <code>hopf-smtp</code>, <code>hopf-pop3</code>, <code>hopf-nntp</code>, <code>hopf-imap</code>, <code>hopf-mqtt</code></td><td>both</td><td>Server and client for each protocol</td></tr>
 <tr><td><code>hopf-socks</code></td><td>both</td><td>SOCKS4/4a/5 server and client</td></tr>
-<tr><td><code>hopf-nntp</code>, <code>hopf-redis</code>, <code>hopf-amqp</code>, <code>hopf-amqp1</code>, <code>hopf-ldap</code></td><td>client</td><td>Client-only crates</td></tr>
+<tr><td><code>hopf-redis</code>, <code>hopf-amqp</code>, <code>hopf-amqp1</code>, <code>hopf-ldap</code></td><td>client</td><td>Client-only crates</td></tr>
 <tr><td><code>hopf-mailbox</code></td><td>storage</td><td>Mailbox storage SPI (mbox, Maildir++) used by SMTP, POP3 and IMAP</td></tr>
 <tr><td><code>hopf-auth</code></td><td>both</td><td>TrustPolicy, IdentityMaterial, credential stores, SASL mechanisms; no dependency on <code>hopf-core</code></td></tr>
 <tr><td><code>hopf-otel</code></td><td>client</td><td>OTLP/HTTP and JSONL telemetry exporters, off the hot path</td></tr>
@@ -565,7 +565,7 @@
 </tr>
 <tr>
 <td><strong>Single role</strong><br>no split, one role only</td>
-<td>The protocol has no counterpart role in-tree: client-only <code>hopf-nntp</code>, <code>hopf-redis</code>, <code>hopf-amqp</code>, <code>hopf-amqp1</code>, <code>hopf-ldap</code> and <code>hopf-otel</code> (an exporter; Hopf does not run a collector); server-only <code>hopf-webdav</code> (a filesystem handler); and <code>hopf-mailbox</code> (a storage backend, not a network protocol).</td>
+<td>The protocol has no counterpart role in-tree: client-only <code>hopf-redis</code>, <code>hopf-amqp</code>, <code>hopf-amqp1</code>, <code>hopf-ldap</code> and <code>hopf-otel</code> (an exporter; Hopf does not run a collector); server-only <code>hopf-webdav</code> (a filesystem handler); and <code>hopf-mailbox</code> (a storage backend, not a network protocol).</td>
 </tr>
 </tbody>
 </table>

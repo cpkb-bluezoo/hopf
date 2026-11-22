@@ -30,6 +30,10 @@ pub struct NntpConnectionMetadata {
     pub local: SocketAddr,
     /// Is the connection encrypted?
     pub tls: bool,
+    /// The W3C `traceparent` of the connection's trace when traces are
+    /// enabled. Pass it to outbound calls (for example
+    /// `hopf_otel::with_traceparent`) so that they continue the trace.
+    pub traceparent: Option<String>,
 }
 
 /// Makes the handler for each new connection.

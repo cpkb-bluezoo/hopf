@@ -129,6 +129,9 @@ pub struct NntpService {
     metrics: Arc<NntpServerMetrics>,
     handler_factory: Arc<dyn NntpHandlerFactory>,
     runtime: Arc<Runtime>,
+    otel_metrics: Option<Arc<hopf_otel::NntpServerMetrics>>,
+    export: Option<hopf_otel::ExportHandle>,
+    traces_enabled: bool,
     /// The listener [`Self::start`] registered, for [`Self::stop`].
     binding: Mutex<Option<BindingId>>,
 }
@@ -154,8 +157,29 @@ impl NntpService {
             metrics: NntpServerMetrics::shared(),
             handler_factory: factory,
             runtime,
+            otel_metrics: None,
+            export: None,
+            traces_enabled: false,
             binding: Mutex::new(None),
         }
+    }
+
+    /// Exports NNTP metrics, and a trace of each connection, through a
+    /// telemetry pipeline (whichever of the two it has enabled). With traces
+    /// on, handlers find the connection's `traceparent` in
+    /// [`NntpConnectionMetadata`](crate::NntpConnectionMetadata).
+    pub fn with_telemetry(mut self, pipeline: &hopf_otel::TelemetryPipeline) -> Self {
+        let cfg = pipeline.config();
+        if cfg.metrics_enabled {
+            self.otel_metrics = Some(pipeline.nntp_metrics());
+        }
+        if cfg.traces_enabled {
+            self.export = Some(pipeline.export_handle());
+            self.traces_enabled = true;
+        } else if cfg.metrics_enabled {
+            self.export = Some(pipeline.export_handle());
+        }
+        self
     }
 
     /// The service's counters.
@@ -169,13 +193,19 @@ impl NntpService {
         let metrics = Arc::clone(&self.metrics);
         let config = self.config.clone();
         let runtime = Arc::clone(&self.runtime);
+        let otel_metrics = self.otel_metrics.clone();
+        let export = self.export.clone();
+        let traces_enabled = self.traces_enabled;
         let mut cfg = TcpListenerConfig::new(self.config.listen, move || {
-            Box::new(NntpControlHandler::new(
-                factory.create(),
-                Arc::clone(&metrics),
-                config.clone(),
-                Arc::clone(&runtime),
-            )) as Box<dyn ProtocolHandler>
+            Box::new(
+                NntpControlHandler::new(
+                    factory.create(),
+                    Arc::clone(&metrics),
+                    config.clone(),
+                    Arc::clone(&runtime),
+                )
+                .with_telemetry(otel_metrics.clone(), export.clone(), traces_enabled),
+            ) as Box<dyn ProtocolHandler>
         })
         .idle_timeout(self.config.idle_timeout);
         if let Some(tls) = &self.config.tls_acceptor {

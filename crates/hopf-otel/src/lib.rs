@@ -39,7 +39,7 @@ pub use log_record::{AttrValue, LogLevel, LogRecord};
 pub use instrument::InstrumentedServerFactory;
 pub use metrics::{
     DnsServerMetrics, DnsUpstreamMetrics, FtpServerMetrics, HttpServerMetrics, ImapServerMetrics, MetricPoint,
-    MqttServerMetrics, Pop3ServerMetrics, RequestTimer, SmtpServerMetrics,
+    MqttServerMetrics, NntpServerMetrics, Pop3ServerMetrics, RequestTimer, SmtpServerMetrics,
 };
 pub use pipeline::TelemetryPipeline;
 pub use propagate::{

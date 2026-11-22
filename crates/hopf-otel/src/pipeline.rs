@@ -18,7 +18,7 @@ use crate::config::{LogSinkConfig, OtelConfig};
 use crate::event::{log_record_from_event, EventKind};
 use crate::log_record::LogLevel;
 use crate::metrics::{
-    DnsServerMetrics, DnsUpstreamMetrics, FtpServerMetrics, HttpServerMetrics, ImapServerMetrics, MqttServerMetrics, Pop3ServerMetrics,
+    DnsServerMetrics, DnsUpstreamMetrics, FtpServerMetrics, HttpServerMetrics, ImapServerMetrics, MqttServerMetrics, NntpServerMetrics, Pop3ServerMetrics,
     SmtpServerMetrics,
 };
 
@@ -30,6 +30,7 @@ pub struct TelemetryPipeline {
     smtp_metrics: Arc<SmtpServerMetrics>,
     ftp_metrics: Arc<FtpServerMetrics>,
     pop3_metrics: Arc<Pop3ServerMetrics>,
+    nntp_metrics: Arc<NntpServerMetrics>,
     imap_metrics: Arc<ImapServerMetrics>,
     mqtt_metrics: Arc<MqttServerMetrics>,
     dns_metrics: Arc<DnsServerMetrics>,
@@ -71,6 +72,7 @@ impl TelemetryPipeline {
         let smtp_metrics = SmtpServerMetrics::new(sender.clone());
         let ftp_metrics = FtpServerMetrics::new(sender.clone());
         let pop3_metrics = Pop3ServerMetrics::new(sender.clone());
+        let nntp_metrics = NntpServerMetrics::new(sender.clone());
         let imap_metrics = ImapServerMetrics::new(sender.clone());
         let mqtt_metrics = MqttServerMetrics::new(sender.clone());
         let dns_metrics = DnsServerMetrics::new(sender.clone());
@@ -82,6 +84,7 @@ impl TelemetryPipeline {
             smtp_metrics,
             ftp_metrics,
             pop3_metrics,
+            nntp_metrics,
             imap_metrics,
             mqtt_metrics,
             dns_metrics,
@@ -122,6 +125,11 @@ impl TelemetryPipeline {
     /// Shared FTP server metrics instruments.
     pub fn ftp_metrics(&self) -> Arc<FtpServerMetrics> {
         Arc::clone(&self.ftp_metrics)
+    }
+
+    /// Shared NNTP server metrics instruments.
+    pub fn nntp_metrics(&self) -> Arc<NntpServerMetrics> {
+        Arc::clone(&self.nntp_metrics)
     }
 
     /// Shared POP3 server metrics instruments.

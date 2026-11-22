@@ -1025,3 +1025,63 @@ fn an_article_posted_after_a_group_was_selected_can_be_read_by_its_number() {
     s.run(&on_the_wire(&post_text("late", "misc.test", "x\r\n")));
     assert!(s.run("STAT 4\r\n").starts_with("223 4 "), "the new article is found without selecting the group again");
 }
+
+// ---- telemetry ----
+
+#[test]
+fn a_session_is_reported_as_metrics_and_traced_with_a_traceparent() {
+    use hopf_otel::{OtelConfig, SpanContext, TelemetryPipeline};
+
+    let out = tempfile::tempdir().unwrap();
+    let path = out.path().join("telemetry.jsonl");
+    let pipeline = TelemetryPipeline::start(OtelConfig::new("nntp-test").with_jsonl_traces(&path).with_jsonl_metrics(&path)).unwrap();
+
+    let root = tempfile::tempdir().unwrap();
+    let factory = Arc::new(MaildirFactory::new(root.path()));
+    {
+        let mut store = factory.create_store();
+        store.open("news").unwrap();
+        store.create_mailbox("misc/test").unwrap();
+        let mut mb = store.open_mailbox("misc/test", false).unwrap();
+        let mut guard = AppendGuard::start(mb.as_mut(), &BTreeSet::new(), None).unwrap();
+        guard.append_content(article("one", "x\r\n").as_bytes()).unwrap();
+        guard.commit().unwrap();
+        mb.close(false).unwrap();
+    }
+    let handlers = DefaultNntpHandlerFactory::new("ready", factory).with_hostname("h");
+    let config = NntpConfig::new("127.0.0.1:1119".parse().unwrap(), "h");
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let handler = NntpControlHandler::new(handlers.create(), NntpServerMetrics::shared(), config, rt)
+        .with_telemetry(Some(pipeline.nntp_metrics()), Some(pipeline.export_handle()), true);
+    let mut peer = Peer::connect(handler, |h| h.busy());
+    let traceparent = peer.handler.meta.traceparent.clone().expect("a traceparent is set on connect");
+    assert!(SpanContext::from_traceparent(&traceparent).is_some(), "{traceparent}");
+    peer.take();
+
+    let mut s = Session { peer, greeting: String::new(), factory: Arc::new(MaildirFactory::new(root.path())), _root: tempfile::tempdir().unwrap() };
+    s.run("GROUP misc.test\r\nARTICLE 1\r\nSTAT 99\r\nDATE\r\n");
+    s.run("POST\r\n");
+    s.run(&on_the_wire(&post_text("p", "misc.test", "b\r\n")));
+    s.run("QUIT\r\n");
+    s.disconnect();
+
+    pipeline.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    pipeline.shutdown();
+    let body = std::fs::read_to_string(&path).unwrap_or_default();
+    for expected in [
+        "nntp.server.connections",
+        "nntp.server.commands",
+        "ARTICLE",
+        "nntp.server.articles",
+        "retrieved",
+        "posted",
+        "nntp.server.session.duration",
+        "nntp.server.bytes_sent",
+        "NNTP connection",
+        "NNTP retrieve",
+        "NNTP post",
+    ] {
+        assert!(body.contains(expected), "missing {expected}: {body}");
+    }
+}

@@ -7,6 +7,34 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
 
 ### Added
 
+- **hopf-nntp: a news reader server** (#543). `NntpService` serves the
+  mailboxes of a `MailboxStore` as newsgroups (a mailbox is a group, a UID is
+  an article number), or any other source of articles through a
+  `ReaderHandler`. Reader mode: `CAPABILITIES`, `MODE READER`, `DATE`, `HELP`,
+  `QUIT`, `GROUP`, `LISTGROUP`, `LAST`, `NEXT`, `ARTICLE`, `HEAD`, `BODY`,
+  `STAT`, `LIST ACTIVE`/`NEWSGROUPS`/`OVERVIEW.FMT`, `NEWGROUPS`, `OVER` and
+  `HDR` (with `XOVER`/`XHDR`), `POST`, `STARTTLS` and `AUTHINFO` (`USER`/`PASS`
+  and `SASL`), with wildmats. Commands may be pipelined. Everything that
+  touches the news runs on the storage pool and writes its answer into a
+  bounded pipe that the connection empties as it drains, so a slow client
+  slows the read of the store and a client that stops reading is closed after
+  `write_stall_timeout`; articles are dot-stuffed by a state machine that holds
+  no line. A 192 MiB article peaks at about 127 KiB of heap. A posted article
+  reaches a `PostSink` dot-unstuffed in pieces of at most 64 KiB, one write at
+  a time; the stock sink keeps only the header block to find the groups, adds a
+  `Message-ID` and a `Date` if they are missing, and aborts every append if the
+  post fails or the client goes away. Passwords are refused (`483`) on a
+  connection that is not encrypted unless `allow_cleartext_auth` is set,
+  `require_authentication` answers news commands with `480` until the client
+  has authenticated, `STARTTLS` discards bytes sent ahead of the handshake and
+  resets the session, and a connection whose credentials are refused
+  `max_auth_failures` times is closed. `NntpService::with_telemetry` exports
+  `nntp.server.*` metrics (`hopf_otel::NntpServerMetrics`, new) and a trace for
+  each connection.
+- **hopf-core testing:** the test `Peer` lets a handler start TLS and records
+  the request (`Peer::tls_started`); the handshake is completed with
+  `Peer::secure`.
+
 - **hopf-redis (new crate):** an async Redis and Valkey client (#527), behind
   the `redis` feature of `hopf`. `RedisClient::connect(&reactor, RedisConfig)`
   is one pipelined connection bound to a reactor: commands from any thread, each
@@ -230,6 +258,12 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
   longer makes a test wait for the time to pass: the peer's clock skips ahead.
 
 ### Fixed
+
+- **hopf-nntp client:** a `283` reply to `AUTHINFO SASL` (success, with data for
+  the client, which SCRAM sends as the server's signature) was treated as a
+  failed login. It is now accepted, and the data is checked.
+- **hopf-imap:** the body structure follows rmimeparser 0.7, whose
+  `MimeHandler::content_id` takes the local part and the domain.
 
 - **hopf-dns:** `DnsResolver::add_server_dot` (and an auto-selected DoT
   upstream) no longer runs each query on its own thread against a blocking

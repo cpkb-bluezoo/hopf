@@ -117,7 +117,7 @@ pub use hopf_pop3 as pop3;
 #[cfg(feature = "imap")]
 pub use hopf_imap as imap;
 
-/// NNTP / NNTPS async client.
+/// NNTP / NNTPS server and async client.
 #[cfg(feature = "nntp")]
 pub use hopf_nntp as nntp;
 #[cfg(feature = "redis")]

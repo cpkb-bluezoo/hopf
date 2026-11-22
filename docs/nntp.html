@@ -77,9 +77,61 @@
     <main class="main">
       <header>
         <h1>NNTP</h1>
-        <p class="lead"><code>hopf-nntp</code> is an NNTP / NNTPS <strong>async client</strong> (RFC 3977, STARTTLS per RFC 4642, AUTHINFO per RFC 4643). It dials, greets, reads <code>CAPABILITIES</code>, negotiates TLS and authenticates for you, then hands your handler a session that queues commands from any thread and answers through callbacks. There is no server in this crate.</p>
+        <p class="lead"><code>hopf-nntp</code> is an NNTP / NNTPS <strong>news reader server</strong> and <strong>async client</strong> (RFC 3977, STARTTLS per RFC 4642, AUTHINFO per RFC 4643). The server serves the mailboxes of a mailbox store as newsgroups, or any other source of articles through a handler, streaming every article in constant memory. The client dials, greets, reads <code>CAPABILITIES</code>, negotiates TLS and authenticates for you, then hands your handler a session that queues commands from any thread and answers through callbacks.</p>
       </header>
-      <h2 id="features">Features</h2>
+      <h2 id="server">Server</h2>
+<p><code>NntpService</code> registers a listener on a <code>Runtime</code> and serves <strong>reader mode</strong> only (no <code>IHAVE</code>, no <code>NEWNEWS</code>, no transit). By default each mailbox of a <code>MailboxStore</code> is a newsgroup: its name with the store's hierarchy delimiter written as <code>.</code> (the mailbox <code>comp/lang/rust</code> is <code>comp.lang.rust</code>), and a message's article number is its UID, so numbers never change and are never reused. A Maildir store always has an <code>INBOX</code>, which is listed as a group of that name. The store is opened for one user, <code>news</code> unless <code>DefaultNntpHandlerFactory::with_store_user</code> says otherwise, whoever the client authenticates as.</p>
+<pre class="rust,ignore"><code>use std::sync::Arc;
+use hopf_core::{Runtime, RuntimeConfig};
+use hopf_mailbox::MaildirFactory;
+use hopf_nntp::{NntpConfig, NntpService};
+
+let rt = Arc::new(Runtime::start(RuntimeConfig::default())?);
+let spool = Arc::new(MaildirFactory::new(&quot;/var/spool/news&quot;));
+let config = NntpConfig::new(&quot;0.0.0.0:119&quot;.parse()?, &quot;news.example.com&quot;)
+    .with_credentials(credentials)   // Arc&lt;dyn CredentialStore&gt;; AUTHINFO is offered
+    .with_tls(acceptor);             // STARTTLS is offered
+let service = NntpService::new(config, rt, spool);
+let addr = service.start()?;         // service.stop() stops accepting</code></pre>
+<p>For NNTPS add <code>.implicit_tls()</code> to the configuration (and listen on 563). A service is not built from Composition XML: like POP3 and IMAP it needs the <code>Runtime</code>, so wire it with <code>Composition::runtime()</code> and <code>Composition::listen_tcp(service.control_listener())</code>. The listener's <a href="runtime-options.html#connection-limits">connection limits</a>, ACL and accept rate limit apply as to any other.</p>
+<p>A runnable version is <code>examples/nntp</code> (<code>cargo run -p nntp</code>). It has been run against Python's <code>nntplib</code> (every reader command, <code>AUTHINFO USER</code>/<code>PASS</code> and a post) and, for STARTTLS, OpenSSL's <code>s_client -starttls nntp</code>.</p>
+<h3 id="server-commands">Commands</h3>
+<p><code>CAPABILITIES</code>, <code>MODE READER</code>, <code>DATE</code>, <code>HELP</code>, <code>QUIT</code>, <code>GROUP</code>, <code>LISTGROUP</code>, <code>LAST</code>, <code>NEXT</code>, <code>ARTICLE</code>, <code>HEAD</code>, <code>BODY</code>, <code>STAT</code>, <code>LIST</code> (<code>ACTIVE</code>, <code>NEWSGROUPS</code>, <code>OVERVIEW.FMT</code>), <code>NEWGROUPS</code>, <code>OVER</code> and <code>HDR</code> (with <code>XOVER</code> and <code>XHDR</code>), <code>POST</code>, <code>STARTTLS</code> and <code>AUTHINFO</code> (<code>USER</code>/<code>PASS</code> and <code>SASL</code>). Wildmats (RFC 3977 section 4.2) are supported wherever a command takes one. A client may pipeline: commands are read one at a time and the bytes behind a command wait in the connection's ring until it has been answered, so answers come back in order.</p>
+<h3 id="server-streaming">Streaming and memory</h3>
+<p>Everything that touches the news runs on the runtime's storage pool, against a handler whose methods may block. A command writes its answer into a bounded pipe (16 KiB chunks, 128 KiB held) that the connection empties as its output drains, so a client that reads slowly slows the read of the store instead of the answer piling up in memory. A client that has not taken what is waiting for <code>write_stall_timeout</code> (default 120 s) is closed, and a client that goes away releases the storage thread at once. Articles are dot-stuffed by a state machine that holds no line, however long. A 192 MiB article peaks at about 127 KiB of heap, and posting one at about 149 KiB (<code>tests/memory_bound.rs</code>, a counting allocator).</p>
+<h3 id="server-post">Posting</h3>
+<p><code>POST</code> answers <code>340</code> and the article then reaches a <code>PostSink</code> dot-unstuffed, in pieces of at most 64 KiB, never whole. One piece is written at a time and the connection reads no more of the client's article until the write has returned, so a store that falls behind slows the client. The stock sink keeps only the header block (up to 64 KiB) to read <code>Newsgroups</code>; it requires <code>Newsgroups</code>, <code>From</code> and <code>Subject</code>, adds a <code>Message-ID</code> and a <code>Date</code> if the article has none, files the article in each named group that exists, and streams the rest into them. An article that cannot be filed gets <code>441</code> with the reason, and nothing is kept; if the client goes away mid-article the appends are aborted. An article over <code>max_post_size</code> (default 64 MiB, <code>None</code> for no limit) is read, thrown away and refused. Posting is refused with <code>440</code> when <code>posting_allowed</code> is false, and a store that cannot append refuses the post.</p>
+<h3 id="server-security">TLS and authentication</h3>
+<ul>
+<li><code>STARTTLS</code> is offered when an acceptor is configured and the connection is neither encrypted nor authenticated. A client that sends bytes ahead of the handshake is disconnected, and after the handshake the server forgets what the client had selected (RFC 4642 section 2.2.2).</li>
+<li><code>AUTHINFO USER</code>/<code>PASS</code> and <code>AUTHINFO SASL</code> run against the <code>CredentialStore</code> given to <code>with_credentials</code>, on the storage pool. The mechanisms offered are those the store supports. A password, or a mechanism that sends one in the clear, is refused with <code>483</code> and not advertised on a connection that is not encrypted, unless <code>allow_cleartext_auth</code> is set; SCRAM is offered either way. <code>EXTERNAL</code> is offered only when the client presented a certificate.</li>
+<li><code>require_authentication</code> answers every command that reads or posts news with <code>480</code> until the client has authenticated.</li>
+<li>A connection whose credentials are refused <code>max_auth_failures</code> times (default 3, 0 for no limit) is closed with <code>400</code>. There is no delay between attempts and no lockout across connections; put an <a href="access-control.html">access control</a> rate limit in front if you need one.</li>
+</ul>
+<h3 id="server-handlers">Handlers</h3>
+<p>The stock handler can be replaced to serve any other source of articles. <code>NntpHandlerFactory::create</code> makes a <code>ClientConnected</code> for each connection, which accepts it (naming the greeting and giving the <code>ReaderHandler</code>) or refuses it. <code>ReaderHandler</code> has the news: <code>select_group</code>, <code>article_numbers</code>, <code>locate_number</code>, <code>locate_message_id</code>, <code>read_article</code> (the article's octets, given to a callback that says whether the server wants more), <code>groups</code>, and optionally <code>new_groups</code>, <code>begin_post</code> (returning a <code>PostSink</code>), <code>authorize</code>, and <code>summarise</code> / <code>overview</code>, which by default read the article. Its methods run on the storage pool and may block.</p>
+<h3 id="server-config">Configuration</h3>
+<table>
+<thead>
+<tr><th><code>NntpConfig</code> field</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>listen</code>, <code>hostname</code></td><td>(given)</td><td>Where to listen; the name in the greeting and in added <code>Message-ID</code>s</td></tr>
+<tr><td><code>posting_allowed</code></td><td>true</td><td>Greet with <code>200</code> (not <code>201</code>) and accept <code>POST</code></td></tr>
+<tr><td><code>tls_acceptor</code>, <code>implicit_tls</code></td><td>none, false</td><td>STARTTLS, or TLS from the first byte</td></tr>
+<tr><td><code>credentials</code></td><td>none</td><td>Offers <code>AUTHINFO</code> against this store</td></tr>
+<tr><td><code>authentication_required</code></td><td>false</td><td>Answer news commands with <code>480</code> until authenticated</td></tr>
+<tr><td><code>allow_cleartext_auth</code></td><td>false</td><td>Accept passwords on a connection that is not encrypted</td></tr>
+<tr><td><code>max_auth_failures</code></td><td>3</td><td>Refused credentials before the connection is closed</td></tr>
+<tr><td><code>max_post_size</code></td><td>64 MiB</td><td>Largest article <code>POST</code> accepts</td></tr>
+<tr><td><code>idle_timeout</code></td><td>10 min</td><td>Silence, both ways, before the connection is closed</td></tr>
+<tr><td><code>write_stall_timeout</code></td><td>120 s</td><td>How long output may wait for a client that is not reading</td></tr>
+</tbody>
+</table>
+<h3 id="server-metrics">Metrics</h3>
+<p>Process-local <code>NntpServerMetrics</code> via <code>NntpService::metrics()</code>: connections, commands, articles retrieved and posted, authentications, <code>STARTTLS</code> upgrades. With <code>NntpService::with_telemetry(&amp;pipeline)</code>, <code>hopf_otel::NntpServerMetrics</code> emits <code>nntp.server.connections</code>, <code>nntp.server.active_connections</code>, <code>nntp.server.session.duration</code> (ms), <code>nntp.server.commands</code> (<code>nntp.command</code>), <code>nntp.server.auth</code> (<code>mechanism</code>, <code>result</code>), <code>nntp.server.articles</code> and <code>nntp.server.article.duration</code> (<code>nntp.article</code>: <code>retrieved</code> or <code>posted</code>, and <code>outcome</code>), <code>nntp.server.bytes_sent</code> (per connection, when it closes) and <code>nntp.server.starttls</code>. With traces enabled each connection is a trace, <code>ARTICLE</code>, <code>HEAD</code>, <code>BODY</code> and posts are spans in it, and handlers find the W3C <code>traceparent</code> in <code>NntpConnectionMetadata</code>.</p>
+<h2 id="client">Client</h2>
+<h3 id="features">Features</h3>
 <table>
 <colgroup>
 <col style="width: 40%" />
@@ -114,10 +166,10 @@
 </tr>
 </tbody>
 </table>
-<h2 id="session-api">Session API</h2>
+<h3 id="session-api">Session API</h3>
 <p><code>NntpClientHandler::on_connected(&amp;NntpSession, &amp;NntpGreeting)</code> fires once the session is usable; the greeting carries the capabilities, whether posting is allowed, and whether the connection is secure and authenticated. Clone the <code>NntpSession</code> and keep it: commands may be queued from any thread, go out one at a time in queue order, and each completion callback receives the final <code>NntpStatus</code> (or the transport error that ended the session, which every still-queued command also hears). <code>quit()</code> sends <code>QUIT</code> and closes once it is answered; <code>is_alive()</code> is false after that or once the connection is gone.</p>
 <p>Callbacks run on the connection's reactor thread: hand the data to another thread rather than doing slow work inside them.</p>
-<h2 id="quick-start">Quick start</h2>
+<h3 id="quick-start">Quick start</h3>
 <pre class="rust,ignore"><code>use std::sync::Arc;
 use hopf_core::{public_trust_connector, Runtime, RuntimeConfig};
 use hopf_nntp::{NntpClient, NntpClientHandler, NntpGreeting, NntpSession};
@@ -144,13 +196,15 @@ NntpClient::new(&quot;news.example.com&quot;, 563)
     .implicit_tls(public_trust_connector(&amp;[]), &quot;news.example.com&quot;)
     .credentials(&quot;alice&quot;, &quot;secret&quot;)
     .connect_with(&amp;rt, Box::new(Headlines))?;</code></pre>
-<h2 id="errors">Errors</h2>
+<h3 id="errors">Errors</h3>
 <p><code>NntpClientHandler::on_error</code> reports a refused or timed-out dial, a TLS failure, a required <code>STARTTLS</code> the server did not offer, rejected credentials (<code>PermissionDenied</code>, with the server's <code>481</code>/<code>482</code> text), a command that got no reply within the budget, or the transport going away mid-session. A command the server rejects is not a session error: its own callback gets <code>NntpClientError</code> with the status code and text.</p>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li>Client only; wildmat matching, overview formats beyond the default eight fields, and <code>LIST OVERVIEW.FMT</code> are left to the application.</li>
-<li>One command in flight at a time (no pipelining).</li>
-<li>Integration tests run against a scripted server inside the crate (<code>--features integration</code>).</li>
+<li>Server: reader mode only. <code>OVER</code> reads each article in full to count <code>:lines</code>, which RFC 3977 requires to be exact, so an overview of a large range is slow with the stock handler; a handler with the figures indexed answers faster by overriding <code>summarise</code> or <code>overview</code>.</li>
+<li>Server: the stock handler does not know when a mailbox was created, so <code>NEWGROUPS</code> lists nothing, and a message-id that is not in the selected group is found by opening every group in turn.</li>
+<li>Server: duplicate <code>Message-ID</code>s are not detected on a post.</li>
+<li>Client: wildmat matching, overview formats beyond the default eight fields, and <code>LIST OVERVIEW.FMT</code> are left to the application, and one command is in flight at a time (no pipelining).</li>
+<li>Integration tests (<code>--features integration</code>) run the client against a scripted server and against the real server (<code>tests/roundtrip.rs</code>).</li>
 </ul>
 </main>
   </div>

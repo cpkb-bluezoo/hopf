@@ -9,12 +9,14 @@
 //! on the storage pool and writes its answer into a bounded pipe, which the
 //! reactor empties as the connection drains (see [`crate::server::pipe`]).
 
+use std::cell::Cell;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, Runtime, StorageError};
+use hopf_otel::{ExportHandle, NntpServerMetrics as OtelNntpMetrics, RequestTimer, Span, SpanKind, Trace};
 
 use crate::server::codec::{NntpCommand, NntpServerLexer, MAX_COMMAND_LINE};
 use crate::server::commands::{self, civil_from_days, JobEnd, SessionState};
@@ -76,6 +78,19 @@ struct Job {
     failed: Arc<AtomicBool>,
     /// Has any of the answer been given to the connection?
     sent_any: bool,
+    /// What is being measured, for the commands that move an article.
+    article: Option<ArticleTelemetry>,
+}
+
+/// Timing and a span for the retrieval or posting of one article.
+struct ArticleTelemetry {
+    timer: RequestTimer,
+    span: Option<Span>,
+    /// `retrieved` or `posted`.
+    kind: &'static str,
+    /// The count of such articles when the command began, to tell whether it
+    /// added one.
+    before: u64,
 }
 
 enum Admission {
@@ -135,6 +150,15 @@ pub struct NntpControlHandler {
     /// `STARTTLS` has been answered and the handshake has not finished:
     /// nothing is read until it has.
     tls_pending: bool,
+    /// How the client is authenticating: `USER`, or the SASL mechanism.
+    auth_attempt: Option<String>,
+    otel_metrics: Option<Arc<OtelNntpMetrics>>,
+    export: Option<ExportHandle>,
+    traces_enabled: bool,
+    conn_trace: Option<Trace>,
+    opened_at: Instant,
+    /// Octets handed to the connection.
+    bytes_sent: Cell<u64>,
 }
 
 impl NntpControlHandler {
@@ -159,7 +183,7 @@ impl NntpControlHandler {
             metrics,
             runtime,
             lexer: NntpServerLexer::new(MAX_COMMAND_LINE),
-            meta: NntpConnectionMetadata { peer: unknown, local: unknown, tls: false },
+            meta: NntpConnectionMetadata { peer: unknown, local: unknown, tls: false, traceparent: None },
             handle: None,
             expect_implicit_tls,
             greeted: false,
@@ -172,6 +196,92 @@ impl NntpControlHandler {
             peer_certificate: None,
             auth_failures: 0,
             tls_pending: false,
+            auth_attempt: None,
+            otel_metrics: None,
+            export: None,
+            traces_enabled: false,
+            conn_trace: None,
+            opened_at: Instant::now(),
+            bytes_sent: Cell::new(0),
+        }
+    }
+
+    /// Attaches OTel metrics and traces from a telemetry pipeline.
+    pub fn with_telemetry(
+        mut self,
+        otel_metrics: Option<Arc<OtelNntpMetrics>>,
+        export: Option<ExportHandle>,
+        traces_enabled: bool,
+    ) -> Self {
+        self.otel_metrics = otel_metrics;
+        self.export = export;
+        self.traces_enabled = traces_enabled;
+        self
+    }
+
+    fn begin_connection_telemetry(&mut self) {
+        self.opened_at = Instant::now();
+        if let Some(m) = &self.otel_metrics {
+            m.connection_opened();
+        }
+        if self.traces_enabled {
+            if let Some(export) = self.export.clone() {
+                let t = Trace::new("NNTP connection", SpanKind::Server);
+                t.set_exporter(export);
+                self.meta.traceparent = Some(t.traceparent());
+                self.conn_trace = Some(t);
+            }
+        }
+    }
+
+    fn end_connection_telemetry(&mut self) {
+        if let Some(trace) = self.conn_trace.take() {
+            let root = trace.root_span();
+            root.set_status_ok();
+            root.end();
+            trace.end();
+        }
+        self.meta.traceparent = None;
+        if let Some(m) = &self.otel_metrics {
+            m.connection_closed(self.opened_at.elapsed(), self.bytes_sent.get());
+        }
+    }
+
+    /// Starts timing a command that moves an article, if telemetry is on.
+    fn begin_article_telemetry(&self, kind: &'static str) -> Option<ArticleTelemetry> {
+        if self.otel_metrics.is_none() && self.conn_trace.is_none() {
+            return None;
+        }
+        let span = self.conn_trace.as_ref().map(|t| {
+            t.start_span(if kind == "posted" { "NNTP post" } else { "NNTP retrieve" }, SpanKind::Server)
+        });
+        let counter = if kind == "posted" { &self.metrics.articles_posted } else { &self.metrics.articles_retrieved };
+        Some(ArticleTelemetry { timer: RequestTimer::start(), span, kind, before: counter.load(Ordering::Relaxed) })
+    }
+
+    fn finish_article_telemetry(&self, telemetry: ArticleTelemetry, failed: bool) {
+        let counter = if telemetry.kind == "posted" { &self.metrics.articles_posted } else { &self.metrics.articles_retrieved };
+        // A command that did not move an article (no such article, a refused
+        // post) is not an article event.
+        if counter.load(Ordering::Relaxed) == telemetry.before && !failed {
+            if let Some(span) = telemetry.span {
+                span.end();
+            }
+            return;
+        }
+        let outcome = if failed { "fail" } else { "ok" };
+        if let Some(span) = telemetry.span {
+            span.set_attribute("nntp.article", telemetry.kind);
+            span.set_attribute("outcome", outcome);
+            if failed {
+                span.set_status_error(outcome);
+            } else {
+                span.set_status_ok();
+            }
+            span.end();
+        }
+        if let Some(m) = &self.otel_metrics {
+            m.article(telemetry.kind, outcome, telemetry.timer.elapsed());
         }
     }
 
@@ -182,6 +292,7 @@ impl NntpControlHandler {
     }
 
     fn send(&self, ep: &mut dyn Endpoint, bytes: &[u8]) {
+        self.bytes_sent.set(self.bytes_sent.get() + bytes.len() as u64);
         ep.send(bytes);
     }
 
@@ -229,6 +340,9 @@ impl NntpControlHandler {
 
     fn dispatch(&mut self, ep: &mut dyn Endpoint, command: NntpCommand) {
         NntpServerMetrics::add(&self.metrics.commands, 1);
+        if let Some(m) = &self.otel_metrics {
+            m.command(command.name());
+        }
         if command == NntpCommand::Post && !self.posting_allowed {
             self.say(ep, 440, "Posting not permitted");
             return;
@@ -441,6 +555,20 @@ impl NntpControlHandler {
         let job_end = Arc::clone(&end);
         let job_failed = Arc::clone(&failed);
         let job_pipe = pipe.clone();
+        let article = match &kind {
+            JobKind::Command(NntpCommand::Article(_) | NntpCommand::Head(_) | NntpCommand::Body(_)) => {
+                self.begin_article_telemetry("retrieved")
+            }
+            JobKind::PostCommit => self.begin_article_telemetry("posted"),
+            _ => None,
+        };
+        match &kind {
+            JobKind::AuthPassword { .. } => self.auth_attempt = Some("USER".to_string()),
+            JobKind::AuthSasl(commands::SaslStep::Begin { mechanism, .. }) => {
+                self.auth_attempt = Some(mechanism.name().to_string());
+            }
+            _ => {}
+        }
         ep.pause_read();
         self.runtime.storage().submit_on(
             handle.clone(),
@@ -480,7 +608,7 @@ impl NntpControlHandler {
                 handle.with_endpoint(|ep| ep.poke_handler());
             },
         );
-        self.job = Some(Job { pipe, end, failed, sent_any: false });
+        self.job = Some(Job { pipe, end, failed, sent_any: false, article });
     }
 
     /// Hands the connection what the running job has produced, as the
@@ -506,6 +634,7 @@ impl NntpControlHandler {
                 Poll::Data(chunks) => {
                     job.sent_any = true;
                     for chunk in &chunks {
+                        self.bytes_sent.set(self.bytes_sent.get() + chunk.len() as u64);
                         ep.send(chunk);
                     }
                     self.write_pending.store(true, Ordering::Relaxed);
@@ -526,8 +655,12 @@ impl NntpControlHandler {
     }
 
     fn finish_job(&mut self, ep: &mut dyn Endpoint) {
-        let Some(job) = self.job.take() else { return };
+        let Some(mut job) = self.job.take() else { return };
         let end = *job.end.lock().unwrap_or_else(|e| e.into_inner());
+        let broken = job.failed.load(Ordering::Relaxed) || end.is_none() || end == Some(JobEnd::Fatal);
+        if let Some(telemetry) = job.article.take() {
+            self.finish_article_telemetry(telemetry, broken);
+        }
         if job.failed.load(Ordering::Relaxed) || end.is_none() {
             hopf_core::subsystem_log(
                 hopf_core::LogLevel::Error,
@@ -548,9 +681,17 @@ impl NntpControlHandler {
             return;
         }
         match end {
-            Some(JobEnd::AuthOk) => NntpServerMetrics::add(&self.metrics.auth_ok, 1),
+            Some(JobEnd::AuthOk) => {
+                NntpServerMetrics::add(&self.metrics.auth_ok, 1);
+                if let (Some(m), Some(mech)) = (&self.otel_metrics, self.auth_attempt.take()) {
+                    m.auth(&mech, true);
+                }
+            }
             Some(JobEnd::AuthFailed) => {
                 NntpServerMetrics::add(&self.metrics.auth_fail, 1);
+                if let (Some(m), Some(mech)) = (&self.otel_metrics, self.auth_attempt.take()) {
+                    m.auth(&mech, false);
+                }
                 self.auth_failures += 1;
                 let limit = self.config.max_auth_failures;
                 if limit > 0 && self.auth_failures >= limit {
@@ -642,6 +783,7 @@ impl ProtocolHandler for NntpControlHandler {
             self.meta.tls = true;
         }
         self.handle = Some(ep.handle());
+        self.begin_connection_telemetry();
         if !self.expect_implicit_tls || self.meta.tls {
             self.greet(ep);
         }
@@ -698,6 +840,7 @@ impl ProtocolHandler for NntpControlHandler {
             client.disconnected();
         }
         self.close_reader();
+        self.end_connection_telemetry();
     }
 
     fn security_established(&mut self, ep: &mut dyn Endpoint, info: &hopf_core::SecurityInfo) {
@@ -715,6 +858,9 @@ impl ProtocolHandler for NntpControlHandler {
             self.pending_user = None;
             *self.shared.session.lock().unwrap_or_else(|e| e.into_inner()) = SessionState::default();
             NntpServerMetrics::add(&self.metrics.starttls, 1);
+            if let Some(m) = &self.otel_metrics {
+                m.starttls();
+            }
             ep.poke_handler();
         }
     }

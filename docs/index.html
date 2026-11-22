@@ -277,6 +277,7 @@
 </ul>
 <h3 id="nntp-hopf-nntp">NNTP (<code>hopf-nntp</code>)</h3>
 <ul>
+<li>News reader server (RFC 3977, 4642, 4643): the mailboxes of a store served as newsgroups, GROUP / LISTGROUP / ARTICLE / HEAD / BODY / STAT / OVER / HDR / LIST / NEWGROUPS, wildmats, streamed <code>POST</code>, STARTTLS or implicit TLS, AUTHINFO USER-PASS and SASL; articles stream in constant memory with backpressure</li>
 <li>Async NNTP / NNTPS client (RFC 3977, 4642, 4643): greeting, CAPABILITIES, STARTTLS or implicit TLS, AUTHINFO SASL / USER-PASS</li>
 <li><code>NntpSession</code> command queue usable from any thread; LIST ACTIVE, GROUP, OVER, ARTICLE, HEAD, POST, QUIT helpers; multi-line replies streamed and dot-unstuffed</li>
 </ul>
@@ -426,9 +427,9 @@
 <tr>
 <td>NNTP / NNTPS</td>
 <td><code>hopf-nntp</code></td>
-<td style="text-align: center;">-</td>
 <td style="text-align: center;">✓</td>
-<td>callback-driven client (<code>NntpSession</code>)</td>
+<td style="text-align: center;">✓</td>
+<td>reader server (<code>NntpService</code>); callback-driven client (<code>NntpSession</code>)</td>
 </tr>
 <tr>
 <td>Redis / Valkey (RESP2, RESP3)</td>

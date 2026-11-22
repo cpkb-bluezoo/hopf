@@ -136,6 +136,37 @@ pub enum NntpCommand {
     TooLong,
 }
 
+impl NntpCommand {
+    /// The command's name, for metrics: the upper-case verb, or `OTHER` for a
+    /// line that was not a command.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Capabilities => "CAPABILITIES",
+            Self::ModeReader => "MODE",
+            Self::Quit => "QUIT",
+            Self::Help => "HELP",
+            Self::Date => "DATE",
+            Self::Group(_) => "GROUP",
+            Self::ListGroup(..) => "LISTGROUP",
+            Self::Last => "LAST",
+            Self::Next => "NEXT",
+            Self::Article(_) => "ARTICLE",
+            Self::Head(_) => "HEAD",
+            Self::Body(_) => "BODY",
+            Self::Stat(_) => "STAT",
+            Self::List(_) => "LIST",
+            Self::NewGroups(_) => "NEWGROUPS",
+            Self::Over(_) => "OVER",
+            Self::Hdr(..) => "HDR",
+            Self::Post => "POST",
+            Self::StartTls => "STARTTLS",
+            Self::AuthinfoUser(_) | Self::AuthinfoPass(_) | Self::AuthinfoSasl { .. } => "AUTHINFO",
+            Self::SaslResponse(_) | Self::SaslAbort | Self::SaslInvalid => "AUTHINFO",
+            Self::Unknown(_) | Self::Malformed(_) | Self::TooLong => "OTHER",
+        }
+    }
+}
+
 /// The incremental parser. See the module documentation.
 #[derive(Debug)]
 pub struct NntpServerLexer {
@@ -565,6 +596,14 @@ mod tests {
     fn an_unknown_command_is_named_in_upper_case() {
         assert_eq!(one("ihave <a@b>"), NntpCommand::Unknown("IHAVE".into()));
         assert_eq!(one("NEWNEWS * 20260101 000000"), NntpCommand::Unknown("NEWNEWS".into()));
+    }
+
+    #[test]
+    fn commands_have_names_for_metrics() {
+        assert_eq!(one("xover 1-2").name(), "OVER");
+        assert_eq!(one("authinfo user x").name(), "AUTHINFO");
+        assert_eq!(one("bogus").name(), "OTHER");
+        assert_eq!(one("GROUP").name(), "OTHER");
     }
 
     #[test]

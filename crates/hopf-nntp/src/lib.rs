@@ -4,7 +4,7 @@
 //!
 //! The server ([`NntpService`]) serves the mailboxes of a mailbox store as
 //! newsgroups to news readers, or any other source of articles through a
-//! [`ReaderHandler`]; see the [`server`] types for the handler SPI.
+//! [`ReaderHandler`]; see [`NntpHandlerFactory`] and [`ReaderHandler`] for the handler SPI.
 //!
 //! The client mirrors the POP3 and IMAP clients: a DNS-aware facade
 //! ([`NntpClient`]) dials on the [`hopf_core::Runtime`], runs the greeting,
