@@ -337,6 +337,9 @@ struct Inner {
     /// Where the nodes' RESP3 pushes go.
     push: Mutex<PushSinks>,
     refreshes: AtomicUsize,
+    /// Told whenever a layout is taken, for what is built on it (a cluster
+    /// subscriber follows the layout this way).
+    layout_listeners: Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
     /// Numbers each sending of a `WAIT`.
     wait_sends: AtomicU64,
 }
@@ -367,6 +370,7 @@ impl RedisCluster {
             closed: AtomicBool::new(false),
             push: Mutex::new(PushSinks::default()),
             refreshes: AtomicUsize::new(0),
+            layout_listeners: Mutex::new(Vec::new()),
             wait_sends: AtomicU64::new(0),
         });
         request_refresh(&inner);
@@ -821,6 +825,33 @@ impl RedisCluster {
     /// The masters in the current layout.
     pub fn masters(&self) -> Vec<(String, u16)> {
         self.inner.state.lock().unwrap().masters.iter().map(|a| (a.host.clone(), a.port)).collect()
+    }
+
+    /// Read the layout while holding it: the slot table, and the masters in it.
+    /// `f` must not call back into the cluster.
+    pub(crate) fn with_layout<R>(&self, f: impl FnOnce(&[Option<Arc<NodeAddr>>], &[Arc<NodeAddr>]) -> R) -> R {
+        let st = self.inner.state.lock().unwrap();
+        f(&st.slots, &st.masters)
+    }
+
+    /// Call `f` each time a layout is taken (it may be the same as the last).
+    pub(crate) fn on_layout(&self, f: impl Fn() + Send + Sync + 'static) {
+        self.inner.layout_listeners.lock().unwrap().push(Arc::new(f));
+    }
+
+    /// The configuration of a connection to `node`, as the cluster's own are made.
+    pub(crate) fn node_config(&self, node: &NodeAddr) -> RedisConfig {
+        self.inner.config.for_node(node)
+    }
+
+    /// The reactor the cluster is bound to.
+    pub(crate) fn reactor(&self) -> &ReactorHandle {
+        &self.inner.reactor
+    }
+
+    /// Whether the cluster has been closed.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::SeqCst)
     }
 
     /// Whether the layout is known.
@@ -1494,6 +1525,10 @@ fn apply(inner: &Arc<Inner>, ranges: Vec<SlotRange>) {
         match work {
             job => dispatch(inner, job, false),
         }
+    }
+    let listeners = inner.layout_listeners.lock().unwrap().clone();
+    for listener in listeners {
+        listener();
     }
 }
 

@@ -75,6 +75,22 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
   kilobytes at most. `tests/api_audit.rs` fails if a public signature
   reintroduces an unbounded type. `hopf-core` gained a `pause_read` fix so a
   paused connection is held by TCP and loses nothing.
+- **hopf-redis: cluster publish/subscribe** (#538). `RedisClusterSubscriber`
+  keeps one `RedisSubscriber` per node that needs one, on the layout a
+  `RedisCluster` keeps, and reconciles them whenever the layout changes. A
+  classic channel or pattern is subscribed on one master, and moves to another
+  (subscribing everything again) when that node's connection is lost or it leaves
+  the cluster. A shard channel is subscribed on the master that owns its slot and
+  follows the slot: on a `MOVED` reply, on the `sunsubscribe` a server pushes
+  when it loses the slot, and on a new layout; the new owner has acknowledged
+  before the old is released. Keyspace and keyevent patterns
+  (`subscribe_keyspace`) are subscribed on every master, following masters as they
+  join and leave. Each node's connection has a handler made for it, so one
+  connection's messages never interleave with another's. The documentation says
+  what is guaranteed (no duplicates from the arrangement, subscribe before
+  unsubscribe, nothing dropped silently) and what is not (at-most-once, as Redis).
+  Tested against scripted nodes and a real Redis cluster, including a slot
+  migrated away and back, and a failover.
 - **hopf-redis:** `WAIT` and `WAITAOF` bound to the connection of the write
   (#532). `RedisCluster::wait_replicas(slot_key, n, timeout_ms, cb)` and
   `wait_aof(...)` send the command behind the last command submitted for the

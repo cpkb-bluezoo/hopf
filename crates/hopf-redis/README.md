@@ -46,6 +46,13 @@ speaking RESP2 and RESP3.
   `wait_replicas` and `wait_aof` run `WAIT` and `WAITAOF` on the connection
   that carried the write they confirm. Works with Redis Cluster and Valkey
   Cluster.
+- **Cluster publish/subscribe:** `RedisClusterSubscriber` keeps one subscriber
+  connection per node that needs one, on the layout a `RedisCluster` keeps. A
+  classic channel is subscribed on one master and moves, subscribing again, if
+  that node is lost; a shard channel is on the master that owns its slot and
+  follows the slot (`MOVED`, a server's `sunsubscribe`, a new layout), the new
+  owner subscribed before the old is released; keyspace notifications are
+  subscribed on every master and follow masters as they come and go.
 - **An event-driven push RESP parser** (`hopf_redis::resp`) that holds none of
   the stream and has no limit on a string's or an aggregate's size, because it
   holds neither. It tells a sink what it reads, with a string's payload as

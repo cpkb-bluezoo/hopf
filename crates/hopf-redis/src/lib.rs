@@ -11,7 +11,8 @@
 //! publish/subscribe that reconnects and subscribes again by itself.
 //! [`RedisCluster`] sends each command to the master of a Redis Cluster or
 //! Valkey Cluster that owns its key's slot, and follows the cluster as slots
-//! move and nodes fail over.
+//! move and nodes fail over; [`RedisClusterSubscriber`] does the same for
+//! subscriptions.
 //!
 //! # Payloads stream; identifiers are bounded
 //!
@@ -70,6 +71,7 @@
 mod argstream;
 mod client;
 mod cluster;
+mod clustersub;
 mod collect;
 mod commands;
 mod config;
@@ -83,6 +85,7 @@ mod topology;
 pub use argstream::{ArgFactory, ArgSource, SourceCtl, SourceRead, SourceWaker, StreamArg};
 pub use client::{Callback, Command, Deadline, RedisClient, Reply, ScalarValue, StreamHandle};
 pub use cluster::{ClusterConfig, RedisCluster};
+pub use clustersub::RedisClusterSubscriber;
 pub use commands::SetOptions;
 pub use config::RedisConfig;
 pub use sinks::{

@@ -62,6 +62,11 @@ name = "cluster_scripted"
 path = "tests/cluster_scripted.rs"
 required-features = ["integration"]
 
+[[test]]
+name = "cluster_pubsub_scripted"
+path = "tests/cluster_pubsub_scripted.rs"
+required-features = ["integration"]
+
 # Measures peak heap with a counting allocator, so it has no test harness: see
 # the file's comment.
 [[test]]

@@ -45,6 +45,8 @@ const RETURNS: &[(&str, &str)] = &[
     ("Option<&str>", "text of a scalar or an error"),
     ("Option<&[u8]>", "a field of what the caller built, or a header the library bounded"),
     ("&Self", "a builder"),
+    ("(Vec<Bytes>,Vec<Bytes>,Vec<Bytes>,Vec<Bytes>)", "RedisClusterSubscriber::subscriptions: what the application itself subscribed to"),
+    ("Vec<(NodeAddr,bool)>", "RedisClusterSubscriber::connections: the nodes in use, a number the layout sets"),
     ("&'a[u8]", "MessageHeader: the channel, an identifier bounded by max_field"),
     ("Option<&'a[u8]>", "MessageHeader: the pattern, an identifier bounded by max_field"),
     ("SubscriptionKind", "a tag"),
@@ -155,7 +157,7 @@ fn is_small_return(t: &str) -> bool {
 }
 
 fn audited_files() -> Vec<&'static str> {
-    vec!["client.rs", "cluster.rs", "commands.rs", "sinks.rs", "pubsub.rs", "config.rs", "argstream.rs", "keys.rs", "topology.rs"]
+    vec!["client.rs", "cluster.rs", "commands.rs", "sinks.rs", "pubsub.rs", "config.rs", "argstream.rs", "keys.rs", "topology.rs", "clustersub.rs"]
 }
 
 #[test]

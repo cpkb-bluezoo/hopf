@@ -24,7 +24,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use hopf_core::{Bytes, Runtime};
-use hopf_redis::{ClusterConfig, Command, RedisClient, RedisCluster, RedisConfig, RedisError};
+use hopf_redis::{ClusterConfig, Command, RedisClient, RedisCluster, RedisClusterSubscriber, RedisConfig, RedisError};
 
 use common::collect::Tree;
 use common::*;
@@ -722,5 +722,268 @@ fn a_failover_is_followed() {
     call!(|cb| c.del(&[&k], cb)).unwrap();
     // Leave nothing for the next test to find half way.
     wait_converged(&rt, &all_nodes, slot, &(m_host.clone(), m_port), &(r_host.clone(), r_port));
+    rt.shutdown();
+}
+
+// ---- publish/subscribe ----
+
+/// A subscriber whose every node's handler is a clone of `rec`, so that what the
+/// whole cluster says is one list of events.
+fn subscriber(c: &RedisCluster, rec: &Recorder) -> RedisClusterSubscriber {
+    let rec = rec.clone();
+    let sub = RedisClusterSubscriber::connect(c, move |_node| Box::new(rec.clone()));
+    sub.check_interval(Duration::from_millis(200));
+    sub
+}
+
+fn messages_on(rec: &Recorder, channel: &str) -> Vec<String> {
+    rec.messages().into_iter().filter(|m| m.channel == channel.as_bytes()).map(|m| String::from_utf8_lossy(&m.payload).into_owned()).collect()
+}
+
+/// Publish to `channel` (as a shard channel, or not) every so often until the
+/// subscriber has heard something on it: a message published while a subscription is
+/// moving is lost, as Redis loses it, and a test must not depend on the timing.
+fn publish_until_heard(publisher: &RedisCluster, rec: &Recorder, channel: &str, shard: bool, tag: &str) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut n = 0;
+    loop {
+        let heard: Vec<String> = messages_on(rec, channel).into_iter().filter(|p| p.starts_with(tag)).collect();
+        if !heard.is_empty() {
+            return heard;
+        }
+        assert!(Instant::now() < deadline, "no message on {channel} was ever heard ({tag})");
+        let payload = format!("{tag}-{n}");
+        n += 1;
+        if shard {
+            let _ = call!(|cb| publisher.spublish(channel, &payload, cb));
+        } else {
+            let _ = call!(|cb| publisher.publish(channel, &payload, cb));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn subscribed(rec: &Recorder, kind: hopf_redis::SubscriptionKind) -> usize {
+    rec.events().iter().filter(|e| matches!(e, Event::Change(hopf_redis::SubscriptionChange::Subscribed { kind: k, .. }) if *k == kind)).count()
+}
+
+#[test]
+fn shard_channels_on_different_nodes_each_receive_what_is_spublished_to_them() {
+    let (seed, _calm) = cluster_or_skip!();
+    let rt = runtime();
+    let c = connect(&rt, &seed);
+    let publisher = connect(&rt, &seed);
+    let rec = Recorder::default();
+    let sub = subscriber(&c, &rec);
+    let (one, two) = (key_in(0..=5460, "shard"), key_in(10923..=16383, "shard"));
+    sub.ssubscribe(&[&one, &two]);
+    rec.wait_for("both subscriptions", |_| subscribed(&rec, hopf_redis::SubscriptionKind::Shard) == 2);
+    assert_eq!(sub.connections().len(), 2, "one connection to each owner");
+    assert_eq!(call!(|cb| publisher.spublish(&one, "to-one", cb)).unwrap(), 1);
+    assert_eq!(call!(|cb| publisher.spublish(&two, "to-two", cb)).unwrap(), 1);
+    rec.wait_for("both messages", |_| !messages_on(&rec, &one).is_empty() && !messages_on(&rec, &two).is_empty());
+    assert_eq!(messages_on(&rec, &one), vec!["to-one"]);
+    assert_eq!(messages_on(&rec, &two), vec!["to-two"]);
+    sub.close();
+    rt.shutdown();
+}
+
+/// The value of `notify-keyspace-events` on a node, for putting back.
+fn notify_setting(node: &RedisClient) -> String {
+    match run(node, &["CONFIG", "GET", "notify-keyspace-events"]).unwrap() {
+        Tree::Array(v) => v.get(1).and_then(|t| t.as_str().map(str::to_string)).unwrap_or_default(),
+        Tree::Map(m) => m.first().and_then(|(_, v)| v.as_str().map(str::to_string)).unwrap_or_default(),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn keyspace_notifications_arrive_from_every_master() {
+    let (seed, _calm) = cluster_or_skip!();
+    let rt = runtime();
+    let c = connect(&rt, &seed);
+    let masters = c.masters();
+    let admins: Vec<RedisClient> = masters.iter().map(|(h, p)| admin(&rt, h, *p)).collect();
+    let before: Vec<String> = admins.iter().map(notify_setting).collect();
+    for a in &admins {
+        run(a, &["CONFIG", "SET", "notify-keyspace-events", "KEA"]).unwrap();
+    }
+    let rec = Recorder::default();
+    let sub = subscriber(&c, &rec);
+    sub.subscribe_keyspace(&["__keyspace@0__:*"]);
+    rec.wait_for("a subscription on every master", |_| subscribed(&rec, hopf_redis::SubscriptionKind::Pattern) == masters.len());
+
+    let keys = [key_in(0..=5460, "ks"), key_in(5461..=10922, "ks"), key_in(10923..=16383, "ks")];
+    for k in &keys {
+        call!(|cb| c.set(k, "v", cb)).unwrap();
+    }
+    for k in &keys {
+        let channel = format!("__keyspace@0__:{k}");
+        rec.wait_for(&format!("the event for {k}"), |_| messages_on(&rec, &channel).contains(&"set".to_string()));
+    }
+    for k in &keys {
+        let _ = call!(|cb| c.del(&[k], cb));
+    }
+    for (a, old) in admins.iter().zip(&before) {
+        run(a, &["CONFIG", "SET", "notify-keyspace-events", old]).unwrap();
+    }
+    sub.close();
+    rt.shutdown();
+}
+
+#[test]
+fn a_classic_subscription_survives_the_loss_of_the_node_it_was_on() {
+    let (seed, _calm) = cluster_or_skip!();
+    let rt = runtime();
+    let c = connect(&rt, &seed);
+    let publisher = connect(&rt, &seed);
+    let rec = Recorder::default();
+    let sub = subscriber(&c, &rec);
+    let channel = unique("classic");
+    sub.subscribe(&[&channel]);
+    rec.wait_for("the subscription", |_| subscribed(&rec, hopf_redis::SubscriptionKind::Channel) == 1);
+    publish_until_heard(&publisher, &rec, &channel, false, "before");
+
+    // Every node drops its subscribers' connections: the one in use is lost.
+    for (h, p) in c.masters() {
+        let a = admin(&rt, &h, p);
+        run(&a, &["CLIENT", "KILL", "TYPE", "pubsub"]).unwrap();
+    }
+    publish_until_heard(&publisher, &rec, &channel, false, "after");
+    assert!(
+        subscribed(&rec, hopf_redis::SubscriptionKind::Channel) >= 2,
+        "it subscribed again: {:?}",
+        rec.events()
+    );
+    sub.close();
+    rt.shutdown();
+}
+
+#[test]
+fn a_shard_subscription_follows_its_slot_when_the_slot_moves_and_when_it_moves_back() {
+    let (seed, _calm) = cluster_or_skip!();
+    let _turn = exclusive();
+    let rt = runtime();
+    let c = connect(&rt, &seed);
+    let publisher = connect(&rt, &seed);
+    let rec = Recorder::default();
+    let sub = subscriber(&c, &rec);
+    let channel = key_in(0..=5460, "follow");
+    let slot = c.slot_of(&channel);
+    let (a_host, a_port) = c.owner_of(slot).unwrap();
+    let (b_host, b_port) = c.owner_of(10923).unwrap();
+    let (a, bn) = (admin(&rt, &a_host, a_port), admin(&rt, &b_host, b_port));
+
+    sub.ssubscribe(&[&channel]);
+    rec.wait_for("the subscription", |_| subscribed(&rec, hopf_redis::SubscriptionKind::Shard) == 1);
+    publish_until_heard(&publisher, &rec, &channel, true, "home");
+
+    move_empty_slot(&a, &bn, slot);
+    publish_until_heard(&publisher, &rec, &channel, true, "moved");
+    wait_until("the subscription is on the new owner", || {
+        sub.connections().iter().any(|(n, up)| *up && (n.host.as_str(), n.port) == (b_host.as_str(), b_port))
+            && !sub.connections().iter().any(|(n, _)| (n.host.as_str(), n.port) == (a_host.as_str(), a_port))
+    });
+
+    move_empty_slot(&bn, &a, slot);
+    publish_until_heard(&publisher, &rec, &channel, true, "back");
+
+    // No message was heard twice.
+    let all = messages_on(&rec, &channel);
+    let mut distinct = all.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(all.len(), distinct.len(), "a message was delivered twice: {all:?}");
+    sub.close();
+    rt.shutdown();
+}
+
+/// A master's replica, from the master's own view: its address, and every node's.
+fn replica_of(master: &RedisClient) -> ((String, u16), Vec<(String, u16)>) {
+    let master_id = node_id(master);
+    let nodes = match run(master, &["CLUSTER", "NODES"]).unwrap() {
+        Tree::Bulk(t) => String::from_utf8(t.to_vec()).unwrap(),
+        other => panic!("{other:?}"),
+    };
+    let parse = |a: &str| a.split('@').next().and_then(|a| a.rsplit_once(':')).map(|(h, p)| (h.to_string(), p.parse::<u16>().unwrap()));
+    let replica = nodes
+        .lines()
+        .find(|l| l.contains(&format!("slave {master_id}")))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(parse)
+        .expect("the master has a replica");
+    let all = nodes.lines().filter_map(|l| l.split_whitespace().nth(1)).filter_map(parse).collect();
+    (replica, all)
+}
+
+/// Ask `asker` to fail over (graceful `CLUSTER FAILOVER`), repeating until `c`
+/// reports `to` as the owner of `slot`: Redis will not vote for a second failover
+/// of the same master within twice its node timeout, so a run soon after another
+/// has to ask again.
+fn fail_over(c: &RedisCluster, asker: &RedisClient, slot: u16, to: &(String, u16)) {
+    let deadline = Instant::now() + Duration::from_secs(75);
+    loop {
+        assert!(Instant::now() < deadline, "the cluster never failed over");
+        let _ = run(asker, &["CLUSTER", "FAILOVER"]);
+        let settle = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < settle {
+            if c.owner_of(slot).as_ref() == Some(to) {
+                return;
+            }
+            c.refresh();
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+#[test]
+fn a_shard_subscription_and_a_keyspace_one_survive_a_failover() {
+    if std::env::var("HOPF_TEST_CLUSTER_FAILOVER").is_err() {
+        eprintln!("skipped: HOPF_TEST_CLUSTER_FAILOVER is not set");
+        return;
+    }
+    let (seed, _calm) = cluster_or_skip!(alone);
+    let _turn = exclusive();
+    let rt = runtime();
+    let c = connect(&rt, &seed);
+    let publisher = connect(&rt, &seed);
+    let channel = key_in(10923..=16383, "fo");
+    let slot = c.slot_of(&channel);
+    let (m_host, m_port) = c.owner_of(slot).unwrap();
+    let master = admin(&rt, &m_host, m_port);
+    let (replica_addr, all_nodes) = replica_of(&master);
+    let replica = admin(&rt, &replica_addr.0, replica_addr.1);
+    // Every node, replicas included: the one that takes over has to produce the events.
+    let masters_admins: Vec<RedisClient> = all_nodes.iter().map(|(h, p)| admin(&rt, h, *p)).collect();
+    let before: Vec<String> = masters_admins.iter().map(notify_setting).collect();
+    for a in &masters_admins {
+        run(a, &["CONFIG", "SET", "notify-keyspace-events", "KEA"]).unwrap();
+    }
+
+    let rec = Recorder::default();
+    let sub = subscriber(&c, &rec);
+    sub.ssubscribe(&[&channel]);
+    sub.subscribe_keyspace(&["__keyspace@0__:*"]);
+    rec.wait_for("the subscriptions", |_| subscribed(&rec, hopf_redis::SubscriptionKind::Shard) == 1);
+    publish_until_heard(&publisher, &rec, &channel, true, "before");
+
+    // The replica takes over. The subscriber follows the slot to it, and the keyspace
+    // subscription is on the new master.
+    fail_over(&c, &replica, slot, &replica_addr);
+    publish_until_heard(&publisher, &rec, &channel, true, "after");
+    let key = key_in(10923..=16383, "fokey");
+    call!(|cb| publisher.set(&key, "v", cb)).unwrap();
+    let event = format!("__keyspace@0__:{key}");
+    rec.wait_for("a keyspace event from the new master", |_| messages_on(&rec, &event).contains(&"set".to_string()));
+
+    // And the roles are put back.
+    fail_over(&c, &master, slot, &(m_host.clone(), m_port));
+    publish_until_heard(&publisher, &rec, &channel, true, "home");
+    let _ = call!(|cb| publisher.del(&[&key], cb));
+    wait_converged(&rt, &all_nodes, slot, &(m_host.clone(), m_port), &replica_addr);
+    for (a, old) in masters_admins.iter().zip(&before) {
+        let _ = run(a, &["CONFIG", "SET", "notify-keyspace-events", old]);
+    }
+    sub.close();
     rt.shutdown();
 }
