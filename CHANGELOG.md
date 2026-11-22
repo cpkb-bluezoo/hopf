@@ -7,6 +7,10 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
 
 ### Added
 
+- **hopf-mailbox: `MemoryFactory`**, a mailbox store held in memory (messages,
+  flags, UIDs, append and any `SearchCriteria`; no files, no sockets), for
+  tests of code that serves or reads mailboxes where unit tests may not touch
+  the file system. The NNTP server's protocol tests run over it.
 - **hopf-nntp client: streaming posts, attachments and a choice of SASL
   mechanism** (#544). `NntpSession::post_stream` takes an `NntpPoster` that is
   asked for the article a piece at a time, the next only when the connection

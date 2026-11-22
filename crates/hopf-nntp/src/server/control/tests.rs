@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use hopf_core::testing::Peer;
 use hopf_core::{Runtime, RuntimeConfig};
-use hopf_mailbox::{AppendGuard, MailboxFactory, MaildirFactory};
+use hopf_mailbox::{AppendGuard, MailboxFactory, MemoryFactory};
 
 use super::*;
 use crate::server::egress::{ArticlePart, NntpDotStuffer};
@@ -27,8 +27,7 @@ pub(super) fn article(subject: &str, body: &str) -> String {
 pub(super) struct Session {
     peer: Peer<NntpControlHandler>,
     pub(super) greeting: String,
-    factory: Arc<MaildirFactory>,
-    _root: tempfile::TempDir,
+    factory: Arc<MemoryFactory>,
 }
 
 impl Deref for Session {
@@ -56,8 +55,7 @@ impl Session {
     }
 
     pub(super) fn with(groups: &[(&str, Vec<String>)], configure: impl FnOnce(NntpConfig) -> NntpConfig) -> Self {
-        let root = tempfile::tempdir().unwrap();
-        let factory = Arc::new(MaildirFactory::new(root.path()));
+        let factory = Arc::new(MemoryFactory::new());
         {
             let mut store = factory.create_store();
             store.open("news").unwrap();
@@ -78,10 +76,10 @@ impl Session {
         }
         let config = configure(NntpConfig::new("127.0.0.1:1119".parse().unwrap(), "news.example"));
         let (peer, greeting) = Self::connect(config, Arc::clone(&factory));
-        Self { peer, greeting, factory, _root: root }
+        Self { peer, greeting, factory }
     }
 
-    pub(super) fn factory_for_checks(&self) -> Arc<MaildirFactory> {
+    pub(super) fn factory_for_checks(&self) -> Arc<MemoryFactory> {
         Arc::clone(&self.factory)
     }
 
@@ -114,7 +112,7 @@ impl Session {
         }
     }
 
-    fn connect(config: NntpConfig, factory: Arc<MaildirFactory>) -> (Peer<NntpControlHandler>, String) {
+    fn connect(config: NntpConfig, factory: Arc<MemoryFactory>) -> (Peer<NntpControlHandler>, String) {
         let handlers = DefaultNntpHandlerFactory::new("ready", factory)
             .with_posting_allowed(config.posting_allowed)
             .with_hostname("news.example");
@@ -905,10 +903,10 @@ mod security {
                 Err(crate::server::handler::HandlerError::Refused(format!("{user} may not read news here")))
             }
         }
-        struct Factory(Arc<MaildirFactory>);
+        struct Factory(Arc<MemoryFactory>);
         impl NntpHandlerFactory for Factory {
             fn create(&self) -> Box<dyn ClientConnected> {
-                struct C(Arc<MaildirFactory>);
+                struct C(Arc<MemoryFactory>);
                 impl ClientConnected for C {
                     fn connected(&mut self, state: &mut dyn crate::server::handler::ConnectedState, _: &crate::server::handler::NntpConnectionMetadata) {
                         let inner = crate::server::mailbox::MailboxReaderHandler::new(self.0.clone(), "news".into(), crate::server::handler::PostingStatus::Allowed);
@@ -918,8 +916,7 @@ mod security {
                 Box::new(C(Arc::clone(&self.0)))
             }
         }
-        let root = tempfile::tempdir().unwrap();
-        let factory = Arc::new(MaildirFactory::new(root.path()));
+        let factory = Arc::new(MemoryFactory::new());
         let config = NntpConfig::new("127.0.0.1:1119".parse().unwrap(), "h").with_credentials(store()).allow_cleartext_auth();
         let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
         let handler = NntpControlHandler::new(Factory(factory).create(), NntpServerMetrics::shared(), config, rt);
@@ -1004,8 +1001,7 @@ mod security {
     #[test]
     fn implicit_tls_greets_when_the_handshake_is_done() {
         let config = NntpConfig::new("127.0.0.1:1119".parse().unwrap(), "h").with_tls(acceptor()).implicit_tls();
-        let root = tempfile::tempdir().unwrap();
-        let factory = Arc::new(MaildirFactory::new(root.path()));
+        let factory = Arc::new(MemoryFactory::new());
         let handlers = DefaultNntpHandlerFactory::new("ready", factory);
         let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
         let handler = NntpControlHandler::new(handlers.create(), NntpServerMetrics::shared(), config, rt);
@@ -1028,6 +1024,8 @@ fn an_article_posted_after_a_group_was_selected_can_be_read_by_its_number() {
 
 // ---- telemetry ----
 
+/// Writes its telemetry to a file, so it is an integration test.
+#[cfg(feature = "integration")]
 #[test]
 fn a_session_is_reported_as_metrics_and_traced_with_a_traceparent() {
     use hopf_otel::{OtelConfig, SpanContext, TelemetryPipeline};
@@ -1036,8 +1034,7 @@ fn a_session_is_reported_as_metrics_and_traced_with_a_traceparent() {
     let path = out.path().join("telemetry.jsonl");
     let pipeline = TelemetryPipeline::start(OtelConfig::new("nntp-test").with_jsonl_traces(&path).with_jsonl_metrics(&path)).unwrap();
 
-    let root = tempfile::tempdir().unwrap();
-    let factory = Arc::new(MaildirFactory::new(root.path()));
+    let factory = Arc::new(MemoryFactory::new());
     {
         let mut store = factory.create_store();
         store.open("news").unwrap();
@@ -1048,7 +1045,7 @@ fn a_session_is_reported_as_metrics_and_traced_with_a_traceparent() {
         guard.commit().unwrap();
         mb.close(false).unwrap();
     }
-    let handlers = DefaultNntpHandlerFactory::new("ready", factory).with_hostname("h");
+    let handlers = DefaultNntpHandlerFactory::new("ready", factory.clone() as Arc<dyn MailboxFactory>).with_hostname("h");
     let config = NntpConfig::new("127.0.0.1:1119".parse().unwrap(), "h");
     let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
     let handler = NntpControlHandler::new(handlers.create(), NntpServerMetrics::shared(), config, rt)
@@ -1058,7 +1055,7 @@ fn a_session_is_reported_as_metrics_and_traced_with_a_traceparent() {
     assert!(SpanContext::from_traceparent(&traceparent).is_some(), "{traceparent}");
     peer.take();
 
-    let mut s = Session { peer, greeting: String::new(), factory: Arc::new(MaildirFactory::new(root.path())), _root: tempfile::tempdir().unwrap() };
+    let mut s = Session { peer, greeting: String::new(), factory: Arc::clone(&factory) };
     s.run("GROUP misc.test\r\nARTICLE 1\r\nSTAT 99\r\nDATE\r\n");
     s.run("POST\r\n");
     s.run(&on_the_wire(&post_text("p", "misc.test", "b\r\n")));
