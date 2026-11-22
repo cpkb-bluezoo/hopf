@@ -3,7 +3,63 @@
 All notable changes to hopf are recorded here. The workspace crates are
 versioned together. Changes before 0.7.0 are in the git history and tags.
 
-## Unreleased
+## 0.8.0 - 2026-11-22
+
+### Breaking changes
+
+- **hopf-dns:** `DnsQueryHandler` is callback-shaped (#525). `handle_query` and
+  `handle_non_query_opcode` take a `DnsQueryCallback` and return nothing. The
+  callback is completed exactly once, with `respond`, `respond_sequence`,
+  `decline` or `error`, before the method returns or later from any thread, so
+  a handler that waits on a client (a Redis round trip, an upstream query) no
+  longer holds the listener. The answer is delivered on the connection's own
+  reactor; cookie handling, TSIG signing and UDP truncation happen when it is
+  ready. Stream transports write each answer as it completes, so several
+  queries on one connection may be answered out of order (RFC 7766
+  section 6.2.1.1). A callback dropped without being completed is logged and
+  answered `SERVFAIL`. `HandlerOutcome` is no longer public.
+  - **Migration:** a handler that returns its answer straight away implements
+    the new `SyncDnsQueryHandler::resolve(&self, &DnsMessage, &QueryContext)
+    -> Option<DnsMessage>` (`None` declines) with no other change, and is
+    adapted automatically. `FnHandler` and `EmptyHandler` already are. A
+    handler that has to wait implements `DnsQueryHandler` directly.
+  - `MetricsSink` no longer has a lifetime and is `Clone`, so a handler can
+    keep it for a later answer. `QueryContext::metrics` has that type.
+  - `DnsService::process_on`, `process_query_sync` and `process_wire` now wait
+    for the answer and are for tests and callers off the reactor. The
+    listeners use the new non-blocking `DnsService::dispatch_wire`.
+- **hopf-dns:** `QueryContext` carries the whole connection (#524), and is
+  owned. It has no lifetime, is `Clone` and `#[non_exhaustive]`, and is read
+  through accessors (`peer()`, `local()`, `transport()`, `tsig_key()`,
+  `security()`, `sni()`, `peer_certificate_chain()`, `metrics()`) instead of
+  public fields; `QueryContext<'_>` in a handler signature becomes
+  `QueryContext`. A handler that answers later keeps a clone and reads the
+  client's mTLS identity from its own callback. `FnHandler::on_opcode` is
+  unchanged; `on_query_ctx` and `on_opcode_ctx` add closures that take the
+  context.
+  - **New:** `ConnectionInfo { peer, local, security }` and
+    `DnsService::{dispatch_wire_with, process_wire_with, process_on_with}`.
+    `dispatch_wire`, `process_wire` and `process_on` are thin wrappers that
+    know only the peer. The TCP, DoT and DoQ listeners fill in the local
+    address and the connection's shared `SecurityInfo` (client certificate
+    chain and SNI); the UDP listener fills in its bound address.
+- **hopf-dns:** `ForwarderHandler` no longer blocks the listener thread while
+  it waits for its upstream. The upstream timeout and the RFC 8767 client
+  response timer run on the resolver's reactor, and the answer is delivered
+  when the upstream replies or the timer fires, whichever is first.
+- **hopf-core (behaviour change):** certificate chain verification checks
+  `extendedKeyUsage` (#540). Verification takes a `ChainRole`: the leaf's
+  extension, when present, must list `id-kp-serverAuth` (server role) or
+  `id-kp-clientAuth` (client role), or `anyExtendedKeyUsage`, and an
+  intermediate CA that carries it must permit the role too (RFC 5280 section
+  4.2.1.12); an absent extension permits any usage and trust anchors are
+  exempt. A mismatch is `VerifyError::ExtendedKeyUsageMismatch`. Before, a
+  `serverAuth`-only certificate satisfied server-side mutual TLS and a
+  `clientAuth`-only certificate was accepted as a server certificate. The TLS
+  1.3 and 1.2 engines verify client certificates with the client role (DTLS and
+  QUIC share them); connecting clients, the DNS upstream client and DANE keep
+  the server role. A deployment that needs the old leniency supplies a
+  `ClientVerifyOverride` or `VerifyOverride`.
 
 ### Added
 
@@ -279,8 +335,49 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
   `Peer::advance`. A handler that is waiting only for a timer it set no
   longer makes a test wait for the time to pass: the peer's clock skips ahead.
 
+### Changed
+
+- **hopf-core: application data written together shares TLS records** (#545).
+  On a TLS connection (1.2 and 1.3), `Endpoint::send` no longer seals a record
+  per call: what a handler writes in one event is held, up to a record's worth
+  at a time, and sealed together just before the socket is written to, which is
+  at the end of the event, so nothing waits and latency is unchanged. A write
+  as large as a record is sealed as it is, without a copy; a close seals what
+  is held before the `close_notify`; and the held bytes count against
+  `max_net_out`. Writing 200,000 small (20-byte) pieces in one callback was
+  200,000 records and 8.4 MB (TLS 1.3) on the wire; it is 245 records and 4.0
+  MB (the data itself), and took 12 ms instead of 204 ms. The peer decrypts,
+  and an observer sees, the record boundaries of the connection and no longer
+  the boundaries of the application's writes.
+- **hopf-webdav (behaviour change):** RFC 3744 privileges are now enforced
+  whenever a `role_policy` is set; before, they were only reported (#512).
+  A method runs only if the authenticated user holds the privileges RFC 3744
+  appendix B requires for it, and is otherwise refused with `403` and the
+  `DAV:need-privileges` precondition. A deployment that set `role_policy` only
+  to report privileges must give its users the `webdav:*` roles they need, and
+  authenticate them; a request with no authenticated user holds no
+  privileges. Privileges are roles, held on every resource: per-resource ACLs
+  and the `ACL` method are still not supported.
+- Unit tests (`cargo test --lib`) do no socket or file I/O and do not wait
+  for the clock. Those that do are behind each crate's `integration` feature.
+  `scripts/check-hermetic-tests.sh` runs the unit tests with no network and a
+  read-only filesystem, and CI runs it. `hopf-mailbox`, `hopf-ldap` and
+  `hopf-otel` have gained an `integration` feature for this.
+
 ### Fixed
 
+- **hopf-quic, hopf-otel:** qlog traces name their event schema
+  `urn:ietf:params:qlog:events:quic-14`, as the drafts require until the RFC
+  exists (the bare `...:quic` URI was written before, and a header advertised
+  `http3` and `http` schemas whose events are never written; it lists `quic`
+  only). `parameters_set` names who set the parameters `initiator`, not
+  `owner` (renamed in draft revision 12), with the same `local`/`remote`
+  values. `hopf_otel::QLOG_REVISION` becomes `qlog_revision()` (#533).
+- **hopf-otel:** the qlog file sink no longer remembers every trace file it has
+  finished, which grew by one entry per connection ever logged. A trace file's
+  reference time is read back from its header when it is reopened, so a late
+  event, or a second sink over the same directory after a restart, appends to
+  the file on its own epoch instead of writing a second header (#534).
 - **hopf-nntp client:** a `283` reply to `AUTHINFO SASL` (success, with data for
   the client, which SCRAM sends as the server's signature) was treated as a
   failed login. It is now accepted, and the data is checked.
@@ -322,78 +419,6 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
 - **hopf-core:** `Endpoint::on_write_ready` now also runs when it is registered
   with nothing buffered; before, no write event was requested for an empty
   buffer, so the callback never ran.
-
-### Breaking changes
-
-- **hopf-dns:** `DnsQueryHandler` is callback-shaped (#525). `handle_query` and
-  `handle_non_query_opcode` take a `DnsQueryCallback` and return nothing. The
-  callback is completed exactly once, with `respond`, `respond_sequence`,
-  `decline` or `error`, before the method returns or later from any thread, so
-  a handler that waits on a client (a Redis round trip, an upstream query) no
-  longer holds the listener. The answer is delivered on the connection's own
-  reactor; cookie handling, TSIG signing and UDP truncation happen when it is
-  ready. Stream transports write each answer as it completes, so several
-  queries on one connection may be answered out of order (RFC 7766
-  section 6.2.1.1). A callback dropped without being completed is logged and
-  answered `SERVFAIL`. `HandlerOutcome` is no longer public.
-  - **Migration:** a handler that returns its answer straight away implements
-    the new `SyncDnsQueryHandler::resolve(&self, &DnsMessage, &QueryContext)
-    -> Option<DnsMessage>` (`None` declines) with no other change, and is
-    adapted automatically. `FnHandler` and `EmptyHandler` already are. A
-    handler that has to wait implements `DnsQueryHandler` directly.
-  - `MetricsSink` no longer has a lifetime and is `Clone`, so a handler can
-    keep it for a later answer. `QueryContext::metrics` has that type.
-  - `DnsService::process_on`, `process_query_sync` and `process_wire` now wait
-    for the answer and are for tests and callers off the reactor. The
-    listeners use the new non-blocking `DnsService::dispatch_wire`.
-- **hopf-dns:** `QueryContext` carries the whole connection (#524), and is
-  owned. It has no lifetime, is `Clone` and `#[non_exhaustive]`, and is read
-  through accessors (`peer()`, `local()`, `transport()`, `tsig_key()`,
-  `security()`, `sni()`, `peer_certificate_chain()`, `metrics()`) instead of
-  public fields; `QueryContext<'_>` in a handler signature becomes
-  `QueryContext`. A handler that answers later keeps a clone and reads the
-  client's mTLS identity from its own callback. `FnHandler::on_opcode` is
-  unchanged; `on_query_ctx` and `on_opcode_ctx` add closures that take the
-  context.
-  - **New:** `ConnectionInfo { peer, local, security }` and
-    `DnsService::{dispatch_wire_with, process_wire_with, process_on_with}`.
-    `dispatch_wire`, `process_wire` and `process_on` are thin wrappers that
-    know only the peer. The TCP, DoT and DoQ listeners fill in the local
-    address and the connection's shared `SecurityInfo` (client certificate
-    chain and SNI); the UDP listener fills in its bound address.
-- **hopf-dns:** `ForwarderHandler` no longer blocks the listener thread while
-  it waits for its upstream. The upstream timeout and the RFC 8767 client
-  response timer run on the resolver's reactor, and the answer is delivered
-  when the upstream replies or the timer fires, whichever is first.
-
-### Changed
-
-- **hopf-core: application data written together shares TLS records** (#545).
-  On a TLS connection (1.2 and 1.3), `Endpoint::send` no longer seals a record
-  per call: what a handler writes in one event is held, up to a record's worth
-  at a time, and sealed together just before the socket is written to, which is
-  at the end of the event, so nothing waits and latency is unchanged. A write
-  as large as a record is sealed as it is, without a copy; a close seals what
-  is held before the `close_notify`; and the held bytes count against
-  `max_net_out`. Writing 200,000 small (20-byte) pieces in one callback was
-  200,000 records and 8.4 MB (TLS 1.3) on the wire; it is 245 records and 4.0
-  MB (the data itself), and took 12 ms instead of 204 ms. The peer decrypts,
-  and an observer sees, the record boundaries of the connection and no longer
-  the boundaries of the application's writes.
-- **hopf-webdav (behaviour change):** RFC 3744 privileges are now enforced
-  whenever a `role_policy` is set; before, they were only reported (#512).
-  A method runs only if the authenticated user holds the privileges RFC 3744
-  appendix B requires for it, and is otherwise refused with `403` and the
-  `DAV:need-privileges` precondition. A deployment that set `role_policy` only
-  to report privileges must give its users the `webdav:*` roles they need, and
-  authenticate them; a request with no authenticated user holds no
-  privileges. Privileges are roles, held on every resource: per-resource ACLs
-  and the `ACL` method are still not supported.
-- Unit tests (`cargo test --lib`) do no socket or file I/O and do not wait
-  for the clock. Those that do are behind each crate's `integration` feature.
-  `scripts/check-hermetic-tests.sh` runs the unit tests with no network and a
-  read-only filesystem, and CI runs it. `hopf-mailbox`, `hopf-ldap` and
-  `hopf-otel` have gained an `integration` feature for this.
 
 ## 0.7.0 - 2026-11-01
 

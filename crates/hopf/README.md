@@ -6,14 +6,14 @@ module (`hopf::core`, `hopf::http`, `hopf::smtp`, `hopf::imap`, …).
 
 ```toml
 [dependencies]
-hopf = "0.7.0"   # everything
+hopf = "0.8.0"   # everything
 ```
 
 Or pick crates individually:
 
 ```toml
 [dependencies]
-hopf = { version = "0.7.0", default-features = false, features = ["http", "tls"] }
+hopf = { version = "0.8.0", default-features = false, features = ["http", "tls"] }
 ```
 
 `hopf-core` is always included. Default features enable every crate. Further

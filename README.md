@@ -59,9 +59,9 @@ The [`hopf`](https://crates.io/crates/hopf) umbrella crate re-exports every
 
 ```toml
 [dependencies]
-hopf = "0.7.0"   # everything
+hopf = "0.8.0"   # everything
 # or pick crates individually:
-hopf = { version = "0.7.0", default-features = false, features = ["http", "tls"] }
+hopf = { version = "0.8.0", default-features = false, features = ["http", "tls"] }
 ```
 
 Individual crates (`hopf-core`, `hopf-http`, …) can also be depended on
