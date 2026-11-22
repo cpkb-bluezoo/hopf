@@ -16,15 +16,20 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::UNIX_EPOCH;
+
 use hopf_mailbox::{
     Mailbox, MailboxAttribute, MailboxError, MailboxFactory, MailboxStore, MessageReadCallback,
     SearchCriteria,
 };
 
 use crate::server::codec::{is_message_id, MAX_ARTICLE_NUMBER};
+use crate::server::commands::civil_from_days;
 use crate::server::handler::{
     ClientConnected, ConnectedState, GroupStatus, HandlerError, HandlerResult, Located,
-    NewsgroupInfo, NntpConnectionMetadata, NntpHandlerFactory, PostingStatus, ReaderHandler,
+    NewsgroupInfo, NntpConnectionMetadata, NntpHandlerFactory, PostSink, PostingStatus, ReaderHandler,
 };
 use crate::server::scan::ArticleScanner;
 use crate::server::wildmat::Wildmat;
@@ -41,6 +46,7 @@ pub struct DefaultNntpHandlerFactory {
     factory: Arc<dyn MailboxFactory>,
     store_user: String,
     posting_allowed: bool,
+    hostname: String,
 }
 
 impl DefaultNntpHandlerFactory {
@@ -51,7 +57,15 @@ impl DefaultNntpHandlerFactory {
             factory,
             store_user: DEFAULT_STORE_USER.to_string(),
             posting_allowed: true,
+            hostname: "localhost".to_string(),
         }
+    }
+
+    /// The name the server gives itself in the `Message-ID` it adds to a
+    /// posted article that has none (default `localhost`).
+    pub fn with_hostname(mut self, hostname: impl Into<String>) -> Self {
+        self.hostname = hostname.into();
+        self
     }
 
     /// The user the store is opened for (default [`DEFAULT_STORE_USER`]).
@@ -75,6 +89,7 @@ impl NntpHandlerFactory for DefaultNntpHandlerFactory {
             factory: Arc::clone(&self.factory),
             store_user: self.store_user.clone(),
             posting_allowed: self.posting_allowed,
+            hostname: self.hostname.clone(),
         })
     }
 }
@@ -84,12 +99,14 @@ struct DefaultClientConnected {
     factory: Arc<dyn MailboxFactory>,
     store_user: String,
     posting_allowed: bool,
+    hostname: String,
 }
 
 impl ClientConnected for DefaultClientConnected {
     fn connected(&mut self, state: &mut dyn ConnectedState, _meta: &NntpConnectionMetadata) {
         let posting = if self.posting_allowed { PostingStatus::Allowed } else { PostingStatus::NotAllowed };
-        let handler = MailboxReaderHandler::new(Arc::clone(&self.factory), self.store_user.clone(), posting);
+        let handler = MailboxReaderHandler::new(Arc::clone(&self.factory), self.store_user.clone(), posting)
+            .with_hostname(self.hostname.clone());
         state.accept_connection(&self.greeting, self.posting_allowed, Box::new(handler));
     }
 }
@@ -119,6 +136,7 @@ pub struct MailboxReaderHandler {
     factory: Arc<dyn MailboxFactory>,
     user: String,
     posting: PostingStatus,
+    hostname: String,
     store: Option<Box<dyn MailboxStore>>,
     selected: Option<Open>,
     foreign: Option<Open>,
@@ -131,10 +149,17 @@ impl MailboxReaderHandler {
             factory,
             user,
             posting,
+            hostname: "localhost".to_string(),
             store: None,
             selected: None,
             foreign: None,
         }
+    }
+
+    /// The name used in the `Message-ID` of a posted article that has none.
+    pub fn with_hostname(mut self, hostname: String) -> Self {
+        self.hostname = hostname;
+        self
     }
 
     fn store(&mut self) -> HandlerResult<&mut Box<dyn MailboxStore>> {
@@ -333,6 +358,21 @@ impl ReaderHandler for MailboxReaderHandler {
         Ok(())
     }
 
+    fn begin_post(&mut self) -> HandlerResult<Box<dyn PostSink>> {
+        if self.posting == PostingStatus::NotAllowed {
+            return Err(HandlerError::Refused("Posting not permitted".into()));
+        }
+        let mut store = self.factory.create_store();
+        store.open(&self.user)?;
+        Ok(Box::new(MailboxPostSink {
+            store,
+            hostname: self.hostname.clone(),
+            header: Vec::new(),
+            targets: Vec::new(),
+            streaming: false,
+        }))
+    }
+
     fn previous_article(&mut self, number: u32) -> HandlerResult<Option<u32>> {
         let Some(open) = &self.selected else { return Ok(None) };
         let at = open.index.partition_point(|e| e.number < number);
@@ -345,5 +385,232 @@ impl ReaderHandler for MailboxReaderHandler {
         if let Some(mut store) = self.store.take() {
             let _ = store.close();
         }
+    }
+}
+
+// ---- posting ----
+
+/// The most of a posted article's headers the stock sink keeps, to find where
+/// it goes.
+pub const MAX_POST_HEADER: usize = 64 * 1024;
+
+/// Counts the identifiers the server makes, so that two made in the same
+/// instant differ.
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Files a posted article in each group it names that exists. It keeps the
+/// header block (up to [`MAX_POST_HEADER`]) to read the `Newsgroups` header,
+/// and passes the rest of the article on to the groups as it arrives.
+struct MailboxPostSink {
+    store: Box<dyn MailboxStore>,
+    hostname: String,
+    header: Vec<u8>,
+    targets: Vec<Box<dyn Mailbox>>,
+    /// The header block has been dealt with; what arrives goes to the groups.
+    streaming: bool,
+}
+
+/// Where the header block of `bytes` ends: the offset of the empty line that
+/// ends it and the offset just after that line.
+fn header_end(bytes: &[u8]) -> Option<(usize, usize)> {
+    let mut line_start = 0;
+    while let Some(nl) = bytes[line_start..].iter().position(|&b| b == b'\n') {
+        let end = line_start + nl;
+        let line = &bytes[line_start..end];
+        if line.is_empty() || line == b"\r" {
+            return Some((line_start, end + 1));
+        }
+        line_start = end + 1;
+    }
+    None
+}
+
+/// The value of header `name` in a header block, folds undone.
+fn header_value(head: &[u8], name: &str) -> Option<String> {
+    let text = String::from_utf8_lossy(head);
+    let mut value: Option<String> = None;
+    for line in text.split('\n') {
+        let line = line.trim_end_matches('\r');
+        if let Some(v) = &mut value {
+            if line.starts_with([' ', '\t']) {
+                v.push(' ');
+                v.push_str(line.trim());
+                continue;
+            }
+            break;
+        }
+        if let Some((n, v)) = line.split_once(':') {
+            if n.eq_ignore_ascii_case(name) {
+                value = Some(v.trim().to_string());
+            }
+        }
+    }
+    value
+}
+
+/// `Sat, 21 Nov 2026 10:00:00 +0000` for a time in seconds since the epoch.
+fn rfc5322_date(secs: u64) -> String {
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let days = (secs / 86_400) as i64;
+    let (y, m, d) = civil_from_days(days);
+    let rem = secs % 86_400;
+    format!(
+        "{}, {d} {} {y} {:02}:{:02}:{:02} +0000",
+        DAYS[((days + 4) % 7) as usize],
+        MONTHS[(m - 1) as usize],
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+impl MailboxPostSink {
+    fn abort_targets(&mut self) {
+        for mut t in self.targets.drain(..) {
+            let _ = t.abort_append();
+            let _ = t.close(false);
+        }
+    }
+
+    /// The header block is complete at `header[..blank_end]`: read it, decide
+    /// where the article goes, and begin writing it there.
+    fn begin(&mut self, blank_start: usize, blank_end: usize) -> HandlerResult<()> {
+        let buffered = std::mem::take(&mut self.header);
+        let head = &buffered[..blank_start];
+        let rest = &buffered[blank_end..];
+        let refuse = |text: &str| HandlerError::Refused(text.to_string());
+
+        let Some(groups) = header_value(head, "newsgroups").filter(|g| !g.is_empty()) else {
+            return Err(refuse("No Newsgroups header"));
+        };
+        for required in ["from", "subject"] {
+            if header_value(head, required).is_none() {
+                return Err(refuse(&format!("No {} header", if required == "from" { "From" } else { "Subject" })));
+            }
+        }
+        let now = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let mut added = Vec::new();
+        match header_value(head, "message-id") {
+            Some(id) if is_message_id(&id) => {}
+            Some(_) => return Err(refuse("Invalid Message-ID")),
+            None => {
+                let id = format!(
+                    "<{:x}.{:x}.{:x}@{}>",
+                    now.as_secs(),
+                    now.subsec_nanos(),
+                    NEXT_ID.fetch_add(1, Ordering::Relaxed),
+                    self.hostname
+                );
+                added.extend_from_slice(format!("Message-ID: {id}\r\n").as_bytes());
+            }
+        }
+        if header_value(head, "date").is_none() {
+            added.extend_from_slice(format!("Date: {}\r\n", rfc5322_date(now.as_secs())).as_bytes());
+        }
+
+        let delimiter = self.store.hierarchy_delimiter();
+        let mut seen = BTreeSet::new();
+        for group in groups.split(',').map(str::trim).filter(|g| !g.is_empty()) {
+            let name = if delimiter == '.' { group.to_string() } else { group.replace('.', &delimiter.to_string()) };
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            match self.store.open_mailbox(&name, false) {
+                Ok(mut mb) => {
+                    let started = mb.start_append(&BTreeSet::new(), None);
+                    if let Err(e) = started {
+                        let _ = mb.close(false);
+                        self.abort_targets();
+                        return Err(match e {
+                            MailboxError::ReadOnly => refuse("Group is read-only"),
+                            e => e.into(),
+                        });
+                    }
+                    self.targets.push(mb);
+                }
+                Err(MailboxError::NotFound(_)) => {}
+                Err(e) => {
+                    self.abort_targets();
+                    return Err(e.into());
+                }
+            }
+        }
+        if self.targets.is_empty() {
+            return Err(refuse("No such newsgroup"));
+        }
+
+        let mut first = Vec::with_capacity(head.len() + added.len() + 2 + rest.len());
+        first.extend_from_slice(head);
+        first.extend_from_slice(&added);
+        first.extend_from_slice(b"\r\n");
+        first.extend_from_slice(rest);
+        self.streaming = true;
+        self.pass_on(&first)
+    }
+
+    fn pass_on(&mut self, piece: &[u8]) -> HandlerResult<()> {
+        for t in &mut self.targets {
+            if let Err(e) = t.append_content(piece) {
+                self.abort_targets();
+                return Err(e.into());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl PostSink for MailboxPostSink {
+    fn write(&mut self, piece: &[u8]) -> HandlerResult<()> {
+        if self.streaming {
+            return self.pass_on(piece);
+        }
+        // Only the header block is held, and only up to a bound.
+        self.header.extend_from_slice(piece);
+        if let Some((start, end)) = header_end(&self.header) {
+            return self.begin(start, end);
+        }
+        if self.header.len() > MAX_POST_HEADER {
+            self.header.clear();
+            return Err(HandlerError::Refused("Header block too large".into()));
+        }
+        Ok(())
+    }
+
+    fn commit(mut self: Box<Self>) -> HandlerResult<()> {
+        if !self.streaming {
+            if self.header.is_empty() {
+                return Err(HandlerError::Refused("Empty article".into()));
+            }
+            // Headers and no body: end the block as a client would have.
+            if !self.header.ends_with(b"\n") {
+                self.header.extend_from_slice(b"\r\n");
+            }
+            self.header.extend_from_slice(b"\r\n");
+            let (start, end) = header_end(&self.header).expect("an empty line was just added");
+            self.begin(start, end)?;
+        }
+        for mut t in std::mem::take(&mut self.targets) {
+            if let Err(e) = t.end_append() {
+                let _ = t.close(false);
+                return Err(e.into());
+            }
+            let _ = t.close(false);
+        }
+        let _ = self.store.close();
+        Ok(())
+    }
+
+    fn abort(mut self: Box<Self>) {
+        self.abort_targets();
+        let _ = self.store.close();
+    }
+}
+
+impl Drop for MailboxPostSink {
+    fn drop(&mut self) {
+        // A sink dropped by a failed write or a refusal has nothing begun
+        // that is not undone.
+        self.abort_targets();
     }
 }

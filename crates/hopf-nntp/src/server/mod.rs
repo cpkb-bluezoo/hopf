@@ -7,6 +7,7 @@ mod commands;
 mod control;
 mod egress;
 mod handler;
+mod ingress;
 mod mailbox;
 mod metrics;
 mod pipe;
@@ -21,14 +22,17 @@ pub use codec::{
 };
 pub use control::NntpControlHandler;
 pub use egress::{ArticlePart, NntpDotStuffer};
+pub use ingress::NntpDotUnstuffer;
 pub use handler::{
     ClientConnected, ConnectedState, GroupStatus, HandlerError, HandlerResult, Located, NewsgroupInfo,
-    NntpConnectionMetadata, NntpHandlerFactory, OverviewRecord, PostingStatus, ReaderHandler,
+    NntpConnectionMetadata, NntpHandlerFactory, OverviewRecord, PostSink, PostingStatus, ReaderHandler,
 };
 pub use mailbox::{
     DefaultNntpHandlerFactory, MailboxReaderHandler, DEFAULT_GREETING, DEFAULT_STORE_USER,
 };
 pub use metrics::NntpServerMetrics;
 pub use scan::{ArticleScanner, ArticleSummary};
-pub use service::{NntpConfig, NntpService, DEFAULT_IDLE_TIMEOUT, DEFAULT_WRITE_STALL_TIMEOUT};
+pub use service::{
+    NntpConfig, NntpService, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_POST_SIZE, DEFAULT_WRITE_STALL_TIMEOUT,
+};
 pub use wildmat::Wildmat;

@@ -10,11 +10,12 @@
 //! back, and a failure after that ends the connection.
 
 use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::server::codec::{ListKind, NewGroupsSince, NntpCommand, Target, MAX_ARTICLE_NUMBER};
 use crate::server::egress::{ArticlePart, NntpDotStuffer};
-use crate::server::handler::{HandlerError, Located, NewsgroupInfo, OverviewRecord, ReaderHandler};
+use crate::server::handler::{HandlerError, Located, NewsgroupInfo, OverviewRecord, PostSink, ReaderHandler};
 use crate::server::metrics::NntpServerMetrics;
 use crate::server::pipe::Output;
 use crate::server::reply::{self, END};
@@ -40,6 +41,8 @@ pub(crate) enum JobEnd {
     /// The answer could not be finished, or could not be delivered: the
     /// connection must be closed.
     Fatal,
+    /// `340` was sent: the client's article follows.
+    PostData,
 }
 
 /// Does `command` run against the handler (and so on the storage pool)?
@@ -58,6 +61,7 @@ pub(crate) fn needs_handler(command: &NntpCommand) -> bool {
             | NntpCommand::NewGroups(_)
             | NntpCommand::Over(_)
             | NntpCommand::Hdr(..)
+            | NntpCommand::Post
     )
 }
 
@@ -110,6 +114,105 @@ pub(crate) fn run(
         NntpCommand::Hdr(field, t) => hdr(handler, session, out, field, t),
         // Not commands for the handler; the connection answers these itself.
         _ => ended(say(out, 500, "Unknown command")),
+    }
+}
+
+// ---- POST ----
+
+/// Where a post in progress is kept between the pieces of it.
+pub(crate) struct PostSlot {
+    pub sink: Mutex<Option<Box<dyn PostSink>>>,
+    /// Why the article is being refused, for the `441`, once it has been.
+    pub error: Mutex<Option<String>>,
+}
+
+impl PostSlot {
+    pub(crate) fn new() -> Self {
+        Self { sink: Mutex::new(None), error: Mutex::new(None) }
+    }
+
+    /// Lets go of a post that was abandoned.
+    pub(crate) fn abandon(&self) {
+        let sink = self.sink.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(sink) = sink {
+            sink.abort();
+        }
+    }
+
+    fn refuse(&self, error: &HandlerError) {
+        let text = match error {
+            HandlerError::Refused(text) => text.clone(),
+            other => {
+                hopf_core::subsystem_log(
+                    hopf_core::LogLevel::Error,
+                    "hopf-nntp",
+                    "nntp.post.failed",
+                    format!("a post failed: {other}"),
+                );
+                "Posting failed".to_string()
+            }
+        };
+        *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(text);
+    }
+}
+
+/// `POST`: asks the handler for somewhere to put the article.
+pub(crate) fn post_begin(handler: &mut dyn ReaderHandler, post: &PostSlot, out: &mut Output) -> JobEnd {
+    *post.error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    match handler.begin_post() {
+        Ok(sink) => {
+            *post.sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
+            if say(out, 340, "Input article; end with <CR-LF>.<CR-LF>") {
+                JobEnd::PostData
+            } else {
+                post.abandon();
+                JobEnd::Fatal
+            }
+        }
+        Err(HandlerError::Refused(text)) => ended(say(out, 440, &text)),
+        Err(e) => fault(out, &e, "POST"),
+    }
+}
+
+/// Gives the sink the next piece of the article.
+pub(crate) fn post_write(post: &PostSlot, piece: &[u8]) -> JobEnd {
+    let mut slot = post.sink.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(sink) = slot.as_mut() {
+        if let Err(e) = sink.write(piece) {
+            *slot = None;
+            post.refuse(&e);
+        }
+    }
+    JobEnd::Continue
+}
+
+/// The article was too large: the sink is let go of and the post refused.
+pub(crate) fn post_too_large(post: &PostSlot) -> JobEnd {
+    post.abandon();
+    *post.error.lock().unwrap_or_else(|e| e.into_inner()) = Some("Article too large".to_string());
+    JobEnd::Continue
+}
+
+/// The article has arrived: accepts it, or says why not.
+pub(crate) fn post_commit(post: &PostSlot, out: &mut Output, metrics: &NntpServerMetrics) -> JobEnd {
+    let refusal = post.error.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(text) = refusal {
+        return ended(say(out, 441, &text));
+    }
+    let sink = post.sink.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let Some(sink) = sink else {
+        return ended(say(out, 441, "Posting failed"));
+    };
+    match sink.commit() {
+        Ok(()) => {
+            metrics.articles_posted.fetch_add(1, Ordering::Relaxed);
+            ended(say(out, 240, "Article received OK"))
+        }
+        Err(e) => {
+            post.refuse(&e);
+            let text = post.error.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+            ended(say(out, 441, &text))
+        }
     }
 }
 

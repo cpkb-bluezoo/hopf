@@ -33,8 +33,8 @@ pub use server::{
     is_message_id, ArticlePart, ArticleScanner, ArticleSummary, ClientConnected, ConnectedState,
     DefaultNntpHandlerFactory, GroupStatus, HandlerError, HandlerResult, ListKind, Located,
     MailboxReaderHandler, NewGroupsSince, NewsgroupInfo, NntpCommand, NntpConfig, NntpConnectionMetadata,
-    NntpControlHandler, NntpDotStuffer, NntpHandlerFactory, NntpServerLexer, NntpServerMetrics, NntpService,
+    NntpControlHandler, NntpDotStuffer, NntpDotUnstuffer, NntpHandlerFactory, PostSink, NntpServerLexer, NntpServerMetrics, NntpService,
     OverviewRecord, PostingStatus, ReaderHandler, Target, Wildmat, DEFAULT_GREETING, DEFAULT_IDLE_TIMEOUT,
-    DEFAULT_STORE_USER, DEFAULT_WRITE_STALL_TIMEOUT, MAX_ARTICLE_NUMBER, MAX_COMMAND_LINE,
+    DEFAULT_MAX_POST_SIZE, DEFAULT_STORE_USER, DEFAULT_WRITE_STALL_TIMEOUT, MAX_ARTICLE_NUMBER, MAX_COMMAND_LINE,
 };
 pub use hopf_core::VERSION;

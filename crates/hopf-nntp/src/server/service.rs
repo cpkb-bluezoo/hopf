@@ -24,6 +24,9 @@ pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 /// connection is closed, unless told otherwise.
 pub const DEFAULT_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The largest article `POST` accepts unless told otherwise.
+pub const DEFAULT_MAX_POST_SIZE: u64 = 64 * 1024 * 1024;
+
 /// NNTP server configuration.
 #[derive(Clone)]
 pub struct NntpConfig {
@@ -44,6 +47,9 @@ pub struct NntpConfig {
     /// Close a connection that has not taken what is waiting to be sent to it
     /// for this long.
     pub write_stall_timeout: Duration,
+    /// The largest article, in octets, that `POST` accepts; a larger one is
+    /// read and thrown away, and refused. `None` sets no limit.
+    pub max_post_size: Option<u64>,
 }
 
 impl NntpConfig {
@@ -57,6 +63,7 @@ impl NntpConfig {
             implicit_tls: false,
             idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
             write_stall_timeout: DEFAULT_WRITE_STALL_TIMEOUT,
+            max_post_size: Some(DEFAULT_MAX_POST_SIZE),
         }
     }
 
@@ -94,7 +101,8 @@ impl NntpService {
     /// with the stock handler.
     pub fn new(config: NntpConfig, runtime: Arc<Runtime>, mailboxes: Arc<dyn MailboxFactory>) -> Self {
         let greeting = format!("{} NNTP server ready", config.hostname);
-        let factory = DefaultNntpHandlerFactory::new(greeting, mailboxes).with_posting_allowed(config.posting_allowed);
+        let factory = DefaultNntpHandlerFactory::new(greeting, mailboxes).with_posting_allowed(config.posting_allowed)
+            .with_hostname(config.hostname.clone());
         Self::with_handler_factory(config, runtime, Arc::new(factory))
     }
 
@@ -201,6 +209,7 @@ mod tests {
         assert!(c.posting_allowed && !c.implicit_tls && c.tls_acceptor.is_none());
         assert_eq!(c.idle_timeout, Some(DEFAULT_IDLE_TIMEOUT));
         assert_eq!(c.write_stall_timeout, DEFAULT_WRITE_STALL_TIMEOUT);
+        assert_eq!(c.max_post_size, Some(DEFAULT_MAX_POST_SIZE));
     }
 
     #[test]
@@ -297,6 +306,25 @@ mod tests {
             }
             assert_eq!(text, "From: a@x.org\r\nSubject: one\r\nMessage-ID: <one@x.org>\r\n\r\nhello\r\n..dot\r\n.\r\n");
             assert_eq!(c.line(), "205 Connection closing\r\n");
+        }
+
+        #[test]
+        fn an_article_posted_over_a_real_connection_can_be_read_back() {
+            let dir = tempfile::tempdir().unwrap();
+            let factory = spool(dir.path(), &[article("one", "hello\r\n")]);
+            let svc = NntpService::new(config(), runtime(), factory);
+            let addr = svc.start().unwrap();
+            let mut c = Client::connect(addr);
+            c.line();
+            c.send("POST\r\n");
+            assert!(c.line().starts_with("340 "));
+            c.send("From: p@x.org\r\nNewsgroups: misc.test\r\nSubject: posted\r\nMessage-ID: <posted@x.org>\r\n\r\nbody\r\n..dot\r\n.\r\nGROUP misc.test\r\nBODY 2\r\nQUIT\r\n");
+            assert_eq!(c.line(), "240 Article received OK\r\n");
+            assert_eq!(c.line(), "211 2 1 2 misc.test\r\n");
+            assert_eq!(c.line(), "222 2 <posted@x.org> Body follows\r\n");
+            assert_eq!(c.line(), "body\r\n");
+            assert_eq!(c.line(), "..dot\r\n");
+            assert_eq!(c.line(), ".\r\n");
         }
 
         #[test]

@@ -62,6 +62,10 @@ pub trait ConnectedState {
 pub enum HandlerError {
     /// There is no such newsgroup.
     NoSuchGroup,
+    /// The handler will not do it, for a reason the client may be told (for
+    /// a post: the article is not acceptable). The text is sent to the
+    /// client.
+    Refused(String),
     /// The handler failed: the store could not be read, or an article went
     /// away while it was being read. The text is for the log, not the client.
     Failed(String),
@@ -71,6 +75,7 @@ impl fmt::Display for HandlerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoSuchGroup => f.write_str("no such newsgroup"),
+            Self::Refused(m) => f.write_str(m),
             Self::Failed(m) => f.write_str(m),
         }
     }
@@ -270,6 +275,36 @@ pub trait ReaderHandler: Send {
         })
     }
 
+    /// A client has asked to post. Returns the sink the article is written
+    /// to, or refuses (with [`HandlerError::Refused`], whose text is sent to
+    /// the client). The stock refusal is for a handler that takes no posts.
+    fn begin_post(&mut self) -> HandlerResult<Box<dyn PostSink>> {
+        Err(HandlerError::Refused("Posting not permitted".into()))
+    }
+
     /// The connection has ended; let go of what it held.
     fn close(&mut self) {}
+}
+
+/// Where a posted article goes. The article arrives in pieces, dot-unstuffed
+/// and with CRLF line ends as the client sent them, headers first; it is never
+/// given whole. Every method may block, and runs on the storage pool.
+///
+/// One piece is written at a time, and the connection reads no more of the
+/// client's article until the write has returned, so a store that falls
+/// behind slows the client.
+pub trait PostSink: Send {
+    /// The next piece of the article. A [`HandlerError::Refused`] says why the
+    /// article cannot be accepted; the rest of it is read and thrown away, and
+    /// the client is told `441` with the text. The sink is dropped after any
+    /// error, so it should have let go of what it held; [`abort`](Self::abort)
+    /// is not called.
+    fn write(&mut self, piece: &[u8]) -> HandlerResult<()>;
+
+    /// The article is complete: accept it. An error refuses it (`441`).
+    fn commit(self: Box<Self>) -> HandlerResult<()>;
+
+    /// The post is abandoned (the client went away, or the article was too
+    /// large): let go of whatever was kept.
+    fn abort(self: Box<Self>);
 }

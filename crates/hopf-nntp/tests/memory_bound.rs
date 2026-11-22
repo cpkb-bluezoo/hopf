@@ -133,6 +133,37 @@ fn measure(addr: std::net::SocketAddr, command: &str) -> (usize, usize) {
     (bytes, peak)
 }
 
+/// Posts an article of about `size` octets, generated a block at a time, and
+/// returns the peak of the heap above where it was when the post began.
+fn measure_post(addr: std::net::SocketAddr, name: &str, size: usize) -> usize {
+    let stream = TcpStream::connect(addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
+    let mut stream = BufReader::with_capacity(4096, stream);
+    let mut line = String::new();
+    stream.read_line(&mut line).unwrap();
+    stream.get_mut().write_all(b"POST\r\n").unwrap();
+    line.clear();
+    stream.read_line(&mut line).unwrap();
+    assert!(line.starts_with("340 "), "{line}");
+    let base = reset_peak();
+    let head = format!("From: p@x.org\r\nNewsgroups: misc.test\r\nSubject: {name}\r\n\r\n");
+    stream.get_mut().write_all(head.as_bytes()).unwrap();
+    let text = b"0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789\r\n";
+    let block: Vec<u8> = text.iter().copied().cycle().take(text.len() * 700).collect();
+    let mut sent = 0;
+    while sent < size {
+        stream.get_mut().write_all(&block).unwrap();
+        sent += block.len();
+    }
+    stream.get_mut().write_all(b".\r\n").unwrap();
+    line.clear();
+    stream.read_line(&mut line).unwrap();
+    assert!(line.starts_with("240 "), "{line}");
+    let peak = peak_above(base);
+    stream.get_mut().write_all(b"QUIT\r\n").unwrap();
+    peak
+}
+
 fn main() {
     let dir = tempfile::tempdir().unwrap();
     let factory = Arc::new(MaildirFactory::new(dir.path()));
@@ -147,6 +178,8 @@ fn main() {
 
     let runtime = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
     let config = NntpConfig::new("127.0.0.1:0".parse().unwrap(), "news.example");
+    let mut config = config;
+    config.max_post_size = None;
     let service = NntpService::new(config, Arc::clone(&runtime), factory);
     let addr = service.start().unwrap();
 
@@ -170,6 +203,14 @@ fn main() {
     assert!(
         large_peak < small_peak + MIB,
         "memory grew with the article: {small_peak} for 64 KiB, {large_peak} for 192 MiB"
+    );
+    let small_post = measure_post(addr, "post-small", 64 * 1024);
+    let large_post = measure_post(addr, "post-large", 192 * MIB);
+    println!("POST peak {} KiB for 64 KiB and {} KiB for 192 MiB", small_post / 1024, large_post / 1024);
+    assert!(large_post < 2 * MIB, "posting a 192 MiB article took {large_post} bytes of heap at its peak");
+    assert!(
+        large_post < small_post + MIB,
+        "memory grew with the posted article: {small_post} for 64 KiB, {large_post} for 192 MiB"
     );
     println!("ok: peak {} KiB for a 64 KiB article and {} KiB for a 192 MiB one", small_peak / 1024, large_peak / 1024);
 }

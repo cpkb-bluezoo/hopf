@@ -18,6 +18,7 @@ use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, Runtime, StorageError};
 
 use crate::server::codec::{NntpCommand, NntpServerLexer, MAX_COMMAND_LINE};
 use crate::server::commands::{self, civil_from_days, JobEnd, SessionState};
+use crate::server::ingress::NntpDotUnstuffer;
 use crate::server::handler::{
     ClientConnected, ConnectedState, NntpConnectionMetadata, ReaderHandler,
 };
@@ -37,6 +38,30 @@ const BATCH: usize = 64 * 1024;
 struct Shared {
     reader: Mutex<Option<Box<dyn ReaderHandler>>>,
     session: Mutex<SessionState>,
+    post: commands::PostSlot,
+}
+
+/// How much of a posted article is taken from the ring and given to the sink
+/// at a time.
+const POST_PIECE: usize = 64 * 1024;
+
+/// An article being received.
+struct PostData {
+    unstuffer: NntpDotUnstuffer,
+    /// Octets of the article so far.
+    bytes: u64,
+    /// The article is being thrown away (too large, or already refused).
+    discarding: bool,
+    /// The whole article has been read; what is left is to accept it.
+    finished: bool,
+}
+
+/// What a job on the storage pool does.
+enum JobKind {
+    Command(NntpCommand),
+    PostWrite(Vec<u8>),
+    PostTooLarge,
+    PostCommit,
 }
 
 /// A command running on the storage pool.
@@ -96,6 +121,8 @@ pub struct NntpControlHandler {
     job: Option<Job>,
     /// Output has been handed to the connection and has not drained yet.
     write_pending: Arc<AtomicBool>,
+    /// An article is being received.
+    post: Option<PostData>,
 }
 
 impl NntpControlHandler {
@@ -113,6 +140,7 @@ impl NntpControlHandler {
             shared: Arc::new(Shared {
                 reader: Mutex::new(None),
                 session: Mutex::new(SessionState::default()),
+                post: commands::PostSlot::new(),
             }),
             config,
             metrics,
@@ -126,6 +154,7 @@ impl NntpControlHandler {
             closed: false,
             job: None,
             write_pending: Arc::new(AtomicBool::new(false)),
+            post: None,
         }
     }
 
@@ -183,8 +212,12 @@ impl NntpControlHandler {
 
     fn dispatch(&mut self, ep: &mut dyn Endpoint, command: NntpCommand) {
         NntpServerMetrics::add(&self.metrics.commands, 1);
+        if command == NntpCommand::Post && !self.posting_allowed {
+            self.say(ep, 440, "Posting not permitted");
+            return;
+        }
         if commands::needs_handler(&command) {
-            self.start_job(ep, command);
+            self.start_job(ep, JobKind::Command(command));
             return;
         }
         match command {
@@ -203,7 +236,6 @@ impl NntpControlHandler {
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
                 self.say(ep, 111, &format_date(now));
             }
-            NntpCommand::Post => self.say(ep, 440, "Posting not permitted"),
             NntpCommand::Malformed(_) => self.say(ep, 501, "Syntax error in command"),
             NntpCommand::TooLong => self.say(ep, 501, "Command line too long"),
             _ => self.say(ep, 500, "Unknown command"),
@@ -256,7 +288,7 @@ impl NntpControlHandler {
 
     // ---- jobs ----
 
-    fn start_job(&mut self, ep: &mut dyn Endpoint, command: NntpCommand) {
+    fn start_job(&mut self, ep: &mut dyn Endpoint, kind: JobKind) {
         let handle = ep.handle();
         let pipe = Pipe::new();
         let wake: Arc<dyn Fn() + Send + Sync> = {
@@ -276,11 +308,19 @@ impl NntpControlHandler {
             handle.clone(),
             move || {
                 let mut out = out;
-                let mut reader = shared.reader.lock().unwrap_or_else(|e| e.into_inner());
-                let mut session = shared.session.lock().unwrap_or_else(|e| e.into_inner());
-                let result = match reader.as_mut() {
-                    Some(r) => commands::run(&command, r.as_mut(), &mut session, &mut out, &metrics),
-                    None => JobEnd::Fatal,
+                let result = match kind {
+                    JobKind::PostWrite(piece) => commands::post_write(&shared.post, &piece),
+                    JobKind::PostTooLarge => commands::post_too_large(&shared.post),
+                    JobKind::PostCommit => commands::post_commit(&shared.post, &mut out, &metrics),
+                    JobKind::Command(command) => {
+                        let mut reader = shared.reader.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut session = shared.session.lock().unwrap_or_else(|e| e.into_inner());
+                        match (reader.as_mut(), command) {
+                            (Some(r), NntpCommand::Post) => commands::post_begin(r.as_mut(), &shared.post, &mut out),
+                            (Some(r), command) => commands::run(&command, r.as_mut(), &mut session, &mut out, &metrics),
+                            (None, _) => JobEnd::Fatal,
+                        }
+                    }
                 };
                 *job_end.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
                 out.finish();
@@ -361,7 +401,47 @@ impl NntpControlHandler {
             self.close(ep);
             return;
         }
+        if end == Some(JobEnd::PostData) {
+            self.post = Some(PostData {
+                unstuffer: NntpDotUnstuffer::new(),
+                bytes: 0,
+                discarding: false,
+                finished: false,
+            });
+        }
         ep.resume_read();
+    }
+
+    /// Takes the next piece of the article being posted from `data`. Returns
+    /// false when there is nothing more to do until more bytes arrive.
+    fn receive_article(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) -> bool {
+        let max = self.config.max_post_size;
+        let post = self.post.as_mut().expect("an article is being received");
+        if post.finished {
+            self.post = None;
+            self.start_job(ep, JobKind::PostCommit);
+            return true;
+        }
+        if data.is_empty() {
+            return false;
+        }
+        let take = data.len().min(POST_PIECE);
+        let mut piece = Vec::with_capacity(take);
+        let used = post.unstuffer.feed(&data[..take], &mut piece);
+        *data = &data[used..];
+        post.finished = post.unstuffer.is_done();
+        post.bytes += piece.len() as u64;
+        let refused = self.shared.post.error.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        if post.discarding || refused {
+            return true;
+        }
+        if max.is_some_and(|m| post.bytes > m) {
+            post.discarding = true;
+            self.start_job(ep, JobKind::PostTooLarge);
+        } else if !piece.is_empty() {
+            self.start_job(ep, JobKind::PostWrite(piece));
+        }
+        true
     }
 
     fn close_reader(&self) {
@@ -370,6 +450,7 @@ impl NntpControlHandler {
         self.runtime.storage().submit_on(
             handle,
             move || {
+                shared.post.abandon();
                 let reader = shared.reader.lock().unwrap_or_else(|e| e.into_inner()).take();
                 if let Some(mut reader) = reader {
                     reader.close();
@@ -422,6 +503,12 @@ impl ProtocolHandler for NntpControlHandler {
                 }
                 if !self.greeted {
                     return;
+                }
+                if self.post.is_some() {
+                    if !self.receive_article(ep, data) {
+                        return;
+                    }
+                    continue;
                 }
                 match self.lexer.next_command(data) {
                     Some(command) => self.dispatch(ep, command),

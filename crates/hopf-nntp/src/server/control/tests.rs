@@ -27,6 +27,7 @@ pub(super) fn article(subject: &str, body: &str) -> String {
 pub(super) struct Session {
     peer: Peer<NntpControlHandler>,
     pub(super) greeting: String,
+    factory: Arc<MaildirFactory>,
     _root: tempfile::TempDir,
 }
 
@@ -73,7 +74,11 @@ impl Session {
         }
         let config = configure(NntpConfig::new("127.0.0.1:1119".parse().unwrap(), "news.example"));
         let (peer, greeting) = Self::connect(config, Arc::clone(&factory));
-        Self { peer, greeting, _root: root }
+        Self { peer, greeting, factory, _root: root }
+    }
+
+    pub(super) fn factory_for_checks(&self) -> Arc<MaildirFactory> {
+        Arc::clone(&self.factory)
     }
 
     /// Writes `wire` and returns everything the server answers, the client
@@ -106,7 +111,9 @@ impl Session {
     }
 
     fn connect(config: NntpConfig, factory: Arc<MaildirFactory>) -> (Peer<NntpControlHandler>, String) {
-        let handlers = DefaultNntpHandlerFactory::new("ready", factory).with_posting_allowed(config.posting_allowed);
+        let handlers = DefaultNntpHandlerFactory::new("ready", factory)
+            .with_posting_allowed(config.posting_allowed)
+            .with_hostname("news.example");
         let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
         let handler = NntpControlHandler::new(handlers.create(), NntpServerMetrics::shared(), config, rt);
         let mut peer = Peer::connect(handler, |h| h.busy());
@@ -432,5 +439,289 @@ fn a_client_that_goes_away_mid_article_lets_go_of_the_storage_thread() {
     while s.handler.shared.reader.lock().unwrap().is_some() {
         assert!(started.elapsed() < Duration::from_secs(20), "the reader was never released");
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+// ---- POST ----
+
+/// An article as a client sends it: dot-stuffed and ended.
+fn on_the_wire(article: &str) -> String {
+    let mut out = String::new();
+    for line in article.split_inclusive('\n') {
+        if line.starts_with('.') {
+            out.push('.');
+        }
+        out.push_str(line);
+    }
+    if !out.ends_with("\r\n") {
+        out.push_str("\r\n");
+    }
+    out.push_str(".\r\n");
+    out
+}
+
+fn post_text(subject: &str, groups: &str, body: &str) -> String {
+    format!("From: p@x.org\r\nNewsgroups: {groups}\r\nSubject: {subject}\r\n\r\n{body}")
+}
+
+#[test]
+fn a_posted_article_is_filed_and_can_be_read_back() {
+    let mut s = spool();
+    assert_eq!(s.run("POST\r\n"), "340 Input article; end with <CR-LF>.<CR-LF>\r\n");
+    let out = s.run(&on_the_wire(&post_text("posted", "misc.test", "hello\r\n.dotted\r\n")));
+    assert_eq!(out, "240 Article received OK\r\n");
+    assert_eq!(s.run("GROUP misc.test\r\n"), "211 4 1 4 misc.test\r\n");
+    let article = s.run("ARTICLE 4\r\n");
+    assert!(article.starts_with("220 4 <"), "{article}");
+    assert!(article.contains("@news.example> Article follows"), "a Message-ID was added: {article}");
+    assert!(article.contains("\r\nSubject: posted\r\n") && article.contains("\r\nDate: "), "{article}");
+    assert!(article.ends_with("\r\n\r\nhello\r\n..dotted\r\n.\r\n"), "{article}");
+}
+
+#[test]
+fn a_message_id_and_a_date_the_client_gave_are_kept() {
+    let mut s = spool();
+    s.run("POST\r\n");
+    let text = format!("Message-ID: <mine@x.org>\r\nDate: Sat, 21 Nov 2026 10:00:00 +0000\r\n{}", post_text("kept", "misc.test", "b\r\n"));
+    assert_eq!(s.run(&on_the_wire(&text)), "240 Article received OK\r\n");
+    s.run("GROUP misc.test\r\n");
+    let head = s.run("HEAD <mine@x.org>\r\n");
+    assert!(head.starts_with("221 4 <mine@x.org>"), "{head}");
+    assert_eq!(head.matches("Message-ID:").count(), 1);
+    assert_eq!(head.matches("Date:").count(), 1);
+}
+
+#[test]
+fn an_article_is_filed_in_each_group_it_names_that_exists() {
+    let mut s = spool();
+    s.run("POST\r\n");
+    assert_eq!(s.run(&on_the_wire(&post_text("many", "misc.test, alt.empty,no.such", "x\r\n"))), "240 Article received OK\r\n");
+    assert_eq!(s.run("GROUP misc.test\r\n"), "211 4 1 4 misc.test\r\n");
+    assert_eq!(s.run("GROUP alt.empty\r\n"), "211 1 1 1 alt.empty\r\n");
+}
+
+#[test]
+fn an_article_that_cannot_be_filed_is_refused_and_nothing_is_kept() {
+    let mut s = spool();
+    for (article, reason) in [
+        (post_text("s", "no.such", "x\r\n"), "No such newsgroup"),
+        ("From: a@b\r\nSubject: s\r\n\r\nx\r\n".to_string(), "No Newsgroups header"),
+        ("Newsgroups: misc.test\r\nSubject: s\r\n\r\nx\r\n".to_string(), "No From header"),
+        ("Newsgroups: misc.test\r\nFrom: a@b\r\n\r\nx\r\n".to_string(), "No Subject header"),
+        (format!("Message-ID: not-an-id\r\n{}", post_text("s", "misc.test", "x\r\n")), "Invalid Message-ID"),
+        ("\r\nno headers at all\r\n".to_string(), "No Newsgroups header"),
+    ] {
+        assert!(s.run("POST\r\n").starts_with("340 "));
+        let out = s.run(&on_the_wire(&article));
+        assert_eq!(out, format!("441 {reason}\r\n"), "{article:?}");
+    }
+    assert_eq!(s.run("GROUP misc.test\r\n"), "211 3 1 3 misc.test\r\n");
+    assert!(s.run("DATE\r\n").starts_with("111 "), "the connection carried on");
+}
+
+#[test]
+fn an_article_with_headers_and_no_body_is_accepted_and_an_empty_one_is_not() {
+    let mut s = spool();
+    s.run("POST\r\n");
+    assert_eq!(s.run(".\r\n"), "441 Empty article\r\n");
+    s.run("POST\r\n");
+    assert_eq!(s.run("From: a@b\r\nNewsgroups: misc.test\r\nSubject: s\r\n.\r\n"), "240 Article received OK\r\n");
+    s.run("GROUP misc.test\r\n");
+    let body = s.run("BODY 4\r\n");
+    assert!(body.starts_with("222 4 <") && body.ends_with("> Body follows\r\n.\r\n"), "{body}");
+}
+
+#[test]
+fn commands_pipelined_behind_an_article_wait_for_it() {
+    let mut s = spool();
+    let wire = format!("POST\r\n{}DATE\r\nGROUP misc.test\r\n", on_the_wire(&post_text("p", "misc.test", "b\r\n")));
+    let out = s.run(&wire);
+    let codes: Vec<&str> = out.split("\r\n").filter(|l| !l.is_empty()).map(|l| &l[..3]).collect();
+    assert_eq!(codes, ["340", "240", "111", "211"], "{out}");
+    assert!(out.contains("211 4 1 4 misc.test"));
+}
+
+#[test]
+fn an_article_arriving_a_byte_at_a_time_is_the_same_article() {
+    let mut s = spool();
+    s.run("POST\r\n");
+    let wire = on_the_wire(&post_text("slow", "misc.test", "line\r\n.dot\r\n..two\r\nlast\r\n"));
+    assert_eq!(s.run_chunked(&wire, 1), "240 Article received OK\r\n");
+    s.run("GROUP misc.test\r\n");
+    assert!(s.run("BODY 4\r\n").ends_with("\r\nline\r\n..dot\r\n...two\r\nlast\r\n.\r\n"));
+}
+
+#[test]
+fn an_article_over_the_size_limit_is_read_and_refused() {
+    let mut s = Session::with(&[("misc.test", vec![article("one", "x\r\n")])], |mut c| {
+        c.max_post_size = Some(2000);
+        c
+    });
+    s.run("POST\r\n");
+    let big = post_text("big", "misc.test", &"0123456789abcdef\r\n".repeat(5000));
+    assert_eq!(s.run(&on_the_wire(&big)), "441 Article too large\r\n");
+    assert_eq!(s.run("GROUP misc.test\r\n"), "211 1 1 1 misc.test\r\n");
+    s.run("POST\r\n");
+    assert_eq!(s.run(&on_the_wire(&post_text("small", "misc.test", "x\r\n"))), "240 Article received OK\r\n");
+}
+
+#[test]
+fn posting_is_refused_when_it_is_not_allowed() {
+    let mut s = Session::with(&[], |c| c.with_posting_allowed(false));
+    assert_eq!(s.run("POST\r\n"), "440 Posting not permitted\r\n");
+    let out = s.run("CAPABILITIES\r\n");
+    assert!(!out.contains("\r\nPOST\r\n"));
+    let mut s = spool();
+    assert!(s.run("CAPABILITIES\r\n").contains("\r\nPOST\r\n"));
+}
+
+#[test]
+fn a_client_that_goes_away_mid_article_leaves_nothing_behind() {
+    let mut s = spool();
+    s.run("POST\r\n");
+    let wire = on_the_wire(&post_text("half", "misc.test", &"data\r\n".repeat(50_000)));
+    s.write_and_receive_once(&wire.as_bytes()[..wire.len() / 2]);
+    s.pump();
+    s.disconnect();
+    let started = std::time::Instant::now();
+    while s.handler.shared.reader.lock().unwrap().is_some() {
+        assert!(started.elapsed() < Duration::from_secs(20), "the connection was never cleaned up");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The group still has its three articles and no partial one.
+    let root_factory = s.factory_for_checks();
+    let mut store = root_factory.create_store();
+    store.open("news").unwrap();
+    let mb = store.open_mailbox("misc/test", true).unwrap();
+    assert_eq!(mb.message_count().unwrap(), 3);
+}
+
+// ---- a store that falls behind ----
+
+mod slow_store {
+    use super::*;
+    use crate::server::handler::{
+        ClientConnected, ConnectedState, GroupStatus, HandlerError, HandlerResult, Located, NewsgroupInfo,
+        NntpConnectionMetadata, NntpHandlerFactory, PostSink, ReaderHandler,
+    };
+    use crate::server::wildmat::Wildmat;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Condvar;
+
+    /// Lets a test hold the sink's writes.
+    struct Gate {
+        open: Mutex<bool>,
+        changed: Condvar,
+        received: AtomicUsize,
+        committed: AtomicBool,
+    }
+
+    struct Sink(Arc<Gate>);
+
+    impl PostSink for Sink {
+        fn write(&mut self, piece: &[u8]) -> HandlerResult<()> {
+            self.0.received.fetch_add(piece.len(), Ordering::SeqCst);
+            let mut open = self.0.open.lock().unwrap();
+            while !*open {
+                open = self.0.changed.wait(open).unwrap();
+            }
+            Ok(())
+        }
+        fn commit(self: Box<Self>) -> HandlerResult<()> {
+            self.0.committed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn abort(self: Box<Self>) {}
+    }
+
+    struct Reader(Arc<Gate>);
+
+    impl ReaderHandler for Reader {
+        fn select_group(&mut self, _: &str) -> HandlerResult<GroupStatus> {
+            Err(HandlerError::NoSuchGroup)
+        }
+        fn article_numbers(&mut self, _: u32, _: u32, _: usize) -> HandlerResult<Vec<u32>> {
+            Ok(Vec::new())
+        }
+        fn locate_number(&mut self, _: u32) -> HandlerResult<Option<Located>> {
+            Ok(None)
+        }
+        fn locate_message_id(&mut self, _: &str) -> HandlerResult<Option<Located>> {
+            Ok(None)
+        }
+        fn read_article(&mut self, _: &Located, _: &mut dyn FnMut(&[u8]) -> bool) -> HandlerResult<()> {
+            Ok(())
+        }
+        fn groups(&mut self, _: &Wildmat, _: bool, _: &mut dyn FnMut(NewsgroupInfo) -> bool) -> HandlerResult<()> {
+            Ok(())
+        }
+        fn begin_post(&mut self) -> HandlerResult<Box<dyn PostSink>> {
+            Ok(Box::new(Sink(Arc::clone(&self.0))))
+        }
+    }
+
+    struct Factory(Arc<Gate>);
+
+    impl NntpHandlerFactory for Factory {
+        fn create(&self) -> Box<dyn ClientConnected> {
+            struct Connected(Arc<Gate>);
+            impl ClientConnected for Connected {
+                fn connected(&mut self, state: &mut dyn ConnectedState, _: &NntpConnectionMetadata) {
+                    state.accept_connection("ready", true, Box::new(Reader(Arc::clone(&self.0))));
+                }
+            }
+            Box::new(Connected(Arc::clone(&self.0)))
+        }
+    }
+
+    #[test]
+    fn a_store_that_falls_behind_holds_the_client_back_instead_of_the_article_piling_up() {
+        let gate = Arc::new(Gate {
+            open: Mutex::new(false),
+            changed: Condvar::new(),
+            received: AtomicUsize::new(0),
+            committed: AtomicBool::new(false),
+        });
+        let config = NntpConfig::new("127.0.0.1:1119".parse().unwrap(), "news.example");
+        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        let handler = NntpControlHandler::new(Factory(Arc::clone(&gate)).create(), NntpServerMetrics::shared(), config, rt);
+        let mut peer = Peer::connect(handler, |h| h.busy());
+        peer.take();
+        let mut out = peer.run("POST\r\n");
+        while peer.handler.job.is_some() {
+            peer.drain();
+            out.push_str(&peer.take());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(out.starts_with("340 "), "{out}");
+
+        let body = "0123456789abcdef\r\n".repeat(30_000);
+        let wire = format!("From: a@b\r\nNewsgroups: x\r\nSubject: s\r\n\r\n{body}.\r\n");
+        peer.write_and_receive_once(wire.as_bytes());
+        std::thread::sleep(Duration::from_millis(300));
+        let held = gate.received.load(Ordering::SeqCst);
+        assert!(held > 0 && held <= POST_PIECE, "the sink was given {held} bytes while it was stuck on its first write");
+        assert!(!gate.committed.load(Ordering::SeqCst));
+
+        *gate.open.lock().unwrap() = true;
+        gate.changed.notify_all();
+        let started = std::time::Instant::now();
+        let mut out = String::new();
+        while !out.contains("240 ") {
+            peer.drain();
+            out.push_str(&peer.take());
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the post never finished: {out:?}, received {} of {}, job {}, post {:?}, pending {}",
+                gate.received.load(Ordering::SeqCst),
+                wire.len(),
+                peer.handler.job.is_some(),
+                peer.handler.post.as_ref().map(|p| (p.bytes, p.finished, p.discarding)),
+                peer.handler.write_pending.load(Ordering::SeqCst)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(gate.received.load(Ordering::SeqCst), wire.len() - ".\r\n".len());
+        assert!(gate.committed.load(Ordering::SeqCst));
     }
 }
