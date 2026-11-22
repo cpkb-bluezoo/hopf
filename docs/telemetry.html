@@ -396,6 +396,8 @@ TelemetryHook enqueue    InstrumentedServerFactory
 <tr><td><code>dns.server.errors</code></td><td>counter</td><td>handler errors</td></tr>
 <tr><td><code>dns.server.cookies.presented</code> / <code>.verified</code></td><td>counter</td><td>queries with a DNS Cookie (RFC 7873), and those with a verified server cookie</td></tr>
 <tr><td><code>dns.server.mqtype.queries</code> / <code>.subqueries</code></td><td>counter</td><td>RFC 10029 queries acted on, and the sub-queries they were expanded into</td></tr>
+<tr><td><code>dns.server.in_flight</code></td><td>up-down</td><td>queries started and not yet answered, over every connection of a stream transport (<code>tcp</code>, <code>dot</code>)</td></tr>
+<tr><td><code>dns.server.backpressure</code></td><td>counter</td><td>times a TCP or DoT connection stopped being read for having as many queries outstanding as <code>DnsService::set_max_in_flight</code> allows</td></tr>
 </tbody>
 </table>
 <p>The upstream client's points carry <code>dns.upstream</code> (the resolver's address) and <code>dns.transport</code> (<code>dot</code> or <code>doq</code>): <code>dns.upstream.queries</code>, <code>.responses</code>, <code>.timeouts</code>, <code>.failures</code>, <code>.retries</code>, <code>.connects</code>, <code>.connect_failures</code>, <code>.reconnects</code> (counters), <code>dns.upstream.query.duration</code> (histogram, ms) and <code>dns.upstream.connections</code> (the pool size) and <code>dns.upstream.in_flight</code> (up-down values).</p>

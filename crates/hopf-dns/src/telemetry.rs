@@ -45,6 +45,13 @@ pub trait DnsServerTelemetry: Send + Sync {
     /// A multiple-QTYPE query (RFC 10029) was acted on and expanded into
     /// `subqueries` queries for the handler (none if it could not be).
     fn multi_qtype(&self, transport: &str, subqueries: u64);
+    /// The number of queries outstanding, started and not yet answered, over
+    /// every connection of this stream transport (`tcp` or `dot`), is now
+    /// `total`.
+    fn in_flight(&self, _transport: &str, _total: i64) {}
+    /// A connection stopped being read because it had as many queries
+    /// outstanding as the server allows one.
+    fn backpressure(&self, _transport: &str) {}
 }
 
 /// A counted event of an upstream client.

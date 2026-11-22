@@ -279,12 +279,12 @@
 <td>UDP listen</td>
 </tr>
 <tr>
-<td><code>listen_dns_tcp</code></td>
-<td>Cleartext TCP listen (RFC 7766). Needed for zone transfers and truncated-answer retries</td>
+<td><code>listen_dns_tcp</code> / <code>listen_dns_tcp_with</code></td>
+<td>Cleartext TCP listen (RFC 7766). Needed for zone transfers and truncated-answer retries. The <code>_with</code> form takes a closure over the listener's <code>TcpListenerConfig</code> (see <a href="#stream-connections">TCP and DoT connections</a>)</td>
 </tr>
 <tr>
-<td><code>listen_dns_dot</code></td>
-<td>DoT listen (<code>dot</code> feature)</td>
+<td><code>listen_dns_dot</code> / <code>listen_dns_dot_with</code></td>
+<td>DoT listen (<code>dot</code> feature); the <code>_with</code> form as for TCP</td>
 </tr>
 <tr>
 <td><code>listen_dns_doq</code></td>
@@ -327,6 +327,21 @@ service.start(&amp;rt)?;
 let handle = DnsServiceHandle::new(service);
 listen_dns_udp(rt.pick_worker(), DnsUdpListenConfig { addr, service: handle.clone() })?;
 listen_dns_tcp(&amp;rt, addr, handle)?;</code></pre>
+<h3 id="stream-connections">TCP and DoT connections</h3>
+<p><strong>Queries in flight.</strong> A client may pipeline queries on a TCP or DoT connection without waiting for the answers (RFC 7766 §6.2.1.1), and a callback-shaped handler (<a href="#dns-server-server-feature">above</a>) may take its time over each. So that one connection cannot tie up handler state, upstream capacity and memory without bound, a connection may have at most <code>DnsService::set_max_in_flight</code> queries outstanding, started and not yet answered: <strong>128</strong> by default, <code>None</code> for no limit. At the limit the connection is simply <em>not read</em> until an answer completes: what the client has sent waits in the socket, where TCP's own flow control holds it back, and nothing is refused or dropped. What has been read but not started waits in the handler, never more than one read's worth. A query is answered when its handler's callback is completed, or let go of (the service then answers <code>SERVFAIL</code>, and the place is free again).</p>
+<ul>
+<li><strong>Order.</strong> Answers on one connection may come back in any order (RFC 7766 §6.2.1.1), and still do: a query that is started is answered when its handler is ready, not behind a slower one. With a limit set, queries <em>start</em> in the order they were sent, so a query held back is started only after one ahead of it is answered, and its answer follows the answers that freed its place. With no limit every query starts as it is read, as before.</li>
+<li><strong>Inline answers.</strong> A handler that answers before it returns never has a query outstanding for longer than the call, so a connection of such queries is never held back however many it pipelines.</li>
+<li><strong>Not DoQ.</strong> A DoQ connection has a stream for each query and the flow control of QUIC, and the limit does not apply to it.</li>
+<li><strong>Metrics.</strong> <code>DnsServerMetrics</code> counts <code>backpressure_events</code> (times a connection stopped being read for being at its limit) and <code>in_flight_peak</code> (the most outstanding at once on one connection). With telemetry attached (<a href="#telemetry">below</a>), <code>dns.server.in_flight</code> is the number outstanding over every connection of <code>tcp</code> or <code>dot</code>, and <code>dns.server.backpressure</code> counts the events. A per-connection gauge is not exported: a connection is not a bounded set of attribute values.</li>
+</ul>
+<p><strong>Listener settings.</strong> <code>listen_dns_tcp_with</code> and <code>listen_dns_dot_with</code> hand the listener's <code>TcpListenerConfig</code> to a closure before it is bound, so everything a listener has is available to a DNS one: the peer allow and deny lists (<code>with_acl</code>), the accept rate limit, per source and global (<code>with_rate_limit</code>), the inbound and outbound buffer caps (<code>max_net_in</code>, <code>max_net_out</code>), PROXY protocol (<code>with_proxy_protocol</code>) and the idle timeout (<code>idle_timeout</code>, which is accepted but <strong>not yet enforced</strong>: see <a href="runtime-options.html#idle-timeout">runtime options</a>). <code>listen_dns_tcp</code> and <code>listen_dns_dot</code> are the same with the defaults.</p>
+<pre><code>listen_dns_tcp_with(&amp;rt, addr, handle, |config| {
+    config
+        .with_rate_limit(AcceptRateLimit::new(20, Duration::from_secs(1), 2000))
+        .max_net_in(64 * 1024)
+})?;</code></pre>
+<p><strong>Not available.</strong> There is no maximum number of connections for a listener, and no limit per address: the runtime has neither for any protocol, so a DNS listener has neither. The accept rate limit bounds how fast connections arrive, and the in-flight limit bounds the work each can have outstanding, but how many may be open at once is not bounded.</p>
 <h3 id="forwarder">Caching forwarder</h3>
 <p><code>ForwarderHandler::new(cache).with_upstream(resolver)</code>, plus <code>cache()</code>. It never declines, so in a chain it goes last. Strips DNSSEC RRs when the client query lacks DO. With no upstream a cache miss is <code>SERVFAIL</code>.</p>
 <p>Three resolver behaviours that the RFCs recommend but do not require are on by default, and each is a policy hook on the handler that can be replaced or turned off (any closure will do):</p>
@@ -710,6 +725,7 @@ printf 'server 127.0.0.1 5353\nzone example.com\nupdate add new.example.com 60 A
 <li>The IXFR journal is in memory (512 changes) and starts empty at each start-up, so a restarted primary answers an IXFR with a full transfer.</li>
 <li>Secondaries do not forward updates to the primary (RFC 2136 §6): they refuse them.</li>
 <li>No access control beyond source address and TSIG key (no per-record-type or per-name update policy).</li>
+<li>No limit on the number of connections to a TCP or DoT listener, or per address (see <a href="#stream-connections">TCP and DoT connections</a>); the idle timeout is not enforced.</li>
 </ul>
 <p>Other:</p>
 <ul>

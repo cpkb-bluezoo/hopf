@@ -75,6 +75,23 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
   kilobytes at most. `tests/api_audit.rs` fails if a public signature
   reintroduces an unbounded type. `hopf-core` gained a `pause_read` fix so a
   paused connection is held by TCP and loses nothing.
+- **hopf-dns:** a limit on the queries outstanding on one TCP or DoT connection
+  (#539). A client could pipeline queries faster than a callback-shaped handler
+  answered them, each tying up handler state, upstream capacity and memory with
+  nothing to stop it. `DnsService::set_max_in_flight` (default 128, `None` for no
+  limit) now stops a connection being read while it has that many outstanding, and
+  reads it again when an answer completes, so TCP's own flow control holds the
+  client back and nothing is refused or dropped; queries start in the order they
+  were sent, and answers may still come back in any order (RFC 7766 §6.2.1.1). A
+  callback let go of without an answer frees its place. `DnsServerMetrics` gains
+  `backpressure_events` and `in_flight_peak`, and `DnsServerTelemetry` gains
+  `in_flight` and `backpressure` (with default no-op bodies), exported by
+  `hopf-otel` as `dns.server.in_flight` and `dns.server.backpressure`.
+  `listen_dns_tcp_with` and `listen_dns_dot_with` give a DNS listener the
+  `TcpListenerConfig` settings (peer lists, accept rate limit, buffer caps, PROXY
+  protocol, idle timeout). The documentation says what a listener does not have:
+  a limit on the number of connections, in total or per address, and an enforced
+  idle timeout.
 - **hopf-redis: cluster publish/subscribe** (#538). `RedisClusterSubscriber`
   keeps one `RedisSubscriber` per node that needs one, on the layout a
   `RedisCluster` keeps, and reconciles them whenever the layout changes. A

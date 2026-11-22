@@ -84,6 +84,11 @@ path = "tests/async_handler.rs"
 required-features = ["integration", "server"]
 
 [[test]]
+name = "inflight_limit"
+path = "tests/inflight_limit.rs"
+required-features = ["integration", "server"]
+
+[[test]]
 name = "query_context"
 path = "tests/query_context.rs"
 required-features = ["integration", "server"]

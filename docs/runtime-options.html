@@ -435,6 +435,7 @@
 </tbody>
 </table>
 <p>Applied on the accept path before the connection is handed to a worker.</p>
+<p>There is <strong>no limit on the number of connections</strong> a listener has open, in total or per address: the accept rate limit above bounds how fast they arrive, not how many are open at once. A protocol that needs the number bounded has to count its connections itself in its handler's <code>connected</code> and <code>disconnected</code>. (A DNS listener takes any of these settings through <code>listen_dns_tcp_with</code> and <code>listen_dns_dot_with</code>, and bounds the queries a connection has outstanding: see <a href="dns.html#stream-connections">DNS: TCP and DoT connections</a>.)</p>
 <h2 id="idle-timeout">Idle timeout</h2>
 <p><code>idle_timeout: Option&lt;Duration&gt;</code> exists on both listen and dial configs and is carried into <code>TcpConnParams</code>, but nothing in the reactor / connection datapath reads it yet - <strong>it is accepted and stored, not enforced</strong>. Do not rely on it to close idle connections. Prefer application-level timers via <code>Endpoint::schedule_timer</code> until this lands.</p>
 <h2 id="telemetry-hook">Telemetry hook</h2>

@@ -69,6 +69,14 @@ impl Telemetry {
         });
     }
 
+    pub(crate) fn in_flight(&self, t: DnsTransport, total: i64) {
+        self.with(|s| s.in_flight(t.as_str(), total));
+    }
+
+    pub(crate) fn backpressure(&self, t: DnsTransport) {
+        self.with(|s| s.backpressure(t.as_str()));
+    }
+
     pub(crate) fn multi_qtype(&self, t: DnsTransport, subqueries: u64) {
         self.with(|s| s.multi_qtype(t.as_str(), subqueries));
     }

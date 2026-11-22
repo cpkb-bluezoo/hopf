@@ -64,6 +64,7 @@ impl ProtocolHandler for DoqServerHandler {
                     &conn,
                     DnsTransport::Doq,
                     write_length_prefixed,
+                    None,
                 ) {
                     // RFC 9250 §4.3: a malformed DNS message on the stream is
                     // a protocol violation, not something to silently drop.

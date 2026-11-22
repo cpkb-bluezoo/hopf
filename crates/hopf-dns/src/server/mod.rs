@@ -40,7 +40,7 @@ pub use policy::{AggressiveNsecDisabled, AggressiveNsecEnabled, AggressiveNsecPo
 pub use policy::{
     NxdomainCutDisabled, NxdomainCutEnabled, NxdomainCutPolicy, ServeStale, ServeStaleDisabled, StalePolicy, StaleTerms,
 };
-pub use framed::listen_dns_tcp;
+pub use framed::{listen_dns_tcp, listen_dns_tcp_with};
 pub use handler::{
     ChainHandler, ConnectionInfo, DnsQueryCallback, DnsQueryHandler, DnsTransport, EmptyHandler, FnHandler,
     MetricsSink, QueryContext, SyncDnsQueryHandler,
@@ -50,7 +50,7 @@ pub use minimal_any::{MinimalAnyDisabled, MinimalAnyEnabled, MinimalAnyPolicy};
 pub use udp::{listen_dns_udp, DnsUdpListenConfig};
 
 #[cfg(feature = "dot")]
-pub use dot::listen_dns_dot;
+pub use dot::{listen_dns_dot, listen_dns_dot_with};
 
 #[cfg(feature = "doq")]
 pub use doq::listen_dns_doq;
@@ -97,7 +97,16 @@ pub struct DnsServerMetrics {
     /// Sub-queries those queries were expanded into, one per extra type
     /// asked of the handler. Not counted in `queries`.
     pub mqtype_subqueries: u64,
+    /// Times a TCP or DoT connection stopped being read because it had as many
+    /// queries outstanding as [`DnsService::set_max_in_flight`] allows.
+    pub backpressure_events: u64,
+    /// The most queries that have been outstanding at once on one TCP or DoT
+    /// connection.
+    pub in_flight_peak: u64,
 }
+
+/// How many queries a TCP or DoT connection may have outstanding by default.
+pub const DEFAULT_MAX_IN_FLIGHT: usize = 128;
 
 /// Where the messages that answer one request are delivered, exactly once,
 /// possibly from another thread.
@@ -115,6 +124,11 @@ pub struct DnsService {
     keyring: Arc<TsigKeyring>,
     max_mqtypes: usize,
     telemetry: telemetry::Telemetry,
+    /// Queries a stream connection may have outstanding; `None` is no limit.
+    max_in_flight: Option<usize>,
+    /// Queries outstanding now on every connection of each stream transport
+    /// (TCP, then DoT), for telemetry.
+    in_flight_total: [std::sync::atomic::AtomicI64; 2],
 }
 
 impl Default for DnsService {
@@ -145,7 +159,26 @@ impl DnsService {
             keyring: Arc::new(TsigKeyring::new()),
             max_mqtypes: 0,
             telemetry: telemetry::Telemetry::default(),
+            max_in_flight: Some(DEFAULT_MAX_IN_FLIGHT),
+            in_flight_total: Default::default(),
         }
+    }
+
+    /// The most queries a TCP or DoT connection may have outstanding (started
+    /// and not yet answered) at once. At the limit the connection is not read
+    /// until an answer is complete, so the client is held back by TCP's own
+    /// flow control and nothing is refused or dropped: a client that pipelines
+    /// more than this has its later queries read, and answered, as earlier ones
+    /// finish. The default is [`DEFAULT_MAX_IN_FLIGHT`]; `None` is no limit, and
+    /// a connection then has as many outstanding as the client sends. DoQ has
+    /// flow control of its own, a stream for each query, and is not affected.
+    ///
+    /// Answers on one connection may come back in any order (RFC 7766
+    /// §6.2.1.1), and with a limit set a later query does not start until an
+    /// earlier one has been answered, so an answer to a query that was held back
+    /// follows the answers that freed it.
+    pub fn set_max_in_flight(&mut self, max: Option<usize>) {
+        self.max_in_flight = max.map(|m| m.max(1));
     }
 
     /// Report this service's counters to `telemetry`: queries, responses (with
@@ -205,6 +238,41 @@ impl DnsService {
     /// Snapshot metrics.
     pub fn metrics(&self) -> DnsServerMetrics {
         self.metrics.lock().unwrap().clone()
+    }
+
+    /// A stream connection has started a query: `on_connection` are now
+    /// outstanding on it.
+    pub(crate) fn query_started(&self, transport: DnsTransport, on_connection: usize) {
+        {
+            let mut m = self.metrics.lock().unwrap();
+            m.in_flight_peak = m.in_flight_peak.max(on_connection as u64);
+        }
+        if let Some(total) = self.stream_total(transport, 1) {
+            self.telemetry.in_flight(transport, total);
+        }
+    }
+
+    /// A stream connection's query is answered (or abandoned).
+    pub(crate) fn query_finished(&self, transport: DnsTransport) {
+        if let Some(total) = self.stream_total(transport, -1) {
+            self.telemetry.in_flight(transport, total);
+        }
+    }
+
+    /// A stream connection stopped being read for having as many queries
+    /// outstanding as it may.
+    pub(crate) fn backpressure(&self, transport: DnsTransport) {
+        self.metrics.lock().unwrap().backpressure_events += 1;
+        self.telemetry.backpressure(transport);
+    }
+
+    fn stream_total(&self, transport: DnsTransport, delta: i64) -> Option<i64> {
+        let at = match transport {
+            DnsTransport::Tcp => 0,
+            DnsTransport::Dot => 1,
+            _ => return None,
+        };
+        Some(self.in_flight_total[at].fetch_add(delta, std::sync::atomic::Ordering::SeqCst) + delta)
     }
 
     /// Process one message from `peer` as if it arrived over UDP, returning
@@ -570,6 +638,12 @@ impl DnsServiceHandle {
         Self {
             inner: Arc::new(service),
         }
+    }
+
+    /// The limit on queries outstanding on a TCP or DoT connection; see
+    /// [`DnsService::set_max_in_flight`].
+    pub fn max_in_flight(&self) -> Option<usize> {
+        self.inner.max_in_flight
     }
 
     /// Process a UDP message from `peer` and wait for the answer; see

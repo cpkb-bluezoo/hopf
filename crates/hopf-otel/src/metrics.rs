@@ -687,6 +687,8 @@ fn rcode_name(rcode: u16) -> String {
 /// | `dns.server.cookies.verified` | counter | of those, with a verified server cookie |
 /// | `dns.server.mqtype.queries` | counter | RFC 10029 multiple-QTYPE queries acted on |
 /// | `dns.server.mqtype.subqueries` | counter | sub-queries those were expanded into |
+/// | `dns.server.in_flight` | up-down | queries started and not yet answered, over every connection of a stream transport (`tcp`, `dot`) |
+/// | `dns.server.backpressure` | counter | times a connection stopped being read for having as many queries outstanding as it may |
 pub struct DnsServerMetrics {
     export: ExportHandle,
 }
@@ -1011,6 +1013,8 @@ mod tests {
         m.response_sent("udp", 3, std::time::Duration::from_millis(7));
         m.cache_hit("dot");
         m.multi_qtype("tcp", 2);
+        hopf_dns::telemetry::DnsServerTelemetry::in_flight(&*m, "tcp", 3);
+        hopf_dns::telemetry::DnsServerTelemetry::backpressure(&*m, "tcp");
         handle.flush().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(80));
         handle.shutdown();
@@ -1023,6 +1027,8 @@ mod tests {
             "dns.server.query.duration",
             "dns.server.cache.hits",
             "dns.server.mqtype.subqueries",
+            "dns.server.in_flight",
+            "dns.server.backpressure",
             "dns.transport",
         ] {
             assert!(body.contains(needle), "missing {needle}: {body}");
@@ -1110,6 +1116,16 @@ impl hopf_dns::telemetry::DnsServerTelemetry for DnsServerMetrics {
     }
     fn multi_qtype(&self, transport: &str, subqueries: u64) {
         DnsServerMetrics::multi_qtype(self, transport, subqueries);
+    }
+    fn in_flight(&self, transport: &str, total: i64) {
+        self.export.try_send_metric(MetricPoint::UpDown {
+            name: "dns.server.in_flight",
+            attributes: vec![("dns.transport".into(), transport.into())],
+            value: total,
+        });
+    }
+    fn backpressure(&self, transport: &str) {
+        self.count("dns.server.backpressure", transport, 1);
     }
 }
 
