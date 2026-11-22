@@ -49,8 +49,12 @@ hopf-quic = { workspace = true, optional = true }
 rcgen = { workspace = true }
 # The telemetry end-to-end test exports through a real pipeline. A
 # dev-dependency on a crate that depends on this one is allowed, and only
-# integration tests (which link this crate as a library) use it.
-hopf-otel = { workspace = true }
+# integration tests (which link this crate as a library) use it. It is given
+# as a path with no version, so that `cargo publish` leaves it out of the
+# published manifest: hopf-otel depends on this crate, so it cannot be on
+# crates.io before this crate is, and a dev-dependency with a version has to
+# resolve there.
+hopf-otel = { path = "../hopf-otel" }
 hopf-core = { workspace = true, features = ["ed448"] }
 
 [[test]]
