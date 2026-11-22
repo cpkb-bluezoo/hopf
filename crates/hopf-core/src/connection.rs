@@ -140,6 +140,12 @@ pub(crate) struct TcpConnection {
     /// size is fixed for the life of the connection.
     net_in: LoopBuf,
     net_out: Vec<u8>,
+    /// Application data written while TLS is active and not yet sealed, so
+    /// that what a handler writes in one go shares records instead of making
+    /// one each. Sealed when it fills a record, before the write to the
+    /// socket (which is at the end of whatever event the writes were made in)
+    /// and before a close; it counts against `max_net_out` like `net_out`.
+    plain_out: Vec<u8>,
     /// Plaintext inbound when TLS is active: a ring too, fed from `net_in`
     /// only while it has room for what the next ciphertext can decrypt to.
     app_in: LoopBuf,
@@ -196,6 +202,10 @@ pub(crate) struct TcpConnection {
 fn placeholder_ring() -> LoopBuf {
     LoopBuf::with_capacity(1)
 }
+
+/// How much application data is staged before it is sealed without waiting for
+/// the end of the event: a full TLS record.
+const STAGE_LIMIT: usize = 16 * 1024;
 
 /// The smallest inbound ring a connection gets: a TLS record is up to 16 KiB
 /// and the ring must hold one whole.
@@ -295,6 +305,7 @@ impl TcpConnection {
             .unwrap_or_else(|_| PeerAddr::Inet(SocketAddr::from(([0, 0, 0, 0], 0))));
         let net_in = pool.acquire_ring(params.max_net_in.max(MIN_NET_IN_BYTES));
         let net_out = pool.acquire(DEFAULT_BUFFER_SIZE);
+        let plain_out = Vec::new();
         let tls = if params.secure {
             if let Some(connector) = params.tls_connector.as_ref() {
                 let name = params.server_name.as_deref().ok_or_else(|| {
@@ -327,6 +338,7 @@ impl TcpConnection {
             handler: Some(handler),
             net_in,
             net_out,
+            plain_out,
             app_in,
             max_net_out: params.max_net_out,
             read_paused: false,
@@ -520,9 +532,13 @@ impl TcpConnection {
 
     fn wants_write(&self) -> bool {
         // TlsRecordEngine pushes ciphertext straight into net_out as it's
-        // produced (sink-based, unlike the old pull-based TlsSession::write_tls),
-        // so net_out already reflects everything pending — no separate check needed.
-        self.connecting || !self.net_out.is_empty() || self.close_requested || self.write_ready.is_some()
+        // produced, so net_out holds everything sealed; `plain_out` holds what
+        // is written and not yet sealed, which the next write seals.
+        self.connecting
+            || !self.net_out.is_empty()
+            || !self.plain_out.is_empty()
+            || self.close_requested
+            || self.write_ready.is_some()
     }
 
     /// Gives the plaintext ring a real size once TLS is on the connection.
@@ -802,6 +818,9 @@ impl TcpConnection {
             self.interest_dirty = true;
             return Ok(WriteOutcome::WouldBlock);
         }
+        // What was written in this event is sealed together, now that there
+        // is no more of it to come.
+        self.flush_plain();
         while !self.net_out.is_empty() {
             match self.stream.write(&self.net_out) {
                 Ok(0) => {
@@ -945,6 +964,7 @@ impl TcpConnection {
         self.closing = true;
         self.close_requested = true;
         self.net_out.clear();
+        self.plain_out.clear();
         self.interest_dirty = true;
     }
 
@@ -977,8 +997,12 @@ impl TcpConnection {
     pub fn release_buffers(&mut self) {
         let inn = std::mem::replace(&mut self.net_in, placeholder_ring());
         let out = std::mem::take(&mut self.net_out);
+        let staged = std::mem::take(&mut self.plain_out);
         self.pool.release_ring(inn);
         self.pool.release(out);
+        if staged.capacity() > 0 {
+            self.pool.release(staged);
+        }
         let app = std::mem::replace(&mut self.app_in, placeholder_ring());
         self.pool.release_ring(app);
     }
@@ -1016,26 +1040,93 @@ impl TcpConnection {
         if !self.open || self.closing {
             return;
         }
-        if self.tls.is_some() {
-            let mut outcome = TlsPumpOutcome::default();
-            {
-                let tls = self.tls.as_mut().expect("checked above");
-                let mut adapter = TlsSinkAdapter {
-                    net_out: &mut self.net_out,
-                    app_in: &mut self.app_in,
-                    outcome: &mut outcome,
-                };
-                tls.send_application_data(data, &mut adapter);
+        match self.tls.as_ref() {
+            // Once the handshake is done what is written is staged, to be
+            // sealed with whatever else is written in the same event.
+            Some(tls) if tls.is_complete() => self.stage(data),
+            Some(_) => self.seal(data),
+            None => self.append_out(data),
+        }
+    }
+
+    /// Takes application data to be sealed with what else is written before the
+    /// socket is next written to. A write as large as a record is not copied:
+    /// what was staged before it is sealed, then it is.
+    fn stage(&mut self, data: &[u8]) {
+        if data.len() >= STAGE_LIMIT {
+            self.flush_plain();
+            if self.open {
+                self.seal(data);
             }
-            if let Err(e) = self.apply_tls_outcome(outcome) {
-                self.log_runtime_error(
-                    "connection.tls.send_failed",
-                    format!("TLS send failed on {}: {e}", self.remote),
-                );
-                self.close_with_error(e);
-            }
-        } else {
-            self.append_out(data);
+            return;
+        }
+        let held = self.net_out.len() + self.plain_out.len() + data.len();
+        if held > self.max_net_out {
+            let message = format!("outbound buffer overflow on {} ({held} > {})", self.remote, self.max_net_out);
+            self.log_runtime_error("connection.outbound.overflow", message.clone());
+            self.close_with_error(io::Error::new(ErrorKind::OutOfMemory, message));
+            return;
+        }
+        if self.plain_out.capacity() == 0 {
+            self.plain_out = self.pool.acquire(STAGE_LIMIT * 2);
+            self.plain_out.clear();
+        }
+        self.plain_out.extend_from_slice(data);
+        self.interest_dirty = true;
+        if self.plain_out.len() >= STAGE_LIMIT {
+            self.seal_full_records();
+        }
+    }
+
+    /// Seals the whole records' worth of what is staged and keeps the rest,
+    /// which has still room to share a record with what comes.
+    fn seal_full_records(&mut self) {
+        let mut staged = std::mem::take(&mut self.plain_out);
+        let whole = staged.len() / STAGE_LIMIT * STAGE_LIMIT;
+        if self.open && whole > 0 {
+            self.seal(&staged[..whole]);
+        }
+        staged.drain(..whole);
+        if self.plain_out.capacity() == 0 {
+            self.plain_out = staged;
+        }
+    }
+
+    /// Seals what has been staged into records.
+    fn flush_plain(&mut self) {
+        if self.plain_out.is_empty() {
+            return;
+        }
+        let staged = std::mem::take(&mut self.plain_out);
+        if self.open {
+            self.seal(&staged);
+        }
+        // The buffer is kept for the next time.
+        let mut staged = staged;
+        staged.clear();
+        if self.plain_out.capacity() == 0 {
+            self.plain_out = staged;
+        }
+    }
+
+    /// Seals `data` into records on `net_out`.
+    fn seal(&mut self, data: &[u8]) {
+        let mut outcome = TlsPumpOutcome::default();
+        {
+            let tls = self.tls.as_mut().expect("seal is for a connection with TLS");
+            let mut adapter = TlsSinkAdapter {
+                net_out: &mut self.net_out,
+                app_in: &mut self.app_in,
+                outcome: &mut outcome,
+            };
+            tls.send_application_data(data, &mut adapter);
+        }
+        if let Err(e) = self.apply_tls_outcome(outcome) {
+            self.log_runtime_error(
+                "connection.tls.send_failed",
+                format!("TLS send failed on {}: {e}", self.remote),
+            );
+            self.close_with_error(e);
         }
     }
 
@@ -1066,6 +1157,8 @@ impl Endpoint for TcpConnection {
         if self.closing {
             return;
         }
+        // What was written before the close goes before it.
+        self.flush_plain();
         self.closing = true;
         self.close_requested = true;
         if let Some(tls) = self.tls.as_mut() {

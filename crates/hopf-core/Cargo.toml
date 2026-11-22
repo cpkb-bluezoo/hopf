@@ -70,3 +70,8 @@ required-features = ["integration"]
 name = "connection_limits"
 path = "tests/connection_limits.rs"
 required-features = ["integration"]
+
+[[test]]
+name = "tls_shared_records"
+path = "tests/tls_shared_records.rs"
+required-features = ["integration"]

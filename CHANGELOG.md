@@ -364,6 +364,18 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
 
 ### Changed
 
+- **hopf-core: application data written together shares TLS records** (#545).
+  On a TLS connection (1.2 and 1.3), `Endpoint::send` no longer seals a record
+  per call: what a handler writes in one event is held, up to a record's worth
+  at a time, and sealed together just before the socket is written to, which is
+  at the end of the event, so nothing waits and latency is unchanged. A write
+  as large as a record is sealed as it is, without a copy; a close seals what
+  is held before the `close_notify`; and the held bytes count against
+  `max_net_out`. Writing 200,000 small (20-byte) pieces in one callback was
+  200,000 records and 8.4 MB (TLS 1.3) on the wire; it is 245 records and 4.0
+  MB (the data itself), and took 12 ms instead of 204 ms. The peer decrypts,
+  and an observer sees, the record boundaries of the connection and no longer
+  the boundaries of the application's writes.
 - **hopf-webdav (behaviour change):** RFC 3744 privileges are now enforced
   whenever a `role_policy` is set; before, they were only reported (#512).
   A method runs only if the authenticated user holds the privileges RFC 3744
