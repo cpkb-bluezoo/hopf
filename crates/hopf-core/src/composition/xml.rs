@@ -119,6 +119,8 @@ struct ListenDoc {
     max_net_in: Option<usize>,
     max_net_out: Option<usize>,
     idle_timeout_ms: Option<u64>,
+    max_connections: Option<usize>,
+    max_connections_per_address: Option<usize>,
     allow: Vec<String>,
     deny: Vec<String>,
     rate_limit: Option<RateDoc>,
@@ -197,6 +199,8 @@ impl CompositionDocument {
                 tls: None,
                 acl: PeerAcl::open(),
                 rate_limit: None,
+                max_connections: listen.max_connections,
+                max_connections_per_address: listen.max_connections_per_address,
                 proxy_protocol: false,
             };
             let mut acl = PeerAcl::open();
@@ -405,6 +409,18 @@ impl CompositionXmlHandler {
                         }
                         "idle-timeout-ms" => {
                             listen.idle_timeout_ms = Some(match parse_u64(&k, &v) {
+                                Ok(n) => n,
+                                Err(e) => return self.fail(e),
+                            });
+                        }
+                        "max-connections" => {
+                            listen.max_connections = Some(match parse_usize(&k, &v) {
+                                Ok(n) => n,
+                                Err(e) => return self.fail(e),
+                            });
+                        }
+                        "max-connections-per-address" => {
+                            listen.max_connections_per_address = Some(match parse_usize(&k, &v) {
                                 Ok(n) => n,
                                 Err(e) => return self.fail(e),
                             });
@@ -688,7 +704,8 @@ mod tests {
         let xml = r#"<?xml version="1.0"?>
 <composition worker-threads="2" storage-threads="4">
   <listen-tcp addr="127.0.0.1:0" handler="echo"
-              max-net-in="1024" max-net-out="2048" idle-timeout-ms="1000">
+              max-net-in="1024" max-net-out="2048" idle-timeout-ms="1000"
+              max-connections="500" max-connections-per-address="20">
     <allow cidr="10.0.0.0/8"/>
     <deny cidr="192.0.2.0/24"/>
     <rate-limit per-source="10" window-ms="1000" global="100"/>
@@ -705,6 +722,7 @@ mod tests {
         assert_eq!(listen.max_net_in, 1024);
         assert_eq!(listen.max_net_out, 2048);
         assert_eq!(listen.idle_timeout, Some(Duration::from_millis(1000)));
+        assert_eq!((listen.max_connections, listen.max_connections_per_address), (Some(500), Some(20)));
         assert_eq!(listen.acl.allow.len(), 1);
         assert_eq!(listen.acl.deny.len(), 1);
         assert!(listen.rate_limit.is_some());

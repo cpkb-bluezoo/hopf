@@ -28,6 +28,7 @@ pub mod endpoint;
 pub mod error;
 pub mod handle;
 pub mod handler;
+pub mod limits;
 pub mod listener;
 pub mod peer_addr;
 pub mod peer_cred;
@@ -71,6 +72,7 @@ pub use listener::{
     HandlerFactory, Listener, TcpListenerConfig, UnixListenerConfig, DEFAULT_BUFFER_SIZE,
     DEFAULT_MAX_NET_IN, DEFAULT_MAX_NET_OUT,
 };
+pub use limits::ConnectionSlot;
 pub use peer_addr::PeerAddr;
 pub use proxy_protocol::ProxyTlv;
 pub use peer_cred::{PeerCredAllowlist, PeerCredentials};

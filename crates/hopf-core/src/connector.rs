@@ -21,7 +21,8 @@ pub struct TcpConnParams {
     pub max_net_in: usize,
     /// Max outbound buffer size before the connection is closed.
     pub max_net_out: usize,
-    /// Idle timeout (no receive); `None` disables.
+    /// Close a connection with nothing received or sent for this long; `None`
+    /// disables.
     pub idle_timeout: Option<Duration>,
     /// Wall-clock budget for the nonblocking TCP connect handshake; `None` disables.
     ///
@@ -43,6 +44,9 @@ pub struct TcpConnParams {
     /// side; a dialed connection never has one. See
     /// [`crate::listener::TcpListenerConfig::with_proxy_protocol`].
     pub expect_proxy_protocol: bool,
+    /// The connection's place under its listener's connection limits, held for
+    /// as long as the connection is. Only an accepted connection has one.
+    pub slot: Option<std::sync::Arc<crate::limits::ConnectionSlot>>,
 }
 
 impl TcpConnParams {
@@ -60,6 +64,7 @@ impl TcpConnParams {
             server_name: None,
             remote_hint,
             expect_proxy_protocol: false,
+            slot: None,
         }
     }
 }
@@ -159,6 +164,7 @@ impl TcpConnectorConfig {
             server_name: self.server_name.clone(),
             remote_hint: self.addr.into(),
             expect_proxy_protocol: false,
+            slot: None,
         }
     }
 
@@ -265,6 +271,7 @@ impl UnixConnectorConfig {
             server_name: self.server_name.clone(),
             remote_hint: PeerAddr::Unix(Some(self.path.clone())),
             expect_proxy_protocol: false,
+            slot: None,
         }
     }
 

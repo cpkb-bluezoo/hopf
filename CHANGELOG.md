@@ -75,6 +75,20 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
   kilobytes at most. `tests/api_audit.rs` fails if a public signature
   reintroduces an unbounded type. `hopf-core` gained a `pause_read` fix so a
   paused connection is held by TCP and loses nothing.
+- **hopf-core:** limits on a listener's open connections, and an idle timeout
+  that is enforced (#542). `TcpListenerConfig::max_connections` and
+  `max_connections_per_address` bound how many connections a listener has open
+  in total and from one peer address (an IPv4 peer on a dual-stack socket counts
+  as its IPv4 address); a connection over either is accepted and closed at once,
+  as the peer lists and the rate limit do, and the telemetry hook is told. The
+  place is held by the connection and given back when it is dropped, however it
+  ended. Composition XML takes `max-connections` and
+  `max-connections-per-address`. `idle_timeout`, accepted and stored but ignored
+  until now on listeners and dials alike, now closes a connection with nothing
+  received or sent for the whole timeout (`ErrorKind::TimedOut` to the handler's
+  `error`, then `disconnected`); it is checked once per timeout, so a busy
+  connection costs no timer per byte. `docs/runtime-options.html` documents both,
+  including that a handler waiting on a slow answer looks idle.
 - **hopf-dns:** a limit on the queries outstanding on one TCP or DoT connection
   (#539). A client could pipeline queries faster than a callback-shaped handler
   answered them, each tying up handler state, upstream capacity and memory with
@@ -89,9 +103,7 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
   `hopf-otel` as `dns.server.in_flight` and `dns.server.backpressure`.
   `listen_dns_tcp_with` and `listen_dns_dot_with` give a DNS listener the
   `TcpListenerConfig` settings (peer lists, accept rate limit, buffer caps, PROXY
-  protocol, idle timeout). The documentation says what a listener does not have:
-  a limit on the number of connections, in total or per address, and an enforced
-  idle timeout.
+  protocol, idle timeout, connection limits).
 - **hopf-redis: cluster publish/subscribe** (#538). `RedisClusterSubscriber`
   keeps one `RedisSubscriber` per node that needs one, on the layout a
   `RedisCluster` keeps, and reconciles them whenever the layout changes. A

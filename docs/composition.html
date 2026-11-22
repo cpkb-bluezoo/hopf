@@ -285,6 +285,18 @@
 <td>unset / <code>None</code></td>
 </tr>
 <tr>
+<td><code>max-connections</code></td>
+<td><code>usize</code></td>
+<td><code>max_connections</code> (<code>&lt;listen-tcp&gt;</code> only): the most connections open at once; more are accepted and closed</td>
+<td>unset / <code>None</code></td>
+</tr>
+<tr>
+<td><code>max-connections-per-address</code></td>
+<td><code>usize</code></td>
+<td><code>max_connections_per_address</code> (<code>&lt;listen-tcp&gt;</code> only): the most open from one peer address</td>
+<td>unset / <code>None</code></td>
+</tr>
+<tr>
 <td><code>connect-timeout-ms</code></td>
 <td><code>u64</code> ms</td>
 <td><code>connect_timeout</code> (<code>&lt;dial-tcp&gt;</code> only)</td>
@@ -354,7 +366,7 @@ comp.listen_tcp(TcpListenerConfig::new(listen_addr, factory).with_tls(acceptor))
 <li>Closed registry only - no dynamic plugin loading.</li>
 <li>Registry factories can't depend on <code>Arc&lt;Runtime&gt;</code> - they're resolved before <code>from_xml*</code> starts the Runtime. Storage-offloading protocol services (SMTP local delivery, POP3, IMAP, ...) compose via the Rust builder instead.</li>
 <li>XML v1 has no TLS / secure / PROXY protocol / telemetry attributes.</li>
-<li><code>idle_timeout</code> is accepted and stored but not yet enforced on the datapath - see <a href="runtime-options.html">runtime-options.md</a>.</li>
+<li>No per-listener connection limits for dials; <code>idle-timeout-ms</code> closes idle connections (<a href="runtime-options.html#idle-timeout">idle timeout</a>).</li>
 <li>QUIC / H3 bindings are not Composition XML elements; use <code>listen_h3</code> / <code>RuntimeQuicExt</code> in Rust.</li>
 </ul>
 <h2 id="see-also">See also</h2>

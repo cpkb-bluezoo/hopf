@@ -65,3 +65,8 @@ required-features = ["integration"]
 name = "pause_read"
 path = "tests/pause_read.rs"
 required-features = ["integration"]
+
+[[test]]
+name = "connection_limits"
+path = "tests/connection_limits.rs"
+required-features = ["integration"]

@@ -335,13 +335,15 @@ listen_dns_tcp(&amp;rt, addr, handle)?;</code></pre>
 <li><strong>Not DoQ.</strong> A DoQ connection has a stream for each query and the flow control of QUIC, and the limit does not apply to it.</li>
 <li><strong>Metrics.</strong> <code>DnsServerMetrics</code> counts <code>backpressure_events</code> (times a connection stopped being read for being at its limit) and <code>in_flight_peak</code> (the most outstanding at once on one connection). With telemetry attached (<a href="#telemetry">below</a>), <code>dns.server.in_flight</code> is the number outstanding over every connection of <code>tcp</code> or <code>dot</code>, and <code>dns.server.backpressure</code> counts the events. A per-connection gauge is not exported: a connection is not a bounded set of attribute values.</li>
 </ul>
-<p><strong>Listener settings.</strong> <code>listen_dns_tcp_with</code> and <code>listen_dns_dot_with</code> hand the listener's <code>TcpListenerConfig</code> to a closure before it is bound, so everything a listener has is available to a DNS one: the peer allow and deny lists (<code>with_acl</code>), the accept rate limit, per source and global (<code>with_rate_limit</code>), the inbound and outbound buffer caps (<code>max_net_in</code>, <code>max_net_out</code>), PROXY protocol (<code>with_proxy_protocol</code>) and the idle timeout (<code>idle_timeout</code>, which is accepted but <strong>not yet enforced</strong>: see <a href="runtime-options.html#idle-timeout">runtime options</a>). <code>listen_dns_tcp</code> and <code>listen_dns_dot</code> are the same with the defaults.</p>
+<p><strong>Listener settings.</strong> <code>listen_dns_tcp_with</code> and <code>listen_dns_dot_with</code> hand the listener's <code>TcpListenerConfig</code> to a closure before it is bound, so everything a listener has is available to a DNS one: the peer allow and deny lists (<code>with_acl</code>), the accept rate limit, per source and global (<code>with_rate_limit</code>), the inbound and outbound buffer caps (<code>max_net_in</code>, <code>max_net_out</code>), PROXY protocol (<code>with_proxy_protocol</code>) the idle timeout (<code>idle_timeout</code>, <a href="runtime-options.html#idle-timeout">enforced</a>: nothing received or sent for that long closes the connection, so set it above your slowest answer), and the connection limits (<code>max_connections</code>, <code>max_connections_per_address</code>: <a href="runtime-options.html#connection-limits">connection limits</a>). <code>listen_dns_tcp</code> and <code>listen_dns_dot</code> are the same with the defaults.</p>
 <pre><code>listen_dns_tcp_with(&amp;rt, addr, handle, |config| {
     config
         .with_rate_limit(AcceptRateLimit::new(20, Duration::from_secs(1), 2000))
-        .max_net_in(64 * 1024)
+        .max_connections(Some(10_000))
+        .max_connections_per_address(Some(50))
+        .idle_timeout(Some(Duration::from_secs(30)))
 })?;</code></pre>
-<p><strong>Not available.</strong> There is no maximum number of connections for a listener, and no limit per address: the runtime has neither for any protocol, so a DNS listener has neither. The accept rate limit bounds how fast connections arrive, and the in-flight limit bounds the work each can have outstanding, but how many may be open at once is not bounded.</p>
+<p><strong>Open connections.</strong> The in-flight limit bounds the work one connection can have outstanding, and the listener's connection limits bound how many connections there are: <code>max_connections</code> in total and <code>max_connections_per_address</code> from one peer address, each closing a connection over it at once. Together with the accept rate limit they bound a listener's memory by configuration: connections &times; (the buffer caps + in-flight queries).</p>
 <h3 id="forwarder">Caching forwarder</h3>
 <p><code>ForwarderHandler::new(cache).with_upstream(resolver)</code>, plus <code>cache()</code>. It never declines, so in a chain it goes last. Strips DNSSEC RRs when the client query lacks DO. With no upstream a cache miss is <code>SERVFAIL</code>.</p>
 <p>Three resolver behaviours that the RFCs recommend but do not require are on by default, and each is a policy hook on the handler that can be replaced or turned off (any closure will do):</p>
@@ -725,7 +727,6 @@ printf 'server 127.0.0.1 5353\nzone example.com\nupdate add new.example.com 60 A
 <li>The IXFR journal is in memory (512 changes) and starts empty at each start-up, so a restarted primary answers an IXFR with a full transfer.</li>
 <li>Secondaries do not forward updates to the primary (RFC 2136 §6): they refuse them.</li>
 <li>No access control beyond source address and TSIG key (no per-record-type or per-name update policy).</li>
-<li>No limit on the number of connections to a TCP or DoT listener, or per address (see <a href="#stream-connections">TCP and DoT connections</a>); the idle timeout is not enforced.</li>
 </ul>
 <p>Other:</p>
 <ul>

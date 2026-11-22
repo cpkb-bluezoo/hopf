@@ -33,7 +33,8 @@ pub struct TcpListenerConfig {
     pub max_net_in: usize,
     /// Max outbound buffer size before the connection is closed.
     pub max_net_out: usize,
-    /// Idle timeout (no receive); `None` disables. Partially wired in Tranche 1.
+    /// Close a connection with nothing received or sent for this long; `None`
+    /// disables.
     pub idle_timeout: Option<Duration>,
     /// When true, TLS handshake begins from the first byte (TLS-from-accept).
     pub secure: bool,
@@ -44,6 +45,13 @@ pub struct TcpListenerConfig {
     pub acl: PeerAcl,
     /// Optional accept rate limit.
     pub rate_limit: Option<AcceptRateLimit>,
+    /// The most connections this listener may have open at once; `None` is no
+    /// limit. A connection over it is accepted and closed at once.
+    pub max_connections: Option<usize>,
+    /// The most connections this listener may have open from one peer address
+    /// (the TCP peer: behind a PROXY protocol relay, the relay); `None` is no
+    /// limit. A connection over it is accepted and closed at once.
+    pub max_connections_per_address: Option<usize>,
     /// When true, every accepted connection is expected to begin with a
     /// PROXY protocol v1/v2 header (issue #342) reporting the real client
     /// address, as sent by an L4 relay (nginx, haproxy, a cloud load
@@ -71,6 +79,8 @@ impl TcpListenerConfig {
             tls: None,
             acl: PeerAcl::open(),
             rate_limit: None,
+            max_connections: None,
+            max_connections_per_address: None,
             proxy_protocol: false,
         }
     }
@@ -118,6 +128,26 @@ impl TcpListenerConfig {
         self
     }
 
+    /// Limit how many connections the listener has open at once. The rate limit
+    /// bounds how fast connections arrive; this bounds how many there are. A
+    /// connection over the limit is accepted and closed at once, and the
+    /// runtime's telemetry hook is told (`connection limit`).
+    pub fn max_connections(mut self, limit: Option<usize>) -> Self {
+        self.max_connections = limit;
+        self
+    }
+
+    /// Limit how many connections the listener has open at once from one peer
+    /// address. An IPv4 peer on a dual-stack socket is counted as its IPv4
+    /// address. Behind a PROXY protocol relay the peer is the relay, so this
+    /// limits the relay, not its clients. A connection over the limit is accepted
+    /// and closed at once, and the runtime's telemetry hook is told
+    /// (`per-address connection limit`).
+    pub fn max_connections_per_address(mut self, limit: Option<usize>) -> Self {
+        self.max_connections_per_address = limit;
+        self
+    }
+
     /// Expect every accepted connection to begin with a PROXY protocol
     /// v1/v2 header (issue #342), and recover the real client address from
     /// it — [`crate::Endpoint::remote_addr`] reports that address rather
@@ -145,6 +175,7 @@ impl TcpListenerConfig {
             server_name: None,
             remote_hint: remote.into(),
             expect_proxy_protocol: self.proxy_protocol,
+            slot: None,
         }
     }
 }
@@ -267,6 +298,7 @@ impl UnixListenerConfig {
             server_name: None,
             remote_hint: crate::peer_addr::PeerAddr::Unix(None),
             expect_proxy_protocol: self.proxy_protocol,
+            slot: None,
         }
     }
 }

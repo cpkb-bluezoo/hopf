@@ -301,7 +301,7 @@
 <td><code>idle_timeout</code></td>
 <td><code>Option&lt;Duration&gt;</code></td>
 <td><code>None</code></td>
-<td>Stored but not enforced</td>
+<td>Close a connection with nothing received or sent for this long (<a href="runtime-options.html#idle-timeout">enforced</a>)</td>
 </tr>
 <tr>
 <td><code>proxy_protocol</code></td>
@@ -337,7 +337,7 @@
 <h2 id="limitations">Limitations</h2>
 <ul>
 <li>The traffic <code>QuotaTracker</code>s are a <strong>skeleton</strong>, not wired into any protocol codec.</li>
-<li><code>idle_timeout</code> is accepted and stored but not enforced on the datapath.</li>
+<li>Limits on the number of open connections, in total and per address (<a href="runtime-options.html#connection-limits">connection limits</a>), are separate from the accept rate limit: the rate limit bounds how fast connections arrive.</li>
 <li>ACL is IP-based only; user/role RBAC belongs in <a href="auth.html">Auth</a> / protocol <code>is_authorized</code> hooks (e.g. FTP).</li>
 <li>No distributed / cluster ACL store - process-local configuration.</li>
 <li>WebDAV has no IP ACL of its own (its RFC 3744 privileges are per user); put <code>PeerAcl</code> on the HTTP listener (<a href="webdav.html">WebDAV</a>).</li>

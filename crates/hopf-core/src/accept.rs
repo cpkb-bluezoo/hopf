@@ -13,6 +13,7 @@ use mio::{Events, Interest, Poll, Token, Waker};
 
 use crate::binding::BindingId;
 use crate::cmd::{ReactorCmd, ReactorHandle};
+use crate::limits::ConnectionLimiter;
 use crate::listener::{Listener, TcpListenerConfig, UnixListenerConfig};
 use crate::telemetry::{emit_connection_log, LogLevel, LogRecord, TelemetryHook};
 
@@ -27,6 +28,8 @@ struct BoundListener {
     token: Token,
     listener: MioTcpListener,
     config: TcpListenerConfig,
+    /// Counts the connections this listener has open, if it limits them.
+    limiter: Option<Arc<ConnectionLimiter>>,
 }
 
 struct BoundUnixListener {
@@ -287,11 +290,13 @@ impl AcceptLoop {
         self.poll
             .registry()
             .register(&mut listener, token, Interest::READABLE)?;
+        let limiter = ConnectionLimiter::new(config.max_connections, config.max_connections_per_address);
         self.listeners.push(BoundListener {
             id,
             token,
             listener,
             config,
+            limiter,
         });
         Ok(())
     }
@@ -354,11 +359,27 @@ impl AcceptLoop {
                             continue;
                         }
                     }
+                    // How many are open: the place is held by the connection, and
+                    // given back when it is dropped, however it ends.
+                    let slot = match &self.listeners[idx].limiter {
+                        Some(limiter) => match limiter.try_acquire(addr.ip()) {
+                            Ok(slot) => Some(Arc::new(slot)),
+                            Err(why) => {
+                                drop(stream);
+                                if let Some(t) = &self.telemetry {
+                                    t.on_error(Some(addr.into()), why.as_str());
+                                }
+                                continue;
+                            }
+                        },
+                        None => None,
+                    };
                     if let Some(t) = &self.telemetry {
                         t.on_accept(addr.into());
                     }
                     let handler = config.create_handler();
-                    let params = config.conn_params(addr);
+                    let mut params = config.conn_params(addr);
+                    params.slot = slot;
                     let worker = self.next_worker();
                     worker.send(ReactorCmd::Register {
                         stream: stream.into(),

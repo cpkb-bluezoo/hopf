@@ -6,7 +6,7 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mio::event::Source;
 use mio::net::{TcpStream, UnixStream};
@@ -158,6 +158,16 @@ pub(crate) struct TcpConnection {
     connecting: bool,
     /// Cancel flag for the dial connect-timeout timer (`None` if no timer armed).
     connect_timeout_cancel: Option<Arc<AtomicBool>>,
+    /// Close the connection after this long with nothing received or sent;
+    /// `None` never does.
+    idle_timeout: Option<Duration>,
+    /// When something was last received or sent (kept only with an idle timeout).
+    last_activity: Instant,
+    /// Stops the idle timer that is armed, once the connection is closed.
+    idle_cancel: Option<Arc<AtomicBool>>,
+    /// The connection's place under its listener's connection limits, given back
+    /// when the connection is dropped.
+    _slot: Option<Arc<crate::limits::ConnectionSlot>>,
     write_ready: Option<WriteReadyCallback>,
     local: PeerAddr,
     remote: PeerAddr,
@@ -328,6 +338,10 @@ impl TcpConnection {
             close_error: None,
             connecting,
             connect_timeout_cancel: None,
+            idle_timeout: params.idle_timeout,
+            last_activity: Instant::now(),
+            idle_cancel: None,
+            _slot: params.slot,
             write_ready: None,
             local,
             remote,
@@ -422,6 +436,69 @@ impl TcpConnection {
         self.force_close();
     }
 
+    /// Something was received or sent: the connection is not idle.
+    #[inline]
+    fn touch(&mut self) {
+        if self.idle_timeout.is_some() {
+            self.last_activity = Instant::now();
+        }
+    }
+
+    /// Start watching for idleness, if the connection has an idle timeout and is
+    /// not already watched. It is checked when it would be due if nothing more
+    /// happened, so a busy connection costs a timer firing once per timeout, not
+    /// a timer per byte.
+    fn arm_idle(&mut self) {
+        if let Some(timeout) = self.idle_timeout {
+            if self.open && self.idle_cancel.is_none() {
+                self.schedule_idle_check(timeout);
+            }
+        }
+    }
+
+    fn schedule_idle_check(&mut self, delay: Duration) {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.idle_cancel = Some(Arc::clone(&cancelled));
+        let (reactor, token) = (self.reactor.clone(), self.token);
+        self.reactor.send(ReactorCmd::ScheduleTimer {
+            delay,
+            callback: Box::new(move || {
+                reactor.send(ReactorCmd::WithConn {
+                    token,
+                    task: Box::new(|conn| conn.on_idle_check()),
+                });
+            }),
+            cancelled,
+        });
+    }
+
+    fn cancel_idle(&mut self) {
+        if let Some(flag) = self.idle_cancel.take() {
+            flag.store(true, Ordering::Release);
+        }
+    }
+
+    /// The idle timer fired: close the connection if nothing has been received or
+    /// sent for the whole timeout, and otherwise look again when it would be due.
+    pub fn on_idle_check(&mut self) {
+        self.idle_cancel = None;
+        let Some(timeout) = self.idle_timeout else {
+            return;
+        };
+        if !self.open || self.closing {
+            return;
+        }
+        let idle = self.last_activity.elapsed();
+        if idle >= timeout {
+            self.close_with_error(io::Error::new(
+                ErrorKind::TimedOut,
+                format!("idle for {} ms", idle.as_millis()),
+            ));
+        } else {
+            self.schedule_idle_check(timeout - idle);
+        }
+    }
+
     pub fn compute_interest(&self) -> Option<Interest> {
         if !self.open {
             return None;
@@ -486,6 +563,7 @@ impl TcpConnection {
             Ok(0) => Ok(ReadOutcome::Eof),
             Ok(n) => {
                 self.net_in.commit_write(n);
+                self.touch();
                 Ok(ReadOutcome::Bytes)
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(ReadOutcome::WouldBlock),
@@ -731,6 +809,7 @@ impl TcpConnection {
                 }
                 Ok(n) => {
                     self.net_out.drain(..n);
+                    self.touch();
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
                     self.interest_dirty = true;
@@ -785,6 +864,7 @@ impl TcpConnection {
             self.force_close();
         }
         self.interest_dirty = true;
+        self.arm_idle();
     }
 
     /// Tell the handler the runtime is draining (see
@@ -880,6 +960,7 @@ impl TcpConnection {
     }
 
     pub fn finish_close(&mut self) {
+        self.cancel_idle();
         self.open = false;
         self.open_flag.store(false, Ordering::Release);
         self.closing = true;
