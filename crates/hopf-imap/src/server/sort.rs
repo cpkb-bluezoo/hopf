@@ -209,7 +209,7 @@ pub fn base_subject(subject: &str) -> String {
 }
 
 /// RFC 5256 §2.2's "is a reply or forward" test (used by THREAD REFERENCES
-/// steps 5B/5C): true iff `subject` starts with something [`strip_leader`]
+/// steps 5B/5C): true iff `subject` starts with something `strip_leader`
 /// would remove — a `Re:`/`Fwd:`/`Fw:` (optionally with a `[...]` blob
 /// first), after whitespace normalization.
 pub fn is_reply_or_forward(subject: &str) -> bool {

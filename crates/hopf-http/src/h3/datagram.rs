@@ -46,7 +46,7 @@ pub fn decode(data: &[u8]) -> Result<(u64, &[u8]), ()> {
 }
 
 /// Whether the peer has advertised willingness to receive HTTP/3 Datagrams
-/// (RFC 9297 §2.1.1). Pass the value from [`crate::h3::endpoint::H3PeerState::peer_h3_datagram`].
+/// (RFC 9297 §2.1.1). Pass the value from `crate::h3::endpoint::H3PeerState::peer_h3_datagram`.
 pub fn peer_accepts_h3_datagram(peer_h3_datagram: Option<bool>) -> bool {
     peer_h3_datagram == Some(true)
 }

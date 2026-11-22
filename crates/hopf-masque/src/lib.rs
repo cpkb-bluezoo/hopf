@@ -8,9 +8,9 @@
 //!
 //! Currently implemented: the RFC 9298 CONNECT-UDP relay, server-side — see
 //! [`ConnectUdpFactory`] — the RFC 9298 client (behind the `h3` feature) —
-//! see [`connect_udp`](client::connect_udp) — the RFC 9484 CONNECT-IP
+//! see `client::connect_udp` — the RFC 9484 CONNECT-IP
 //! relay, server-side — see [`ConnectIpFactory`] — and the RFC 9484 client
-//! (behind the `h3` feature) — see [`connect_ip`](ip_client::connect_ip).
+//! (behind the `h3` feature) — see `ip_client::connect_ip`.
 
 #![warn(missing_docs)]
 

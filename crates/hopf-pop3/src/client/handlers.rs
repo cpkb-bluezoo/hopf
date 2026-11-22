@@ -179,7 +179,7 @@ pub trait Pop3ClientDriver: Send {
 
     /// One entry from a multi-message LIST response.
     ///
-    /// Called for each line before [`on_list_complete`].
+    /// Called for each line before `on_list_complete`.
     fn on_list_entry(&mut self, message: u32, size: u64);
 
     /// All LIST entries have been delivered.

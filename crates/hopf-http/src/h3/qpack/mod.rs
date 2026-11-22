@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
 //! QPACK support for HTTP/3 (RFC 9204): a real dynamic table
-//! ([`H3Qpack`]), plus a static-table-only [`encode`]/[`decode`] pair kept
+//! (`H3Qpack`), plus a static-table-only [`encode`]/[`decode`] pair kept
 //! around as a simple building block for tests.
 
 use std::sync::Mutex;

@@ -853,7 +853,7 @@ impl GrpcResponseMessage {
     }
 }
 
-/// Factory that routes `POST` + supported gRPC Content-Types to [`GrpcHandler`].
+/// Factory that routes `POST` + supported gRPC Content-Types to `GrpcHandler`.
 pub struct GrpcHandlerFactory {
     proto_file: Arc<ProtoFile>,
     service: Arc<dyn GrpcService>,

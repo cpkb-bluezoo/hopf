@@ -17,8 +17,8 @@ pub(crate) use server::ResponseControl;
 
 /// How this peer participates in an HTTP request/response exchange.
 ///
-/// Independent of listen vs dial (transport birth). Usually listen→[`Server`]
-/// and dial→[`Client`], but relays may combine them differently.
+/// Independent of listen vs dial (transport birth). Usually listen→`Server`
+/// and dial→`Client`, but relays may combine them differently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HttpRole {
     /// Receives requests and sends responses.

@@ -666,7 +666,7 @@ impl BrokerState {
     /// Set or clear the retained message for `topic`, handing off ownership
     /// of `spool`'s handle (if any) to the retained-message store — see
     /// [`RetainedStore::publish`]. No blocking I/O here: replacing or
-    /// clearing an entry just drops an [`SpoolHandle`], which self-offloads
+    /// clearing an entry just drops an `SpoolHandle`, which self-offloads
     /// its own file deletion (issue #187) once nothing else — including any
     /// in-flight [`Self::deliver_retained`] read — still holds a clone.
     pub fn retain(&self, topic: &str, qos: QoS, spool: Option<(SpoolHandle, u64)>, properties: Properties) {

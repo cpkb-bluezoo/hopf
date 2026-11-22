@@ -27,7 +27,7 @@ pub struct TcpConnParams {
     /// Wall-clock budget for the nonblocking TCP connect handshake; `None` disables.
     ///
     /// Only meaningful when registering a dial (`connecting = true`). Enforced by the
-    /// reactor while [`crate::connection::TcpConnection::is_connecting`] is true.
+    /// reactor while `crate::connection::TcpConnection::is_connecting` is true.
     pub connect_timeout: Option<Duration>,
     /// When true, TLS begins from the first byte (TLS-from-accept / TLS-from-dial).
     pub secure: bool,

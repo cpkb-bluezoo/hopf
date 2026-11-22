@@ -89,7 +89,7 @@ pub trait Endpoint: Send {
     /// Initiate client-side STARTTLS upgrade on a plaintext connection.
     ///
     /// Stores the TLS connector; the handshake runs asynchronously and
-    /// [`ProtocolHandler::security_established`] fires once it completes.
+    /// `ProtocolHandler::security_established` fires once it completes.
     fn start_client_tls(
         &mut self,
         connector: crate::tls::SharedTlsConnector,

@@ -209,7 +209,7 @@ impl HttpClient {
     /// itself watches for a fresh `Alt-Svc` response header and upgrades
     /// to h3, once the connection goes idle, for later requests on the
     /// same session. Mirrors Gumdrop's `HTTPClient.discoverAndConnect`.
-    /// h3 (tiers 1/2) is used regardless of [`Self::secure`]/[`Self::tls`]
+    /// h3 (tiers 1/2) is used regardless of `Self::secure`/[`Self::tls`]
     /// (it's always TLS 1.3 via QUIC either way) — but the tier-3 TCP
     /// fallback is not: call [`Self::tls`] too if that fallback should be
     /// secure as well, same as if h3 weren't in the picture at all.
@@ -376,7 +376,7 @@ impl HttpClient {
     /// [`Self::disable_h3`]d) and `self.addr`/a literal host don't already
     /// pin the connection to a bare TCP dial, transport negotiation is
     /// automatic — h3 if discoverable, else h2 via ALPN, else h1.1 — see
-    /// [`Self::negotiate_connect`]. [`Self::from_unix_path`] dials a UNIX
+    /// `Self::negotiate_connect`. [`Self::from_unix_path`] dials a UNIX
     /// domain socket instead — skips DNS and h3 negotiation entirely.
     pub fn connect(
         &self,

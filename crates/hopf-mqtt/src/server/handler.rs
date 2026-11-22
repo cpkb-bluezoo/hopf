@@ -114,7 +114,7 @@ pub trait MqttHandlerFactory: Send + Sync {
 }
 
 /// Default: require CONNECT credentials when a store is configured; reject
-/// anonymous CONNECT unless [`MqttConfig::allow_anonymous`] was set.
+/// anonymous CONNECT unless `MqttConfig::allow_anonymous` was set.
 pub struct DefaultConnectHandler {
     credentials: Option<Arc<dyn CredentialStore>>,
     allow_anonymous: bool,

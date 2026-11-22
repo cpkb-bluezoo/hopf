@@ -77,9 +77,9 @@ pub trait ServerHandlerFactory: Send + Sync {
 
 /// Receives one inbound HTTP request as incremental push events.
 ///
-/// Sequence with a body: [`headers`] → [`start_request_body`] →
-/// [`request_body_content`]* → [`end_request_body`] → [`request_complete`].
-/// Without a body: [`headers`] → [`request_complete`].
+/// Sequence with a body: `headers` → `start_request_body` →
+/// `request_body_content`* → `end_request_body` → `request_complete`.
+/// Without a body: `headers` → `request_complete`.
 pub trait ServerHandler: Send {
     /// Request headers are complete (pseudo-headers included).
     fn headers(&mut self, response: &mut dyn ServerWriter, headers: &Headers);
@@ -181,7 +181,7 @@ impl ServerWriter for DiscardingWriter {
 /// Cloneable handle to finish this Stream's response after offload.
 ///
 /// Obtain via [`ServerWriter::response_handle`]. Framing and flush stay inside
-/// the transport's [`ResponseControl`] implementation.
+/// the transport's `ResponseControl` implementation.
 #[derive(Clone)]
 pub struct ServerResponseHandle {
     conn: ConnHandle,
@@ -272,7 +272,7 @@ pub trait ServerWriter {
     /// Send a 1xx informational response.
     fn send_informational(&mut self, _code: u16, _headers: &Headers) {}
 
-    /// Buffer response headers (flushed on [`start_response_body`] or [`complete`]).
+    /// Buffer response headers (flushed on `start_response_body` or `complete`).
     fn headers(&mut self, headers: Headers);
 
     /// Flush response headers and begin the body.

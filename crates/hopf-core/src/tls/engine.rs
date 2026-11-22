@@ -113,7 +113,7 @@ const PSK_HASH: Tls13Hash = Tls13Hash::Sha256;
 
 /// Negotiated TLS 1.3 AEAD — one of [`SUPPORTED_CIPHER_SUITES`]. Threaded
 /// through [`super::sink::TlsEventSink`]'s key-ready callbacks so both this
-/// crate's own TCP record layer ([`super::record`]) and `hopf-quic`'s packet
+/// crate's own TCP record layer (`super::record`) and `hopf-quic`'s packet
 /// protection (which consumes the same callbacks directly, bypassing the
 /// TCP record layer) know which AEAD to instantiate — key length is the only
 /// thing that varies (16 vs 32 bytes); nonce construction is identical.
@@ -424,7 +424,7 @@ pub struct HandshakeConfig {
     /// `CertificateVerify` signature schemes (RFC 8446 §4.2.3) offered in
     /// `signature_algorithms` and `CertificateRequest`, accepted from the peer,
     /// and the only ones this side signs with. Default:
-    /// [`SUPPORTED_SIGNATURE_SCHEMES`]. Entries this crate cannot verify are
+    /// `SUPPORTED_SIGNATURE_SCHEMES`. Entries this crate cannot verify are
     /// advertised but never usable.
     pub signature_schemes: Option<Vec<u16>>,
     /// Certificate-chain signature schemes (`signature_algorithms_cert`,

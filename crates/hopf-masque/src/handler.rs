@@ -26,7 +26,7 @@ const PROTOCOL: &str = "connect-udp";
 /// traffic in either direction before it's torn down.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
-/// Builds per-request [`ConnectUdpRequestHandler`]s.
+/// Builds per-request `ConnectUdpRequestHandler`s.
 ///
 /// Needs a [`Runtime`] (to open each relay's outbound UDP socket on one of
 /// its workers) and a [`DnsResolver`] (to resolve each request's target

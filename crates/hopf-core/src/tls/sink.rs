@@ -218,7 +218,7 @@ pub enum KeyUpdateDirection {
     Write,
 }
 
-/// Certificate chain verification request — engine idles until [`HandshakeEngine::feed_verification_result`].
+/// Certificate chain verification request — engine idles until `HandshakeEngine::feed_verification_result`.
 #[derive(Debug, Clone)]
 pub struct VerifyRequest {
     /// Opaque correlation id matching the verification result.

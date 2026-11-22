@@ -16,7 +16,7 @@ use crate::ip_target;
 
 const PROTOCOL: &str = "connect-ip";
 
-/// Builds per-request [`ConnectIpRequestHandler`]s.
+/// Builds per-request `ConnectIpRequestHandler`s.
 ///
 /// Needs a [`ConnectIpHandlerFactory`] (to build the application's
 /// per-tunnel forwarding handler — see that trait's own docs for why this

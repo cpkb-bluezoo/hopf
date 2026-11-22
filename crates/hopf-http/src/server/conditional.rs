@@ -44,7 +44,7 @@ const NOT_MODIFIED_KEEPS: [&str; 7] = [
 ];
 
 /// [`ServerHandlerFactory`] decorator that answers conditional `GET`/`HEAD`
-/// requests with `304` / `412`. See the [module docs](self).
+/// requests with `304` / `412`. See the module docs.
 ///
 /// # Response rules
 ///

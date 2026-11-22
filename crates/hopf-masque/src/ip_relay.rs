@@ -29,7 +29,7 @@ pub trait ConnectIpHandlerFactory: Send + Sync {
 ///
 /// Kept deliberately separate from [`ConnectIpSession`] (the crate hands
 /// the app one of each, not one type playing both roles) — see
-/// [`crate::ConnectUdpEventHandler`]'s docs for why that split holds up
+/// `crate::ConnectUdpEventHandler`'s docs for why that split holds up
 /// better than it might look at first.
 pub trait ConnectIpHandler: Send {
     /// The tunnel is open; `session` sends packets, assigns addresses, and

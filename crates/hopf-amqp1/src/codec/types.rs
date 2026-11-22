@@ -494,7 +494,7 @@ fn read_bytes(buf: &[u8], n: usize) -> Result<&[u8], Amqp1Error> {
 
 /// Growable byte-string encoder for the AMQP 1.0 type system. Always
 /// chooses the most compact constructor for scalar values; compound values
-/// (list/map) are built via [`Encoder::compound`] which measures the
+/// (list/map) are built via `Encoder::compound` which measures the
 /// encoded elements before choosing the 8- or 32-bit size/count form.
 #[derive(Debug, Default, Clone)]
 pub struct Encoder {

@@ -1,8 +1,8 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! In-tree TLS 1.3: [`HandshakeEngine`] (Phase 2, QUIC-first) plus [`record`],
+//! In-tree TLS 1.3: [`HandshakeEngine`] (Phase 2, QUIC-first) plus `record`,
 //! the Phase 4 TCP record layer wrapping it in [`HandshakeMode::TcpRecordLayer`]
-//! behind [`TlsRecordEngine`]. [`pem`] loads PEM certs/keys into
+//! behind [`TlsRecordEngine`]. `pem` loads PEM certs/keys into
 //! [`TlsAcceptor`]/[`TlsConnector`] factories that `TcpConnection` pumps
 //! directly — `hopf-tls` (rustls) is no longer in `TcpConnection`'s path.
 
@@ -217,7 +217,7 @@ impl TlsVariant {
     }
 
     /// Hold this connection to the FIPS profile (see
-    /// [`fips`](crate::tls::fips)): TLS 1.3 and TLS 1.2 are both restricted,
+    /// [`fips`]): TLS 1.3 and TLS 1.2 are both restricted,
     /// so a negotiating engine is on the profile whichever version it lands on.
     /// Must be called before [`Self::start`]. Fails, leaving the engine
     /// unchanged, if it is already started or its config names anything

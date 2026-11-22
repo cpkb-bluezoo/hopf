@@ -112,7 +112,7 @@ impl<'a> DkimSigner<'a> {
         self
     }
 
-    /// Explicit `t=` signing timestamp; defaults to "now" at [`Self::sign`] time.
+    /// Explicit `t=` signing timestamp; defaults to "now" at `Self::sign` time.
     pub fn timestamp(mut self, t: u64) -> Self {
         self.timestamp = Some(t);
         self

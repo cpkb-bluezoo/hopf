@@ -1,8 +1,8 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! HTTP/1.x adapter: one transport [`Endpoint`](hopf_core::Endpoint) → serialized [`HttpStream`]s.
+//! HTTP/1.x adapter: one transport [`Endpoint`](hopf_core::Endpoint) → serialized `HttpStream`s.
 //!
-//! Bind or dial creates the Endpoint the same way; [`HttpRole`] selects server vs
+//! Bind or dial creates the Endpoint the same way; `HttpRole` selects server vs
 //! client codecs. H1 presents Streams one at a time on a single byte pipe.
 
 mod client_codec;

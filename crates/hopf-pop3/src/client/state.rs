@@ -4,7 +4,7 @@
 //!
 //! Each trait represents a stage of the POP3 protocol.  Implementations on
 //! [`super::endpoint::Pop3ClientEndpoint`] queue command bytes for dispatch;
-//! the actual bytes are flushed to the [`Endpoint`] after every driver
+//! the actual bytes are flushed to the `Endpoint` after every driver
 //! callback returns.
 
 /// Capabilities advertised by the server in its CAPA response (RFC 2449).

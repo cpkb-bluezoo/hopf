@@ -195,7 +195,7 @@ pub struct DigestAuthConfig {
     /// Realm name.
     pub realm: String,
     /// How long an issued nonce remains acceptable if never used —
-    /// see [`DEFAULT_NONCE_TTL`].
+    /// see `DEFAULT_NONCE_TTL`.
     pub nonce_ttl: Duration,
     /// Also offer, and accept, the MD5 algorithm. Off by default: only
     /// SHA-256 (RFC 7616) is challenged for and accepted. The credential

@@ -5,10 +5,10 @@
 //! negotiation, key schedule, transcript, `Certificate`/`Finished`,
 //! ticket/PSK resumption) unchanged from TLS 1.3; everything in this module
 //! is genuinely DTLS-specific, with no TCP or QUIC equivalent: the record
-//! layer ([`record`]: epoch/sequence-numbered `DTLSCiphertext` framing,
+//! layer (`record`: epoch/sequence-numbered `DTLSCiphertext` framing,
 //! record sequence-number encryption, anti-replay), handshake-message
-//! fragmentation and reassembly ([`reassembly`]), and flight-based
-//! retransmission ([`retransmit`]).
+//! fragmentation and reassembly (`reassembly`), and flight-based
+//! retransmission (`retransmit`).
 //!
 //! ## TLS 1.2 vs 1.3 on one UDP port
 //!

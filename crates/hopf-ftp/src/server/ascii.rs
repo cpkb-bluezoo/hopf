@@ -165,7 +165,7 @@ impl AsciiNewlineDenormalizer {
     }
 }
 
-/// Format a [`SystemTime`] as RFC 3659 `YYYYMMDDHHMMSS` (UTC).
+/// Format a `SystemTime` as RFC 3659 `YYYYMMDDHHMMSS` (UTC).
 pub fn format_ftp_mtime(t: std::time::SystemTime) -> String {
     let secs = t
         .duration_since(std::time::UNIX_EPOCH)

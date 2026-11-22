@@ -13,7 +13,7 @@
 //! Success is the protocol's own OK. On failure the server may first send
 //! a challenge carrying a base64 JSON error (`{"status":"401",…}`), to
 //! which the client must answer with an empty response before the server
-//! returns its final NO; [`XOauth2Client`] does that.
+//! returns its final NO; `XOauth2Client` does that.
 //!
 //! Reference: <https://developers.google.com/gmail/imap/xoauth2-protocol>.
 

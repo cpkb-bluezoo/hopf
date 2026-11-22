@@ -44,7 +44,7 @@ fn default_slot() -> &'static Mutex<Option<Arc<dyn KeyLog>>> {
     DEFAULT_KEY_LOG.get_or_init(|| Mutex::new(None))
 }
 
-/// Process-wide default key log ([`HandshakeConfig::key_log`] falls back to this).
+/// Process-wide default key log (`HandshakeConfig::key_log` falls back to this).
 pub fn set_default_key_log(key_log: Option<Arc<dyn KeyLog>>) {
     *default_slot().lock().unwrap_or_else(|e| e.into_inner()) = key_log;
 }

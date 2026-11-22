@@ -20,8 +20,8 @@ pub trait ClientHandlerFactory: Send + Sync {
 
 /// Drives one outbound HTTP request and receives the response.
 ///
-/// Typical sequence: write request via [`ClientWriter`] in [`start`], then
-/// [`response_headers`] → body* → [`response_complete`].
+/// Typical sequence: write request via [`ClientWriter`] in `start`, then
+/// `response_headers` → body* → `response_complete`.
 pub trait ClientHandler: Send {
     /// Stream is ready; send the request (headers ± body) via `request`.
     fn start(&mut self, request: &mut dyn ClientWriter);

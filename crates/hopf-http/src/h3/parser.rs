@@ -38,7 +38,7 @@ pub trait H3FrameHandler {
     /// required first SETTINGS frame (§6.2.1 / §7.2.4).
     ///
     /// Must not be used for the HTTP/2 leftovers in
-    /// [`frame::is_reserved_http2_frame_type`] — those go through
+    /// `frame::is_reserved_http2_frame_type` — those go through
     /// [`Self::reserved_http2_frame`].
     fn unknown_frame(&mut self, _frame_type: u64) {}
     /// A reserved HTTP/2 frame type (`0x02` / `0x06` / `0x08` / `0x09`) —

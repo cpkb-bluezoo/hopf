@@ -75,8 +75,8 @@ const MAX_SIGNATURES: usize = 10;
 pub type BodyHashMap = HashMap<(Canonicalization, Option<u64>), Vec<u8>>;
 
 /// The distinct `(c=body-side, l=)` pairs across every `DKIM-Signature`
-/// header in `headers` (bounded to [`MAX_SIGNATURES`], matching
-/// [`verify_all`]/[`verify_all_with_body_hashes`]) — i.e. exactly the set
+/// header in `headers` (bounded to `MAX_SIGNATURES`, matching
+/// `verify_all`/[`verify_all_with_body_hashes`]) — i.e. exactly the set
 /// of [`super::canon::IncrementalBodyCanon`] instances a streaming caller
 /// needs to run the message body through before calling
 /// [`verify_all_with_body_hashes`]. Malformed `DKIM-Signature` headers are
@@ -99,7 +99,7 @@ pub fn required_body_hash_keys(headers: &[RawHeader]) -> Vec<(Canonicalization, 
     keys
 }
 
-/// Streaming counterpart to [`verify_all`]: verifies every `DKIM-Signature`
+/// Streaming counterpart to `verify_all`: verifies every `DKIM-Signature`
 /// header using body hashes computed ahead of time (see
 /// [`required_body_hash_keys`] / [`BodyHashMap`]) instead of a
 /// fully-materialized message body — issue #86.

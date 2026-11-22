@@ -2,7 +2,7 @@
 
 //! QUIC transport for Hopf (in-tree RFC 9000 transport + mio UDP).
 //!
-//! HTTP/3 codecs live in [`hopf_http`] (feature `h3`), not here.
+//! HTTP/3 codecs live in `hopf_http` (feature `h3`), not here.
 //! Each bidirectional QUIC stream is exposed as a [`QuicStreamEndpoint`]
 //! implementing [`hopf_core::Endpoint`].
 

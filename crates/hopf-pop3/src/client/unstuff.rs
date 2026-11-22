@@ -29,7 +29,7 @@ enum DotState {
 
 /// POP3 message-body dot-unstuffer.
 ///
-/// Starts in [`DotState::SawCrlf`] so a leading `.\r\n` correctly terminates
+/// Starts in `DotState::SawCrlf` so a leading `.\r\n` correctly terminates
 /// an empty message.
 #[derive(Debug, Default)]
 pub struct Pop3DotUnstuffer {

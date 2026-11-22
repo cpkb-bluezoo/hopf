@@ -180,7 +180,7 @@ impl WebDavConfig {
     }
 }
 
-/// Shared factory for [`WebDavHandler`] instances.
+/// Shared factory for `WebDavHandler` instances.
 pub struct WebDavFactory {
     pub(crate) config: Arc<WebDavConfig>,
     pub(crate) storage: Arc<StorageExecutor>,

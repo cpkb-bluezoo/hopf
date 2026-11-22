@@ -374,7 +374,7 @@ impl Stage {
 ///
 /// Feed body bytes with [`push`](Self::push) as they arrive and call
 /// [`finish`](Self::finish) at end of body. Output is delivered to the sink
-/// in chunks of at most [`SCRATCH_LEN`] bytes.
+/// in chunks of at most `SCRATCH_LEN` bytes.
 pub struct Decoder {
     /// Outermost coding first: the order data must be decoded in.
     stages: Vec<Stage>,

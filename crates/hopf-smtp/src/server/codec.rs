@@ -58,7 +58,7 @@ pub enum SmtpCommand {
     /// `EHLO hostname`
     Ehlo(String),
     /// `MAIL FROM:<path> [params]` - the path and the parameters as the
-    /// lexer tokenized them (see [`PathTokenizer`]); what they mean is
+    /// lexer tokenized them (see `PathTokenizer`); what they mean is
     /// `server::delivery::interpret_mail_from`. A syntax error is the `Err`.
     Mail(Result<PathArgs, ParamParseError>),
     /// `RCPT TO:<path> [params]`, tokenized likewise; what they mean is

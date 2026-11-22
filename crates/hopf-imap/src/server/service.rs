@@ -78,7 +78,7 @@ pub struct ImapConfig {
     pub enable_objectid: bool,
     /// Advertise and accept METADATA (RFC 5464).
     pub enable_metadata: bool,
-    /// Advertise and accept NOTIFY (RFC 5465). See [`crate::server::notify`]
+    /// Advertise and accept NOTIFY (RFC 5465). See `crate::server::notify`
     /// for which selectors/event-groups this implementation covers.
     pub enable_notify: bool,
     /// Quota backend (default: unlimited).

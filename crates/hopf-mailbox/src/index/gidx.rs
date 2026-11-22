@@ -19,7 +19,7 @@ pub const INDEX_MAGIC: [u8; 4] = *b"GIDX";
 /// Headers-only, pre-#407 layout (8 descriptors) — read-only; a file this
 /// old is rewritten as [`INDEX_VERSION_THREADING`] (or `_BODY`) the next
 /// time anything in it changes, since [`super::IndexBuilder`] no longer
-/// produces entries this short. See [`DESCRIPTOR_COUNT_HEADERS_V1`].
+/// produces entries this short. See `DESCRIPTOR_COUNT_HEADERS_V1`.
 pub const INDEX_VERSION_HEADERS: u16 = 1;
 /// Headers-plus-body, pre-#407 layout (9 descriptors) — read-only, ditto.
 pub const INDEX_VERSION_BODY: u16 = 2;

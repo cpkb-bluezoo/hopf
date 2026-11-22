@@ -237,7 +237,7 @@ fn new_opaque_token() -> String {
 ///
 /// By default locks live in this manager's memory, which is the right
 /// authority for one handler on a private content tree. Given a lock root
-/// ([`WebDavLockManager::with_lock_root`]; see [`FileLockStore`]), every
+/// ([`WebDavLockManager::with_lock_root`]; see `FileLockStore`), every
 /// lock is a file there instead, so that handlers sharing the tree also
 /// share the locks, and the in-memory maps are not consulted at all — in
 /// that mode every method does blocking file I/O and must only be called

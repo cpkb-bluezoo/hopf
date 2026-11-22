@@ -100,7 +100,7 @@ struct Pop3FetchState {
 
 /// Auto-pilot POP3 fetch pipeline.
 ///
-/// Implements [`Pop3ClientHandlerFactory`]; pass to [`Pop3Client::connect`].
+/// Implements [`Pop3ClientHandlerFactory`]; pass to `Pop3Client::connect`.
 pub struct Pop3Fetch(Arc<Mutex<Pop3FetchState>>);
 
 impl Pop3Fetch {

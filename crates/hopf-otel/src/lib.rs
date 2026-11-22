@@ -2,7 +2,7 @@
 
 //! OpenTelemetry exporters and protocol instrumentation for Hopf.
 //!
-//! Connection logs use [`TelemetryHook`] via [`TelemetryPipeline::hook`].
+//! Connection logs use `TelemetryHook` via [`TelemetryPipeline::hook`].
 //! HTTP request traces/metrics use [`InstrumentedServerFactory`]. SMTP
 //! metrics are available via [`TelemetryPipeline::smtp_metrics`]; protocol
 //! crates wire them at control-handler call sites. Encoding and I/O run on

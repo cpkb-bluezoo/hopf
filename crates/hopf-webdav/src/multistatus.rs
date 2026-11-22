@@ -12,7 +12,7 @@ use crate::xml_out::{
     dav_element_text, dav_end, dav_start, write_prop_end, write_prop_start, DavWriter,
 };
 
-/// Streaming `207 Multi-Status` document builder over one [`PropXmlWriter`](crate::xml_out::PropXmlWriter).
+/// Streaming `207 Multi-Status` document builder over one `PropXmlWriter`.
 pub struct MultistatusWriter {
     w: DavWriter,
     open: bool,

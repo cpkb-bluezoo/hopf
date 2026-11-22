@@ -28,7 +28,7 @@ pub struct AltSvcH3Entry {
     pub host: Option<String>,
     /// The advertised port.
     pub port: u16,
-    /// RFC 7838 §3 `ma` parameter, or [`DEFAULT_MAX_AGE`] if absent.
+    /// RFC 7838 §3 `ma` parameter, or `DEFAULT_MAX_AGE` if absent.
     pub max_age: Duration,
 }
 

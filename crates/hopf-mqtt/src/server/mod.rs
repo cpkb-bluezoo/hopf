@@ -2,7 +2,7 @@
 
 //! MQTT server: config, listener factory, `ProtocolHandler`.
 //!
-//! CONNECT / PUBLISH / SUBSCRIBE authorization is staged (see [`handler`]),
+//! CONNECT / PUBLISH / SUBSCRIBE authorization is staged (see `handler`),
 //! matching Gumdrop and `hopf-pop3` / `hopf-imap`'s handler-factory shape —
 //! the default requires [`MqttConfig::with_credentials`] or
 //! [`MqttConfig::allow_anonymous`]; PUBLISH/SUBSCRIBE still default to

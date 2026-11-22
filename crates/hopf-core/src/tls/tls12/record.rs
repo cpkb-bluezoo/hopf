@@ -286,7 +286,7 @@ impl<S: Tls12RecordSink + ?Sized> Tls12EventSink for InnerSink<'_, S> {
     }
 }
 
-/// Reactive TLS 1.2 record layer — wraps [`Tls12Engine`] with RFC 5246/5288
+/// Reactive TLS 1.2 record layer — wraps `Tls12Engine` with RFC 5246/5288
 /// record framing and GCM AEAD.
 pub struct Tls12RecordEngine {
     engine: Tls12Engine,
@@ -307,7 +307,7 @@ impl Tls12RecordEngine {
         self.engine.set_alpn(protocols)
     }
 
-    /// Hold this engine to the FIPS profile; see [`Tls12Engine::set_fips`].
+    /// Hold this engine to the FIPS profile; see `Tls12Engine::set_fips`.
     pub fn set_fips(&mut self) -> Result<(), crate::tls::fips::FipsProfileError> {
         self.engine.set_fips()
     }

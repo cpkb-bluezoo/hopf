@@ -52,7 +52,7 @@ fn matches_record_der(record: &TlsaRecord, cert_der: &[u8]) -> bool {
 /// Verify a presented certificate chain (DER, leaf first) against `records`
 /// (RFC 6698 §2.1) with no dependency on `rustls` — the shape
 /// [`hopf_core::connector_with_verify_override`] needs. Same matching rules
-/// as [`DaneServerCertVerifier`] (see that type's docs: only DANE-TA(2) and
+/// as `DaneServerCertVerifier` (see that type's docs: only DANE-TA(2) and
 /// DANE-EE(3) are matched; DANE-TA re-chains the rest of the presented chain
 /// up to the pinned anchor using [`hopf_core::crypto::trust::TrustStore`]
 /// instead of `rustls`'s `WebPkiServerVerifier`).
@@ -122,7 +122,7 @@ fn hash_selected_data(matching_type: TlsaMatchingType, selected: &[u8]) -> Optio
 
 /// Compute a TLSA record's association data for `selector`/`matching_type`
 /// from a DER-encoded certificate (RFC 6698 §2.1) — the same computation
-/// [`DaneServerCertVerifier`] performs internally to check a *presented*
+/// `DaneServerCertVerifier` performs internally to check a *presented*
 /// certificate against an existing record, exposed here for tooling that
 /// needs to *generate* one instead (e.g. computing the record an operator
 /// should publish for their own MX certificate). `None` for an

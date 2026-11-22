@@ -1,6 +1,6 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! SMTP server using stock [`AcceptAllSmtpHandler`].
+//! SMTP server using stock `AcceptAllSmtpHandler`.
 //!
 //! ```text
 //! cargo run -p smtp-server -- 127.0.0.1:2525

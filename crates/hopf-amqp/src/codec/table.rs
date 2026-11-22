@@ -42,7 +42,7 @@ pub enum FieldValue {
         /// Mantissa.
         value: i32,
     },
-    /// Short string (`s` in 0-9-1; RabbitMQ uses `S` for longstr — see [`LongString`]).
+    /// Short string (`s` in 0-9-1; RabbitMQ uses `S` for longstr — see `LongString`).
     ShortString(String),
     /// Long string (`S`).
     LongString(Vec<u8>),

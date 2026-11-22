@@ -497,7 +497,7 @@ impl MqttMessageStore for FileBackedMessageStore {
 
     /// Issue #216: reads the disk off the reactor thread, ordered against
     /// this subscriber's pending `Append`/`ClearFile` jobs by running on
-    /// the same [`SubQueue`] rather than racing it — see the type-level
+    /// the same `SubQueue` rather than racing it — see the type-level
     /// doc comment.
     fn take_offline_async(
         &self,

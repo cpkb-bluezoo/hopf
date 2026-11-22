@@ -6,9 +6,9 @@
 //! hash of the server's TLS certificate. This module has no TLS awareness
 //! of its own — the caller (the protocol crate that owns the live TLS
 //! connection) computes that hash from the negotiated certificate and
-//! supplies it via [`ScramSha256Client::new_plus`] /
-//! [`ScramSha256Server::with_channel_binding`], the same way
-//! [`crate::external::ExternalServer::with_peer_certificate`] is supplied
+//! supplies it via `ScramSha256Client::new_plus` /
+//! `ScramSha256Server::with_channel_binding`, the same way
+//! `crate::external::ExternalServer::with_peer_certificate` is supplied
 //! peer-certificate material for EXTERNAL.
 //!
 //! Scope note: this defends against a MITM relaying the SASL exchange

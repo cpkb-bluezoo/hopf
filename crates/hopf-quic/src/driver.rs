@@ -145,7 +145,7 @@ impl QuicDriverHandle {
 
     /// Request shutdown and join the driver thread — unless called from
     /// the driver thread itself, in which case the join is skipped (see
-    /// [`Self::join_driver_thread`]).
+    /// `Self::join_driver_thread`).
     ///
     /// The driver will flush any queued application writes (e.g. H3 GOAWAY),
     /// then send CONNECTION_CLOSE on every open connection, transmit those
@@ -172,11 +172,11 @@ impl QuicDriverHandle {
     /// gone or there is no usable client connection — callers should dial
     /// fresh in that case. If the handshake is still in progress and
     /// 0-RTT is not available the open is queued and applied once
-    /// [`Event::Connected`] fires; when [`Connection::has_0rtt`] is true
+    /// `Event::Connected` fires; when `Connection::has_0rtt` is true
     /// the stream is opened immediately so data can ride as early data.
     /// If the peer's stream-concurrency limit is exhausted (`MAX_STREAMS`,
     /// RFC 9000 §4.6), the open is queued and applied when
-    /// [`StreamEvent::Available`] reports new credit — callers do not
+    /// `StreamEvent::Available` reports new credit — callers do not
     /// need to retry.
     pub fn open_bi(&self, factory: HandlerFactory) -> io::Result<()> {
         if !self.active.load(Ordering::Acquire) {

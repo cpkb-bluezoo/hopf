@@ -198,7 +198,7 @@ pub struct Config {
     pub server: Option<ServerCredentials>,
     /// Trust anchors for server chain verification (client role). Checked
     /// before [`Self::verify_override`] when both are set. With neither
-    /// set, the engine gates on [`Tls12EventSink::verification_requested`],
+    /// set, the engine gates on `Tls12EventSink::verification_requested`,
     /// matching the TLS 1.3 engine's `insecure_connector` pattern.
     pub trust_store: Option<TrustStore>,
     /// Custom server-chain verification (client role) — the TLS 1.2 twin of
@@ -223,7 +223,7 @@ pub struct Config {
     /// Trust anchors for verifying the client's certificate chain (server
     /// role) — only consulted when [`Self::client_auth`] isn't
     /// [`ClientAuthPolicy::None`]. `None` gates on
-    /// [`Tls12EventSink::verification_requested`] instead.
+    /// `Tls12EventSink::verification_requested` instead.
     pub client_trust_store: Option<TrustStore>,
     /// Client trust store fetched for each handshake (server role), taking
     /// the place of [`Self::client_trust_store`].
@@ -265,7 +265,7 @@ pub struct Config {
     /// fail to validate. `None` (the default, and TCP TLS 1.2's only mode)
     /// generates a fresh random as before.
     pub fixed_client_random: Option<[u8; 32]>,
-    /// DTLS role only: starting values for [`Self::hash_message`]'s
+    /// DTLS role only: starting values for `Self::hash_message`'s
     /// per-direction `message_seq` counters — nonzero exactly when
     /// `hopf-core::dtls12` is constructing the engine that builds/receives
     /// the real `ClientHello2` flight *after* a `HelloVerifyRequest` round
@@ -276,7 +276,7 @@ pub struct Config {
     /// 1`, continuing from `ClientHello1`'s `0`) — so the hash still needs
     /// to start counting from wherever the real wire numbering left off,
     /// not from 0. `(0, 0)` (both TCP TLS 1.2's only value, and DTLS with
-    /// no cookie round trip) leaves [`Self::hash_message`]'s behaviour
+    /// no cookie round trip) leaves `Self::hash_message`'s behaviour
     /// unchanged from a plain fresh count.
     pub dtls_initial_seq: (u16, u16),
     /// ALPN protocol names (RFC 7301), in preference order. A client offers

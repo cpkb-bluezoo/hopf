@@ -5,7 +5,7 @@
 //! Correlates pipelined tagged replies via [`PendingMap`], routes untagged
 //! responses (now already-typed [`ImapEvent`] variants, not raw text) to
 //! the oldest compatible pending command, and delivers unsolicited EXISTS /
-//! EXPUNGE / FLAGS to [`MailboxEventListener`] (including during active
+//! EXPUNGE / FLAGS to `MailboxEventListener` (including during active
 //! IDLE).
 
 use std::io;

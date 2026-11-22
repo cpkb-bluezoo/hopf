@@ -235,7 +235,7 @@ impl DenialCache {
 
     /// Cache the NSEC/NSEC3 records (and the SOA) of a negative response.
     ///
-    /// **The caller must have validated the denial** ([module docs](self)).
+    /// **The caller must have validated the denial** (see the module docs).
     /// Only signed records are kept, only under the zone that signed them, and
     /// only if the response carries the SOA that gives them their lifetime.
     pub fn store_validated(&self, msg: &DnsMessage) {

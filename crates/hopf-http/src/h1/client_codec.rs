@@ -55,7 +55,7 @@ impl<H: ClientHandler> H1ClientCodec<H> {
 
     /// Bind the real [`ConnHandle`] once the transport is connected —
     /// see [`ClientWriter::conn_handle`]. Before this is called,
-    /// [`UaView::conn_handle`] answers with a synchronous no-op handle.
+    /// `UaView::conn_handle` answers with a synchronous no-op handle.
     pub fn bind_conn_handle(&mut self, conn: ConnHandle) {
         self.driver.conn = conn;
     }
@@ -165,11 +165,11 @@ impl<H: ClientHandler> H1ClientCodec<H> {
     /// Reclaim the handler after a `101 Switching Protocols` response halted
     /// this codec (see [`crate::stream::ClientHandler::switching_protocols`]).
     /// The caller now owns the raw transport and any bytes this codec left
-    /// unconsumed in the last [`Self::receive`] call.
+    /// unconsumed in the last `Self::receive` call.
     ///
     /// For h2c Upgrade only — a genuine [`ProtocolUpgradeHandler`] installed
     /// via [`ClientWriter::upgrade`] is instead driven internally by this
-    /// codec (see [`Self::receive`]/[`Self::take_outbound`]) and needs no
+    /// codec (see `Self::receive`/[`Self::take_outbound`]) and needs no
     /// handoff at all.
     ///
     /// Panics if called twice, or before the handler has been installed —

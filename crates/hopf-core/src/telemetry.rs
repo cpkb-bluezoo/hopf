@@ -21,7 +21,7 @@ fn process_hook_slot() -> &'static RwLock<Option<Arc<dyn TelemetryHook>>> {
     PROCESS_HOOK.get_or_init(|| RwLock::new(None))
 }
 
-/// Install the process-wide hook (for example [`hopf_otel::TelemetryPipeline::hook`]).
+/// Install the process-wide hook (for example `hopf_otel::TelemetryPipeline::hook`).
 pub fn set_process_telemetry(hook: Arc<dyn TelemetryHook>) {
     *process_hook_slot().write().unwrap_or_else(|e| e.into_inner()) = Some(hook);
 }

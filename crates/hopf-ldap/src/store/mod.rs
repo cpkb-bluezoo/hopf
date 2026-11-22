@@ -4,7 +4,7 @@
 //!
 //! # Reactor safety
 //!
-//! [`CredentialStore::password_match`](hopf_auth::CredentialStore::password_match)
+//! [`CredentialStore::password_match`]
 //! **must not** run on a Hopf reactor thread. It blocks on a `Condvar` with a
 //! timeout while LDAP callbacks complete on the reactor. Call it from a
 //! storage/worker pool (or equivalent off-reactor context).

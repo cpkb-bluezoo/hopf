@@ -56,8 +56,8 @@ pub struct IndexEntry {
 impl IndexEntry {
     /// Build from parts. `props` length 10 (headers) or 11 (with body) for
     /// entries built by this version; an entry loaded from an older
-    /// on-disk index may still be 8 or 9 (see [`DESCRIPTOR_COUNT_HEADERS_V1`]
-    /// / [`DESCRIPTOR_COUNT_BODY_V1`]) — those simply read back `None` from
+    /// on-disk index may still be 8 or 9 (see `DESCRIPTOR_COUNT_HEADERS_V1`
+    /// / `DESCRIPTOR_COUNT_BODY_V1`) — those simply read back `None` from
     /// [`Self::references`] / [`Self::in_reply_to`] until the message is
     /// re-indexed.
     pub fn new(

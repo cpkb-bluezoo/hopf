@@ -47,7 +47,7 @@ impl H3ClientConnection {
     /// request stream once connected, driving it from `factory` — the
     /// shape every existing caller ([`connect_h3`]) still wants. For a
     /// connection whose requests are decided over time (a session issuing
-    /// many sequential requests), see [`connect_h3_session`].
+    /// many sequential requests), see `connect_h3_session`.
     pub fn new(factory: Arc<dyn ClientHandlerFactory>, limits: HttpLimits) -> Self {
         let pending_opens: PendingOpens = Arc::new(Mutex::new(std::collections::VecDeque::from([factory])));
         Self::with_shared_state(pending_opens, Arc::new(Mutex::new(None)), limits)

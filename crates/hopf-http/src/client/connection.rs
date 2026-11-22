@@ -62,7 +62,7 @@ pub struct HttpClientConnection {
 
 impl HttpClientConnection {
     /// `config.secure` and `secure` must agree (the config decides what
-    /// [`HttpConnectionHandler::on_security_established`] expects); `secure`
+    /// `HttpConnectionHandler::on_security_established` expects); `secure`
     /// is accepted separately only because the surrounding dial helpers in
     /// this module already had it to hand.
     pub fn new(

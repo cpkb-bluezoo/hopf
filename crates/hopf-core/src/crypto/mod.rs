@@ -4,7 +4,7 @@
 //!
 //! Protocol crates call this module instead of `aws-lc-rs` directly. Hopf does
 //! **not** reimplement algorithms here; operations delegate to AWS-LC via
-//! `aws-lc-rs` (or [`ed448`](ed448) for DNSSEC Ed448 where libcrypto has no
+//! `aws-lc-rs` (or [`ed448`] for DNSSEC Ed448 where libcrypto has no
 //! support).
 
 #![warn(missing_docs)]

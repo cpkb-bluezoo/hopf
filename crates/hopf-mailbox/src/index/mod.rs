@@ -177,7 +177,7 @@ impl MessageIndex {
     /// it as a real stream. `header_loader` is the equivalent fallback for
     /// `HEADER <name> <string>` when `name` isn't one of the entry's
     /// specifically-indexed fields (see [`IndexEntry::header_value`]) —
-    /// see [`crate::search::header_lookup_streaming`]. `modseq_loader`
+    /// see `crate::search::header_lookup_streaming`. `modseq_loader`
     /// resolves a uid's current CONDSTORE mod-sequence (0 if unknown) —
     /// `IndexEntry` itself doesn't carry one (the backend's own
     /// `.uidlist`/`.flags` sidecar is the single source of truth for it,

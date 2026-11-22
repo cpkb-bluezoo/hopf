@@ -82,7 +82,7 @@ impl std::fmt::Debug for ResumptionMasterSecret {
 }
 
 /// One direction's traffic secret (handshake or application phase) —
-/// keying material, never to be confused with a [`TranscriptHash`].
+/// keying material, never to be confused with a `TranscriptHash`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct TrafficSecret(Secret);
 

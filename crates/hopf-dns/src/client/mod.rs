@@ -927,8 +927,8 @@ impl DnsResolver {
     }
 
     /// Add upstream (`addr` already resolved). Plain UDP with automatic
-    /// TCP-on-truncation fallback — see [`Self::add_server_dot`]/
-    /// [`Self::add_server_doq`]/[`Self::add_server_doh`] for encrypted
+    /// TCP-on-truncation fallback — see `Self::add_server_dot`/
+    /// `Self::add_server_doq`/`Self::add_server_doh` for encrypted
     /// transports.
     ///
     /// This is the capability cache's "auto mode" entry point (see
@@ -1079,7 +1079,7 @@ impl DnsResolver {
     /// while the host can reach the public IPv6 internet, with a short head
     /// start before the same query also goes to IPv4; on a host without IPv6
     /// the IPv6 entries are skipped instantly, and a later network change is
-    /// noticed after a few minutes. See [`public_fallback`] for the algorithm.
+    /// noticed after a few minutes. See `public_fallback` for the algorithm.
     /// Nameservers added any other way (including from `resolv.conf`) are
     /// used exactly as configured.
     pub fn use_public_resolvers(&self) {

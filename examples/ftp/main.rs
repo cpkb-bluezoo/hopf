@@ -1,6 +1,6 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! FTP server using stock [`FilesystemFtpHandler`].
+//! FTP server using stock `FilesystemFtpHandler`.
 //!
 //! ```text
 //! mkdir -p /tmp/ftp-root && cargo run -p ftp-server -- 127.0.0.1:2121 /tmp/ftp-root

@@ -378,7 +378,7 @@ pub trait Mailbox: Send {
     /// IMAP SEARCH — **must** be invoked on the storage pool.
     fn search(&self, criteria: &SearchCriteria) -> MailboxResult<Vec<u32>>;
 
-    /// Run `f` with the [`MessageContext`] for `message_number` — the same
+    /// Run `f` with the `MessageContext` for `message_number` — the same
     /// per-message metadata/header access [`Self::search`] evaluates
     /// [`SearchCriteria`] against, exposed here for RFC 5256 SORT/THREAD
     /// sort-key and threading-header extraction (issue #407). **Must** be

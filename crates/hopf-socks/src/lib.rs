@@ -12,7 +12,7 @@
 //! and [`SocksUdpAssociateHandler`] / [`socks_udp_associate_config`]).
 //!
 //! RFC 1961 GSSAPI authentication is not implemented today; it is planned
-//! together with optional GSSAPI/Kerberos SASL in [`hopf_auth`]. Until then,
+//! together with optional GSSAPI/Kerberos SASL in `hopf_auth`. Until then,
 //! deployments needing enterprise auth can terminate TLS in front of the proxy
 //! and use RFC 1929 username/password instead.
 //!

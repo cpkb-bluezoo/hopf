@@ -43,7 +43,7 @@ pub fn qlog_export_enabled() -> bool {
     QLOG_EXPORT_ENABLED.load(Ordering::Relaxed)
 }
 
-/// Updated by [`hopf_otel::TelemetryPipeline::start`] (and cleared on shutdown).
+/// Updated by `hopf_otel::TelemetryPipeline::start` (and cleared on shutdown).
 pub fn set_qlog_export_enabled(enabled: bool) {
     QLOG_EXPORT_ENABLED.store(enabled, Ordering::Relaxed);
 }
