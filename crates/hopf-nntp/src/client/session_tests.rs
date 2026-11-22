@@ -423,3 +423,364 @@ fn opportunistic_starttls_carries_on_in_the_clear_when_refused() {
     peer.run("502 Command unavailable\r\n");
     assert!(log.lock().unwrap().session.is_some());
 }
+
+// ── streaming posts ───────────────────────────────────────────────────────
+
+use super::post::{NntpAttachment, NntpPostStream, NntpPoster, PostStep};
+use super::session::NntpArticleHandler;
+
+/// Writes `pieces` one a call, noting each call.
+struct Pieces {
+    pieces: Vec<&'static str>,
+    next: usize,
+    calls: Arc<Mutex<usize>>,
+}
+
+impl NntpPoster for Pieces {
+    fn next(&mut self, out: &mut NntpPostStream<'_>) -> PostStep {
+        *self.calls.lock().unwrap() += 1;
+        out.write(self.pieces[self.next].as_bytes());
+        self.next += 1;
+        if self.next == self.pieces.len() {
+            PostStep::Done
+        } else {
+            PostStep::More
+        }
+    }
+}
+
+#[test]
+fn a_streamed_post_is_asked_for_a_piece_at_a_time_as_the_connection_drains() {
+    let (mut peer, log) = ready();
+    let r: Slot<()> = slot();
+    let calls = Arc::new(Mutex::new(0));
+    session(&log).post_stream(Pieces { pieces: vec!["Subject: s\n", "\n.one\nsec", "ond\n"], next: 0, calls: Arc::clone(&calls) }, put(&r));
+    assert_eq!(sent(&mut peer), "POST\r\n");
+    // The first piece is asked for at the 340, and no more until what was
+    // written has drained.
+    assert_eq!(peer.run("340 go\r\n"), "Subject: s\r\n");
+    peer.pump();
+    assert_eq!(*calls.lock().unwrap(), 1);
+    peer.drain();
+    assert_eq!(peer.take(), "\r\n..one\r\nsec");
+    assert_eq!(*calls.lock().unwrap(), 2);
+    peer.drain();
+    // The last piece ends the article.
+    assert_eq!(peer.take(), "ond\r\n.\r\n");
+    assert_eq!(*calls.lock().unwrap(), 3);
+    peer.run("240 ok\r\n");
+    got(&r).unwrap();
+}
+
+#[test]
+fn a_poster_that_waits_is_not_called_until_it_wakes_the_connection() {
+    struct Later {
+        step: u8,
+        waker: Arc<Mutex<Option<super::post::PostWaker>>>,
+    }
+    impl NntpPoster for Later {
+        fn next(&mut self, out: &mut NntpPostStream<'_>) -> PostStep {
+            self.step += 1;
+            match self.step {
+                1 => {
+                    *self.waker.lock().unwrap() = Some(out.waker());
+                    PostStep::Wait
+                }
+                _ => {
+                    out.write(b"late\n");
+                    PostStep::Done
+                }
+            }
+        }
+    }
+    let (mut peer, log) = ready();
+    let r: Slot<()> = slot();
+    let waker = Arc::default();
+    session(&log).post_stream(Later { step: 0, waker: Arc::clone(&waker) }, put(&r));
+    sent(&mut peer);
+    assert_eq!(peer.run("340 go\r\n"), "");
+    peer.pump();
+    peer.drain();
+    assert_eq!(peer.take(), "", "the poster is still waiting");
+    waker.lock().unwrap().as_ref().unwrap().wake();
+    peer.pump();
+    assert_eq!(peer.take(), "late\r\n.\r\n");
+    peer.run("240 ok\r\n");
+    got(&r).unwrap();
+}
+
+#[test]
+fn a_poster_that_fails_closes_the_connection_and_the_post_hears_why() {
+    struct Fails;
+    impl NntpPoster for Fails {
+        fn next(&mut self, out: &mut NntpPostStream<'_>) -> PostStep {
+            out.write(b"half an article\n");
+            PostStep::Failed(io::Error::new(io::ErrorKind::BrokenPipe, "the file went away"))
+        }
+    }
+    let (mut peer, log) = ready();
+    let r: Slot<()> = slot();
+    session(&log).post_stream(Fails, put(&r));
+    sent(&mut peer);
+    peer.run("340 go\r\n");
+    assert!(peer.is_closed());
+    assert!(got(&r).unwrap_err().to_string().contains("the file went away"));
+    assert!(log.lock().unwrap().errors[0].contains("the file went away"));
+    assert!(!peer.take().contains(".\r\n"), "the article was not ended");
+}
+
+#[test]
+fn a_refused_post_never_calls_its_poster() {
+    let (mut peer, log) = ready();
+    let r: Slot<()> = slot();
+    let calls = Arc::new(Mutex::new(0));
+    session(&log).post_stream(Pieces { pieces: vec!["x"], next: 0, calls: Arc::clone(&calls) }, put(&r));
+    sent(&mut peer);
+    peer.run("440 no\r\n");
+    assert_eq!(*calls.lock().unwrap(), 0);
+    assert!(got(&r).unwrap_err().to_string().contains("440"));
+}
+
+#[test]
+fn a_server_that_answers_before_the_article_is_complete_ends_the_session() {
+    let (mut peer, log) = ready();
+    let r: Slot<()> = slot();
+    let calls = Arc::new(Mutex::new(0));
+    session(&log).post_stream(Pieces { pieces: vec!["a\n", "b\n"], next: 0, calls }, put(&r));
+    sent(&mut peer);
+    peer.run("340 go\r\n");
+    peer.run("441 posting failed\r\n");
+    assert!(peer.is_closed());
+}
+
+#[test]
+fn a_large_post_goes_out_in_pieces_the_size_of_the_poster_writes() {
+    let (mut peer, log) = ready();
+    let r: Slot<()> = slot();
+    let article: Vec<u8> = (0..100_000).flat_map(|i| format!("line {i}\n").into_bytes()).collect();
+    session(&log).post(&article, put(&r));
+    sent(&mut peer);
+    let mut out = peer.run_bytes(b"340 go\r\n");
+    let mut rounds = 0;
+    while !out.ends_with(b"\r\n.\r\n") {
+        rounds += 1;
+        assert!(rounds < 1000);
+        peer.drain();
+        let piece = peer.take_bytes();
+        assert!(piece.len() < 64 * 1024, "{} bytes at once", piece.len());
+        out.extend_from_slice(&piece);
+    }
+    assert!(rounds > 10, "the article went out in {rounds} pieces");
+    assert_eq!(out, crate::client::dot_stuff(&article));
+    peer.run("240 ok\r\n");
+    got(&r).unwrap();
+}
+
+// ── attachments ───────────────────────────────────────────────────────────
+
+/// What a client with an attachment sends, the server taking it as it comes.
+fn sent_article(peer: &mut Peer<NntpClientEndpoint>, first: Vec<u8>) -> Vec<u8> {
+    let mut out = first;
+    let started = std::time::Instant::now();
+    while !out.ends_with(b"\r\n.\r\n") {
+        assert!(started.elapsed() < Duration::from_secs(10), "the article never ended: {:?}", String::from_utf8_lossy(&out));
+        peer.drain();
+        out.extend_from_slice(&peer.take_bytes());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    out
+}
+
+#[test]
+fn attachments_are_posted_as_uuencoded_blocks_after_the_text() {
+    let (mut peer, log) = ready();
+    let r: Slot<()> = slot();
+    let big: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+    session(&log).post_with_attachments(
+        b"Subject: with files\r\n\r\nSee attached",
+        vec![NntpAttachment::from_bytes("a.txt", b"hello".to_vec()), NntpAttachment::from_bytes("b.bin", big.clone()).mode(0o600)],
+        put(&r),
+    );
+    sent(&mut peer);
+    let first = peer.run_bytes(b"340 go\r\n");
+    let out = sent_article(&mut peer, first);
+    // Decode what went out, as a reader would.
+    let mut seen = Vec::new();
+    struct Collect<'a>(&'a mut Vec<(String, u32, Vec<u8>, bool)>, Vec<u8>);
+    impl rmimeparser::UuHandler for Collect<'_> {
+        fn text(&mut self, d: &[u8]) -> rmimeparser::ParseResult<()> {
+            self.1.extend_from_slice(d);
+            Ok(())
+        }
+        fn begin(&mut self, mode: u32, name: &[u8]) -> rmimeparser::ParseResult<()> {
+            self.0.push((String::from_utf8_lossy(name).into_owned(), mode, Vec::new(), false));
+            Ok(())
+        }
+        fn data(&mut self, d: &[u8]) -> rmimeparser::ParseResult<()> {
+            self.0.last_mut().unwrap().2.extend_from_slice(d);
+            Ok(())
+        }
+        fn end(&mut self, complete: bool) -> rmimeparser::ParseResult<()> {
+            self.0.last_mut().unwrap().3 = complete;
+            Ok(())
+        }
+    }
+    let mut scanner = rmimeparser::UuScanner::new(Collect(&mut seen, Vec::new()));
+    scanner.feed(&out[..out.len() - 3]).unwrap();
+    scanner.finish().unwrap();
+    let text = scanner.into_handler().1;
+    assert_eq!(String::from_utf8_lossy(&text), "Subject: with files\r\n\r\nSee attached\r\n");
+    assert_eq!(seen.len(), 2);
+    assert_eq!((seen[0].0.as_str(), seen[0].1, seen[0].2.as_slice(), seen[0].3), ("a.txt", 0o644, &b"hello"[..], true));
+    assert_eq!((seen[1].0.as_str(), seen[1].1, seen[1].3), ("b.bin", 0o600, true));
+    assert_eq!(seen[1].2, big);
+    peer.run("240 ok\r\n");
+    got(&r).unwrap();
+}
+
+#[test]
+fn an_attachment_that_cannot_be_read_fails_the_post() {
+    let (mut peer, log) = ready();
+    let r: Slot<()> = slot();
+    session(&log).post_with_attachments(b"Subject: s\r\n\r\nx\r\n", vec![NntpAttachment::from_path("/no/such/file/anywhere")], put(&r));
+    sent(&mut peer);
+    peer.run("340 go\r\n");
+    let started = std::time::Instant::now();
+    while !peer.is_closed() {
+        assert!(started.elapsed() < Duration::from_secs(10), "the post never failed");
+        peer.drain();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(got(&r).is_err());
+}
+
+struct Files {
+    text: Vec<u8>,
+    files: Vec<(u32, Vec<u8>, Vec<u8>, bool)>,
+}
+
+impl NntpArticleHandler for Arc<Mutex<Files>> {
+    fn text(&mut self, data: &[u8]) {
+        self.lock().unwrap().text.extend_from_slice(data);
+    }
+    fn attachment_begin(&mut self, mode: u32, name: &[u8]) {
+        self.lock().unwrap().files.push((mode, name.to_vec(), Vec::new(), false));
+    }
+    fn attachment_data(&mut self, data: &[u8]) {
+        self.lock().unwrap().files.last_mut().unwrap().2.extend_from_slice(data);
+    }
+    fn attachment_end(&mut self, complete: bool) {
+        self.lock().unwrap().files.last_mut().unwrap().3 = complete;
+    }
+}
+
+#[test]
+fn an_article_with_attachments_is_told_as_text_and_files_however_it_arrives() {
+    let content: Vec<u8> = (0..5000u32).map(|i| (i % 253) as u8).collect();
+    let mut block = Vec::new();
+    let mut enc = rmimeparser::UuencodeEncoder::new("pic.jpg", 0o644);
+    enc.write(&mut block, &content).unwrap();
+    enc.finish(&mut block).unwrap();
+    let mut article = b"Subject: pics\r\n\r\nLook at this:\r\n".to_vec();
+    article.extend_from_slice(&block);
+    article.extend_from_slice(b"Cheers\r\n");
+    // dot-stuffed on the wire (an encoded line may begin with a dot).
+    let wire = {
+        let mut w = b"220 1 <a@x> article follows\r\n".to_vec();
+        w.extend_from_slice(&crate::client::dot_stuff(&article));
+        String::from_utf8(w).unwrap()
+    };
+    for chunk in [1usize, 7, 64, usize::MAX] {
+        let (mut peer, log) = ready();
+        let files = Arc::new(Mutex::new(Files { text: Vec::new(), files: Vec::new() }));
+        let r: Slot<()> = slot();
+        session(&log).article_with_attachments(1, Arc::clone(&files), put(&r));
+        assert_eq!(sent(&mut peer), "ARTICLE 1\r\n");
+        if chunk == usize::MAX {
+            peer.run(&wire);
+        } else {
+            peer.run_chunked(&wire, chunk);
+        }
+        got(&r).unwrap();
+        let f = files.lock().unwrap();
+        assert_eq!(String::from_utf8_lossy(&f.text), "Subject: pics\r\n\r\nLook at this:\r\nCheers\r\n", "chunks of {chunk}");
+        assert_eq!(f.files.len(), 1);
+        assert_eq!((f.files[0].0, f.files[0].1.as_slice(), f.files[0].3), (0o644, &b"pic.jpg"[..], true));
+        assert_eq!(f.files[0].2, content, "chunks of {chunk}");
+    }
+}
+
+// ── choosing the SASL mechanism ───────────────────────────────────────────
+
+fn connect_with(credentials: (&str, &str), mechanisms: &[hopf_auth::SaslMechanism]) -> Client {
+    let log: Arc<Mutex<Log>> = Arc::default();
+    let ep = NntpClientEndpoint::new(
+        Box::new(Handler(Arc::clone(&log))),
+        Some((credentials.0.to_string(), credentials.1.to_string())),
+        None,
+        TlsMode::None,
+        Duration::from_secs(60),
+    )
+    .with_mechanisms(Some(mechanisms.to_vec()));
+    (Peer::connect(ep, |_| false), log)
+}
+
+#[test]
+fn the_application_can_choose_the_mechanism() {
+    use hopf_auth::SaslMechanism::*;
+    // PLAIN is preferred to nothing, though SCRAM is offered, because the
+    // application said PLAIN.
+    let (mut peer, _log) = connect_with(("alice", "secret"), &[Plain]);
+    peer.run("200 hi\r\n");
+    assert_eq!(peer.run("101 caps\r\nSASL SCRAM-SHA-256 PLAIN\r\n.\r\n"), "AUTHINFO SASL PLAIN AGFsaWNlAHNlY3JldA==\r\n");
+}
+
+#[test]
+fn a_mechanism_that_is_not_offered_is_an_error_not_a_fallback() {
+    use hopf_auth::SaslMechanism::*;
+    let (mut peer, log) = connect_with(("alice", "secret"), &[ScramSha256Plus, External]);
+    peer.run("200 hi\r\n");
+    assert_eq!(peer.run("101 caps\r\nAUTHINFO USER\r\nSASL PLAIN LOGIN\r\n.\r\n"), "", "nothing was sent");
+    assert!(peer.is_closed());
+    let error = log.lock().unwrap().errors[0].clone();
+    assert!(error.contains("SCRAM-SHA-256-PLUS") && error.contains("EXTERNAL") && error.contains("PLAIN LOGIN"), "{error}");
+}
+
+#[test]
+fn external_sends_its_authorization_identity_or_an_equals_sign() {
+    use hopf_auth::SaslMechanism::*;
+    let (mut peer, log) = connect_with(("", ""), &[External]);
+    peer.run("200 hi\r\n");
+    assert_eq!(peer.run("101 caps\r\nSASL EXTERNAL\r\n.\r\n"), "AUTHINFO SASL EXTERNAL =\r\n");
+    peer.run("281 ok\r\n");
+    assert!(log.lock().unwrap().greeting.as_ref().unwrap().authenticated);
+    let (mut peer, _log) = connect_with(("bob", ""), &[External]);
+    peer.run("200 hi\r\n");
+    assert_eq!(peer.run("101 caps\r\nSASL EXTERNAL\r\n.\r\n"), "AUTHINFO SASL EXTERNAL Ym9i\r\n");
+}
+
+#[test]
+fn bearer_tokens_use_oauthbearer_and_xoauth2() {
+    use hopf_auth::SaslMechanism::*;
+    let (mut peer, log) = connect_with(("alice", "tok123"), &[OauthBearer, XOauth2]);
+    peer.run("200 hi\r\n");
+    let sent = peer.run("101 caps\r\nSASL XOAUTH2 OAUTHBEARER\r\n.\r\n");
+    // OAUTHBEARER is first in the application's order.
+    assert!(sent.starts_with("AUTHINFO SASL OAUTHBEARER "), "{sent}");
+    let initial = base64_decode(sent.trim_end().rsplit(' ').next().unwrap());
+    assert_eq!(String::from_utf8(initial).unwrap(), "n,a=alice,\u{1}auth=Bearer tok123\u{1}\u{1}");
+    peer.run("281 ok\r\n");
+    assert!(log.lock().unwrap().greeting.as_ref().unwrap().authenticated);
+
+    let (mut peer, _log) = connect_with(("alice", "tok123"), &[OauthBearer, XOauth2]);
+    peer.run("200 hi\r\n");
+    let sent = peer.run("101 caps\r\nSASL XOAUTH2\r\n.\r\n");
+    assert!(sent.starts_with("AUTHINFO SASL XOAUTH2 "), "{sent}");
+    let initial = base64_decode(sent.trim_end().rsplit(' ').next().unwrap());
+    assert_eq!(String::from_utf8(initial).unwrap(), "user=alice\u{1}auth=Bearer tok123\u{1}\u{1}");
+}
+
+fn base64_decode(text: &str) -> Vec<u8> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(text).unwrap()
+}

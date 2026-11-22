@@ -7,6 +7,24 @@ versioned together. Changes before 0.7.0 are in the git history and tags.
 
 ### Added
 
+- **hopf-nntp client: streaming posts, attachments and a choice of SASL
+  mechanism** (#544). `NntpSession::post_stream` takes an `NntpPoster` that is
+  asked for the article a piece at a time, the next only when the connection
+  has taken the last, with dot-stuffing and the terminator added; a poster that
+  fails closes the connection and the post hears the error. `post` is now that
+  over a slice, so there is one way an article is sent.
+  `post_with_attachments` follows the text with `NntpAttachment`s (a path,
+  bytes, a `Read` or an `AttachmentSource`) as uuencoded blocks, each read and
+  encoded on a thread of its own and written a piece at a time, and
+  `article_with_attachments` / `body_with_attachments` tell an
+  `NntpArticleHandler` the text of an article and, apart from it, each file as
+  it arrives. Posting a 128 MiB article or attachment to the server, and reading
+  it back, takes the same heap as a small one. `NntpClient::sasl_mechanisms`
+  names the mechanisms to try (and when the server offers none the connection
+  fails instead of sending a password another way), `bearer_token` uses
+  OAUTHBEARER or XOAUTH2, and `sasl_external` uses the TLS client certificate.
+  `tests/roundtrip.rs` runs the client against the server for each mechanism,
+  and for posts with attachments that come back the same.
 - **hopf-nntp: a news reader server** (#543). `NntpService` serves the
   mailboxes of a `MailboxStore` as newsgroups (a mailbox is a group, a UID is
   an article number), or any other source of articles through a

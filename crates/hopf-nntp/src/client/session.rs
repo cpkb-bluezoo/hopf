@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 use hopf_core::ConnHandle;
 
 use super::error::NntpClientError;
-use super::reply::{dot_stuff, ArticleRef, Block, GroupResult, NewsgroupEntry, NntpStatus, OverviewEntry};
+use super::post::{AttachmentPoster, NntpAttachment, NntpPoster, SlicePoster};
+use super::reply::{ArticleRef, Block, GroupResult, NewsgroupEntry, NntpStatus, OverviewEntry};
+use rmimeparser::{UuHandler, UuScanner};
 
 /// Receives the text of a multi-line block as it arrives: dot-unstuffed, line
 /// ends kept, in as many pieces as the connection delivers it in. No line
@@ -49,9 +51,9 @@ pub(crate) struct Command {
     /// Receives the fields of a `GROUP` or article status.
     pub on_detail: Option<Box<dyn FnMut(Detail) + Send>>,
     pub on_complete: CompletionCallback,
-    /// When the first reply carries this code, write the payload (already
-    /// framed) and wait for a second status line.
-    pub continuation: Option<(u16, Vec<u8>)>,
+    /// For `POST`: writes the article once the server has said `340`; a
+    /// second status line then answers the whole.
+    pub poster: Option<Box<dyn NntpPoster>>,
 }
 
 #[derive(Default)]
@@ -107,7 +109,7 @@ impl NntpSession {
     }
 
     fn queue(&self, line: String, sink: Option<Sink>, on_detail: Option<Box<dyn FnMut(Detail) + Send>>, on_complete: CompletionCallback) {
-        self.enqueue(Command { line, sink, on_detail, on_complete, continuation: None });
+        self.enqueue(Command { line, sink, on_detail, on_complete, poster: None });
     }
 
     /// Any command. `on_content` receives the multi-line block (dot-unstuffed,
@@ -236,16 +238,90 @@ impl NntpSession {
         });
     }
 
-    /// `POST` an article (headers, blank line, body; any line endings).
-    /// Dot-stuffing and the terminator are added here.
+    /// `POST` an article that is in memory (headers, blank line, body; any line
+    /// endings). Dot-stuffing and the terminator are added. This is
+    /// [`Self::post_stream`] with the article written a piece at a time.
     pub fn post(&self, article: &[u8], on_complete: impl FnOnce(Result<(), NntpClientError>) + Send + 'static) {
+        self.post_stream(SlicePoster::new(article.to_vec()), on_complete);
+    }
+
+    /// `POST` an article written piece by piece by `poster`, in constant
+    /// memory: once the server has said `340` the poster is asked for the
+    /// article a piece at a time, and for the next only when the connection has
+    /// taken the last. Dot-stuffing and the terminator are added. If the poster
+    /// fails, the connection is closed (a half-sent article cannot be
+    /// abandoned) and `on_complete` hears the error.
+    pub fn post_stream(
+        &self,
+        poster: impl NntpPoster + 'static,
+        on_complete: impl FnOnce(Result<(), NntpClientError>) + Send + 'static,
+    ) {
         self.enqueue(Command {
             line: "POST".to_string(),
             sink: None,
             on_detail: None,
             on_complete: Box::new(move |r| on_complete(expect(r, "POST", 240).map(|_| ()))),
-            continuation: Some((340, dot_stuff(article))),
+            poster: Some(Box::new(poster)),
         });
+    }
+
+    /// `POST` `text` (headers, blank line, body) followed by `attachments` as
+    /// uuencoded blocks. Each attachment is read, on a thread of its own, only
+    /// as fast as the connection takes it, so none is ever held whole.
+    pub fn post_with_attachments(
+        &self,
+        text: &[u8],
+        attachments: Vec<NntpAttachment>,
+        on_complete: impl FnOnce(Result<(), NntpClientError>) + Send + 'static,
+    ) {
+        self.post_stream(AttachmentPoster::new(text.to_vec(), attachments), on_complete);
+    }
+
+    /// `ARTICLE number`, with the uuencoded files in it found as it arrives and
+    /// told to `handler` apart from the text around them, in constant memory.
+    pub fn article_with_attachments(
+        &self,
+        number: u64,
+        handler: impl NntpArticleHandler + 'static,
+        on_complete: impl FnOnce(Result<(), NntpClientError>) + Send + 'static,
+    ) {
+        self.with_attachments(format!("ARTICLE {number}"), "ARTICLE", 220, handler, on_complete);
+    }
+
+    /// `BODY number`, as [`Self::article_with_attachments`].
+    pub fn body_with_attachments(
+        &self,
+        number: u64,
+        handler: impl NntpArticleHandler + 'static,
+        on_complete: impl FnOnce(Result<(), NntpClientError>) + Send + 'static,
+    ) {
+        self.with_attachments(format!("BODY {number}"), "BODY", 222, handler, on_complete);
+    }
+
+    fn with_attachments(
+        &self,
+        line: String,
+        name: &'static str,
+        code: u16,
+        handler: impl NntpArticleHandler + 'static,
+        on_complete: impl FnOnce(Result<(), NntpClientError>) + Send + 'static,
+    ) {
+        let scanner = Arc::new(Mutex::new(UuScanner::new(Adapter(Box::new(handler)))));
+        let feed = Arc::clone(&scanner);
+        self.command(
+            line,
+            true,
+            move |chunk| {
+                let _ = feed.lock().unwrap().feed(chunk);
+            },
+            move |r| {
+                let r = expect(r, name, code);
+                if r.is_ok() {
+                    let _ = scanner.lock().unwrap().finish();
+                }
+                on_complete(r.map(|_| ()))
+            },
+        );
     }
 
     /// `QUIT`; the session takes no commands after this.
@@ -256,9 +332,62 @@ impl NntpSession {
             sink: None,
             on_detail: None,
             on_complete: Box::new(move |_| conn.close()),
-            continuation: None,
+            poster: None,
         });
         self.queue.lock().unwrap().closed = Some("QUIT sent".to_string());
+    }
+}
+
+/// Told of an article as it arrives: the text of it, and the files in it.
+///
+/// Every method has an empty default. The calls come in the order of the
+/// article, on the connection's reactor thread, in whatever pieces the
+/// connection delivers it in.
+pub trait NntpArticleHandler: Send {
+    /// Text outside any attached file: the headers, the empty line and the
+    /// words of the body, exactly as they arrived (line ends included).
+    /// Adjacent calls are one run of text.
+    fn text(&mut self, data: &[u8]) {
+        let _ = data;
+    }
+
+    /// An attached file begins, with the mode and name in its `begin` line. The
+    /// name is bytes, because nothing says what encoding it is in.
+    fn attachment_begin(&mut self, mode: u32, name: &[u8]) {
+        let _ = (mode, name);
+    }
+
+    /// Some of the decoded file.
+    fn attachment_data(&mut self, data: &[u8]) {
+        let _ = data;
+    }
+
+    /// The file is over. `complete` is false when it was cut off: by the end of
+    /// the article, or by a line that is not uuencode.
+    fn attachment_end(&mut self, complete: bool) {
+        let _ = complete;
+    }
+}
+
+/// Gives what the scanner finds to an [`NntpArticleHandler`].
+struct Adapter(Box<dyn NntpArticleHandler>);
+
+impl UuHandler for Adapter {
+    fn text(&mut self, data: &[u8]) -> rmimeparser::ParseResult<()> {
+        self.0.text(data);
+        Ok(())
+    }
+    fn begin(&mut self, mode: u32, name: &[u8]) -> rmimeparser::ParseResult<()> {
+        self.0.attachment_begin(mode, name);
+        Ok(())
+    }
+    fn data(&mut self, data: &[u8]) -> rmimeparser::ParseResult<()> {
+        self.0.attachment_data(data);
+        Ok(())
+    }
+    fn end(&mut self, complete: bool) -> rmimeparser::ParseResult<()> {
+        self.0.attachment_end(complete);
+        Ok(())
     }
 }
 

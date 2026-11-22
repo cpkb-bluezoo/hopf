@@ -6,6 +6,7 @@ mod endpoint;
 mod error;
 mod facade;
 mod handlers;
+mod post;
 pub(crate) mod reply;
 mod session;
 #[cfg(test)]
@@ -19,5 +20,6 @@ pub use reply::{
     dot_stuff, parse_group_response, parse_newsgroup_line, parse_overview_line, parse_status,
     ArticleRef, GroupResult, NewsgroupEntry, NntpStatus, OverviewEntry,
 };
-pub use session::{CompletionCallback, ContentCallback, NntpSession};
+pub use post::{AttachmentSource, NntpAttachment, NntpPostStream, NntpPoster, PostStep, PostWaker};
+pub use session::{CompletionCallback, ContentCallback, NntpArticleHandler, NntpSession};
 pub use timeout::NntpClientTimeouts;

@@ -36,7 +36,14 @@ service.start()?;
 - **DNS:** async hostname resolution via hopf-dns (`DnsResolver`)
 - **TLS:** implicit NNTPS (port 563) and STARTTLS, required or opportunistic
 - **Auth:** AUTHINFO USER/PASS and AUTHINFO SASL (SCRAM-SHA-256, PLAIN,
-  LOGIN) chosen from CAPABILITIES
+  LOGIN) chosen from CAPABILITIES, or the mechanisms you name
+  (`sasl_mechanisms`, `bearer_token` for OAUTHBEARER / XOAUTH2,
+  `sasl_external` for a client certificate)
+- **Posting in constant memory:** `post_stream` takes an `NntpPoster` asked for
+  the article a piece at a time as the connection drains;
+  `post_with_attachments` uuencodes files as they are read;
+  `article_with_attachments` tells you the text and each file as an article
+  arrives
 - **Session:** a cloneable `NntpSession` queues commands from any thread;
   replies and completions come back as callbacks
 - **Parsing:** one pass over the connection's ring, nothing buffered whole.

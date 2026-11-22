@@ -4,6 +4,7 @@
 //! `AUTHINFO`, then the command queue.
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,6 +19,7 @@ use super::reply::{
     has_capability, is_multiline_code, normalize_capabilities, sasl_mechanisms, Block, NntpReplyLexer,
     NntpStatus, ReplyEvent,
 };
+use super::post::{NntpPostStream, NntpPoster, PostStep, PostStuffer};
 use super::session::{Command, Detail, NntpSession, Queue, Sink};
 
 /// Mechanisms tried for a password, in order of preference.
@@ -61,8 +63,20 @@ enum Phase {
 enum InFlight {
     Status,
     Lines,
-    /// The continuation payload went out; a final status is due.
+    /// The server said `340` and the article is being written.
+    Posting,
+    /// The article went out; a final status is due.
     Final,
+}
+
+/// An article being written to a `POST`.
+struct PostRun {
+    poster: Box<dyn NntpPoster>,
+    stuffer: PostStuffer,
+    /// Set when the poster is waiting to be woken, cleared by its waker.
+    waiting: Arc<AtomicBool>,
+    /// Set when what was written has not drained; cleared when it has.
+    write_pending: Arc<AtomicBool>,
 }
 
 pub(crate) struct NntpClientEndpoint {
@@ -80,6 +94,10 @@ pub(crate) struct NntpClientEndpoint {
     secure: bool,
     authenticated: bool,
     sasl: Option<Box<dyn SaslClient>>,
+    /// The mechanisms to try, in order, when the application chose; `None`
+    /// for the default preference.
+    mechanisms: Option<Vec<SaslMechanism>>,
+    posting: Option<PostRun>,
     in_flight: Option<(Command, InFlight)>,
     timer: Option<TimerHandle>,
     connected_notified: bool,
@@ -112,12 +130,21 @@ impl NntpClientEndpoint {
             secure: false,
             authenticated: false,
             sasl: None,
+            mechanisms: None,
+            posting: None,
             in_flight: None,
             timer: None,
             connected_notified: false,
             lexer: NntpReplyLexer::default(),
             block_next: None,
         }
+    }
+
+    /// Authenticates with these SASL mechanisms, in this order of preference,
+    /// instead of the default, and with no fallback to `AUTHINFO USER`.
+    pub fn with_mechanisms(mut self, mechanisms: Option<Vec<SaslMechanism>>) -> Self {
+        self.mechanisms = mechanisms;
+        self
     }
 
     fn send_line(&mut self, ep: &mut dyn Endpoint, line: &str) {
@@ -158,6 +185,7 @@ impl NntpClientEndpoint {
             return;
         }
         self.phase = Phase::Closed;
+        self.posting = None;
         self.cancel_timer();
         self.fail_commands(&err.to_string());
         if let Some(h) = self.handler.as_mut() {
@@ -262,10 +290,23 @@ impl NntpClientEndpoint {
             return self.become_ready(ep);
         };
         let offered = sasl_mechanisms(&self.capabilities);
-        let mech = SASL_PREFERENCE
+        let preference: &[SaslMechanism] = self.mechanisms.as_deref().unwrap_or(SASL_PREFERENCE);
+        let mech = preference
             .iter()
             .copied()
             .find(|m| offered.iter().any(|o| o.eq_ignore_ascii_case(m.name())));
+        if mech.is_none() && self.mechanisms.is_some() {
+            // The application named the mechanisms: not offering any is an
+            // error, not a reason to send a password another way.
+            let wanted: Vec<&str> = preference.iter().map(|m| m.name()).collect();
+            return self.fail(
+                ep,
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("none of the SASL mechanisms asked for ({}) is offered (the server offers: {})", wanted.join(", "), offered.join(" ")),
+                ),
+            );
+        }
         if let Some(mech) = mech {
             let mut client = create_client(mech, &user, &pass, None);
             let mut line = format!("AUTHINFO SASL {}", mech.name());
@@ -412,12 +453,26 @@ impl NntpClientEndpoint {
             self.in_flight = Some((cmd, waiting));
             return;
         }
-        if let (InFlight::Status, Some((code, payload))) = (&waiting, cmd.continuation.take()) {
-            if status.code == code {
-                ep.send(&payload);
-                self.arm_timer(ep);
-                self.in_flight = Some((cmd, InFlight::Final));
-                return;
+        if matches!(waiting, InFlight::Posting) {
+            // The server has answered before the article was finished, and
+            // what remains of it cannot now be told from commands.
+            self.in_flight = Some((cmd, waiting));
+            return self.protocol_error(ep, "the server answered a POST before the article was complete", status.text.as_bytes());
+        }
+        if matches!(waiting, InFlight::Status) {
+            if let Some(poster) = cmd.poster.take() {
+                if status.code == 340 {
+                    self.posting = Some(PostRun {
+                        poster,
+                        stuffer: PostStuffer::new(),
+                        waiting: Arc::new(AtomicBool::new(false)),
+                        write_pending: Arc::new(AtomicBool::new(false)),
+                    });
+                    self.in_flight = Some((cmd, InFlight::Posting));
+                    self.drive_post(ep);
+                    return;
+                }
+                // Refused (`440`): nothing is to be written.
             }
         }
         if let (Some(detail), Some(on_detail)) = (detail, cmd.on_detail.as_mut()) {
@@ -476,6 +531,54 @@ impl NntpClientEndpoint {
             // The status that opened the block is already captured in the
             // completion wrapper; this placeholder is replaced there.
             self.complete(ep, cmd, Ok(NntpStatus { code: 0, text: String::new() }));
+        }
+    }
+
+    /// Asks the poster for the next piece of the article if the connection has
+    /// taken the last, and ends the article when the poster says it is done.
+    fn drive_post(&mut self, ep: &mut dyn Endpoint) {
+        let Some(mut run) = self.posting.take() else { return };
+        if run.write_pending.load(Ordering::SeqCst) || run.waiting.load(Ordering::SeqCst) {
+            self.posting = Some(run);
+            return;
+        }
+        self.arm_timer(ep);
+        // Set before the poster is called, so that a wake that comes while it
+        // is deciding to wait is not lost.
+        run.waiting.store(true, Ordering::SeqCst);
+        let step = {
+            let waiting = Arc::clone(&run.waiting);
+            let mut stream = NntpPostStream::new(ep, &mut run.stuffer, &waiting);
+            run.poster.next(&mut stream)
+        };
+        match step {
+            PostStep::More => {
+                run.waiting.store(false, Ordering::SeqCst);
+                run.write_pending.store(true, Ordering::SeqCst);
+                let flag = Arc::clone(&run.write_pending);
+                ep.on_write_ready(Some(Box::new(move |ep| {
+                    flag.store(false, Ordering::SeqCst);
+                    ep.poke_handler();
+                })));
+                self.posting = Some(run);
+            }
+            PostStep::Wait => {
+                self.posting = Some(run);
+            }
+            PostStep::Done => {
+                let mut end = Vec::new();
+                run.stuffer.finish(&mut end);
+                ep.send(&end);
+                self.arm_timer(ep);
+                if let Some((cmd, _)) = self.in_flight.take() {
+                    self.in_flight = Some((cmd, InFlight::Final));
+                }
+            }
+            PostStep::Failed(error) => {
+                // Half an article has gone out, and there is no taking it
+                // back: the connection ends, and the post hears why.
+                self.fail(ep, error);
+            }
         }
     }
 
@@ -557,7 +660,9 @@ impl ProtocolHandler for NntpClientEndpoint {
             }
         }
         self.lexer = lexer;
-        // A poke, or the end of a reply: send what is queued.
+        // A poke, or the end of a reply: go on with an article being posted,
+        // and send what is queued.
+        self.drive_post(ep);
         self.dispatch(ep);
     }
 
@@ -565,6 +670,7 @@ impl ProtocolHandler for NntpClientEndpoint {
         self.cancel_timer();
         let was_closed = self.phase == Phase::Closed;
         self.phase = Phase::Closed;
+        self.posting = None;
         self.fail_commands("connection closed");
         if let Some(h) = self.handler.as_mut() {
             if !self.connected_notified && !was_closed {

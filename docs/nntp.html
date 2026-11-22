@@ -150,11 +150,15 @@ let addr = service.start()?;         // service.stop() stops accepting</code></p
 </tr>
 <tr>
 <td>Auth</td>
-<td><code>AUTHINFO SASL</code> (SCRAM-SHA-256, PLAIN, LOGIN - chosen from the <code>SASL</code> capability in that order of preference) or <code>AUTHINFO USER</code> / <code>PASS</code>; credentials go out only once TLS is as configured</td>
+<td><code>AUTHINFO SASL</code> (SCRAM-SHA-256, PLAIN, LOGIN - chosen from the <code>SASL</code> capability in that order of preference, or the mechanisms you name with <code>sasl_mechanisms</code>; <code>bearer_token</code> for OAUTHBEARER / XOAUTH2; <code>sasl_external</code> for a TLS client certificate) or <code>AUTHINFO USER</code> / <code>PASS</code>; credentials go out only once TLS is as configured. Name mechanisms and the server offers none of them, and the connection fails: nothing is sent another way</td>
 </tr>
 <tr>
 <td>Commands</td>
 <td>Typed helpers for <code>LIST ACTIVE [wildmat]</code>, <code>GROUP</code>, <code>STAT</code>, <code>OVER</code>, <code>ARTICLE</code>, <code>HEAD</code>, <code>BODY</code>, <code>POST</code>, <code>QUIT</code>; <code>NntpSession::command</code> for anything else</td>
+</tr>
+<tr>
+<td>Posting</td>
+<td><code>post</code> (an article in memory), <code>post_stream</code> (an <code>NntpPoster</code> that writes it a piece at a time, in constant memory) and <code>post_with_attachments</code> (files uuencoded as they are read); see <a href="#client-posting">Posting and attachments</a></td>
 </tr>
 <tr>
 <td>Multi-line replies</td>
@@ -196,6 +200,9 @@ NntpClient::new(&quot;news.example.com&quot;, 563)
     .implicit_tls(public_trust_connector(&amp;[]), &quot;news.example.com&quot;)
     .credentials(&quot;alice&quot;, &quot;secret&quot;)
     .connect_with(&amp;rt, Box::new(Headlines))?;</code></pre>
+<h3 id="client-posting">Posting and attachments</h3>
+<p><code>NntpSession::post</code> takes an article already in memory. For one that is not, <code>post_stream</code> takes an <code>NntpPoster</code>: once the server has said <code>340</code>, <code>next(&amp;mut NntpPostStream)</code> is called on the reactor to write the next piece (any line ends; dot-stuffing, the CRLFs and the terminating dot are added), and called again only when the connection has taken what the last call wrote, so a poster that writes a chunk a call holds no more than that. It returns <code>PostStep::More</code>, <code>Done</code>, <code>Failed(error)</code>, or <code>Wait</code> when its data is coming from another thread, which then calls the <code>PostWaker</code> from <code>NntpPostStream::waker()</code>. A poster that fails closes the connection (a half-sent article cannot be abandoned) and the post's callback hears the error. <code>post</code> is a poster over a slice, so there is one way an article is sent.</p>
+<p><code>post_with_attachments(text, attachments, ...)</code> follows the text with each <code>NntpAttachment</code> as a uuencoded block (<code>from_path</code>, <code>from_bytes</code>, <code>from_reader</code> or <code>from_source</code> for a source of your own; <code>mode</code> sets the permissions in the <code>begin</code> line). Each attachment is read and encoded on a thread of its own, two pieces ahead of the connection at most, so the reactor never blocks and none is held whole. In the other direction <code>article_with_attachments</code> and <code>body_with_attachments</code> take an <code>NntpArticleHandler</code> that is told the text and, apart from it, each file (<code>attachment_begin(mode, name)</code>, <code>attachment_data</code>, <code>attachment_end(complete)</code>) as the article arrives, found by rmimeparser's <code>UuScanner</code>. Posting a 128 MiB article, or one with a 128 MiB attachment, to a hopf server and reading it back takes the same heap as a small one (<code>tests/memory_bound.rs</code>).</p>
 <h3 id="errors">Errors</h3>
 <p><code>NntpClientHandler::on_error</code> reports a refused or timed-out dial, a TLS failure, a required <code>STARTTLS</code> the server did not offer, rejected credentials (<code>PermissionDenied</code>, with the server's <code>481</code>/<code>482</code> text), a command that got no reply within the budget, or the transport going away mid-session. A command the server rejects is not a session error: its own callback gets <code>NntpClientError</code> with the status code and text.</p>
 <h2 id="limitations">Limitations</h2>
@@ -203,7 +210,7 @@ NntpClient::new(&quot;news.example.com&quot;, 563)
 <li>Server: reader mode only. <code>OVER</code> reads each article in full to count <code>:lines</code>, which RFC 3977 requires to be exact, so an overview of a large range is slow with the stock handler; a handler with the figures indexed answers faster by overriding <code>summarise</code> or <code>overview</code>.</li>
 <li>Server: the stock handler does not know when a mailbox was created, so <code>NEWGROUPS</code> lists nothing, and a message-id that is not in the selected group is found by opening every group in turn.</li>
 <li>Server: duplicate <code>Message-ID</code>s are not detected on a post.</li>
-<li>Client: wildmat matching, overview formats beyond the default eight fields, and <code>LIST OVERVIEW.FMT</code> are left to the application, and one command is in flight at a time (no pipelining).</li>
+<li>Client: wildmat matching, overview formats beyond the default eight fields, and <code>LIST OVERVIEW.FMT</code> are left to the application, and one command is in flight at a time (no pipelining). <code>ARTICLE</code>, <code>HEAD</code>, <code>BODY</code> and <code>STAT</code> take an article number, not a message-id.</li>
 <li>Integration tests (<code>--features integration</code>) run the client against a scripted server and against the real server (<code>tests/roundtrip.rs</code>).</li>
 </ul>
 </main>

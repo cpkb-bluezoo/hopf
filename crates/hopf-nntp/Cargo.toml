@@ -25,6 +25,7 @@ hopf-core = { workspace = true }
 hopf-auth = { workspace = true }
 hopf-mailbox = { workspace = true }
 hopf-otel = { workspace = true }
+rmimeparser = { workspace = true }
 hopf-dns = { workspace = true }
 base64 = "0.22"
 

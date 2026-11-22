@@ -25,7 +25,8 @@ mod integration;
 
 pub use client::{
     dot_stuff, parse_group_response, parse_newsgroup_line, parse_overview_line, parse_status,
-    ArticleRef, CompletionCallback, GroupResult, ContentCallback, NewsgroupEntry, NntpClient, NntpClientError, NntpClientHandler,
+    ArticleRef, AttachmentSource, CompletionCallback, NntpArticleHandler, NntpAttachment, NntpPostStream, NntpPoster,
+    PostStep, PostWaker, GroupResult, ContentCallback, NewsgroupEntry, NntpClient, NntpClientError, NntpClientHandler,
     NntpClientHandlerFactory, NntpClientTimeouts, NntpGreeting, NntpSession, NntpStatus,
     OverviewEntry,
 };

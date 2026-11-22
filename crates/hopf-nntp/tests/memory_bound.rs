@@ -18,7 +18,10 @@ use std::time::Duration;
 
 use hopf_core::{Runtime, RuntimeConfig};
 use hopf_mailbox::{AppendGuard, MailboxFactory, MaildirFactory};
-use hopf_nntp::{NntpConfig, NntpService};
+use hopf_nntp::{
+    AttachmentSource, NntpArticleHandler, NntpAttachment, NntpClient, NntpClientHandler, NntpConfig, NntpGreeting, NntpPostStream,
+    NntpPoster, NntpService, NntpSession, PostStep,
+};
 
 struct Peak;
 
@@ -164,6 +167,137 @@ fn measure_post(addr: std::net::SocketAddr, name: &str, size: usize) -> usize {
     peak
 }
 
+// ---- the hopf client posting ----
+
+/// Article text of `size` octets, a block at a time.
+struct Generated {
+    head: Vec<u8>,
+    left: usize,
+}
+
+impl NntpPoster for Generated {
+    fn next(&mut self, out: &mut NntpPostStream<'_>) -> PostStep {
+        out.write(&std::mem::take(&mut self.head));
+        let line = b"0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789\n";
+        let block: Vec<u8> = line.iter().copied().cycle().take(line.len() * 200).collect();
+        let n = self.left.min(block.len());
+        out.write(&block[..n]);
+        self.left -= n;
+        if self.left == 0 {
+            PostStep::Done
+        } else {
+            PostStep::More
+        }
+    }
+}
+
+/// `size` bytes of a repeating pattern, read a block at a time.
+struct Pattern {
+    left: usize,
+    at: u32,
+}
+
+impl AttachmentSource for Pattern {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.left.min(buf.len());
+        for b in &mut buf[..n] {
+            *b = (self.at % 251) as u8;
+            self.at = self.at.wrapping_add(1);
+        }
+        self.left -= n;
+        Ok(n)
+    }
+}
+
+fn pattern_checksum(size: usize) -> u64 {
+    (0..size as u32).fold(0u64, |sum, i| sum.wrapping_mul(31).wrapping_add(u64::from((i % 251) as u8)))
+}
+
+#[derive(Default)]
+struct Done {
+    posted: Option<Result<(), String>>,
+    attached: Option<(u64, u64, bool)>,
+    finished: bool,
+}
+
+struct Post {
+    streamed: Option<usize>,
+    attached: Option<usize>,
+    done: Arc<Mutex<Done>>,
+}
+
+struct Count(Arc<Mutex<Done>>);
+
+impl NntpArticleHandler for Count {
+    fn attachment_begin(&mut self, _mode: u32, _name: &[u8]) {
+        self.0.lock().unwrap().attached = Some((0, 0, false));
+    }
+    fn attachment_data(&mut self, data: &[u8]) {
+        let mut d = self.0.lock().unwrap();
+        let a = d.attached.as_mut().unwrap();
+        a.0 += data.len() as u64;
+        a.1 = data.iter().fold(a.1, |sum, &b| sum.wrapping_mul(31).wrapping_add(u64::from(b)));
+    }
+    fn attachment_end(&mut self, complete: bool) {
+        self.0.lock().unwrap().attached.as_mut().unwrap().2 = complete;
+    }
+}
+
+impl NntpClientHandler for Post {
+    fn on_connected(&mut self, session: &NntpSession, _greeting: &NntpGreeting) {
+        let d = Arc::clone(&self.done);
+        let head = b"From: p@x.org\r\nNewsgroups: misc.test\r\nSubject: streamed\r\n\r\n";
+        if let Some(size) = self.streamed {
+            session.post_stream(Generated { head: head.to_vec(), left: size }, move |r| d.lock().unwrap().posted = Some(r.map_err(|e| e.to_string())));
+        }
+        if let Some(size) = self.attached {
+            let d = Arc::clone(&self.done);
+            session.post_with_attachments(
+                b"From: p@x.org\r\nNewsgroups: misc.test\r\nSubject: attached\r\nMessage-ID: <attached@x.org>\r\n\r\nA file.\r\n",
+                vec![NntpAttachment::from_source("data.bin", Pattern { left: size, at: 0 })],
+                move |r| d.lock().unwrap().posted = Some(r.map_err(|e| e.to_string())),
+            );
+            // The last article in the group is the one just posted.
+            let (s2, d2) = (session.clone(), Arc::clone(&self.done));
+            session.group("misc.test", move |g| {
+                let last = g.unwrap().last;
+                let s3 = s2.clone();
+                s2.article_with_attachments(last, Count(Arc::clone(&d2)), move |_| s3.quit());
+            });
+        } else {
+            session.quit();
+        }
+    }
+    fn on_error(&mut self, error: &io::Error) {
+        self.done.lock().unwrap().posted = Some(Err(error.to_string()));
+        self.done.lock().unwrap().finished = true;
+    }
+    fn on_disconnected(&mut self) {
+        self.done.lock().unwrap().finished = true;
+    }
+}
+
+use std::io;
+use std::sync::Mutex;
+
+/// Posts through the hopf client, and returns the peak of the heap above where
+/// it was before, the client and the server in this process together.
+fn measure_client(rt: &Arc<Runtime>, addr: std::net::SocketAddr, streamed: Option<usize>, attached: Option<usize>) -> (usize, Done) {
+    let done: Arc<Mutex<Done>> = Arc::default();
+    let base = reset_peak();
+    NntpClient::from_addr(addr)
+        .connect_with(rt, Box::new(Post { streamed, attached, done: Arc::clone(&done) }))
+        .unwrap();
+    let started = std::time::Instant::now();
+    while !done.lock().unwrap().finished {
+        assert!(started.elapsed() < Duration::from_secs(300), "the client never finished");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let peak = peak_above(base);
+    let d = std::mem::take(&mut *done.lock().unwrap());
+    (peak, d)
+}
+
 fn main() {
     let dir = tempfile::tempdir().unwrap();
     let factory = Arc::new(MaildirFactory::new(dir.path()));
@@ -212,5 +346,26 @@ fn main() {
         large_post < small_post + MIB,
         "memory grew with the posted article: {small_post} for 64 KiB, {large_post} for 192 MiB"
     );
+    // The hopf client posting to the hopf server, both counted.
+    let (small, d) = measure_client(&runtime, addr, Some(64 * 1024), None);
+    assert_eq!(d.posted, Some(Ok(())));
+    let (large, d) = measure_client(&runtime, addr, Some(128 * MIB), None);
+    assert_eq!(d.posted, Some(Ok(())));
+    println!("client post_stream peak {} KiB for 64 KiB and {} KiB for 128 MiB", small / 1024, large / 1024);
+    assert!(large < 3 * MIB && large < small + 2 * MIB, "memory grew with the streamed article: {small} then {large}");
+
+    let (small_a, d) = measure_client(&runtime, addr, None, Some(8 * MIB));
+    assert_eq!(d.posted, Some(Ok(())));
+    let size = 128 * MIB;
+    let (large_a, d) = measure_client(&runtime, addr, None, Some(size));
+    assert_eq!(d.posted, Some(Ok(())));
+    println!("client attachment peak {} KiB for 8 MiB and {} KiB for 128 MiB", small_a / 1024, large_a / 1024);
+    // (A client that is slower than the server lets its inbound ring fill, and
+    // the ring grows to its limit of a megabyte: that is the 2 MiB over the
+    // posting alone. It is the same for 8 MiB as for 128.)
+    assert!(large_a < 4 * MIB && large_a < small_a + MIB / 2, "memory grew with the attachment: {small_a} then {large_a}");
+    // And what came back out of the server, decoded as it arrived, is what went in.
+    assert_eq!(d.attached, Some((size as u64, pattern_checksum(size), true)));
+
     println!("ok: peak {} KiB for a 64 KiB article and {} KiB for a 192 MiB one", small_peak / 1024, large_peak / 1024);
 }

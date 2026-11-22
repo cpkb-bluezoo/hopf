@@ -6,6 +6,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use hopf_auth::SaslMechanism;
 use hopf_core::{Runtime, SharedTlsConnector, TcpConnectorConfig};
 use hopf_dns::DnsResolver;
 
@@ -27,6 +28,7 @@ pub struct NntpClient {
     tls: Option<(SharedTlsConnector, String)>,
     tls_mode: TlsMode,
     credentials: Option<(String, String)>,
+    mechanisms: Option<Vec<SaslMechanism>>,
     resolver: Option<Arc<DnsResolver>>,
 }
 
@@ -41,6 +43,7 @@ impl NntpClient {
             tls: None,
             tls_mode: TlsMode::None,
             credentials: None,
+            mechanisms: None,
             resolver: None,
         }
     }
@@ -86,6 +89,32 @@ impl NntpClient {
         self
     }
 
+    /// Authenticates with a bearer token (`OAUTHBEARER`, then `XOAUTH2`)
+    /// instead of a password, for `user`. Not for use without TLS.
+    pub fn bearer_token(mut self, user: impl Into<String>, token: impl Into<String>) -> Self {
+        self.credentials = Some((user.into(), token.into()));
+        self.mechanisms = Some(vec![SaslMechanism::OauthBearer, SaslMechanism::XOauth2]);
+        self
+    }
+
+    /// Authenticates with the TLS client certificate (`EXTERNAL`), acting as
+    /// `authzid` (empty to act as whoever the certificate names). The connector
+    /// has to present a certificate.
+    pub fn sasl_external(mut self, authzid: impl Into<String>) -> Self {
+        self.credentials = Some((authzid.into(), String::new()));
+        self.mechanisms = Some(vec![SaslMechanism::External]);
+        self
+    }
+
+    /// The SASL mechanisms to try, in order of preference, instead of the
+    /// default (`SCRAM-SHA-256`, `PLAIN`, `LOGIN`, then `AUTHINFO USER`/`PASS`
+    /// if none of those is offered). When mechanisms are named and the server
+    /// offers none of them the connection fails: nothing is sent another way.
+    pub fn sasl_mechanisms(mut self, mechanisms: &[SaslMechanism]) -> Self {
+        self.mechanisms = Some(mechanisms.to_vec());
+        self
+    }
+
     pub fn resolver(mut self, resolver: Arc<DnsResolver>) -> Self {
         self.resolver = Some(resolver);
         self
@@ -94,11 +123,15 @@ impl NntpClient {
     fn connector_for(&self, factory: &Arc<dyn NntpClientHandlerFactory>, addr: SocketAddr) -> TcpConnectorConfig {
         let factory = Arc::clone(factory);
         let credentials = self.credentials.clone();
+        let mechanisms = self.mechanisms.clone();
         let tls = self.tls.clone();
         let tls_mode = self.tls_mode;
         let command = self.timeouts.command;
         let mut cfg = TcpConnectorConfig::new(addr, move || {
-            Box::new(NntpClientEndpoint::new(factory.create(), credentials.clone(), tls.clone(), tls_mode, command))
+            Box::new(
+                NntpClientEndpoint::new(factory.create(), credentials.clone(), tls.clone(), tls_mode, command)
+                    .with_mechanisms(mechanisms.clone()),
+            )
         })
         .connect_timeout(Some(self.timeouts.connect));
         if tls_mode == TlsMode::Implicit {
@@ -140,6 +173,7 @@ impl NntpClient {
             tls: self.tls.clone(),
             tls_mode: self.tls_mode,
             credentials: self.credentials.clone(),
+            mechanisms: self.mechanisms.clone(),
             resolver: None,
         };
         let rt2 = Arc::clone(rt);
