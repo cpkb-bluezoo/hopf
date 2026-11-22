@@ -275,6 +275,14 @@ pub trait ReaderHandler: Send {
         })
     }
 
+    /// The client has proved who it is. Returns an error to refuse it anyway
+    /// ([`HandlerError::Refused`]'s text is sent in the `481`); the stock
+    /// handler accepts everyone the credentials accept.
+    fn authorize(&mut self, username: &str) -> HandlerResult<()> {
+        let _ = username;
+        Ok(())
+    }
+
     /// A client has asked to post. Returns the sink the article is written
     /// to, or refuses (with [`HandlerError::Refused`], whose text is sent to
     /// the client). The stock refusal is for a handler that takes no posts.

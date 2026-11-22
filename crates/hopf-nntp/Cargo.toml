@@ -37,3 +37,8 @@ name = "memory_bound"
 path = "tests/memory_bound.rs"
 harness = false
 required-features = ["integration"]
+
+[[test]]
+name = "roundtrip"
+path = "tests/roundtrip.rs"
+required-features = ["integration"]

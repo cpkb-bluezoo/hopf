@@ -10,7 +10,10 @@
 //! back, and a failure after that ends the connection.
 
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use base64::Engine;
+use hopf_auth::{create_server, CredentialStore, SaslMechanism, SaslServer, SaslServerOptions, SaslServerStep};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::server::codec::{ListKind, NewGroupsSince, NntpCommand, Target, MAX_ARTICLE_NUMBER};
@@ -43,6 +46,12 @@ pub(crate) enum JobEnd {
     Fatal,
     /// `340` was sent: the client's article follows.
     PostData,
+    /// The client is authenticated.
+    AuthOk,
+    /// The credentials were refused.
+    AuthFailed,
+    /// A `383` was sent: the client's next line is its response.
+    SaslContinue,
 }
 
 /// Does `command` run against the handler (and so on the storage pool)?
@@ -114,6 +123,159 @@ pub(crate) fn run(
         NntpCommand::Hdr(field, t) => hdr(handler, session, out, field, t),
         // Not commands for the handler; the connection answers these itself.
         _ => ended(say(out, 500, "Unknown command")),
+    }
+}
+
+// ---- AUTHINFO ----
+
+/// What authentication has established on a connection.
+#[derive(Default)]
+pub(crate) struct AuthState {
+    /// Who the client is, once it has proved it.
+    pub user: Option<String>,
+    /// An exchange in progress, between a `383` and the response to it.
+    pub sasl: Option<Box<dyn SaslServer>>,
+}
+
+/// How a SASL exchange begins or goes on.
+pub(crate) enum SaslStep {
+    /// `AUTHINFO SASL mechanism [initial-response]`.
+    Begin {
+        mechanism: SaslMechanism,
+        initial_response: Option<Vec<u8>>,
+        peer_certificate: Option<String>,
+    },
+    /// The client's response to a challenge.
+    Respond(Vec<u8>),
+}
+
+fn encode(data: &[u8]) -> String {
+    if data.is_empty() {
+        "=".to_string()
+    } else {
+        base64::engine::general_purpose::STANDARD.encode(data)
+    }
+}
+
+/// The client is who it says: asks the handler whether it will serve it, and
+/// answers.
+fn authenticated(
+    handler: &mut dyn ReaderHandler,
+    auth: &Mutex<AuthState>,
+    username: &str,
+    final_message: Option<&[u8]>,
+    out: &mut Output,
+) -> JobEnd {
+    match handler.authorize(username) {
+        Ok(()) => {
+            auth.lock().unwrap_or_else(|e| e.into_inner()).user = Some(username.to_string());
+            let ok = match final_message.filter(|m| !m.is_empty()) {
+                Some(data) => say(out, 283, &encode(data)),
+                None => say(out, 281, "Authentication accepted"),
+            };
+            if ok {
+                JobEnd::AuthOk
+            } else {
+                JobEnd::Fatal
+            }
+        }
+        Err(HandlerError::Refused(text)) => {
+            if say(out, 481, &text) {
+                JobEnd::AuthFailed
+            } else {
+                JobEnd::Fatal
+            }
+        }
+        Err(e) => fault(out, &e, "authorization"),
+    }
+}
+
+fn refused(out: &mut Output) -> JobEnd {
+    if say(out, 481, "Authentication failed/rejected") {
+        JobEnd::AuthFailed
+    } else {
+        JobEnd::Fatal
+    }
+}
+
+/// `AUTHINFO PASS`: checks the password.
+pub(crate) fn auth_password(
+    handler: &mut dyn ReaderHandler,
+    store: &Arc<dyn CredentialStore>,
+    auth: &Mutex<AuthState>,
+    user: &str,
+    password: &str,
+    out: &mut Output,
+) -> JobEnd {
+    if store.password_match(user, password) {
+        authenticated(handler, auth, user, None, out)
+    } else {
+        refused(out)
+    }
+}
+
+/// Runs one step of a SASL mechanism and waits for its answer: a mechanism may
+/// complete inline, or hand off to something that does not.
+fn run_step(server: &mut dyn SaslServer, response: Option<&[u8]>) -> Option<SaslServerStep> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    server.step(response, Box::new(move |step| {
+        let _ = tx.send(step);
+    }));
+    rx.recv().ok()
+}
+
+/// `AUTHINFO SASL`, and the lines that follow it.
+pub(crate) fn auth_sasl(
+    handler: &mut dyn ReaderHandler,
+    store: &Arc<dyn CredentialStore>,
+    auth: &Mutex<AuthState>,
+    step: SaslStep,
+    out: &mut Output,
+) -> JobEnd {
+    let (mut server, response, first) = match step {
+        SaslStep::Begin { mechanism, initial_response, peer_certificate } => {
+            let server = create_server(
+                mechanism,
+                Arc::clone(store),
+                SaslServerOptions { peer_certificate, channel_binding: None },
+            );
+            if server.server_first() && initial_response.is_some() {
+                // A mechanism that speaks first has no use for an initial response.
+                let _ = say(out, 482, "SASL protocol error");
+                return JobEnd::AuthFailed;
+            }
+            if !server.server_first() && initial_response.is_none() {
+                // The client speaks first, and has not: ask it to (RFC 4422).
+                auth.lock().unwrap_or_else(|e| e.into_inner()).sasl = Some(server);
+                return if say(out, 383, "=") { JobEnd::SaslContinue } else { JobEnd::Fatal };
+            }
+            let first = server.server_first();
+            (server, initial_response, first)
+        }
+        SaslStep::Respond(response) => {
+            let server = auth.lock().unwrap_or_else(|e| e.into_inner()).sasl.take();
+            let Some(server) = server else {
+                return ended(say(out, 482, "SASL protocol error"));
+            };
+            (server, Some(response), false)
+        }
+    };
+    let result = run_step(server.as_mut(), response.as_deref());
+    match result {
+        Some(SaslServerStep::Challenge(c)) => {
+            auth.lock().unwrap_or_else(|e| e.into_inner()).sasl = Some(server);
+            if say(out, 383, &encode(&c)) {
+                JobEnd::SaslContinue
+            } else {
+                JobEnd::Fatal
+            }
+        }
+        // A mechanism that completes before the client has said anything has
+        // authenticated nobody.
+        Some(SaslServerStep::Complete { username, final_message }) if !first => {
+            authenticated(handler, auth, &username, final_message.as_deref(), out)
+        }
+        Some(SaslServerStep::Complete { .. }) | Some(SaslServerStep::Failure) | None => refused(out),
     }
 }
 

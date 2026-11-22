@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use hopf_auth::CredentialStore;
 use hopf_core::tls::SharedTlsAcceptor;
 use hopf_core::{BindingId, ProtocolHandler, Runtime, TcpListenerConfig};
 use hopf_mailbox::MailboxFactory;
@@ -26,6 +27,9 @@ pub const DEFAULT_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The largest article `POST` accepts unless told otherwise.
 pub const DEFAULT_MAX_POST_SIZE: u64 = 64 * 1024 * 1024;
+
+/// Credentials a connection may have refused, unless told otherwise.
+pub const DEFAULT_MAX_AUTH_FAILURES: u32 = 3;
 
 /// NNTP server configuration.
 #[derive(Clone)]
@@ -50,6 +54,17 @@ pub struct NntpConfig {
     /// The largest article, in octets, that `POST` accepts; a larger one is
     /// read and thrown away, and refused. `None` sets no limit.
     pub max_post_size: Option<u64>,
+    /// Who may log in, and how. Without it the server offers no `AUTHINFO`.
+    pub credentials: Option<Arc<dyn CredentialStore>>,
+    /// Must a client authenticate before it reads or posts news?
+    pub authentication_required: bool,
+    /// May a password (`AUTHINFO USER`/`PASS`, or a SASL mechanism that sends
+    /// one in the clear) be sent on a connection that is not encrypted?
+    /// Default no: a client has to `STARTTLS` first.
+    pub allow_cleartext_auth: bool,
+    /// Credentials one connection may have refused before it is closed with a
+    /// `400`. `0` means no limit. Default 3.
+    pub max_auth_failures: u32,
 }
 
 impl NntpConfig {
@@ -64,6 +79,10 @@ impl NntpConfig {
             idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
             write_stall_timeout: DEFAULT_WRITE_STALL_TIMEOUT,
             max_post_size: Some(DEFAULT_MAX_POST_SIZE),
+            credentials: None,
+            authentication_required: false,
+            allow_cleartext_auth: false,
+            max_auth_failures: DEFAULT_MAX_AUTH_FAILURES,
         }
     }
 
@@ -76,6 +95,24 @@ impl NntpConfig {
     /// Begins TLS as soon as a client connects (NNTPS).
     pub fn implicit_tls(mut self) -> Self {
         self.implicit_tls = true;
+        self
+    }
+
+    /// Offers `AUTHINFO` against `store`.
+    pub fn with_credentials(mut self, store: Arc<dyn CredentialStore>) -> Self {
+        self.credentials = Some(store);
+        self
+    }
+
+    /// Requires clients to authenticate before they read or post news.
+    pub fn require_authentication(mut self) -> Self {
+        self.authentication_required = true;
+        self
+    }
+
+    /// Lets a password be sent on a connection that is not encrypted.
+    pub fn allow_cleartext_auth(mut self) -> Self {
+        self.allow_cleartext_auth = true;
         self
     }
 
@@ -210,6 +247,8 @@ mod tests {
         assert_eq!(c.idle_timeout, Some(DEFAULT_IDLE_TIMEOUT));
         assert_eq!(c.write_stall_timeout, DEFAULT_WRITE_STALL_TIMEOUT);
         assert_eq!(c.max_post_size, Some(DEFAULT_MAX_POST_SIZE));
+        assert!(c.credentials.is_none() && !c.authentication_required && !c.allow_cleartext_auth);
+        assert_eq!(c.max_auth_failures, DEFAULT_MAX_AUTH_FAILURES);
     }
 
     #[test]

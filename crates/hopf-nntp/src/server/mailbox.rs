@@ -124,6 +124,8 @@ struct Open {
     mailbox: Box<dyn Mailbox>,
     /// In increasing order of number.
     index: Vec<Entry>,
+    /// When the group was last looked at on disk.
+    read_at: std::time::Instant,
 }
 
 /// Set in [`Located::token`] for an article of the group a message-id lookup
@@ -203,7 +205,31 @@ impl MailboxReaderHandler {
             })
             .collect();
         index.sort_by_key(|e| e.number);
-        Ok(Open { group: group.to_string(), mailbox, index })
+        Ok(Open { group: group.to_string(), mailbox, index, read_at: std::time::Instant::now() })
+    }
+
+    /// Looks at the selected group on disk again, for articles that have
+    /// arrived since it was selected (a post, a delivery). The numbers a
+    /// client already has stay as they were: they are UIDs.
+    fn refresh_selected(&mut self) -> HandlerResult<()> {
+        let Some(open) = self.selected.as_mut() else { return Ok(()) };
+        open.mailbox.refresh()?;
+        let mut index: Vec<Entry> = open
+            .mailbox
+            .messages()?
+            .into_iter()
+            .filter_map(|d| {
+                let number = d.uid.unwrap_or(u64::from(d.message_number));
+                (number >= 1 && number <= u64::from(MAX_ARTICLE_NUMBER)).then_some(Entry {
+                    number: number as u32,
+                    seq: d.message_number,
+                })
+            })
+            .collect();
+        index.sort_by_key(|e| e.number);
+        open.index = index;
+        open.read_at = std::time::Instant::now();
+        Ok(())
     }
 
     fn status(open: &Open) -> GroupStatus {
@@ -251,6 +277,14 @@ impl ReaderHandler for MailboxReaderHandler {
     }
 
     fn article_numbers(&mut self, from: u32, to: u32, limit: usize) -> HandlerResult<Vec<u32>> {
+        // A range that reaches past the last article known may reach articles
+        // that have come in since; look again, but not on every page.
+        let stale = self.selected.as_ref().is_some_and(|o| {
+            o.index.last().map_or(0, |e| e.number) < to && o.read_at.elapsed() >= std::time::Duration::from_secs(1)
+        });
+        if stale {
+            self.refresh_selected()?;
+        }
         let Some(open) = &self.selected else { return Ok(Vec::new()) };
         let start = open.index.partition_point(|e| e.number < from);
         Ok(open.index[start..]
@@ -262,6 +296,10 @@ impl ReaderHandler for MailboxReaderHandler {
     }
 
     fn locate_number(&mut self, number: u32) -> HandlerResult<Option<Located>> {
+        if self.selected.as_ref().is_some_and(|o| o.index.binary_search_by_key(&number, |e| e.number).is_err()) {
+            // Not there: it may have arrived since the group was selected.
+            self.refresh_selected()?;
+        }
         let Some(open) = self.selected.as_mut() else { return Ok(None) };
         let Ok(at) = open.index.binary_search_by_key(&number, |e| e.number) else { return Ok(None) };
         let seq = open.index[at].seq;

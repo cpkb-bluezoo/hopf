@@ -33,6 +33,7 @@ pub use mailbox::{
 pub use metrics::NntpServerMetrics;
 pub use scan::{ArticleScanner, ArticleSummary};
 pub use service::{
-    NntpConfig, NntpService, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_POST_SIZE, DEFAULT_WRITE_STALL_TIMEOUT,
+    NntpConfig, NntpService, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_AUTH_FAILURES, DEFAULT_MAX_POST_SIZE,
+    DEFAULT_WRITE_STALL_TIMEOUT,
 };
 pub use wildmat::Wildmat;

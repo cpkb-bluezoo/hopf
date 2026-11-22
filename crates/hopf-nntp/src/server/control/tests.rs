@@ -51,6 +51,10 @@ impl Session {
         Self::with(groups, |c| c)
     }
 
+    pub(super) fn with_groups_and(groups: &[(&str, Vec<String>)], configure: impl FnOnce(NntpConfig) -> NntpConfig) -> Self {
+        Self::with(groups, configure)
+    }
+
     pub(super) fn with(groups: &[(&str, Vec<String>)], configure: impl FnOnce(NntpConfig) -> NntpConfig) -> Self {
         let root = tempfile::tempdir().unwrap();
         let factory = Arc::new(MaildirFactory::new(root.path()));
@@ -724,4 +728,300 @@ mod slow_store {
         assert_eq!(gate.received.load(Ordering::SeqCst), wire.len() - ".\r\n".len());
         assert!(gate.committed.load(Ordering::SeqCst));
     }
+}
+
+// ---- STARTTLS and AUTHINFO ----
+
+mod security {
+    use super::*;
+    use base64::Engine;
+    use crate::server::handler::{ClientConnected, HandlerResult, NntpHandlerFactory, ReaderHandler};
+    use hopf_auth::{create_client, CredentialStore, PasswordStore, SaslClientStep, SaslMechanism};
+
+    fn b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn unb64(text: &str) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD.decode(text).unwrap()
+    }
+
+    fn store() -> Arc<dyn CredentialStore> {
+        Arc::new(PasswordStore::new().with_user("u", "p"))
+    }
+
+    fn acceptor() -> hopf_core::tls::SharedTlsAcceptor {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        hopf_core::acceptor_from_pem_bytes(cert.cert.pem().as_bytes(), cert.key_pair.serialize_pem().as_bytes(), &[]).unwrap()
+    }
+
+    /// A session where passwords may be sent in the clear.
+    fn open_session() -> Session {
+        Session::with_groups_and(&[("misc.test", vec![article("one", "x\r\n")])], |c| {
+            c.with_credentials(store()).allow_cleartext_auth()
+        })
+    }
+
+    #[test]
+    fn a_server_without_credentials_has_no_authinfo() {
+        let mut s = spool();
+        assert!(s.run("AUTHINFO USER u\r\n").starts_with("502 "));
+        assert!(s.run("AUTHINFO SASL PLAIN\r\n").starts_with("502 "));
+        assert!(!s.run("CAPABILITIES\r\n").contains("AUTHINFO"));
+    }
+
+    #[test]
+    fn a_password_is_not_taken_on_a_connection_that_is_not_encrypted() {
+        let mut s = Session::with(&[], |c| c.with_credentials(store()));
+        let caps = s.run("CAPABILITIES\r\n");
+        assert!(!caps.contains("AUTHINFO USER") && !caps.contains("PLAIN"), "{caps}");
+        assert!(s.run("AUTHINFO USER u\r\n").starts_with("483 "));
+        assert!(s.run("AUTHINFO PASS p\r\n").starts_with("483 "));
+        assert!(s.run("AUTHINFO SASL PLAIN AHUAcA==\r\n").starts_with("483 "));
+        // SCRAM sends no password, so it may be offered.
+        assert!(caps.contains("SASL SCRAM-SHA-256"), "{caps}");
+    }
+
+    #[test]
+    fn user_and_pass_authenticate() {
+        let mut s = open_session();
+        assert!(s.run("CAPABILITIES\r\n").contains("\r\nAUTHINFO USER\r\n"));
+        assert_eq!(s.run("AUTHINFO USER u\r\n"), "381 Password required\r\n");
+        assert_eq!(s.run("AUTHINFO PASS p\r\n"), "281 Authentication accepted\r\n");
+        assert!(s.run("AUTHINFO USER u\r\n").starts_with("502 "), "already authenticated");
+        assert!(!s.run("CAPABILITIES\r\n").contains("AUTHINFO"));
+        assert!(s.run("GROUP misc.test\r\n").starts_with("211 "));
+    }
+
+    #[test]
+    fn a_wrong_password_and_a_pass_out_of_sequence_are_refused() {
+        let mut s = open_session();
+        assert!(s.run("AUTHINFO PASS p\r\n").starts_with("482 "));
+        s.run("AUTHINFO USER u\r\n");
+        assert_eq!(s.run("AUTHINFO PASS wrong\r\n"), "481 Authentication failed/rejected\r\n");
+        assert!(s.run("AUTHINFO PASS p\r\n").starts_with("482 "), "the user was forgotten with the failure");
+        s.run("AUTHINFO USER nobody\r\n");
+        assert!(s.run("AUTHINFO PASS p\r\n").starts_with("481 "));
+    }
+
+    #[test]
+    fn a_connection_that_keeps_failing_is_closed() {
+        let mut s = Session::with(&[], |c| c.with_credentials(store()).allow_cleartext_auth());
+        for _ in 0..2 {
+            s.run("AUTHINFO USER u\r\n");
+            assert!(s.run("AUTHINFO PASS no\r\n").starts_with("481 "));
+        }
+        s.run("AUTHINFO USER u\r\n");
+        let out = s.run("AUTHINFO PASS no\r\n");
+        assert_eq!(out, "481 Authentication failed/rejected\r\n400 Too many authentication failures\r\n");
+        assert!(s.is_closed());
+    }
+
+    #[test]
+    fn the_limit_can_be_lifted() {
+        let mut s = Session::with(&[], |mut c| {
+            c.max_auth_failures = 0;
+            c.with_credentials(store()).allow_cleartext_auth()
+        });
+        for _ in 0..10 {
+            s.run("AUTHINFO USER u\r\n");
+            s.run("AUTHINFO PASS no\r\n");
+        }
+        assert!(!s.is_closed());
+    }
+
+    #[test]
+    fn sasl_plain_with_an_initial_response() {
+        let mut s = open_session();
+        assert!(s.run("CAPABILITIES\r\n").contains("SASL "));
+        assert_eq!(s.run(&format!("AUTHINFO SASL PLAIN {}\r\n", b64(b"\0u\0p"))), "281 Authentication accepted\r\n");
+        assert!(s.run("AUTHINFO SASL PLAIN\r\n").starts_with("502 "));
+    }
+
+    #[test]
+    fn sasl_plain_without_one_asks_for_it() {
+        let mut s = open_session();
+        assert_eq!(s.run("AUTHINFO SASL PLAIN\r\n"), "383 =\r\n");
+        assert_eq!(s.run(&format!("{}\r\n", b64(b"\0u\0p"))), "281 Authentication accepted\r\n");
+    }
+
+    #[test]
+    fn sasl_failures() {
+        let mut s = open_session();
+        assert!(s.run("AUTHINFO SASL NOPE\r\n").starts_with("503 "));
+        assert!(s.run(&format!("AUTHINFO SASL PLAIN {}\r\n", b64(b"\0u\0wrong"))).starts_with("481 "));
+        assert!(s.run("AUTHINFO SASL PLAIN !!!\r\n").starts_with("504 "));
+        // Cancelled with "*".
+        assert_eq!(s.run("AUTHINFO SASL PLAIN\r\n"), "383 =\r\n");
+        assert!(s.run("*\r\n").starts_with("481 "));
+        // A response that is not base64.
+        assert_eq!(s.run("AUTHINFO SASL PLAIN\r\n"), "383 =\r\n");
+        assert!(s.run("!!!\r\n").starts_with("504 "));
+        // And the connection still works, and can still authenticate.
+        assert!(s.run(&format!("AUTHINFO SASL PLAIN {}\r\n", b64(b"\0u\0p"))).starts_with("281 "));
+    }
+
+    #[test]
+    fn scram_sha_256_runs_to_the_end_with_the_server_signature_in_a_283() {
+        let mut s = open_session();
+        let mut client = create_client(SaslMechanism::ScramSha256, "u", "p", None);
+        let SaslClientStep::Response(first) = client.evaluate(None) else { panic!("no first message") };
+        let mut out = s.run(&format!("AUTHINFO SASL SCRAM-SHA-256 {}\r\n", b64(&first)));
+        let mut rounds = 0;
+        loop {
+            rounds += 1;
+            assert!(rounds < 6, "{out}");
+            if let Some(challenge) = out.strip_prefix("383 ") {
+                // The SCRAM client's last message comes as `Complete`: it is
+                // finished, but the server has still to be sent it.
+                let (SaslClientStep::Response(reply) | SaslClientStep::Complete(reply)) =
+                    client.evaluate(Some(&unb64(challenge.trim_end())))
+                else {
+                    panic!("the client did not answer: {out}")
+                };
+                out = s.run(&format!("{}\r\n", b64(&reply)));
+            } else if let Some(data) = out.strip_prefix("283 ") {
+                assert!(matches!(client.evaluate(Some(&unb64(data.trim_end()))), SaslClientStep::Complete(_)));
+                break;
+            } else {
+                panic!("unexpected: {out}");
+            }
+        }
+        assert!(s.run("GROUP misc.test\r\n").starts_with("211 "));
+    }
+
+    #[test]
+    fn a_handler_can_refuse_someone_the_credentials_accept() {
+        // A handler that will not serve user "u".
+        struct Refuse(Box<dyn ReaderHandler>);
+        impl ReaderHandler for Refuse {
+            fn select_group(&mut self, n: &str) -> HandlerResult<crate::server::handler::GroupStatus> { self.0.select_group(n) }
+            fn article_numbers(&mut self, a: u32, b: u32, c: usize) -> HandlerResult<Vec<u32>> { self.0.article_numbers(a, b, c) }
+            fn locate_number(&mut self, n: u32) -> HandlerResult<Option<crate::server::handler::Located>> { self.0.locate_number(n) }
+            fn locate_message_id(&mut self, i: &str) -> HandlerResult<Option<crate::server::handler::Located>> { self.0.locate_message_id(i) }
+            fn read_article(&mut self, l: &crate::server::handler::Located, f: &mut dyn FnMut(&[u8]) -> bool) -> HandlerResult<()> { self.0.read_article(l, f) }
+            fn groups(&mut self, w: &crate::server::wildmat::Wildmat, c: bool, f: &mut dyn FnMut(crate::server::handler::NewsgroupInfo) -> bool) -> HandlerResult<()> { self.0.groups(w, c, f) }
+            fn authorize(&mut self, user: &str) -> HandlerResult<()> {
+                Err(crate::server::handler::HandlerError::Refused(format!("{user} may not read news here")))
+            }
+        }
+        struct Factory(Arc<MaildirFactory>);
+        impl NntpHandlerFactory for Factory {
+            fn create(&self) -> Box<dyn ClientConnected> {
+                struct C(Arc<MaildirFactory>);
+                impl ClientConnected for C {
+                    fn connected(&mut self, state: &mut dyn crate::server::handler::ConnectedState, _: &crate::server::handler::NntpConnectionMetadata) {
+                        let inner = crate::server::mailbox::MailboxReaderHandler::new(self.0.clone(), "news".into(), crate::server::handler::PostingStatus::Allowed);
+                        state.accept_connection("ready", true, Box::new(Refuse(Box::new(inner))));
+                    }
+                }
+                Box::new(C(Arc::clone(&self.0)))
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let factory = Arc::new(MaildirFactory::new(root.path()));
+        let config = NntpConfig::new("127.0.0.1:1119".parse().unwrap(), "h").with_credentials(store()).allow_cleartext_auth();
+        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        let handler = NntpControlHandler::new(Factory(factory).create(), NntpServerMetrics::shared(), config, rt);
+        let mut peer = Peer::connect(handler, |h| h.busy());
+        peer.take();
+        peer.run("AUTHINFO USER u\r\n");
+        let mut out = peer.run("AUTHINFO PASS p\r\n");
+        for _ in 0..50 {
+            peer.drain();
+            out.push_str(&peer.take());
+        }
+        assert_eq!(out, "481 u may not read news here\r\n");
+    }
+
+    #[test]
+    fn when_authentication_is_required_the_news_waits_for_it() {
+        let mut s = Session::with_groups_and(&[("misc.test", vec![article("one", "x\r\n")])], |c| {
+            c.with_credentials(store()).allow_cleartext_auth().require_authentication()
+        });
+        for cmd in ["GROUP misc.test", "LIST", "ARTICLE <one@x.org>", "POST", "NEWGROUPS 20260101 000000", "OVER 1"] {
+            assert_eq!(s.run(&format!("{cmd}\r\n")), "480 Authentication required\r\n", "{cmd}");
+        }
+        // What does not need it still works.
+        assert!(s.run("CAPABILITIES\r\n").starts_with("101 "));
+        assert!(s.run("DATE\r\n").starts_with("111 "));
+        assert!(s.run("MODE READER\r\n").starts_with("200 "));
+        s.run("AUTHINFO USER u\r\n");
+        s.run("AUTHINFO PASS p\r\n");
+        assert!(s.run("GROUP misc.test\r\n").starts_with("211 "));
+        assert!(s.run("POST\r\n").starts_with("340 "));
+    }
+
+    // ---- STARTTLS ----
+
+    #[test]
+    fn starttls_is_offered_only_where_it_can_be_done() {
+        let mut plain = spool();
+        assert!(!plain.run("CAPABILITIES\r\n").contains("STARTTLS"));
+        assert_eq!(plain.run("STARTTLS\r\n"), "580 Can not initiate TLS negotiation\r\n");
+        let mut s = Session::with(&[], |c| c.with_tls(acceptor()));
+        assert!(s.run("CAPABILITIES\r\n").contains("\r\nSTARTTLS\r\n"));
+        assert!(!s.tls_started());
+    }
+
+    #[test]
+    fn starttls_begins_a_handshake_and_the_protocol_starts_again_after_it() {
+        let mut s = Session::with_groups_and(&[("misc.test", vec![article("one", "x\r\n")])], |c| {
+            c.with_tls(acceptor()).with_credentials(store())
+        });
+        s.run("GROUP misc.test\r\n");
+        assert!(s.run("STAT 1\r\n").starts_with("223 "));
+        assert_eq!(s.run("STARTTLS\r\n"), "382 Continue with TLS negotiation\r\n");
+        assert!(s.tls_started());
+        s.secure(&hopf_core::SecurityInfo::plaintext());
+        // What the client had selected is forgotten (RFC 4642 section 2.2.2).
+        assert!(s.run("STAT 1\r\n").starts_with("412 "));
+        let caps = s.run("CAPABILITIES\r\n");
+        assert!(!caps.contains("STARTTLS") && caps.contains("AUTHINFO USER") && caps.contains("PLAIN"), "{caps}");
+        assert!(s.run("STARTTLS\r\n").starts_with("502 "), "already encrypted");
+        // A password may be sent now.
+        s.run("AUTHINFO USER u\r\n");
+        assert!(s.run("AUTHINFO PASS p\r\n").starts_with("281 "));
+    }
+
+    #[test]
+    fn starttls_is_not_allowed_after_authentication() {
+        let mut s = Session::with(&[], |c| c.with_tls(acceptor()).with_credentials(store()).allow_cleartext_auth());
+        s.run("AUTHINFO USER u\r\n");
+        s.run("AUTHINFO PASS p\r\n");
+        assert!(s.run("STARTTLS\r\n").starts_with("502 "));
+        assert!(!s.tls_started());
+    }
+
+    #[test]
+    fn bytes_sent_ahead_of_the_handshake_close_the_connection() {
+        let mut s = Session::with(&[], |c| c.with_tls(acceptor()));
+        let out = s.run("STARTTLS\r\nDATE\r\n");
+        assert_eq!(out, "382 Continue with TLS negotiation\r\n");
+        assert!(s.is_closed(), "a command smuggled in ahead of the handshake");
+    }
+
+    #[test]
+    fn implicit_tls_greets_when_the_handshake_is_done() {
+        let config = NntpConfig::new("127.0.0.1:1119".parse().unwrap(), "h").with_tls(acceptor()).implicit_tls();
+        let root = tempfile::tempdir().unwrap();
+        let factory = Arc::new(MaildirFactory::new(root.path()));
+        let handlers = DefaultNntpHandlerFactory::new("ready", factory);
+        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        let handler = NntpControlHandler::new(handlers.create(), NntpServerMetrics::shared(), config, rt);
+        let mut peer = Peer::connect(handler, |h| h.busy());
+        assert_eq!(peer.take(), "", "nothing is said before the handshake");
+        peer.secure(&hopf_core::SecurityInfo::plaintext());
+        assert_eq!(peer.take(), "200 ready\r\n");
+    }
+}
+
+#[test]
+fn an_article_posted_after_a_group_was_selected_can_be_read_by_its_number() {
+    let mut s = spool();
+    s.run("GROUP misc.test\r\n");
+    assert!(s.run("STAT 4\r\n").starts_with("423 "));
+    s.run("POST\r\n");
+    s.run(&on_the_wire(&post_text("late", "misc.test", "x\r\n")));
+    assert!(s.run("STAT 4\r\n").starts_with("223 4 "), "the new article is found without selecting the group again");
 }

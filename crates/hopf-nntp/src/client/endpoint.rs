@@ -320,6 +320,22 @@ impl NntpClientEndpoint {
                 self.authenticated = true;
                 self.become_ready(ep);
             }
+            283 => {
+                // Success with data for the client (RFC 4643 section 2.4.2): for
+                // SCRAM, the server's signature, which has to be checked.
+                let data = if s.text.trim() == "=" { Some(Vec::new()) } else { B64.decode(s.text.trim()).ok() };
+                let verified = match (self.sasl.take(), data) {
+                    (Some(mut client), Some(data)) => !matches!(client.evaluate(Some(&data)), SaslClientStep::Failure),
+                    (None, Some(_)) => true,
+                    (_, None) => false,
+                };
+                if verified {
+                    self.authenticated = true;
+                    self.become_ready(ep);
+                } else {
+                    self.fail(ep, io::Error::new(io::ErrorKind::PermissionDenied, "SASL exchange failed (server verification)"));
+                }
+            }
             383 => {
                 let challenge = if s.text.trim() == "=" { Vec::new() } else {
                     match B64.decode(s.text.trim()) {

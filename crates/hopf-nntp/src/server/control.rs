@@ -39,6 +39,7 @@ struct Shared {
     reader: Mutex<Option<Box<dyn ReaderHandler>>>,
     session: Mutex<SessionState>,
     post: commands::PostSlot,
+    auth: Mutex<commands::AuthState>,
 }
 
 /// How much of a posted article is taken from the ring and given to the sink
@@ -62,6 +63,8 @@ enum JobKind {
     PostWrite(Vec<u8>),
     PostTooLarge,
     PostCommit,
+    AuthPassword { user: String, password: String },
+    AuthSasl(commands::SaslStep),
 }
 
 /// A command running on the storage pool.
@@ -123,6 +126,15 @@ pub struct NntpControlHandler {
     write_pending: Arc<AtomicBool>,
     /// An article is being received.
     post: Option<PostData>,
+    /// The name given by `AUTHINFO USER`, awaiting its `PASS`.
+    pending_user: Option<String>,
+    /// The fingerprint of the certificate the client presented, for EXTERNAL.
+    peer_certificate: Option<String>,
+    /// Credentials this connection has had refused.
+    auth_failures: u32,
+    /// `STARTTLS` has been answered and the handshake has not finished:
+    /// nothing is read until it has.
+    tls_pending: bool,
 }
 
 impl NntpControlHandler {
@@ -141,6 +153,7 @@ impl NntpControlHandler {
                 reader: Mutex::new(None),
                 session: Mutex::new(SessionState::default()),
                 post: commands::PostSlot::new(),
+                auth: Mutex::new(commands::AuthState::default()),
             }),
             config,
             metrics,
@@ -155,6 +168,10 @@ impl NntpControlHandler {
             job: None,
             write_pending: Arc::new(AtomicBool::new(false)),
             post: None,
+            pending_user: None,
+            peer_certificate: None,
+            auth_failures: 0,
+            tls_pending: false,
         }
     }
 
@@ -217,10 +234,29 @@ impl NntpControlHandler {
             return;
         }
         if commands::needs_handler(&command) {
+            if self.config.authentication_required && !self.authenticated() {
+                self.say(ep, 480, "Authentication required");
+                return;
+            }
             self.start_job(ep, JobKind::Command(command));
             return;
         }
         match command {
+            NntpCommand::StartTls => self.starttls(ep),
+            NntpCommand::AuthinfoUser(user) => self.authinfo_user(ep, user),
+            NntpCommand::AuthinfoPass(password) => self.authinfo_pass(ep, password),
+            NntpCommand::AuthinfoSasl { mechanism, initial_response } => self.authinfo_sasl(ep, &mechanism, initial_response),
+            NntpCommand::SaslResponse(response) => {
+                self.start_job(ep, JobKind::AuthSasl(commands::SaslStep::Respond(response)));
+            }
+            NntpCommand::SaslAbort => {
+                self.shared.auth.lock().unwrap_or_else(|e| e.into_inner()).sasl = None;
+                self.say(ep, 481, "Authentication failed/rejected");
+            }
+            NntpCommand::SaslInvalid => {
+                self.shared.auth.lock().unwrap_or_else(|e| e.into_inner()).sasl = None;
+                self.say(ep, 504, "Base64 encoding was incorrect");
+            }
             NntpCommand::Capabilities => self.capabilities(ep),
             NntpCommand::ModeReader => {
                 let code = if self.posting_allowed { 200 } else { 201 };
@@ -242,6 +278,92 @@ impl NntpControlHandler {
         }
     }
 
+    fn authenticated(&self) -> bool {
+        self.shared.auth.lock().unwrap_or_else(|e| e.into_inner()).user.is_some()
+    }
+
+    /// May a password be sent on this connection?
+    fn cleartext_ok(&self) -> bool {
+        self.meta.tls || self.config.allow_cleartext_auth
+    }
+
+    /// The SASL mechanisms offered on this connection.
+    fn mechanisms(&self) -> Vec<hopf_auth::SaslMechanism> {
+        let Some(store) = &self.config.credentials else { return Vec::new() };
+        store
+            .supported_mechanisms()
+            .into_iter()
+            .filter(|m| self.cleartext_ok() || !m.requires_tls())
+            .filter(|m| *m != hopf_auth::SaslMechanism::External || self.peer_certificate.is_some())
+            .collect()
+    }
+
+    fn starttls(&mut self, ep: &mut dyn Endpoint) {
+        if self.meta.tls || self.authenticated() {
+            self.say(ep, 502, "Command unavailable");
+            return;
+        }
+        if self.config.tls_acceptor.is_none() || self.config.implicit_tls {
+            self.say(ep, 580, "Can not initiate TLS negotiation");
+            return;
+        }
+        self.say(ep, 382, "Continue with TLS negotiation");
+        self.tls_pending = true;
+        if ep.start_tls().is_err() {
+            self.close(ep);
+        }
+    }
+
+    fn authinfo_user(&mut self, ep: &mut dyn Endpoint, user: String) {
+        if self.config.credentials.is_none() || self.authenticated() {
+            self.say(ep, 502, "Command unavailable");
+        } else if !self.cleartext_ok() {
+            self.say(ep, 483, "Encryption or stronger authentication required");
+        } else {
+            self.pending_user = Some(user);
+            self.say(ep, 381, "Password required");
+        }
+    }
+
+    fn authinfo_pass(&mut self, ep: &mut dyn Endpoint, password: String) {
+        if self.config.credentials.is_none() || self.authenticated() {
+            self.say(ep, 502, "Command unavailable");
+        } else if !self.cleartext_ok() {
+            self.say(ep, 483, "Encryption or stronger authentication required");
+        } else if let Some(user) = self.pending_user.take() {
+            self.start_job(ep, JobKind::AuthPassword { user, password });
+        } else {
+            self.say(ep, 482, "Authentication commands issued out of sequence");
+        }
+    }
+
+    fn authinfo_sasl(&mut self, ep: &mut dyn Endpoint, mechanism: &str, initial_response: Option<Vec<u8>>) {
+        if self.config.credentials.is_none() || self.authenticated() {
+            self.say(ep, 502, "Command unavailable");
+            return;
+        }
+        let Some(mech) = hopf_auth::SaslMechanism::from_name(mechanism) else {
+            self.say(ep, 503, "Mechanism not recognized");
+            return;
+        };
+        let supported = self.config.credentials.as_ref().is_some_and(|s| s.supported_mechanisms().contains(&mech));
+        if !supported {
+            self.say(ep, 503, "Mechanism not recognized");
+        } else if mech.requires_tls() && !self.cleartext_ok() {
+            self.say(ep, 483, "Encryption or stronger authentication required");
+        } else {
+            self.pending_user = None;
+            self.start_job(
+                ep,
+                JobKind::AuthSasl(commands::SaslStep::Begin {
+                    mechanism: mech,
+                    initial_response,
+                    peer_certificate: self.peer_certificate.clone(),
+                }),
+            );
+        }
+    }
+
     fn capabilities(&self, ep: &mut dyn Endpoint) {
         let mut body = Vec::new();
         reply::data_line("VERSION 2", &mut body);
@@ -253,6 +375,21 @@ impl NntpControlHandler {
         reply::data_line("LIST ACTIVE NEWSGROUPS OVERVIEW.FMT", &mut body);
         reply::data_line("OVER", &mut body);
         reply::data_line("HDR", &mut body);
+        if !self.authenticated() {
+            if !self.meta.tls && self.config.tls_acceptor.is_some() && !self.config.implicit_tls {
+                reply::data_line("STARTTLS", &mut body);
+            }
+            if self.config.credentials.is_some() {
+                if self.cleartext_ok() {
+                    reply::data_line("AUTHINFO USER", &mut body);
+                }
+                let mechanisms = self.mechanisms();
+                if !mechanisms.is_empty() {
+                    let names: Vec<&str> = mechanisms.iter().map(|m| m.name()).collect();
+                    reply::data_line(&format!("SASL {}", names.join(" ")), &mut body);
+                }
+            }
+        }
         body.extend_from_slice(reply::END);
         let mut out = reply::status(101, "Capability list follows");
         out.extend_from_slice(&body);
@@ -300,6 +437,7 @@ impl NntpControlHandler {
         let failed = Arc::new(AtomicBool::new(false));
         let shared = Arc::clone(&self.shared);
         let metrics = Arc::clone(&self.metrics);
+        let credentials = self.config.credentials.clone();
         let job_end = Arc::clone(&end);
         let job_failed = Arc::clone(&failed);
         let job_pipe = pipe.clone();
@@ -312,6 +450,14 @@ impl NntpControlHandler {
                     JobKind::PostWrite(piece) => commands::post_write(&shared.post, &piece),
                     JobKind::PostTooLarge => commands::post_too_large(&shared.post),
                     JobKind::PostCommit => commands::post_commit(&shared.post, &mut out, &metrics),
+                    JobKind::AuthPassword { user, password } => match (credentials.as_ref(), shared.reader.lock().unwrap_or_else(|e| e.into_inner()).as_mut()) {
+                        (Some(store), Some(r)) => commands::auth_password(r.as_mut(), store, &shared.auth, &user, &password, &mut out),
+                        _ => JobEnd::Fatal,
+                    },
+                    JobKind::AuthSasl(step) => match (credentials.as_ref(), shared.reader.lock().unwrap_or_else(|e| e.into_inner()).as_mut()) {
+                        (Some(store), Some(r)) => commands::auth_sasl(r.as_mut(), store, &shared.auth, step, &mut out),
+                        _ => JobEnd::Fatal,
+                    },
                     JobKind::Command(command) => {
                         let mut reader = shared.reader.lock().unwrap_or_else(|e| e.into_inner());
                         let mut session = shared.session.lock().unwrap_or_else(|e| e.into_inner());
@@ -400,6 +546,21 @@ impl NntpControlHandler {
         if end == Some(JobEnd::Fatal) {
             self.close(ep);
             return;
+        }
+        match end {
+            Some(JobEnd::AuthOk) => NntpServerMetrics::add(&self.metrics.auth_ok, 1),
+            Some(JobEnd::AuthFailed) => {
+                NntpServerMetrics::add(&self.metrics.auth_fail, 1);
+                self.auth_failures += 1;
+                let limit = self.config.max_auth_failures;
+                if limit > 0 && self.auth_failures >= limit {
+                    self.say(ep, 400, "Too many authentication failures");
+                    self.close(ep);
+                    return;
+                }
+            }
+            Some(JobEnd::SaslContinue) => self.lexer.expect_sasl_response(),
+            _ => {}
         }
         if end == Some(JobEnd::PostData) {
             self.post = Some(PostData {
@@ -504,6 +665,16 @@ impl ProtocolHandler for NntpControlHandler {
                 if !self.greeted {
                     return;
                 }
+                if self.tls_pending {
+                    // The client must wait for the answer to STARTTLS before it
+                    // sends more; what it sent ahead of the handshake is not to
+                    // be taken as if it had been sent after it.
+                    if !data.is_empty() {
+                        *data = &[];
+                        self.close(ep);
+                    }
+                    return;
+                }
                 if self.post.is_some() {
                     if !self.receive_article(ep, data) {
                         return;
@@ -529,10 +700,22 @@ impl ProtocolHandler for NntpControlHandler {
         self.close_reader();
     }
 
-    fn security_established(&mut self, ep: &mut dyn Endpoint, _info: &hopf_core::SecurityInfo) {
+    fn security_established(&mut self, ep: &mut dyn Endpoint, info: &hopf_core::SecurityInfo) {
         self.meta.tls = true;
+        self.peer_certificate = info.peer_certificate_fingerprint().map(str::to_string);
         if self.expect_implicit_tls && !self.greeted {
             self.greet(ep);
+            return;
+        }
+        if self.tls_pending {
+            // The protocol starts again, as after the greeting: nothing the
+            // client said before the handshake is remembered (RFC 4642
+            // section 2.2.2).
+            self.tls_pending = false;
+            self.pending_user = None;
+            *self.shared.session.lock().unwrap_or_else(|e| e.into_inner()) = SessionState::default();
+            NntpServerMetrics::add(&self.metrics.starttls, 1);
+            ep.poke_handler();
         }
     }
 

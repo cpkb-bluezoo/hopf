@@ -350,7 +350,9 @@ fn parse_authinfo(args: &[&str], name: &str) -> NntpCommand {
                 mechanism: (*m).to_string(),
                 initial_response: Some(bytes),
             },
-            None => bad(),
+            // RFC 4643 section 2.4.2: a response that cannot be decoded is
+            // refused with 504.
+            None => NntpCommand::SaslInvalid,
         },
         _ => bad(),
     }
@@ -549,9 +551,14 @@ mod tests {
             one("AUTHINFO SASL SCRAM-SHA-256"),
             NntpCommand::AuthinfoSasl { mechanism: "SCRAM-SHA-256".into(), initial_response: None }
         );
-        for bad in ["AUTHINFO", "AUTHINFO USER", "AUTHINFO PASS a b", "AUTHINFO FOO x", "AUTHINFO SASL PLAIN !!!"] {
+        for bad in ["AUTHINFO", "AUTHINFO USER", "AUTHINFO PASS a b", "AUTHINFO FOO x"] {
             assert!(matches!(one(bad), NntpCommand::Malformed(_)), "{bad}");
         }
+    }
+
+    #[test]
+    fn an_initial_response_that_is_not_base64_is_its_own_error() {
+        assert_eq!(one("AUTHINFO SASL PLAIN !!!"), NntpCommand::SaslInvalid);
     }
 
     #[test]

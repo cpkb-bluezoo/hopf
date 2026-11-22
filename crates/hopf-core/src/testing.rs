@@ -63,6 +63,8 @@ pub struct Wire {
     write_ready: Mutex<Option<crate::endpoint::WriteReadyCallback>>,
     paused: AtomicBool,
     closed: AtomicBool,
+    /// The handler has asked for TLS to begin ([`Endpoint::start_tls`]).
+    tls_started: AtomicBool,
     /// Errors passed to [`Endpoint::fail`] and not yet given to the handler.
     failures: Mutex<Vec<io::Error>>,
 }
@@ -79,6 +81,7 @@ impl Wire {
             write_ready: Mutex::new(None),
             paused: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            tls_started: AtomicBool::new(false),
             failures: Mutex::default(),
         }
     }
@@ -184,7 +187,9 @@ impl Endpoint for TestEndpoint {
         PLAINTEXT.get_or_init(SecurityInfo::plaintext)
     }
     fn start_tls(&mut self) -> Result<(), StartTlsError> {
-        Err(StartTlsError::Unsupported)
+        // The handshake is the test's to complete, with [`Peer::secure`].
+        self.0.tls_started.store(true, Ordering::Relaxed);
+        Ok(())
     }
     fn pause_read(&mut self) {
         self.0.paused.store(true, Ordering::Relaxed);
@@ -362,6 +367,12 @@ impl<H: ProtocolHandler> Peer<H> {
     pub fn secure(&mut self, info: &crate::SecurityInfo) {
         self.handler.security_established(&mut self.endpoint, info);
         self.pump();
+    }
+
+    /// Has the handler asked for TLS to begin? The handshake is not run: a
+    /// test completes it with [`Self::secure`].
+    pub fn tls_started(&self) -> bool {
+        self.wire.tls_started.load(Ordering::Relaxed)
     }
 
     /// Has the handler closed the connection?
