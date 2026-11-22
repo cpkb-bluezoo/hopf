@@ -104,7 +104,7 @@ aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys",
 tractrix = "0.3"
 rjsonparser = "0.3"
 loopbuf = "0.2"
-rmimeparser = "0.6"
+rmimeparser = "0.7"
 rprotobuf = "0.2"
 # Internal crates: `version` must match [workspace.package] version (required
 # for publishing; cargo cannot inherit it here). Bump together on release.

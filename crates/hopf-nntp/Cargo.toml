@@ -9,7 +9,7 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "NNTP / NNTPS async client for Hopf (RFC 3977, 4642, 4643)"
+description = "NNTP / NNTPS server and async client for Hopf (RFC 3977, 4642, 4643)"
 readme = "README.md"
 keywords = ["nntp", "usenet", "news", "networking"]
 categories = ["network-programming"]
@@ -23,6 +23,7 @@ integration = []
 [dependencies]
 hopf-core = { workspace = true }
 hopf-auth = { workspace = true }
+hopf-mailbox = { workspace = true }
 hopf-dns = { workspace = true }
 base64 = "0.22"
 
@@ -30,3 +31,9 @@ base64 = "0.22"
 hopf-core = { workspace = true, features = ["testing"] }
 rcgen = { workspace = true }
 tempfile = { workspace = true }
+
+[[test]]
+name = "memory_bound"
+path = "tests/memory_bound.rs"
+harness = false
+required-features = ["integration"]

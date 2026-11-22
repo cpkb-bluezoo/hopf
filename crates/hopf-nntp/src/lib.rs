@@ -1,6 +1,10 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! NNTP / NNTPS async client for Hopf (RFC 3977, 4642, 4643).
+//! NNTP / NNTPS server and async client for Hopf (RFC 3977, 4642, 4643).
+//!
+//! The server ([`NntpService`]) serves the mailboxes of a mailbox store as
+//! newsgroups to news readers, or any other source of articles through a
+//! [`ReaderHandler`]; see the [`server`] types for the handler SPI.
 //!
 //! The client mirrors the POP3 and IMAP clients: a DNS-aware facade
 //! ([`NntpClient`]) dials on the [`hopf_core::Runtime`], runs the greeting,
@@ -14,6 +18,8 @@
 
 pub mod client;
 
+mod server;
+
 #[cfg(all(test, feature = "integration"))]
 mod integration;
 
@@ -22,5 +28,13 @@ pub use client::{
     ArticleRef, CompletionCallback, GroupResult, ContentCallback, NewsgroupEntry, NntpClient, NntpClientError, NntpClientHandler,
     NntpClientHandlerFactory, NntpClientTimeouts, NntpGreeting, NntpSession, NntpStatus,
     OverviewEntry,
+};
+pub use server::{
+    is_message_id, ArticlePart, ArticleScanner, ArticleSummary, ClientConnected, ConnectedState,
+    DefaultNntpHandlerFactory, GroupStatus, HandlerError, HandlerResult, ListKind, Located,
+    MailboxReaderHandler, NewGroupsSince, NewsgroupInfo, NntpCommand, NntpConfig, NntpConnectionMetadata,
+    NntpControlHandler, NntpDotStuffer, NntpHandlerFactory, NntpServerLexer, NntpServerMetrics, NntpService,
+    OverviewRecord, PostingStatus, ReaderHandler, Target, Wildmat, DEFAULT_GREETING, DEFAULT_IDLE_TIMEOUT,
+    DEFAULT_STORE_USER, DEFAULT_WRITE_STALL_TIMEOUT, MAX_ARTICLE_NUMBER, MAX_COMMAND_LINE,
 };
 pub use hopf_core::VERSION;

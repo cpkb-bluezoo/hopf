@@ -22,7 +22,7 @@
 use hopf_mailbox::{Mailbox, MailboxResult, MessageReadCallback};
 use loopbuf::LoopBuf;
 use rmimeparser::{
-    ContentDisposition, ContentDispositionCollector, ContentId, ContentTypeCollector,
+    ContentDisposition, ContentDispositionCollector, ContentTypeCollector,
     MessageHandler, MessageParser, MimeHandler, OffsetDateTime, ParseResult,
 };
 
@@ -298,9 +298,9 @@ impl MimeHandler for StructureBuilder {
         Ok(())
     }
 
-    fn content_id(&mut self, id: &ContentId) -> ParseResult<()> {
+    fn content_id(&mut self, local_part: &str, domain: &str) -> ParseResult<()> {
         if let Some(top) = self.stack.last_mut() {
-            top.content_id = Some(id.to_string());
+            top.content_id = Some(format!("<{local_part}@{domain}>"));
         }
         Ok(())
     }
