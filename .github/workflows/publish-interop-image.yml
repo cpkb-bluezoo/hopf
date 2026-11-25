@@ -1,0 +1,125 @@
+name: Publish interop image
+
+# Builds the QUIC interoperability endpoint (test/quic-interop-runner) for
+# linux/amd64 and publishes it to the GitHub Container Registry, where the
+# quic-interop-runner pulls it from:
+#
+#   ghcr.io/cpkb-bluezoo/hopf-interop:latest
+#
+# A published release pushes <version> and latest. A manual run pushes the
+# one tag it is given (edge by default), from any ref; it only changes latest
+# if latest is the tag you give it.
+#
+# The runner only uses linux/amd64 images, so that is all that is built.
+#
+# The package must be public for the runner to pull it: after the first
+# push, check its visibility under the repository's Packages.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to give the image, e.g. edge for a test build or latest (a release pushes its own version and latest, whatever this says)'
+        default: 'edge'
+        type: string
+      ref:
+        description: 'Commit, branch or tag to build (empty builds this workflow''s own commit)'
+        default: ''
+        type: string
+
+env:
+  IMAGE: ghcr.io/cpkb-bluezoo/hopf-interop
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Build, check and push the endpoint image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      # Values from the event and the inputs go through the environment, not
+      # into the script text.
+      - name: Tags
+        id: tags
+        env:
+          EVENT: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "$EVENT" = release ]; then
+            # v0.8.0 -> 0.8.0
+            tag="${RELEASE_TAG#v}"
+            tags="$IMAGE:$tag,$IMAGE:latest"
+          else
+            tag="${INPUT_TAG:-edge}"
+            tags="$IMAGE:$tag"
+          fi
+          if ! printf '%s' "$tag" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'; then
+            echo "::error::Not a valid image tag: $tag"
+            exit 1
+          fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          # the commit that was checked out (a manual run may build any ref)
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "$tags"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and smoke-test linux/amd64
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: test/quic-interop-runner/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: hopf-interop:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The endpoint exits 127 for a test case it does not know, which is how
+      # the runner finds out what is unsupported; check that on the image the
+      # runner will get before publishing it. The entrypoint script runs the
+      # simulator's network setup first, which needs the simulator, so the
+      # endpoint is run directly: it decides on the exit status itself.
+      - name: Unsupported test case exits 127
+        run: |
+          set +e
+          docker run --rm --entrypoint /hopf/quic-interop \
+            -e ROLE=server -e TESTCASE=no-such-case hopf-interop:smoke
+          status=$?
+          echo "exit status $status"
+          test "$status" = 127
+
+      # The layers come from the build above, so this does not compile again.
+      - name: Push linux/amd64
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: test/quic-interop-runner/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/cpkb-bluezoo/hopf
+            org.opencontainers.image.revision=${{ steps.tags.outputs.revision }}
+            org.opencontainers.image.description=hopf endpoint for the QUIC Interop Runner
+            org.opencontainers.image.licenses=LGPL-3.0-or-later
+          cache-from: type=gha
